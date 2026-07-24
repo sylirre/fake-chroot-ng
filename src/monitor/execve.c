@@ -164,6 +164,10 @@ void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
         }
     }
 
+    if (cng_g_debug)
+        cng_dprintf(2, "[cng] exec %s host=%s file_backed=%d\n", path, host,
+                    cng_g_loader_file);
+
     struct cng_loaded prog;
     int rc = cng_load_elf(host, 0, &prog);
     if (rc != CNG_LOAD_OK) {
@@ -173,6 +177,12 @@ void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
                                                               : -ENOEXEC);
         return;
     }
+    if (cng_g_debug)
+        cng_dprintf(2,
+                    "[cng]   prog dyn=%d base=%lx entry=%lx phdr=%lx "
+                    "lo=%lx hi=%lx interp=%d\n",
+                    prog.is_dyn, prog.base, prog.entry, prog.phdr, prog.load_lo,
+                    prog.load_hi, prog.has_interp);
 
     struct cng_loaded interp;
     int have_interp = 0;
@@ -186,6 +196,10 @@ void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
             return;
         }
         have_interp = 1;
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng]   interp %s base=%lx entry=%lx lo=%lx hi=%lx\n",
+                        prog.interp, interp.base, interp.entry, interp.load_lo,
+                        interp.load_hi);
     }
 
     int argc = 0;
@@ -197,6 +211,9 @@ void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
                                        &prog, have_interp ? &interp : 0,
                                        eff_argv ? eff_argv[0] : path);
     unsigned long entry = have_interp ? interp.entry : prog.entry;
+    if (cng_g_debug)
+        cng_dprintf(2, "[cng]   argc=%d sp=%lx entry=%lx -> enter\n", argc, sp,
+                    entry);
 
     /* Commit point: the new image loaded successfully, so from here we behave
      * like a real execve. Close FD_CLOEXEC descriptors (see cng_close_cloexec)
