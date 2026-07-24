@@ -39,17 +39,6 @@ int cng_sig_install(int signo, cng_sighandler_t h) {
     return (int)r;
 }
 
-/* One-shot-per-number notice that a host syscall was blocked by Android's
- * seccomp filter and turned into ENOSYS. Diagnostic; async-signal-safe. */
-static void warn_blocked(int nr) {
-    static unsigned char warned[600];
-    if (nr < 0 || nr >= (int)sizeof warned || warned[nr])
-        return;
-    warned[nr] = 1;
-    cng_dprintf(2, "chroot-ng: host syscall %d blocked by Android seccomp"
-                   " -> ENOSYS\n", nr);
-}
-
 void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si) {
     unsigned long long *r = uc->uc_mcontext.regs;
 
@@ -64,7 +53,7 @@ void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si) {
     unsigned long ca = (unsigned long)si->_u._sigsys.call_addr;
     if (ca >= (unsigned long)__cng_gate_start &&
         ca < (unsigned long)__cng_gate_end) {
-        warn_blocked(si->_u._sigsys.syscall);
+        cng_note_blocked(si->_u._sigsys.syscall);
         r[0] = (unsigned long long)(long)-ENOSYS;
         return;
     }
@@ -87,7 +76,7 @@ void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si) {
 
     r[0] = (unsigned long long)cng_dispatch(nr, (long)r[0], (long)r[1],
                                             (long)r[2], (long)r[3], (long)r[4],
-                                            (long)r[5]);
+                                            (long)r[5], /*trapped=*/1);
 }
 
 static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {

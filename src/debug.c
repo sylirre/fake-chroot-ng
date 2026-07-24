@@ -88,7 +88,7 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
 
     if (!strcmp(op, "open")) {
         long fd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
-                               CNG_O_RDONLY, 0, 0, 0);
+                               CNG_O_RDONLY, 0, 0, 0, /*trapped=*/0);
         if (fd < 0) {
             cng_dprintf(1, "open: errno %d\n", (int)-fd);
             return 1;
@@ -106,7 +106,7 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     }
     if (!strcmp(op, "access")) {
         long r = cng_dispatch(__NR_faccessat, CNG_AT_FDCWD, (long)gpath, 0, 0, 0,
-                              0);
+                              0, /*trapped=*/0);
         cng_dprintf(1, "access: %s\n", r == 0 ? "ok" : "no");
         return r == 0 ? 0 : 1;
     }
@@ -206,13 +206,13 @@ int cng_cmd_faketest(int argc, char **argv, char **envp, unsigned long *auxv) {
     cng_g_exe_guest = "/bin/sh";
 
     cng_dprintf(1, "getuid=%d\n",
-                (int)cng_dispatch(__NR_getuid, 0, 0, 0, 0, 0, 0));
+                (int)cng_dispatch(__NR_getuid, 0, 0, 0, 0, 0, 0, 0));
     cng_dprintf(1, "geteuid=%d\n",
-                (int)cng_dispatch(__NR_geteuid, 0, 0, 0, 0, 0, 0));
+                (int)cng_dispatch(__NR_geteuid, 0, 0, 0, 0, 0, 0, 0));
 
     char sb[256];
     long r = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)file, (long)sb,
-                          0, 0, 0);
+                          0, 0, 0, /*trapped=*/0);
     if (r == 0)
         cng_dprintf(1, "st_uid=%u st_gid=%u\n", *(unsigned *)(sb + 24),
                     *(unsigned *)(sb + 28));
@@ -221,7 +221,8 @@ int cng_cmd_faketest(int argc, char **argv, char **envp, unsigned long *auxv) {
 
     char lb[256];
     long n = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD,
-                          (long)"/proc/self/exe", (long)lb, sizeof lb, 0, 0);
+                          (long)"/proc/self/exe", (long)lb, sizeof lb, 0, 0,
+                          /*trapped=*/0);
     if (n > 0) {
         lb[n] = '\0';
         cng_dprintf(1, "exe=%s\n", lb);
@@ -308,21 +309,41 @@ int cng_cmd_nettest(int argc, char **argv, char **envp, unsigned long *auxv) {
                     (int)-ENOSYS, ok ? "OK" : "FAIL");
         fails += !ok;
     }
-    /* 2) non-gate seccomp trap of getpid -> dispatch -> real pid. */
+    /* 2) non-gate seccomp trap of a translated path syscall -> dispatched and
+     * re-issued (faccessat "/" with identity rootfs succeeds). */
+    {
+        struct cng_ucontext uc;
+        cng_siginfo_t si;
+        memset(&uc, 0, sizeof uc);
+        memset(&si, 0, sizeof si);
+        const char *root = "/";
+        si.si_code = CNG_SYS_SECCOMP;
+        si._u._sigsys.call_addr = (void *)0x1000; /* not the gate */
+        uc.uc_mcontext.regs[8] = __NR_faccessat;
+        uc.uc_mcontext.regs[0] = (unsigned long long)(long)CNG_AT_FDCWD;
+        uc.uc_mcontext.regs[1] = (unsigned long long)(unsigned long)root;
+        uc.uc_mcontext.regs[2] = 0; /* F_OK */
+        cng_sigsys_body(&uc, &si);
+        long got = (long)uc.uc_mcontext.regs[0];
+        int ok = (got == 0);
+        cng_dprintf(1, "nettest dispatch: faccessat(/)=%d -> %s\n", (int)got,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+    /* 2b) a blocked non-path syscall reaching default -> emulated ENOSYS. */
     {
         struct cng_ucontext uc;
         cng_siginfo_t si;
         memset(&uc, 0, sizeof uc);
         memset(&si, 0, sizeof si);
         si.si_code = CNG_SYS_SECCOMP;
-        si._u._sigsys.call_addr = (void *)0x1000; /* not the gate */
-        uc.uc_mcontext.regs[8] = __NR_getpid;
+        si._u._sigsys.call_addr = (void *)0x1000;
+        uc.uc_mcontext.regs[8] = __NR_setgid;
         cng_sigsys_body(&uc, &si);
         long got = (long)uc.uc_mcontext.regs[0];
-        long real = sys_getpid();
-        int ok = (got == real);
-        cng_dprintf(1, "nettest dispatch: regs0=%d want-pid=%d -> %s\n",
-                    (int)got, (int)real, ok ? "OK" : "FAIL");
+        int ok = (got == -ENOSYS);
+        cng_dprintf(1, "nettest blocked-direct: setgid=%d want=%d -> %s\n",
+                    (int)got, (int)-ENOSYS, ok ? "OK" : "FAIL");
         fails += !ok;
     }
     /* 3) guest-directed SIGSYS (si_code != SYS_SECCOMP) -> untouched. */

@@ -31,10 +31,16 @@ extern const char *cng_g_exe_guest;
 void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
                         char **argv, char **envp);
 
-/* Emulate one trapped syscall: translate path args, re-issue via the gate,
- * return the kernel result. Directly callable for testing (no seccomp needed). */
-long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4,
-                  long a5);
+/* Emulate one syscall: translate path args, re-issue via the gate, return the
+ * kernel result. `trapped` = 1 when invoked from the SIGSYS handler (a syscall
+ * reaching `default` was trapped by Android => emulate ENOSYS), 0 from an M8
+ * trampoline (an unhandled syscall is ordinary => re-issue it). Directly
+ * callable for testing (no seccomp needed). */
+long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
+                  int trapped);
+
+/* One-shot-per-number diagnostic for a syscall we emulate away. */
+void cng_note_blocked(int nr);
 
 /* Install a signal handler with our own rt_sigreturn restorer. Returns 0/-errno. */
 int cng_sig_install(int signo, cng_sighandler_t h);

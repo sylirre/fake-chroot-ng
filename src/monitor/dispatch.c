@@ -27,6 +27,17 @@ const char *cng_g_exe_guest = "/";
 #define STATX_UID_OFF 20
 #define STATX_GID_OFF 24
 
+/* One-shot-per-number diagnostic that a syscall was emulated away (blocked by
+ * Android's seccomp filter, or a credential change we can't perform). Shared
+ * with the SIGSYS gate-net. Async-signal-safe. */
+void cng_note_blocked(int nr) {
+    static unsigned char warned[600];
+    if (nr < 0 || nr >= (int)sizeof warned || warned[nr])
+        return;
+    warned[nr] = 1;
+    cng_dprintf(2, "chroot-ng: syscall %d not permitted here -> emulated\n", nr);
+}
+
 static const char *xlate(long dirfd, const char *gp, char *buf, size_t bufsz) {
     if (!gp)
         return gp;
@@ -59,8 +70,8 @@ static long proc_self_fixup(const char *canon, char *buf, unsigned long bufsz) {
     return (long)len;
 }
 
-long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4,
-                  long a5) {
+long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
+                  int trapped) {
     char b1[CNG_PATH_MAX], b2[CNG_PATH_MAX];
 
     switch (nr) {
@@ -224,13 +235,34 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4,
             *(unsigned *)a2 = v;
         return 0;
     }
+    /* Credential setters: under -0, fake success as the emulated identity.
+     * Otherwise emulate the result DIRECTLY — never re-issue: these are on
+     * Android's seccomp block-list, and a re-issue from inside this (SIGSYS)
+     * handler force-kills the process (masked nested seccomp SIGSYS). */
     case __NR_setuid:
     case __NR_setgid:
     case __NR_setresuid:
     case __NR_setresgid:
-        return cng_g_fake_id ? 0 : cng_syscall6(a0, a1, a2, a3, a4, a5, nr);
+    case __NR_setreuid:
+    case __NR_setregid:
+    case __NR_setgroups:
+        if (cng_g_fake_id)
+            return 0;
+        cng_note_blocked((int)nr);
+        return -ENOSYS;
+    case __NR_setfsuid:
+    case __NR_setfsgid:
+        return 0; /* returns the previous fs id (0); never fails */
 
     default:
+        /* From a seccomp trap, an unhandled syscall was blocked by Android
+         * (our filter only traps handled ones) => emulate ENOSYS rather than
+         * re-issue and die on the nested trap. From a trampoline it is just an
+         * ordinary syscall we don't translate => run it. */
+        if (trapped) {
+            cng_note_blocked((int)nr);
+            return -ENOSYS;
+        }
         return cng_syscall6(a0, a1, a2, a3, a4, a5, nr);
     }
 }

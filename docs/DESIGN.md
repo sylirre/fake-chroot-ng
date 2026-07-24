@@ -99,13 +99,24 @@ Two consequences:
    may block that too. Since the re-issue happens inside the handler, a naive
    design gets a masked seccomp SIGSYS → force-kill.
 
-The **gate-net** handles both: the handler runs with `SA_NODEFER` (SIGSYS stays
-deliverable), and its first check is "did the trapped `svc` come from our gate?"
-— if so, Android blocked something *we* issued, so we return `-ENOSYS` instead
-of re-dispatching. Any Android-blocked syscall (guest-issued or re-issued) thus
-becomes a clean `-ENOSYS`, no per-syscall list required. For a real container
-you additionally want `-0` (root emulation), which emulates the credential
-syscalls as succeeding instead of returning ENOSYS — mirroring proot's `-0` and
+Two layers handle this:
+
+- **Direct emulation (primary).** The SIGSYS handler passes `trapped=1` to the
+  dispatcher. Since our filter only traps syscalls we have explicit handlers
+  for, anything reaching the dispatcher's `default` was trapped by *Android* —
+  so we emulate `-ENOSYS` directly instead of re-issuing. Credential setters are
+  likewise emulated in place (fake success under `-0`, else `-ENOSYS`). Nothing
+  is re-issued, so this does not depend on nested signal delivery. (The M8
+  trampoline path passes `trapped=0`, where an unhandled syscall is an ordinary
+  one to run, not a blocked one.)
+- **Gate-net (backstop).** For the syscalls we *do* re-issue (translated path
+  syscalls), Android may still block one (e.g. `mknodat`). The handler runs with
+  `SA_NODEFER` and, if a trapped `svc` is our own gate, returns `-ENOSYS`. This
+  needs nested seccomp SIGSYS delivery, which some kernels don't honor, so it is
+  a best-effort backstop rather than the primary mechanism.
+
+For a real container you want `-0` (root emulation), which emulates the
+credential syscalls as succeeding instead of ENOSYS — mirroring proot's `-0` and
 the way the reference emulator recommends `--fake-id` for apt/dpkg.
 
 ### Known hazards (why the tiers exist)

@@ -28,7 +28,8 @@ cng_svc_tramp_tpl:
     stp     x14, x15, [sp, #112]
     stp     x16, x17, [sp, #128]
     stp     x18, x30, [sp, #144]
-    /* cng_dispatch(nr=x8, a0=x0, a1=x1, a2=x2, a3=x3, a4=x4, a5=x5) */
+    /* cng_dispatch(nr=x8, a0=x0..a5=x5, trapped=0) — trampoline path, so an
+     * unhandled syscall is re-issued rather than turned into ENOSYS. */
     mov     x6, x5
     mov     x5, x4
     mov     x4, x3
@@ -36,6 +37,7 @@ cng_svc_tramp_tpl:
     mov     x2, x1
     mov     x1, x0
     mov     x0, x8
+    mov     x7, xzr             /* trapped = 0 */
     ldr     x16, cng_svc_tramp_disp
     blr     x16
     str     x0, [sp, #160]          /* result */
