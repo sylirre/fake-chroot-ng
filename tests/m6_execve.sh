@@ -25,3 +25,10 @@ if $GCC -static-pie -O2 -o "$ER/hello" tests/guests/hello.c 2>/dev/null; then
     check_contains "plain ELF exec via emulate_execve" "argv0=/hello" "$out"
 fi
 rm -rf "$ER"
+
+# emulated execve must close FD_CLOEXEC fds like a real execve, or fork/exec
+# launchers (git run-command, posix_spawn) block on their O_CLOEXEC notify pipe.
+out=$(run _cloexectest 2>&1); rc=$?
+check "cloexectest exit 0" 0 "$rc"
+check_contains "emulated execve closes FD_CLOEXEC fds" \
+    "cloexec: cloexec_closed=1 plain_open=1 -> OK" "$out"

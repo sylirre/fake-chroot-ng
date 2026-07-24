@@ -504,6 +504,29 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
     return fails ? 1 : 0;
 }
 
+/* _cloexectest — emulated execve must close FD_CLOEXEC fds like a real execve
+ * (else fork/exec launchers' O_CLOEXEC notify pipes never close and the parent
+ * hangs — the git-clone symptom). Open one CLOEXEC and one plain fd, run the
+ * close pass, and check only the CLOEXEC one went away. */
+int cng_cmd_cloexectest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    long ce = sys_openat(CNG_AT_FDCWD, "/dev/null",
+                         CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    long pl = sys_openat(CNG_AT_FDCWD, "/dev/null", CNG_O_RDONLY, 0);
+    cng_close_cloexec();
+    long ce_fl = CNG_SYS(__NR_fcntl, (int)ce, 1 /*F_GETFD*/, 0, 0, 0, 0);
+    long pl_fl = CNG_SYS(__NR_fcntl, (int)pl, 1 /*F_GETFD*/, 0, 0, 0, 0);
+    int ok = (ce >= 0 && pl >= 0 && ce_fl == -EBADF && pl_fl >= 0);
+    cng_dprintf(1, "cloexec: cloexec_closed=%d plain_open=%d -> %s\n",
+                ce_fl == -EBADF, pl_fl >= 0, ok ? "OK" : "FAIL");
+    if (pl >= 0)
+        sys_close((int)pl);
+    return ok ? 0 : 1;
+}
+
 /* _nettest — drive cng_sigsys_body with synthetic seccomp contexts to validate
  * the Android SIGSYS net branching (no real seccomp needed). */
 int cng_cmd_nettest(int argc, char **argv, char **envp, unsigned long *auxv) {

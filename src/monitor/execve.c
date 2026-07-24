@@ -21,6 +21,48 @@
 
 unsigned long *cng_host_auxv = 0;
 
+/* A real execve closes every FD_CLOEXEC descriptor. Our in-process emulation
+ * never issues a real execve, so we must do this ourselves — otherwise the
+ * exec-notify pipe that fork/exec launchers (git's run-command, posix_spawn)
+ * open with O_CLOEXEC never closes, and the parent blocks forever waiting for
+ * the EOF that signals "exec succeeded". Iterate /proc/self/fd and close each fd
+ * whose FD_CLOEXEC bit is set (skipping the directory fd we are scanning). */
+void cng_close_cloexec(void) {
+    long dfd = sys_openat(CNG_AT_FDCWD, "/proc/self/fd",
+                          CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
+    if (dfd < 0)
+        return;
+    char buf[4096];
+    for (;;) {
+        long n = CNG_SYS(__NR_getdents64, (int)dfd, buf, sizeof buf, 0, 0, 0);
+        if (n <= 0)
+            break;
+        long o = 0;
+        while (o + 19 <= n) {
+            unsigned short reclen;
+            memcpy(&reclen, buf + o + 16, 2);
+            if (reclen == 0 || o + reclen > n)
+                break;
+            const char *nm = buf + o + 19; /* d_name at record offset +19 */
+            o += reclen;
+            int fd = 0, ok = (nm[0] >= '0' && nm[0] <= '9');
+            for (const char *c = nm; *c; c++) {
+                if (*c < '0' || *c > '9') {
+                    ok = 0;
+                    break;
+                }
+                fd = fd * 10 + (*c - '0');
+            }
+            if (!ok || fd == (int)dfd)
+                continue;
+            long fl = CNG_SYS(__NR_fcntl, fd, 1 /*F_GETFD*/, 0, 0, 0, 0);
+            if (fl >= 0 && (fl & 1 /*FD_CLOEXEC*/))
+                sys_close(fd);
+        }
+    }
+    sys_close((int)dfd);
+}
+
 void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
                         char **argv, char **envp) {
     unsigned long long *r = uc->uc_mcontext.regs;
@@ -132,6 +174,11 @@ void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
                                        &prog, have_interp ? &interp : 0,
                                        eff_argv ? eff_argv[0] : path);
     unsigned long entry = have_interp ? interp.entry : prog.entry;
+
+    /* Commit point: the new image loaded successfully, so from here we behave
+     * like a real execve. Close FD_CLOEXEC descriptors (see cng_close_cloexec)
+     * before entering the new program. */
+    cng_close_cloexec();
 
     /* Rewrite the signal context to the new program's fresh entry state, then
      * return: rt_sigreturn resumes at `entry` with the new stack, handler and

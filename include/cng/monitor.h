@@ -31,6 +31,11 @@ extern const char *cng_g_exe_guest;
 void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
                         char **argv, char **envp);
 
+/* Close every FD_CLOEXEC descriptor, as a real execve would (emulated execve
+ * does not, so fork/exec launchers' O_CLOEXEC notify pipes must be closed here
+ * or the parent blocks). Exposed for testing. */
+void cng_close_cloexec(void);
+
 /* Emulate one syscall: translate path args, re-issue via the gate, return the
  * kernel result. `trapped` = 1 when invoked from the SIGSYS handler (a syscall
  * reaching `default` was trapped by Android => emulate ENOSYS), 0 from an M8
