@@ -225,6 +225,34 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         return 0;
     }
 
+    /* Protect our SIGSYS handler: ignore guest attempts to replace it, and
+     * strip SIGSYS from any handler's sa_mask so it can't be masked while a
+     * guest handler runs. Kernel struct sigaction: handler,flags,restorer,mask
+     * (mask at offset 24). */
+    case __NR_rt_sigaction:
+        if ((int)a0 == CNG_SIGSYS)
+            return 0;
+        if (a1) {
+            unsigned char act[32];
+            memcpy(act, (void *)a1, sizeof act);
+            *(unsigned long *)(act + 24) &= ~(1UL << (CNG_SIGSYS - 1));
+            return cng_syscall6(a0, (long)act, a2, a3, a4, a5,
+                                __NR_rt_sigaction);
+        }
+        return cng_syscall6(a0, a1, a2, a3, a4, a5, __NR_rt_sigaction);
+
+    /* rt_sigprocmask on the trampoline path (the SIGSYS path handles it via
+     * uc_sigmask): apply the mask but never block SIGSYS. */
+    case __NR_rt_sigprocmask: {
+        int how = (int)a0;
+        if ((how == 0 /*BLOCK*/ || how == 2 /*SETMASK*/) && a1) {
+            unsigned long set = *(unsigned long *)a1 & ~(1UL << (CNG_SIGSYS - 1));
+            return cng_syscall6(a0, (long)&set, a2, a3, a4, a5,
+                                __NR_rt_sigprocmask);
+        }
+        return cng_syscall6(a0, a1, a2, a3, a4, a5, __NR_rt_sigprocmask);
+    }
+
     /* --- credential faking (only trapped when -0 is active) --- */
     case __NR_getuid:
     case __NR_geteuid:

@@ -60,6 +60,28 @@ void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si) {
 
     long nr = (long)r[8];
 
+    /* rt_sigprocmask: apply the guest's requested mask but never let SIGSYS be
+     * blocked (a masked seccomp SIGSYS force-kills). We edit uc_sigmask, which
+     * sigreturn restores — re-issuing the syscall here would be undone by that
+     * same restore. */
+    if (nr == __NR_rt_sigprocmask) {
+        int how = (int)r[0];
+        unsigned long *pset = (unsigned long *)r[1];
+        unsigned long *pold = (unsigned long *)r[2];
+        unsigned long cur = uc->uc_sigmask.sig[0];
+        if (pold)
+            *pold = cur;
+        if (pset) {
+            unsigned long set = *pset;
+            unsigned long neu = (how == 0)   ? (cur | set)   /* SIG_BLOCK */
+                                : (how == 1) ? (cur & ~set)  /* SIG_UNBLOCK */
+                                             : set;          /* SIG_SETMASK */
+            uc->uc_sigmask.sig[0] = neu & ~(1UL << (CNG_SIGSYS - 1));
+        }
+        r[0] = 0;
+        return;
+    }
+
     /* execve/execveat are emulated in-process (they'd otherwise wipe us). */
     if (nr == __NR_execve) {
         cng_emulate_execve(uc, CNG_AT_FDCWD, (const char *)r[0], (char **)r[1],

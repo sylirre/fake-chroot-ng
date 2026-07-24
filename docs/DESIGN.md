@@ -122,6 +122,15 @@ Two layers handle this:
   which some kernels don't honor — so it is only a backstop; correctness comes
   from the two mechanisms above.
 
+**Keeping SIGSYS ours and deliverable.** A masked seccomp SIGSYS force-kills, so
+the guest must never block SIGSYS or replace our handler. musl does exactly this
+at startup (`rt_sigprocmask(SIG_BLOCK, ~[a few RT sigs])`), which neutered us
+until we virtualized it. We trap `rt_sigprocmask` and `rt_sigaction`: mask
+changes are applied with SIGSYS forced clear (in the SIGSYS handler we edit
+`uc_sigmask`, which `sigreturn` restores — re-issuing there would be undone),
+`sa_mask` on installed handlers has SIGSYS stripped, and `rt_sigaction(SIGSYS)`
+is ignored so the guest can't take over our slot.
+
 For a real container you want `-0` (root emulation), which emulates the
 credential syscalls as succeeding instead of ENOSYS — mirroring proot's `-0` and
 the way the reference emulator recommends `--fake-id` for apt/dpkg.

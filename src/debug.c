@@ -379,6 +379,28 @@ int cng_cmd_nettest(int argc, char **argv, char **envp, unsigned long *auxv) {
                     (int)got, (int)-ENOSYS, ok ? "OK" : "FAIL");
         fails += !ok;
     }
+    /* 2c) rt_sigprocmask(SETMASK, block-all) must apply the mask but leave
+     * SIGSYS unblocked (else a later blocked seccomp trap force-kills). */
+    {
+        struct cng_ucontext uc;
+        cng_siginfo_t si;
+        memset(&uc, 0, sizeof uc);
+        memset(&si, 0, sizeof si);
+        unsigned long block_all = ~0UL;
+        si.si_code = CNG_SYS_SECCOMP;
+        si._u._sigsys.call_addr = (void *)0x1000;
+        uc.uc_mcontext.regs[8] = __NR_rt_sigprocmask;
+        uc.uc_mcontext.regs[0] = 2; /* SIG_SETMASK */
+        uc.uc_mcontext.regs[1] = (unsigned long)&block_all;
+        uc.uc_sigmask.sig[0] = 0;
+        cng_sigsys_body(&uc, &si);
+        int sigsys_blocked = (uc.uc_sigmask.sig[0] >> (CNG_SIGSYS - 1)) & 1;
+        long ret = (long)uc.uc_mcontext.regs[0];
+        int ok = (ret == 0 && !sigsys_blocked);
+        cng_dprintf(1, "nettest sigprocmask: ret=%d sigsys_blocked=%d -> %s\n",
+                    (int)ret, sigsys_blocked, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
     /* 3) guest-directed SIGSYS (si_code != SYS_SECCOMP) -> untouched. */
     {
         struct cng_ucontext uc;
