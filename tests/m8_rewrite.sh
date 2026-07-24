@@ -29,4 +29,19 @@ else
     sed 's/^/    /' "$GDIR/readfile.log"
 fi
 
+# execve from a rewritten svc site must be emulated in-process (translated,
+# monitor kept), not re-issued raw — raw would exec the untranslated guest path
+# on the host and fail with ENOENT.
+if $GCC -static-pie -O2 -o "$ROOT/bin/hello" tests/guests/hello.c \
+        2>"$GDIR/hello.log" &&
+   $GCC -static-pie -O2 -o "$ROOT/bin/execer" tests/guests/execer.c \
+        2>"$GDIR/execer.log"; then
+    out=$(run run -R -r "$ROOT" -- /bin/execer 2>/dev/null); rc=$?
+    check "execve via rewrite exits through exec'd guest" 42 $rc
+    check_contains "exec'd program got its argv" "argv1=from-execer" "$out"
+else
+    fail=$((fail + 1)); printf '  FAIL could not build execer guests\n'
+    sed 's/^/    /' "$GDIR/hello.log" "$GDIR/execer.log" 2>/dev/null
+fi
+
 rm -rf "$ROOT"

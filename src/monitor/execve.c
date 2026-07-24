@@ -86,27 +86,26 @@ void cng_close_cloexec(void) {
     sys_close((int)dfd);
 }
 
-void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
-                        char **argv, char **envp) {
-    unsigned long long *r = uc->uc_mcontext.regs;
-
+/* Shared emulation core: resolve the target (shebang-aware), load it, build its
+ * stack, and pass the commit point (close FD_CLOEXEC fds, reset signal
+ * dispositions, retarget /proc/self/exe). Returns -errno on failure (all of
+ * which occur before the commit point), or 0 with *out_sp/*out_entry set for
+ * the caller to transfer control into the new program. */
+static long execve_core(int dirfd, const char *path, char **argv, char **envp,
+                        unsigned long *out_sp, unsigned long *out_entry) {
     if (cng_g_debug)
         cng_dprintf(2, "[cng] execve enter path=%s\n", path ? path : "(null)");
 
-    if (!path) {
-        r[0] = (unsigned long long)(long)-EFAULT;
-        return;
-    }
+    if (!path)
+        return -EFAULT;
 
     /* Resolve the target through the rootfs/bind map, following symlinks
      * (absolute or AT_FDCWD); a real dirfd with a relative path is a rare case
      * we pass through. */
     char host[CNG_PATH_MAX];
     if (path[0] == '/' || dirfd == CNG_AT_FDCWD) {
-        if (cng_resolve(path, 1, host, sizeof host) != 0) {
-            r[0] = (unsigned long long)(long)-ENOENT;
-            return;
-        }
+        if (cng_resolve(path, 1, host, sizeof host) != 0)
+            return -ENOENT;
     } else {
         cng_strlcpy(host, path, sizeof host);
     }
@@ -119,10 +118,8 @@ void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
     char **eff_argv = argv;
     {
         long fd = sys_openat(CNG_AT_FDCWD, host, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
-        if (fd < 0) {
-            r[0] = (unsigned long long)(long)-ENOENT;
-            return;
-        }
+        if (fd < 0)
+            return -ENOENT;
         char hdr[257];
         long n = sys_pread64((int)fd, hdr, 256, 0);
         sys_close((int)fd);
@@ -141,10 +138,8 @@ void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
             while (*p && *p != '\n' && *p != '\r')
                 p++;
             size_t alen = (size_t)(p - a0);
-            if (ilen == 0 || ilen >= sizeof interp_buf) {
-                r[0] = (unsigned long long)(long)-ENOEXEC;
-                return;
-            }
+            if (ilen == 0 || ilen >= sizeof interp_buf)
+                return -ENOEXEC;
             memcpy(interp_buf, i0, ilen);
             interp_buf[ilen] = '\0';
             int k = 0;
@@ -160,10 +155,8 @@ void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
                     sheb_argv[k++] = argv[j];
             sheb_argv[k] = 0;
             eff_argv = sheb_argv;
-            if (cng_resolve(interp_buf, 1, host, sizeof host) != 0) {
-                r[0] = (unsigned long long)(long)-ENOENT;
-                return;
-            }
+            if (cng_resolve(interp_buf, 1, host, sizeof host) != 0)
+                return -ENOENT;
         }
     }
 
@@ -176,9 +169,7 @@ void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
     if (rc != CNG_LOAD_OK) {
         cng_dprintf(2, "chroot-ng: exec %s (%s): load failed rc=%d\n", path,
                     host, rc);
-        r[0] = (unsigned long long)(long)(rc == CNG_LOAD_EOPEN ? -ENOENT
-                                                              : -ENOEXEC);
-        return;
+        return rc == CNG_LOAD_EOPEN ? -ENOENT : -ENOEXEC;
     }
     if (cng_g_debug)
         cng_dprintf(2,
@@ -195,8 +186,7 @@ void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
             cng_load_elf(ip, 0, &interp) != CNG_LOAD_OK) {
             cng_dprintf(2, "chroot-ng: exec %s: interp %s load failed\n", path,
                         prog.interp);
-            r[0] = (unsigned long long)(long)-ENOENT;
-            return;
+            return -ENOENT;
         }
         have_interp = 1;
         if (cng_g_debug)
@@ -234,6 +224,21 @@ void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
     if (cng_fs_untranslate(cng_g_fs, host, exe_guest, sizeof exe_guest) == 0)
         cng_g_exe_guest = exe_guest;
 
+    *out_sp = sp;
+    *out_entry = entry;
+    return 0;
+}
+
+void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
+                        char **argv, char **envp) {
+    unsigned long long *r = uc->uc_mcontext.regs;
+    unsigned long sp, entry;
+    long rc = execve_core(dirfd, path, argv, envp, &sp, &entry);
+    if (rc < 0) {
+        r[0] = (unsigned long long)rc;
+        return;
+    }
+
     /* Rewrite the signal context to the new program's fresh entry state, then
      * return: rt_sigreturn resumes at `entry` with the new stack, handler and
      * filter still installed. */
@@ -241,4 +246,14 @@ void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
         r[i] = 0;
     uc->uc_mcontext.sp = sp;
     uc->uc_mcontext.pc = entry;
+}
+
+long cng_execve_tramp(int dirfd, const char *path, char **argv, char **envp) {
+    unsigned long sp, entry;
+    long rc = execve_core(dirfd, path, argv, envp, &sp, &entry);
+    if (rc < 0)
+        return rc;
+    /* Ordinary call context (no signal frame): abandon the old program's stack
+     * and enter the new image directly, like the initial `run` does. */
+    cng_enter(sp, entry);
 }

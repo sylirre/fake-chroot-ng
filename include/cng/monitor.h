@@ -31,6 +31,11 @@ extern const char *cng_g_exe_guest;
 void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
                         char **argv, char **envp);
 
+/* Trampoline-path (-R) counterpart: same emulation from an ordinary call
+ * context — on success it enters the new program and never returns; on failure
+ * it returns -errno for the trampoline to hand back to the guest. */
+long cng_execve_tramp(int dirfd, const char *path, char **argv, char **envp);
+
 /* Close every FD_CLOEXEC descriptor, as a real execve would (emulated execve
  * does not, so fork/exec launchers' O_CLOEXEC notify pipes must be closed here
  * or the parent blocks). Exposed for testing. */

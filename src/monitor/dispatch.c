@@ -397,6 +397,21 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         return cng_syscall6(flags, a1, a2, a3, a4, a5, __NR_clone);
     }
 
+    /* execve/execveat: only reached via an M8 trampoline (-R); the SIGSYS path
+     * intercepts them in cng_sigsys_body (it must rewrite the signal context).
+     * Emulate in-process — re-issuing the raw syscall would exec the
+     * untranslated guest path on the host (ENOENT), or worse, succeed and wipe
+     * the monitor. On success cng_execve_tramp enters the new program and never
+     * returns; on failure return -errno like a real execve. */
+    case __NR_execve:
+        return cng_execve_tramp(CNG_AT_FDCWD, (const char *)a0, (char **)a1,
+                                (char **)a2);
+#ifdef __NR_execveat
+    case __NR_execveat:
+        return cng_execve_tramp((int)a0, (const char *)a1, (char **)a2,
+                                (char **)a3);
+#endif
+
     /* rename: two translated paths. If the destination is one of our
      * link2symlink names, it is replaced by the rename, so drop its group's
      * refcount (apk installs by renaming a temp file over the final name). */
