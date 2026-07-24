@@ -34,12 +34,25 @@ Two hard shared components sit under a tiered interception mechanism.
 
 ### Shared component 1 — userland ELF loader (`ul_exec`)
 
-Read the target ELF as *data* (works on `noexec`), map its `PT_LOAD` segments
-into anonymous memory via `mmap(PROT_READ|PROT_WRITE)` → copy → `mprotect(RX)`,
+Read the target ELF as *data* (works on `noexec`), map its `PT_LOAD` segments,
 load its `PT_INTERP` (`ld.so`) the same way for dynamic binaries, build the
 initial stack (`argv`/`envp`/`auxv`, `AT_PHDR`/`AT_ENTRY`/`AT_BASE`/`AT_RANDOM`),
-set up TLS, and jump to the entry point — **no kernel `execve`, no file-backed
-`PROT_EXEC`**. This single component:
+set up TLS, and jump to the entry point — **no kernel `execve`**. Two mapping
+strategies:
+
+- **anonymous** — `mmap(RW)` → copy → `mprotect(RX)`. Defeats a true `noexec`
+  mount, but needs `execmem`. **Gotcha found on device:** `PR_SET_NO_NEW_PRIVS`
+  (mandatory for the unprivileged seccomp filter) *revokes* anon executable
+  memory on Android — so this works at startup (before the monitor) but the
+  `mprotect(RX)` is denied for programs started via emulated `execve` afterward.
+- **file-backed** — `mmap` each segment `PROT_EXEC` straight from the file (+
+  anon BSS). Needs no `execmem`; works on an exec-permitted mount (e.g. Termux
+  app-data, which forbids `execve` but allows file-backed execute — the actual
+  reason chroot-ng is needed there). Doesn't defeat a true `noexec` mount.
+
+We probe anon exec memory right after installing the monitor and, if it's been
+revoked, switch to file-backed for subsequent loads (with a per-load fallback as
+a backstop). This single component also:
 
 1. defeats `noexec` (the whole reason we can't just `execve`),
 2. is libc-agnostic by construction (we are the loader — glibc/musl/static/

@@ -61,6 +61,8 @@ int cng_cmd_run(int argc, char **argv, char **envp, unsigned long *auxv) {
             cng_g_fake_gid = 0;
         } else if (!strcmp(argv[i], "-R")) {
             cng_g_rewrite = 1;
+        } else if (!strcmp(argv[i], "-F")) {
+            cng_g_loader_file = 1;
         } else if (!strcmp(argv[i], "-r") && i + 1 < argc) {
             rootfs = argv[++i];
         } else if (!strcmp(argv[i], "-b") && i + 1 < argc && nb < CNG_MAX_BINDS) {
@@ -86,7 +88,9 @@ int cng_cmd_run(int argc, char **argv, char **envp, unsigned long *auxv) {
                        " [-L dir] -- PROG [args]\n"
                        "  -0   fake root (uid/gid 0, ownership, chown)\n"
                        "  -R   rewrite svc sites to trampolines (faster; also\n"
-                       "       provides translation where seccomp is absent)\n");
+                       "       provides translation where seccomp is absent)\n"
+                       "  -F   force file-backed segment mapping (auto-selected\n"
+                       "       when anon exec memory is denied, e.g. Android NNP)\n");
         return 2;
     }
 

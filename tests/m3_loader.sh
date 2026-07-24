@@ -27,3 +27,10 @@ else
     printf '  FAIL could not build static-PIE guest:\n'
     sed 's/^/    /' "$GDIR/hello.log"
 fi
+
+# file-backed mapping path (-F): the fallback used on Android when NO_NEW_PRIVS
+# revokes anon executable memory. Must produce a working guest.
+out=$(run run -F -- "$GDIR/hello" FB 2>&1); rc=$?
+check "file-backed (-F) exit code (42)" 42 $rc
+check_contains "file-backed guest ran" "guest: argc=2" "$out"
+check_contains "file-backed argv forwarded" "argv1=FB" "$out"

@@ -5,6 +5,7 @@
  * svc. We emulate the syscall (translating paths) and write the result into x0;
  * on return the restorer runs rt_sigreturn and the guest continues.
  */
+#include "cng/loader.h"
 #include "cng/monitor.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
@@ -113,5 +114,9 @@ int cng_install_monitor(struct cng_fs *fs) {
     /* Measure which syscalls Android blocks (before our own filter is active)
      * so dispatch emulates them rather than trapping on a re-issue. */
     cng_probe_blocked();
-    return cng_install_seccomp();
+    int r = cng_install_seccomp();
+    /* NO_NEW_PRIVS is now set; on Android that can revoke anon executable memory,
+     * so switch the loader to file-backed mapping if so (before the guest execs). */
+    cng_loader_check_execmem();
+    return r;
 }

@@ -38,6 +38,17 @@ struct cng_loaded {
 #define CNG_LOAD_EIO      -3  /* short/failed read */
 #define CNG_LOAD_EMAP     -4  /* mmap/mprotect failed */
 #define CNG_LOAD_ETOOBIG  -5  /* too many phdrs / interp too long */
+#define CNG_LOAD_EEXEC    -6  /* anon mprotect(RX) denied — retry file-backed */
+
+/* Force file-backed segment mapping (mmap PROT_EXEC from the file) instead of
+ * anon copy+mprotect. Set automatically after the first anon-exec denial (e.g.
+ * NO_NEW_PRIVS revoking execmem on Android), or via `run -F`. Requires an
+ * exec-permitted mount; anon is required to defeat a true noexec mount. */
+extern int cng_g_loader_file;
+
+/* Re-test anon executable memory after NO_NEW_PRIVS/seccomp are active; sets
+ * cng_g_loader_file if it is now denied. Call once after installing the monitor. */
+void cng_loader_check_execmem(void);
 
 /* Load the ELF at `path` (opened read-only). On success fills *out and returns
  * CNG_LOAD_OK. `base_hint` is an mmap hint for ET_DYN (0 = let kernel choose).
