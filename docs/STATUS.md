@@ -2,6 +2,20 @@
 
 Milestones are committed individually. Each builds on the previous.
 
+## Verified on-device (Android 15, kernel 5.15, rootless, SELinux, no userns)
+An Alpine aarch64 rootfs runs under `chroot-ng run -0` with no ptrace and no
+user namespaces, on an execmem-denied mount:
+- interactive shell + coreutils/busybox, `su -l`
+- `apk` (full package manager: add/fix, incl. hardlinked packages via
+  link2symlink)
+- `git clone` over https
+- **Go** builds end-to-end, including **cgo** (`go build` drives `gcc`→`cc1`)
+- **gcc** compiles and links a working binary
+Getting the C/Go toolchains working shook out a chain of execve/clone-fidelity
+gaps that only a real fork+exec of a compiler exposes — see the entries below on
+handler-stack isolation, signal masking, the 0x400000 relocation, and the
+vfork/`posix_spawn` child-stack handling.
+
 ## Legend
 - [x] done and tested
 - [~] in progress
