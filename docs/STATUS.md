@@ -14,10 +14,13 @@ Milestones are committed individually. Each builds on the previous.
   (single `svc`), mem/str helpers, mini-printf, `version`/`help`/`probe`/`run`
   dispatch. Verified under qemu-aarch64.
 
-- [ ] **M2 — capability probe** (`chroot-ng probe`)
-  Detect kernel version, seccomp-BPF (mode 2) availability, `RET_TRAP`,
-  `execmem` (anon `mprotect` RX), and per-mount `noexec`. This gates the whole
-  in-process design; run it first on any target device.
+- [x] **M2 — capability probe** (`chroot-ng probe [path...]`)
+  Reports kernel version (uname parse), auxv/identity, seccomp filter
+  availability (child-process RET_ERRNO functional test), `execmem` (anon
+  `mmap` RW→RX→execute a thunk — the pivotal test, with AArch64 icache flush),
+  and per-mount `noexec` (`statfs` f_flags). Emits a viability verdict. Verified
+  under qemu; the seccomp path is inert under qemu and must be confirmed on real
+  hardware. Live `RET_TRAP`+SIGSYS validation deferred to M5.
 
 - [ ] **M3 — `ul_exec` loader: static binaries**
   Parse ELF64, map `PT_LOAD` into anon RW→RX, build stack/auxv, jump to entry.

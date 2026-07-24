@@ -1,0 +1,9 @@
+# Make clangd resolve headers/types the way the cross build does.
+CompileFlags:
+  Add:
+    - -Iinclude
+    - --target=aarch64-linux-gnu
+    - -ffreestanding
+    - -nostdlib
+    - -std=gnu11
+    - -D__aarch64__

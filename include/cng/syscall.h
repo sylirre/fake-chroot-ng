@@ -88,6 +88,26 @@ static inline long sys_seccomp(unsigned op, unsigned flags, void *args) {
 static inline long sys_memfd_create(const char *name, unsigned flags) {
     return CNG_SYS(__NR_memfd_create, name, flags, 0, 0, 0, 0);
 }
+static inline long sys_getuid(void) {
+    return CNG_SYS(__NR_getuid, 0, 0, 0, 0, 0, 0);
+}
+static inline long sys_geteuid(void) {
+    return CNG_SYS(__NR_geteuid, 0, 0, 0, 0, 0, 0);
+}
+static inline long sys_getgid(void) {
+    return CNG_SYS(__NR_getgid, 0, 0, 0, 0, 0, 0);
+}
+static inline long sys_getegid(void) {
+    return CNG_SYS(__NR_getegid, 0, 0, 0, 0, 0, 0);
+}
+static inline long sys_wait4(int pid, int *wstatus, int options, void *rusage) {
+    return CNG_SYS(__NR_wait4, pid, wstatus, options, rusage, 0, 0);
+}
+/* fork() via raw clone: newsp=0 gives copy-on-write of the parent stack.
+ * AArch64 clone order: (flags, newsp, ptid, ctid, tls). SIGCHLD = 17. */
+static inline long sys_fork(void) {
+    return CNG_SYS(__NR_clone, 17 /*SIGCHLD*/, 0, 0, 0, 0, 0);
+}
 static inline _Noreturn void sys_exit_group(int code) {
     CNG_SYS(__NR_exit_group, code, 0, 0, 0, 0, 0);
     __builtin_unreachable();

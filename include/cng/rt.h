@@ -45,4 +45,8 @@ void cng_vdprintf(int fd, const char *fmt, va_list ap);
 /* Print "<msg>: <errno-name-or-number>\n" to stderr and exit(1). */
 _Noreturn void cng_die(const char *msg, long err);
 
+/* AArch64 cache maintenance (src/rt/cache.S): make [start,end) executable-
+ * coherent after writing code into it. */
+void cng_flush_icache(void *start, void *end);
+
 #endif /* CNG_RT_H */
