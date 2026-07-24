@@ -21,6 +21,7 @@ static void usage(int fd, const char *prog) {
  * project grows). Stubs live here until then. */
 int cng_cmd_probe(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_run(int argc, char **argv, char **envp, unsigned long *auxv);
+int cng_cmd_xlate(int argc, char **argv, char **envp, unsigned long *auxv);
 
 int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
     const char *prog = argc > 0 ? argv[0] : "chroot-ng";
@@ -43,6 +44,8 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
         return cng_cmd_probe(argc - 1, argv + 1, envp, auxv);
     if (!strcmp(sub, "run"))
         return cng_cmd_run(argc - 1, argv + 1, envp, auxv);
+    if (!strcmp(sub, "_xlate"))
+        return cng_cmd_xlate(argc - 1, argv + 1, envp, auxv);
 
     cng_dprintf(2, "chroot-ng: unknown command '%s'\n", sub);
     usage(2, prog);
