@@ -36,9 +36,15 @@ Milestones are committed individually. Each builds on the previous.
     page (true for max-page-size-aligned AArch64 ELFs). Add per-page perm-union
     if a counterexample appears.
 
-- [ ] **M4 — `ul_exec` loader: dynamic binaries**
-  Load `PT_INTERP` (`ld.so`), set `AT_BASE`, hand control to the interpreter.
-  glibc + musl dynamic guests.
+- [x] **M4 — `ul_exec` loader: dynamic binaries**
+  Load `PT_INTERP` (`ld.so`) at its own base, set `AT_BASE`/`AT_ENTRY`/`AT_PHDR`,
+  and jump to the interpreter's entry; ld.so then maps libraries and bootstraps
+  the main program. Verified under qemu with a dynamic glibc guest (`-L` resolves
+  the interpreter path; `LD_LIBRARY_PATH` lets ld.so find libc at a real host
+  path until M5 redirects its opens into the guest rootfs).
+  Note: on a real noexec mount, ld.so's own file-backed `PROT_EXEC` mmap of
+  `.so`s will fail — M5's mmap hook must convert those to anon-exec. Under qemu
+  the libs live on an exec-permitted mount so this isn't exercised yet.
 
 - [ ] **M5 — seccomp filter + SIGSYS monitor + path-translation core**
   Install BPF (trap path syscalls, allow gate IP range), SIGSYS handler,

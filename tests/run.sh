@@ -48,6 +48,7 @@ run frobnicate >/dev/null 2>&1; check "unknown-cmd rc" 2 $?
 # M2+ tests are appended as milestones land.
 if [ -f tests/m2_probe.sh ]; then . tests/m2_probe.sh; fi
 if [ -f tests/m3_loader.sh ]; then . tests/m3_loader.sh; fi
+if [ -f tests/m4_dynamic.sh ]; then . tests/m4_dynamic.sh; fi
 
 echo
 echo "== summary: $pass passed, $fail failed =="
