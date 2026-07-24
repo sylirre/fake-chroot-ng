@@ -46,10 +46,24 @@ Milestones are committed individually. Each builds on the previous.
   `.so`s will fail — M5's mmap hook must convert those to anon-exec. Under qemu
   the libs live on an exec-permitted mount so this isn't exercised yet.
 
-- [ ] **M5 — seccomp filter + SIGSYS monitor + path-translation core**
-  Install BPF (trap path syscalls, allow gate IP range), SIGSYS handler,
-  bind/rootfs path translation. Handler unit-tested via simulated SIGSYS;
-  end-to-end on real AArch64 kernel.
+- [x] **M5a — path-translation core**
+  rootfs + longest-prefix component-aware binds, lexical `..` canonicalization
+  (no rootfs escape), cwd-relative resolution. `_xlate` debug cmd, 9 tests.
+
+- [x] **M5b — seccomp filter + SIGSYS monitor + dispatcher**
+  - `dispatch.c`: translate path args of the trapped syscall set (openat family,
+    rename/link/symlink two-path forms, chdir/getcwd/chroot/truncate/statfs) and
+    re-issue via the gate. In-process, so path pointers are read directly.
+  - `seccomp.c`: BPF that KILLs non-AArch64, ALLOWs gate-IP syscalls, TRAPs the
+    path set, ALLOWs the rest. Jump offsets verified by construction.
+  - `sigsys.c` + `sig.S`: SIGSYS handler reading x0..x5/x8 from the AArch64
+    sigcontext and writing x0; own rt_sigreturn restorer (no vDSO dependency).
+  - `run.c`: sets up the fs view and installs the monitor before entering the
+    guest (only when translation is requested).
+  Validated under qemu via `_dtest` (dispatch translate+reissue, escape block)
+  and `_sigtest` (signal round-trip + sigcontext offsets). The seccomp *trap*
+  itself is inert under qemu-user and MUST be confirmed on a real AArch64 kernel
+  (the `probe` filter test covers install permission there).
 
 - [ ] **M6 — execve/execveat emulation**
   Re-run the loader in-process so filter + handler survive program replacement.

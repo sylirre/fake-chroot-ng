@@ -1,17 +1,23 @@
-/* `chroot-ng run [opts] -- PROG [args]` — load PROG with the userland loader
- * and transfer control to it.
+/* `chroot-ng run [opts] -- PROG [args]` — load PROG with the userland loader,
+ * install the path-translation monitor, and transfer control.
  *
- * M3: static / static-PIE guests.
- * M4: dynamic guests — load PT_INTERP (ld.so) and jump to *its* entry with
- *     AT_BASE/AT_ENTRY/AT_PHDR set so it bootstraps the main program.
+ *   -r DIR   guest rootfs (host path); default "/" (identity)
+ *   -b G:H   bind guest path G to host path H (repeatable)
+ *   -L DIR   resolve the ELF interpreter under DIR (test aid; on real hardware
+ *            the interpreter and libraries resolve through -r/-b + the monitor)
  *
- * `-L DIR` resolves the interpreter (and, once M5 lands, the whole guest
- * filesystem) under DIR. Later milestones replace it with -r rootfs + -b binds
- * and route ld.so's own opens through the SIGSYS path translator.
+ * PROG is a guest path resolved through the rootfs/bind map. The monitor traps
+ * the guest's own path syscalls and translates them (see monitor.h). Under
+ * qemu-user the seccomp filter is inert, so translation is only exercised on a
+ * real AArch64 kernel (and via the `_dtest` self-test).
  */
 #include "cng/loader.h"
+#include "cng/monitor.h"
+#include "cng/path.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
+
+static struct cng_fs g_fs; /* static: the monitor keeps a pointer after we jump */
 
 static const char *load_err(int rc) {
     switch (rc) {
@@ -30,7 +36,6 @@ static const char *load_err(int rc) {
     }
 }
 
-/* dst = a + b, truncating safely. Returns dst. */
 static char *join2(char *dst, size_t size, const char *a, const char *b) {
     size_t n = cng_strlcpy(dst, a, size);
     if (n < size)
@@ -41,42 +46,77 @@ static char *join2(char *dst, size_t size, const char *a, const char *b) {
 int cng_cmd_run(int argc, char **argv, char **envp, unsigned long *auxv) {
     int i = 1; /* argv[0] == "run" */
     const char *libprefix = 0;
+    const char *rootfs = "/";
+    const char *bind_g[CNG_MAX_BINDS];
+    const char *bind_h[CNG_MAX_BINDS];
+    int nb = 0;
 
     while (i < argc && argv[i][0] == '-' && strcmp(argv[i], "--") != 0) {
         if (!strcmp(argv[i], "-L") && i + 1 < argc) {
-            libprefix = argv[i + 1];
-            i += 2;
-            continue;
+            libprefix = argv[++i];
+        } else if (!strcmp(argv[i], "-r") && i + 1 < argc) {
+            rootfs = argv[++i];
+        } else if (!strcmp(argv[i], "-b") && i + 1 < argc && nb < CNG_MAX_BINDS) {
+            char *spec = argv[++i];
+            char *c = strchr(spec, ':');
+            if (c) {
+                *c = '\0';
+                bind_g[nb] = spec;
+                bind_h[nb] = c + 1;
+                nb++;
+            }
+        } else {
+            cng_dprintf(2, "chroot-ng run: bad option %s\n", argv[i]);
+            return 2;
         }
-        cng_dprintf(2, "chroot-ng run: unknown option %s\n", argv[i]);
-        return 2;
+        i++;
     }
     if (i < argc && !strcmp(argv[i], "--"))
         i++;
     if (i >= argc) {
         cng_dprintf(2, "chroot-ng run: missing program\n"
-                       "usage: chroot-ng run [-L dir] -- PROG [args]\n");
+                       "usage: chroot-ng run [-r rootfs] [-b g:h] [-L dir]"
+                       " -- PROG [args]\n");
         return 2;
     }
 
     char **gargv = argv + i;
     int gargc = argc - i;
-    const char *path = gargv[0];
+    const char *prog_guest = gargv[0];
+
+    /* Filesystem view. */
+    cng_fs_init(&g_fs, rootfs);
+    for (int j = 0; j < nb; j++)
+        cng_fs_add_bind(&g_fs, bind_g[j], bind_h[j]);
+    char cwd[CNG_PATH_MAX];
+    if (sys_getcwd(cwd, sizeof cwd) > 0)
+        cng_fs_set_cwd(&g_fs, cwd);
+
+    /* Resolve the program itself through the map to find the host file. */
+    char host_prog[CNG_PATH_MAX];
+    if (cng_fs_translate(&g_fs, prog_guest, host_prog, sizeof host_prog) != 0) {
+        cng_dprintf(2, "chroot-ng: path too long: %s\n", prog_guest);
+        return 1;
+    }
 
     struct cng_loaded prog;
-    int rc = cng_load_elf(path, 0, &prog);
+    int rc = cng_load_elf(host_prog, 0, &prog);
     if (rc != CNG_LOAD_OK) {
-        cng_dprintf(2, "chroot-ng: cannot load %s: %s\n", path, load_err(rc));
+        cng_dprintf(2, "chroot-ng: cannot load %s (%s): %s\n", prog_guest,
+                    host_prog, load_err(rc));
         return 1;
     }
 
     unsigned long sp, entry;
     if (prog.has_interp) {
-        /* Resolve interpreter path (absolute), optionally under -L prefix. */
-        char ipath[512];
-        const char *ip = prog.interp;
+        char ipath[CNG_PATH_MAX];
+        const char *ip;
         if (libprefix)
             ip = join2(ipath, sizeof ipath, libprefix, prog.interp);
+        else if (cng_fs_translate(&g_fs, prog.interp, ipath, sizeof ipath) == 0)
+            ip = ipath;
+        else
+            ip = prog.interp;
 
         struct cng_loaded interp;
         int rc2 = cng_load_elf(ip, 0, &interp);
@@ -85,12 +125,26 @@ int cng_cmd_run(int argc, char **argv, char **envp, unsigned long *auxv) {
                         load_err(rc2));
             return 1;
         }
-        /* Jump to ld.so; it maps libraries and bootstraps the main program. */
-        sp = cng_build_stack(gargc, gargv, envp, auxv, &prog, &interp, path);
+        sp = cng_build_stack(gargc, gargv, envp, auxv, &prog, &interp,
+                             prog_guest);
         entry = interp.entry;
     } else {
-        sp = cng_build_stack(gargc, gargv, envp, auxv, &prog, 0, path);
+        sp = cng_build_stack(gargc, gargv, envp, auxv, &prog, 0, prog_guest);
         entry = prog.entry;
+    }
+
+    /* Install the monitor last, after all of our own path syscalls are done.
+     * Only when translation was actually requested; identity needs none. */
+    int want_xlate = (strcmp(rootfs, "/") != 0) || nb > 0;
+    if (want_xlate) {
+        int mrc = cng_install_monitor(&g_fs);
+        if (mrc < 0)
+            cng_dprintf(2,
+                        "chroot-ng: warning: could not install seccomp monitor "
+                        "(errno %d); path translation is INACTIVE\n"
+                        "           (expected under qemu-user; real AArch64 "
+                        "kernel required)\n",
+                        -mrc);
     }
 
     cng_enter(sp, entry);

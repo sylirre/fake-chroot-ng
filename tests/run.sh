@@ -50,6 +50,7 @@ if [ -f tests/m2_probe.sh ]; then . tests/m2_probe.sh; fi
 if [ -f tests/m3_loader.sh ]; then . tests/m3_loader.sh; fi
 if [ -f tests/m4_dynamic.sh ]; then . tests/m4_dynamic.sh; fi
 if [ -f tests/m5_xlate.sh ]; then . tests/m5_xlate.sh; fi
+if [ -f tests/m5b_monitor.sh ]; then . tests/m5b_monitor.sh; fi
 
 echo
 echo "== summary: $pass passed, $fail failed =="

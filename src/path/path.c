@@ -75,8 +75,8 @@ int cng_path_canon(const char *abs, char *out, size_t outsz) {
     return 0;
 }
 
-int cng_fs_translate(const struct cng_fs *fs, const char *path, char *out,
-                     size_t outsz) {
+int cng_fs_abscanon(const struct cng_fs *fs, const char *path, char *out,
+                    size_t outsz) {
     char tmp[CNG_PATH_MAX];
     if (path[0] == '/') {
         cng_strlcpy(tmp, path, sizeof tmp);
@@ -88,9 +88,13 @@ int cng_fs_translate(const struct cng_fs *fs, const char *path, char *out,
         }
         cng_strlcpy(tmp + n, path, sizeof tmp - n);
     }
+    return cng_path_canon(tmp, out, outsz);
+}
 
+int cng_fs_translate(const struct cng_fs *fs, const char *path, char *out,
+                     size_t outsz) {
     char canon[CNG_PATH_MAX];
-    if (cng_path_canon(tmp, canon, sizeof canon) < 0)
+    if (cng_fs_abscanon(fs, path, canon, sizeof canon) < 0)
         return -1;
 
     /* Longest-prefix bind match. */

@@ -32,6 +32,11 @@ void cng_fs_set_cwd(struct cng_fs *fs, const char *guest_cwd);
  * the root stays at the root. Returns 0 on success, -1 on overflow. */
 int cng_path_canon(const char *abs, char *out, size_t outsz);
 
+/* Resolve a guest path (absolute or relative to fs->cwd) to a canonical guest
+ * absolute path (no host rootfs applied). Returns 0/-1. */
+int cng_fs_abscanon(const struct cng_fs *fs, const char *path, char *out,
+                    size_t outsz);
+
 /* Translate a guest path (absolute, or relative to fs->cwd) to a host path.
  * Returns 0 on success, -1 on overflow. */
 int cng_fs_translate(const struct cng_fs *fs, const char *path, char *out,
