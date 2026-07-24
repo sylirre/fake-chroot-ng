@@ -76,6 +76,15 @@ dynamically-loaded code: when `ld.so` tries to `mmap(PROT_EXEC)` a `.so` from
 the `noexec` rootfs (which fails natively), we intercept it, read+map the file
 into anon RW→RX, and rewrite its `svc` sites before flipping to RX.
 
+**Rewriting needs no seccomp** (a rewritten site is a plain `b` to a trampoline
+that calls the dispatcher directly). So the rewriting tier is not only the speed
+path — it is also a *seccomp-free interception mechanism*, extending translation
+to kernels below the 3.5 seccomp-BPF floor (e.g. 3.4) and to environments where
+seccomp is unavailable. Its limit is coverage: it only catches statically
+locatable `svc` sites in objects we load (not JIT/self-modifying code, and not
+`.so`s until the mmap hook lands), whereas the SIGSYS floor catches every raw
+syscall. The two compose: rewrite what we can find, trap the rest.
+
 ### Known hazards (why the tiers exist)
 
 - `execve` erases the in-process handler → emulate `execve` via the loader.
