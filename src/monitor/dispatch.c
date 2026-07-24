@@ -290,6 +290,13 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                     cng_strlcpy(tgt, oldg, sizeof tgt); /* guest-absolute */
                 long s = reissue((long)tgt, CNG_AT_FDCWD, (long)np, 0, 0, 0,
                                  __NR_symlinkat);
+                if (s == -EEXIST) {
+                    /* Reinstall: the link name already exists — replace it. */
+                    cng_syscall6(CNG_AT_FDCWD, (long)np, 0, 0, 0, 0,
+                                 __NR_unlinkat);
+                    s = reissue((long)tgt, CNG_AT_FDCWD, (long)np, 0, 0, 0,
+                                __NR_symlinkat);
+                }
                 if (s == 0)
                     return 0;
             }

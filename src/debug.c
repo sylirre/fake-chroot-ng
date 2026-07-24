@@ -386,6 +386,9 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
     }
     long lr = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/a", CNG_AT_FDCWD,
                            (long)"/w/b", 0, 0, 0);
+    /* second time must replace the existing symlink, not fail with EEXIST */
+    long lr2 = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/a",
+                            CNG_AT_FDCWD, (long)"/w/b", 0, 0, 0);
     char buf[256];
     long n = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD, (long)"/w/b",
                           (long)buf, sizeof buf - 1, 0, 0, 0);
@@ -394,9 +397,9 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
     int leak = (strncmp(buf, "/data", 5) == 0) ||
                (strlen(rootfs) > 1 &&
                 strncmp(buf, rootfs, strlen(rootfs)) == 0);
-    int ok_l2s = (lr == 0 && n > 0 && !leak);
-    cng_dprintf(1, "l2s: link rc=%d target=%s leak=%d -> %s\n", (int)lr, buf,
-                leak, ok_l2s ? "OK" : "FAIL");
+    int ok_l2s = (lr == 0 && lr2 == 0 && n > 0 && !leak);
+    cng_dprintf(1, "l2s: link rc=%d rc2=%d target=%s leak=%d -> %s\n", (int)lr,
+                (int)lr2, buf, leak, ok_l2s ? "OK" : "FAIL");
     fails += !ok_l2s;
 
     /* fchdir cwd tracking. */
