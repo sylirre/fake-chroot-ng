@@ -27,6 +27,29 @@ unsigned long *cng_host_auxv = 0;
  * open with O_CLOEXEC never closes, and the parent blocks forever waiting for
  * the EOF that signals "exec succeeded". Iterate /proc/self/fd and close each fd
  * whose FD_CLOEXEC bit is set (skipping the directory fd we are scanning). */
+/* A real execve resets signal dispositions (caught -> default, ignored kept)
+ * and disables the alternate signal stack. Our in-process emulation must do the
+ * same, or the new program inherits the previous one's handlers and altstack —
+ * e.g. a C compiler exec'd from Go would inherit Go's SIGSEGV/SIGURG handlers
+ * and Go's small per-thread sigaltstack, onto which our SA_ONSTACK SIGSYS
+ * handler would then deliver. SIGSYS is left alone (our monitor owns it). */
+static void cng_reset_signals(void) {
+    /* kernel struct sigaction: handler, flags, restorer, mask (32 bytes). */
+    unsigned long cur[4], dfl[4] = {0, 0, 0, 0};
+    for (int s = 1; s <= 64; s++) {
+        if (s == CNG_SIGSYS)
+            continue;
+        if (CNG_SYS(__NR_rt_sigaction, s, 0, cur, 8, 0, 0) < 0)
+            continue;             /* SIGKILL/SIGSTOP etc.: unqueryable, skip */
+        if (cur[0] == 0 || cur[0] == 1)
+            continue;             /* already SIG_DFL, or SIG_IGN (keep ignored) */
+        CNG_SYS(__NR_rt_sigaction, s, dfl, 0, 8, 0, 0);
+    }
+    /* stack_t: ss_sp(8), ss_flags(4)@8, ss_size(8)@16 => 24 bytes. SS_DISABLE=2. */
+    unsigned long ss[3] = {0, 2, 0};
+    CNG_SYS(__NR_sigaltstack, ss, 0, 0, 0, 0, 0);
+}
+
 void cng_close_cloexec(void) {
     long dfd = sys_openat(CNG_AT_FDCWD, "/proc/self/fd",
                           CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
@@ -179,6 +202,7 @@ void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
      * like a real execve. Close FD_CLOEXEC descriptors (see cng_close_cloexec)
      * before entering the new program. */
     cng_close_cloexec();
+    cng_reset_signals();
 
     /* Track the running program for /proc/self/exe fixups. A real kernel updates
      * /proc/self/exe on every execve (symlinks resolved); tools derive their
