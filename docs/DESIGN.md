@@ -1,0 +1,98 @@
+# chroot-ng — design
+
+A `proot`-like tool that emulates a chroot environment and bind mounts for
+**rootless, SELinux-restricted Android without user namespaces**, but without
+paying `proot`'s per-syscall `ptrace` overhead.
+
+## Target environment (locked)
+
+- **Arch:** AArch64 only.
+- **Kernel floor:** Linux 3.5+ is the real floor (seccomp-BPF needs 3.5). 3.4
+  is best-effort at most (would require a pure-ptrace tier we are not building
+  first).
+- **Rootless**, SELinux-confined app domain, **no `CONFIG_USER_NS`**.
+- **Binaries live on a true `MNT_NOEXEC` mount** (SD/USB/FUSE), so neither
+  `execve` nor file-backed `PROT_EXEC` mmap works on them. The only in-process
+  way to run such code is anonymous executable memory, which depends on the
+  SELinux `execmem` permission (the W^X-compliant `mmap(RW)` → `mprotect(RX)`
+  flow used by ART's JIT). **This is the pivotal prerequisite** — `probe`
+  checks it.
+- **Fidelity beyond chroot+bind:** uid/gid faking (`-0`/`-S`), `/proc` self-path
+  fixups, and `link2symlink`.
+
+## Why not the obvious approaches
+
+- **LD_PRELOAD / linker interception** (termux-exec): fails for static musl/glibc,
+  Go, Rust, and any program issuing raw `svc` — exactly our constraint.
+- **User namespaces** (bubblewrap-style): unavailable on Android.
+- **Plain ptrace** (classic proot): works but is the overhead we are removing —
+  two stops + a context switch to a separate tracer per syscall.
+
+## Architecture: a layered, ptrace-free engine
+
+Two hard shared components sit under a tiered interception mechanism.
+
+### Shared component 1 — userland ELF loader (`ul_exec`)
+
+Read the target ELF as *data* (works on `noexec`), map its `PT_LOAD` segments
+into anonymous memory via `mmap(PROT_READ|PROT_WRITE)` → copy → `mprotect(RX)`,
+load its `PT_INTERP` (`ld.so`) the same way for dynamic binaries, build the
+initial stack (`argv`/`envp`/`auxv`, `AT_PHDR`/`AT_ENTRY`/`AT_BASE`/`AT_RANDOM`),
+set up TLS, and jump to the entry point — **no kernel `execve`, no file-backed
+`PROT_EXEC`**. This single component:
+
+1. defeats `noexec` (the whole reason we can't just `execve`),
+2. is libc-agnostic by construction (we are the loader — glibc/musl/static/
+   dynamic all work with no version pinning),
+3. lets the in-process interception survive `execve` (we emulate `execve` by
+   re-running the loader while keeping our monitor resident).
+
+### Shared component 2 — path translation core
+
+The well-trodden `proot`-equivalent logic, independent of interception
+mechanism: enumerate the ~40 path-bearing syscalls, canonicalize, apply the
+bind list + guest rootfs, guard against symlink escape, special-case
+`/proc/self/{exe,cwd,root,maps}`, and track the virtual cwd/root.
+
+### Interception mechanism — tiered, auto-selected
+
+| Tier | Mechanism | Min kernel | Notes |
+|------|-----------|-----------|-------|
+| primary | seccomp `RET_TRAP` → in-process `SIGSYS` | 3.5 | one signal per path syscall, no second process; handler translates into its own buffer and re-issues via the gate |
+| perf    | AoT rewrite of `svc #0` sites in our own pages → trampoline | any | AArch64-clean because we own the (anon, RW→RX) pages; optimization on top of the SIGSYS floor |
+| upgrade | seccomp `RET_USER_NOTIF` → supervisor | 5.0 | out-of-process, sheds SIGSYS/execve/clobber fragility where available |
+| fallback| ptrace + seccomp `RET_TRACE` | 3.5 (3.4 plain) | correctness backstop; cannot defeat true `noexec` |
+
+**Correctness floor = seccomp `RET_TRAP`/`SIGSYS`.** One BPF filter traps the
+path-bearing syscalls unless the syscall's `instruction_pointer` is inside our
+gate `[__cng_gate_start, __cng_gate_end)`. Every raw `svc` from anywhere —
+glibc, musl, Go's runtime, Rust, JIT — traps synchronously, in-process, to the
+`SIGSYS` handler, which reads args from the `ucontext`, translates the path into
+its own buffer, re-issues the real syscall through the gate, and writes the
+result back into the return register. Non-path syscalls run natively.
+
+**The mmap hook is the choke point** for both `noexec`-defeat and rewriting of
+dynamically-loaded code: when `ld.so` tries to `mmap(PROT_EXEC)` a `.so` from
+the `noexec` rootfs (which fails natively), we intercept it, read+map the file
+into anon RW→RX, and rewrite its `svc` sites before flipping to RX.
+
+### Known hazards (why the tiers exist)
+
+- `execve` erases the in-process handler → emulate `execve` via the loader.
+- The guest (notably Go) can clobber the `SIGSYS` handler or block the signal →
+  virtualize `rt_sigaction`/`rt_sigprocmask`/`seccomp`/`prctl`.
+- `SIGSYS` signal-stack correctness on guest-created threads → per-thread
+  `sigaltstack`, validate against Go.
+- `execmem` denied → no in-process path exists on a true `noexec` mount; only
+  the ptrace fallback (from an exec-permitted location) remains.
+
+## Build & test
+
+Cross-compiled with `aarch64-linux-gnu-gcc`, exercised under `qemu-aarch64`.
+Caveat: qemu-user does **not** faithfully run guest-installed seccomp filters,
+so the SIGSYS mechanism is validated with simulated-SIGSYS unit tests plus real
+AArch64-kernel integration; the loader and path logic are fully testable under
+qemu.
+
+The binary is freestanding (`-nostdlib`, own `_start`, own syscall gate) so it
+never depends on libc and the SIGSYS handler has no re-entrancy hazards.
