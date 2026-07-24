@@ -389,13 +389,12 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * CLONE_VFORK so it becomes an ordinary COW fork: the child gets a private
      * copy, the emulated execve happens there, and the parent continues (the
      * child's execve closes the O_CLOEXEC notify pipe, signalling success). */
+    /* The SIGSYS path handles clone in cng_sigsys_body (it needs the ucontext to
+     * fix the child's stack). This branch is only reached via an M8 trampoline
+     * (-R); best-effort strip of the shared-VM flags. */
     case __NR_clone: {
         long flags = a0 & ~(long)(CNG_CLONE_VM | CNG_CLONE_VFORK);
-        long r = cng_syscall6(flags, a1, a2, a3, a4, a5, __NR_clone);
-        if (cng_g_debug)
-            cng_dprintf(2, "[cng] clone vfork->fork a0=%lx stk=%lx ret=%ld\n",
-                        a0, a1, r);
-        return r;
+        return cng_syscall6(flags, a1, a2, a3, a4, a5, __NR_clone);
     }
 
     /* rename: two translated paths. If the destination is one of our

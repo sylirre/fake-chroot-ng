@@ -125,6 +125,33 @@ void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si) {
     }
 #endif
 
+    /* clone with CLONE_VFORK (only these trap; see seccomp.c): a vfork-style
+     * spawn shares the parent's address space and suspends it until the child
+     * execs. Our execve is emulated in-process, so a shared-VM child would load
+     * the new program over the parent and never issue the real execve that
+     * resumes it. Convert to a plain COW fork, with two stack adjustments:
+     *  - pass child_stack=0 to the real clone so the forked child inherits (COW)
+     *    the parent's current SP — which here is the *scratch stack* our handler
+     *    frames sit on. The child must unwind those frames and sigreturn; giving
+     *    it the caller-supplied child stack instead sets its SP into a buffer
+     *    with no such frames -> Bus error before it can even execve.
+     *  - then point uc->sp at that caller-supplied child stack for the child, so
+     *    after sigreturn it resumes on the stack the guest's clone wrapper
+     *    expects (musl's __clone/posix_spawn stored the child fn+arg there).
+     *    child_stack==0 is a bare vfork: the child just continues on the
+     *    parent's stack, so leave uc->sp alone. */
+    if (nr == __NR_clone) {
+        unsigned long child_stack = (unsigned long)r[1];
+        long flags = (long)(r[0] & ~(unsigned long long)(CNG_CLONE_VM |
+                                                         CNG_CLONE_VFORK));
+        long ret = cng_syscall6(flags, 0, (long)r[2], (long)r[3], (long)r[4],
+                                (long)r[5], __NR_clone);
+        if (ret == 0 && child_stack)
+            uc->uc_mcontext.sp = child_stack;
+        r[0] = (unsigned long long)ret;
+        return;
+    }
+
     long res = cng_dispatch(nr, (long)r[0], (long)r[1], (long)r[2], (long)r[3],
                             (long)r[4], (long)r[5], /*trapped=*/1);
     if (cng_g_debug && res < 0 && res != -ENOENT)

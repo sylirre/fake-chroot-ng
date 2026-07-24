@@ -172,13 +172,24 @@ Milestones are committed individually. Each builds on the previous.
   intermittent `exec format error`/`no such file` for a valid tool plus a
   monitor SIGSEGV during `go build`'s parallel compile. The seccomp filter now
   traps `clone` *only when `CLONE_VFORK` is set* (a small `args[0] & CLONE_VFORK`
-  BPF test, so thread creation and plain fork run natively), and the dispatcher
-  strips `CLONE_VM|CLONE_VFORK` to make it an ordinary COW fork: the child gets a
-  private copy, the emulated execve happens there, and the parent continues
-  (the child's execve closes the O_CLOEXEC notify pipe to signal success).
-  Validated by `_clonetest` (child runs and exits; a child write is invisible to
-  the parent). 80/80. Gap: `clone3` with VFORK is not detected (flags live
-  behind a pointer); Go/musl use `clone` for spawning, not `clone3`.
+  BPF test, so thread creation and plain fork run natively), and converts it to
+  an ordinary COW fork so the emulated execve happens in a private copy and the
+  parent continues (the child's execve closes the O_CLOEXEC notify pipe to
+  signal success).
+  - **Child stack.** The conversion is done in `cng_sigsys_body` (not just
+    `cng_dispatch`) because it must touch the ucontext. musl's `__clone` /
+    `posix_spawn` (which gcc uses to launch cc1) passes a *caller-allocated child
+    stack* with the child fn/arg pre-stored on it. We must reissue the real
+    clone with `child_stack=0` so the forked child inherits (COW) the parent's
+    SP — the **scratch stack** our handler frames live on — and can unwind them
+    and sigreturn; then set the child's `uc->sp` to the original child stack so,
+    after sigreturn, it resumes where the clone wrapper expects. Passing the
+    child stack straight through set the child's SP into a frameless buffer and
+    it died with a Bus error before ever reaching execve — the gcc→cc1 crash.
+  Validated by `_clonetest` (private VM) and `_clonestktest` (child resumes on
+  its own stack, parent's untouched — driven through the real SIGSYS body). Gap:
+  `clone3` with VFORK is not detected (flags live behind a pointer); Go/musl use
+  `clone`, not `clone3`, for spawning.
 
 - [x] **Relocate chroot-ng out of the guest ET_EXEC range (0x400000)**
   chroot-ng is `-static -no-pie`, so it defaulted to load address `0x400000` —

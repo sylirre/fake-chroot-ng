@@ -60,3 +60,11 @@ out=$(run _clonetest 2>&1); rc=$?
 check "clonetest exit 0" 0 "$rc"
 check_contains "vfork clone converted to private-VM fork" \
     "clone: pid>0=1 child_exit7=1 private_vm=1 -> OK" "$out"
+
+# A vfork-style clone carrying a caller-provided child stack (musl __clone /
+# posix_spawn, as gcc uses to launch cc1) must resume the converted child on
+# that stack — driven through the real SIGSYS body, which fixes uc->sp.
+out=$(run _clonestktest 2>&1); rc=$?
+check "clonestktest exit 0" 0 "$rc"
+check_contains "converted clone resumes child on its own stack" \
+    "clonestk: pid>0=1 child_sp=childstk=1 parent_sp=orig=1 -> OK" "$out"

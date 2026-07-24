@@ -593,6 +593,62 @@ int cng_cmd_clonetest(int argc, char **argv, char **envp, unsigned long *auxv) {
     return ok ? 0 : 1;
 }
 
+/* _clonestktest — a vfork-style clone with a caller-provided child stack (as
+ * musl's __clone/posix_spawn passes) must, after conversion, resume the child on
+ * that stack. Drive cng_sigsys_body (the real SIGSYS path) with a synthetic
+ * clone context and check it forks and sets the child's uc->sp to the child
+ * stack while leaving the parent's untouched. */
+int cng_cmd_clonestktest(int argc, char **argv, char **envp,
+                         unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    static struct cng_fs fs;
+    cng_fs_init(&fs, "/");
+    cng_g_fs = &fs;
+
+    void *cs = sys_mmap(0, 65536, CNG_PROT_READ | CNG_PROT_WRITE,
+                        CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (cs == CNG_MAP_FAILED || cng_is_err((long)cs)) {
+        cng_dprintf(1, "clonestk: mmap -> FAIL\n");
+        return 1;
+    }
+    unsigned long cs_top = ((unsigned long)cs + 65536) & ~15UL;
+    unsigned long sentinel = 0x5eed0d5eed0d0000UL;
+
+    static struct cng_ucontext uc;
+    memset(&uc, 0, sizeof uc);
+    unsigned long long *r = uc.uc_mcontext.regs;
+    r[8] = __NR_clone;
+    r[0] = CNG_CLONE_VM | CNG_CLONE_VFORK | 17; /* SIGCHLD */
+    r[1] = cs_top;                              /* caller-provided child stack */
+    uc.uc_mcontext.sp = sentinel;               /* guest's original sp */
+
+    cng_siginfo_t si;
+    memset(&si, 0, sizeof si);
+    si.si_code = CNG_SYS_SECCOMP;
+    si._u._sigsys.call_addr = (void *)0x1000; /* not in gate -> guest syscall */
+    si._u._sigsys.syscall = __NR_clone;
+
+    cng_sigsys_body(&uc, &si); /* forks internally */
+
+    if (uc.uc_mcontext.regs[0] == 0)           /* child */
+        sys_exit_group(uc.uc_mcontext.sp == cs_top ? 7 : 8);
+
+    long pid = (long)uc.uc_mcontext.regs[0];
+    int status = 0;
+    sys_wait4((int)pid, &status, 0, 0);
+    int child_sp_ok = ((status & 0x7f) == 0 && ((status >> 8) & 0xff) == 7);
+    int parent_sp_ok = (uc.uc_mcontext.sp == sentinel);
+    int ok = (pid > 0 && child_sp_ok && parent_sp_ok);
+    cng_dprintf(1,
+                "clonestk: pid>0=%d child_sp=childstk=%d parent_sp=orig=%d "
+                "-> %s\n",
+                pid > 0, child_sp_ok, parent_sp_ok, ok ? "OK" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 /* _nettest — drive cng_sigsys_body with synthetic seccomp contexts to validate
  * the Android SIGSYS net branching (no real seccomp needed). */
 int cng_cmd_nettest(int argc, char **argv, char **envp, unsigned long *auxv) {
