@@ -36,7 +36,13 @@ ifeq ($(CC_IS_CLANG),0)
 CFLAGS  += -fno-tree-loop-distribute-patterns
 endif
 LDFLAGS ?=
-LDFLAGS += -static -nostdlib -no-pie -Wl,--build-id=none -Wl,-z,noexecstack \
+# Link chroot-ng far above the guest ET_EXEC range. A non-PIE guest (notably
+# gcc's cc1) has a fixed load address of 0x400000 — the same place a -no-pie
+# executable defaults to — so if chroot-ng lived there, MAP_FIXED-loading such a
+# guest would overwrite our own monitor code. 0x1000000000 (64 GiB) is clear of
+# every guest's fixed vaddr yet well below the kernel's high mmap region.
+LDFLAGS += -static -nostdlib -no-pie -Wl,-Ttext-segment=0x1000000000 \
+           -Wl,--build-id=none -Wl,-z,noexecstack \
            -Wl,--gc-sections -Wl,-e,_start
 
 CSRC := $(shell find src -name '*.c' 2>/dev/null)

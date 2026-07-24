@@ -180,6 +180,23 @@ Milestones are committed individually. Each builds on the previous.
   the parent). 80/80. Gap: `clone3` with VFORK is not detected (flags live
   behind a pointer); Go/musl use `clone` for spawning, not `clone3`.
 
+- [x] **Relocate chroot-ng out of the guest ET_EXEC range (0x400000)**
+  chroot-ng is `-static -no-pie`, so it defaulted to load address `0x400000` —
+  the exact fixed address a non-PIE `ET_EXEC` guest uses. Loading such a guest
+  (notably gcc's `cc1`, `Type: EXEC` at `0x400000`) MAP_FIXED-overwrote our own
+  monitor code, crashing early with `SEGV_ACCERR`. PIE guests were unaffected
+  (kernel-picked high base). Link chroot-ng at `0x1000000000` (64 GiB) via
+  `-Wl,-Ttext-segment` — clear of every guest's fixed vaddr and well below the
+  kernel's high mmap region. (Small code model is fine: chroot-ng's own span is
+  < 4 GiB so intra-image `adrp` still reaches; the SIGSYS gate allowlist and M8
+  trampolines use runtime/absolute addressing, unaffected by the base.)
+  Regression test in m3: a `-static -no-pie` guest (ET_EXEC @ 0x400000) runs to
+  exit 42 on both the anon and file-backed paths. 84/84.
+
+  With this, Go builds run end-to-end (incl. cgo -> gcc -> cc1); pure-Go builds
+  (`CGO_ENABLED=0`) were already working once the handler-stack and clone fixes
+  landed.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

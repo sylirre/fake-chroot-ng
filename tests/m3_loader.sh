@@ -34,3 +34,25 @@ out=$(run run -F -- "$GDIR/hello" FB 2>&1); rc=$?
 check "file-backed (-F) exit code (42)" 42 $rc
 check_contains "file-backed guest ran" "guest: argc=2" "$out"
 check_contains "file-backed argv forwarded" "argv1=FB" "$out"
+
+# Fixed-address non-PIE guest (ET_EXEC @ 0x400000, e.g. gcc's cc1). chroot-ng is
+# linked high (0x1000000000) precisely so MAP_FIXED-loading such a guest at
+# 0x400000 doesn't overwrite our own monitor; verify it loads and runs (both the
+# anon and file-backed paths, since the collision is in the fixed mapping).
+if $GCC -static -no-pie -O2 -o "$GDIR/hello_exec" tests/guests/hello.c \
+        2>"$GDIR/hello_exec.log"; then
+    if file "$GDIR/hello_exec" | grep -qi 'ELF.*executable' &&
+       ! file "$GDIR/hello_exec" | grep -qi 'pie'; then
+        pass=$((pass + 1)); printf '  ok   guest is fixed-address ET_EXEC\n'
+    else
+        fail=$((fail + 1)); printf '  FAIL guest not ET_EXEC: %s\n' \
+            "$(file "$GDIR/hello_exec")"
+    fi
+    out=$(run run -- "$GDIR/hello_exec" NP 2>&1); rc=$?
+    check "ET_EXEC@0x400000 guest exit (42) — no collision with monitor" 42 $rc
+    check_contains "ET_EXEC guest ran" "guest: argc=2" "$out"
+    out=$(run run -F -- "$GDIR/hello_exec" NPF 2>&1); rc=$?
+    check "ET_EXEC@0x400000 file-backed exit (42)" 42 $rc
+else
+    printf '  (skip ET_EXEC test: no -static -no-pie toolchain)\n'
+fi
