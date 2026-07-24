@@ -279,6 +279,39 @@ int cng_cmd_rwtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     return ok ? 0 : 1;
 }
 
+/* _blocktest — validate that a syscall marked blocked (as cng_probe_blocked
+ * would on Android) is emulated to ENOSYS by the dispatcher instead of being
+ * re-issued, while an unblocked one still runs. */
+int cng_cmd_blocktest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    static struct cng_fs fs;
+    cng_fs_init(&fs, "/");
+    cng_g_fs = &fs;
+    int fails = 0;
+
+    cng_blocked[__NR_fchownat] = 1; /* pretend Android blocks chown */
+    long r = cng_dispatch(__NR_fchownat, CNG_AT_FDCWD, (long)"/x", 0, 0, 0, 0,
+                          /*trapped=*/1);
+    int ok1 = (r == -ENOSYS);
+    cng_dprintf(1, "blocktest fchownat(blocked)=%d want=%d -> %s\n", (int)r,
+                (int)-ENOSYS, ok1 ? "OK" : "FAIL");
+    fails += !ok1;
+
+    cng_blocked[__NR_faccessat] = 0; /* allowed -> still re-issued */
+    long r2 = cng_dispatch(__NR_faccessat, CNG_AT_FDCWD, (long)"/", 0, 0, 0, 0,
+                           /*trapped=*/1);
+    int ok2 = (r2 == 0);
+    cng_dprintf(1, "blocktest faccessat(allowed)=%d -> %s\n", (int)r2,
+                ok2 ? "OK" : "FAIL");
+    fails += !ok2;
+
+    cng_blocked[__NR_fchownat] = 0; /* reset */
+    return fails ? 1 : 0;
+}
+
 /* _nettest — drive cng_sigsys_body with synthetic seccomp contexts to validate
  * the Android SIGSYS net branching (no real seccomp needed). */
 int cng_cmd_nettest(int argc, char **argv, char **envp, unsigned long *auxv) {

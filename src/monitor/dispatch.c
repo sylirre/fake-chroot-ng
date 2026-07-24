@@ -38,6 +38,18 @@ void cng_note_blocked(int nr) {
     cng_dprintf(2, "chroot-ng: syscall %d not permitted here -> emulated\n", nr);
 }
 
+/* Re-issue the guest's (translated) syscall through the gate — but if Android's
+ * filter blocks it (measured by cng_probe_blocked), emulate ENOSYS instead, so
+ * we never trap on the re-issue. Same signature as cng_syscall6. */
+static long reissue(long a0, long a1, long a2, long a3, long a4, long a5,
+                    long nr) {
+    if (nr >= 0 && nr < CNG_NR_MAX && cng_blocked[nr]) {
+        cng_note_blocked((int)nr);
+        return -ENOSYS;
+    }
+    return cng_syscall6(a0, a1, a2, a3, a4, a5, nr);
+}
+
 static const char *xlate(long dirfd, const char *gp, char *buf, size_t bufsz) {
     if (!gp)
         return gp;
@@ -94,13 +106,13 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
 #endif
     {
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1);
-        return cng_syscall6(a0, (long)p, a2, a3, a4, a5, nr);
+        return reissue(a0, (long)p, a2, a3, a4, a5, nr);
     }
 
     /* stat: translate, reissue, then fake ownership if -0. */
     case __NR_newfstatat: {
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1);
-        long r = cng_syscall6(a0, (long)p, a2, a3, a4, a5, __NR_newfstatat);
+        long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_newfstatat);
         if (r == 0 && cng_g_fake_id && a2) {
             *(unsigned *)((char *)a2 + STAT_UID_OFF) = cng_g_fake_uid;
             *(unsigned *)((char *)a2 + STAT_GID_OFF) = cng_g_fake_gid;
@@ -109,7 +121,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     }
     case __NR_statx: {
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1);
-        long r = cng_syscall6(a0, (long)p, a2, a3, a4, a5, __NR_statx);
+        long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_statx);
         if (r == 0 && cng_g_fake_id && a4) {
             *(unsigned *)((char *)a4 + STATX_UID_OFF) = cng_g_fake_uid;
             *(unsigned *)((char *)a4 + STATX_GID_OFF) = cng_g_fake_gid;
@@ -122,7 +134,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         if (cng_g_fake_id)
             return 0;
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1);
-        return cng_syscall6(a0, (long)p, a2, a3, a4, a5, __NR_fchownat);
+        return reissue(a0, (long)p, a2, a3, a4, a5, __NR_fchownat);
     }
 
     /* readlinkat: /proc/self/* fixups, else translate + reissue. */
@@ -138,13 +150,13 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             }
         }
         const char *p = xlate(a0, gp, b1, sizeof b1);
-        return cng_syscall6(a0, (long)p, a2, a3, a4, a5, __NR_readlinkat);
+        return reissue(a0, (long)p, a2, a3, a4, a5, __NR_readlinkat);
     }
 
     /* symlinkat(target, newdirfd, linkpath): translate only the linkpath. */
     case __NR_symlinkat: {
         const char *lp = xlate(a1, (const char *)a2, b2, sizeof b2);
-        return cng_syscall6(a0, a1, (long)lp, a3, a4, a5, __NR_symlinkat);
+        return reissue(a0, a1, (long)lp, a3, a4, a5, __NR_symlinkat);
     }
 
     /* rename: two translated paths. */
@@ -152,7 +164,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_renameat2: {
         const char *op = xlate(a0, (const char *)a1, b1, sizeof b1);
         const char *np = xlate(a2, (const char *)a3, b2, sizeof b2);
-        return cng_syscall6(a0, (long)op, a2, (long)np, a4, a5, nr);
+        return reissue(a0, (long)op, a2, (long)np, a4, a5, nr);
     }
 
     /* linkat: hardlink; fall back to a symlink where the fs forbids hardlinks
@@ -161,10 +173,10 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_linkat: {
         const char *op = xlate(a0, (const char *)a1, b1, sizeof b1);
         const char *np = xlate(a2, (const char *)a3, b2, sizeof b2);
-        long r = cng_syscall6(a0, (long)op, a2, (long)np, a4, a5, __NR_linkat);
+        long r = reissue(a0, (long)op, a2, (long)np, a4, a5, __NR_linkat);
         if (r == -EPERM || r == -EMLINK || r == -EXDEV || r == -ENOSYS ||
             r == -EACCES || r == -EOPNOTSUPP) {
-            long s = cng_syscall6((long)op, CNG_AT_FDCWD, (long)np, 0, 0, 0,
+            long s = reissue((long)op, CNG_AT_FDCWD, (long)np, 0, 0, 0,
                                   __NR_symlinkat);
             if (s == 0)
                 return 0;
@@ -176,13 +188,13 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_truncate:
     case __NR_statfs: {
         const char *p = xlate(CNG_AT_FDCWD, (const char *)a0, b1, sizeof b1);
-        return cng_syscall6((long)p, a1, a2, a3, a4, a5, nr);
+        return reissue((long)p, a1, a2, a3, a4, a5, nr);
     }
 
     case __NR_chdir: {
         const char *gp = (const char *)a0;
         const char *hp = xlate(CNG_AT_FDCWD, gp, b1, sizeof b1);
-        long r = cng_syscall6((long)hp, 0, 0, 0, 0, 0, __NR_chdir);
+        long r = reissue((long)hp, 0, 0, 0, 0, 0, __NR_chdir);
         if (r == 0) {
             char gc[CNG_PATH_MAX];
             if (cng_fs_abscanon(cng_g_fs, gp, gc, sizeof gc) == 0)
@@ -225,7 +237,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_getresuid:
     case __NR_getresgid: {
         if (!cng_g_fake_id)
-            return cng_syscall6(a0, a1, a2, a3, a4, a5, nr);
+            return reissue(a0, a1, a2, a3, a4, a5, nr);
         unsigned v = (nr == __NR_getresuid) ? cng_g_fake_uid : cng_g_fake_gid;
         if (a0)
             *(unsigned *)a0 = v;
@@ -263,6 +275,6 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             cng_note_blocked((int)nr);
             return -ENOSYS;
         }
-        return cng_syscall6(a0, a1, a2, a3, a4, a5, nr);
+        return reissue(a0, a1, a2, a3, a4, a5, nr);
     }
 }

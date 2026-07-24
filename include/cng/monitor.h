@@ -42,6 +42,13 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
 /* One-shot-per-number diagnostic for a syscall we emulate away. */
 void cng_note_blocked(int nr);
 
+/* Ambient-seccomp block-list: cng_blocked[nr] != 0 means Android blocks that
+ * syscall, so dispatch emulates ENOSYS instead of re-issuing it. Populated by
+ * cng_probe_blocked() at monitor install (a no-op result off Android). */
+#define CNG_NR_MAX 512
+extern unsigned char cng_blocked[CNG_NR_MAX];
+void cng_probe_blocked(void);
+
 /* Install a signal handler with our own rt_sigreturn restorer. Returns 0/-errno. */
 int cng_sig_install(int signo, cng_sighandler_t h);
 

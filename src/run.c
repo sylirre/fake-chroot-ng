@@ -155,7 +155,8 @@ int cng_cmd_run(int argc, char **argv, char **envp, unsigned long *auxv) {
 
     /* Install the monitor last, after all of our own path syscalls are done.
      * Only when translation was actually requested; identity needs none. */
-    int want_xlate = (strcmp(rootfs, "/") != 0) || nb > 0 || cng_g_fake_id;
+    int want_xlate =
+        (strcmp(rootfs, "/") != 0) || nb > 0 || cng_g_fake_id || cng_g_rewrite;
     if (want_xlate) {
         int mrc = cng_install_monitor(&g_fs);
         if (mrc < 0)

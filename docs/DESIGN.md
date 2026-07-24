@@ -109,11 +109,18 @@ Two layers handle this:
   is re-issued, so this does not depend on nested signal delivery. (The M8
   trampoline path passes `trapped=0`, where an unhandled syscall is an ordinary
   one to run, not a blocked one.)
-- **Gate-net (backstop).** For the syscalls we *do* re-issue (translated path
-  syscalls), Android may still block one (e.g. `mknodat`). The handler runs with
-  `SA_NODEFER` and, if a trapped `svc` is our own gate, returns `-ENOSYS`. This
-  needs nested seccomp SIGSYS delivery, which some kernels don't honor, so it is
-  a best-effort backstop rather than the primary mechanism.
+- **Block-list probe (for re-issued path syscalls).** Some syscalls we *do*
+  re-issue (translated path syscalls) are also Android-blocked — notably
+  `fchownat` and `mknodat`. At monitor install we measure the ambient filter:
+  fork a child that (with only Android's filter active) invokes each candidate
+  with harmless NULL args and records which trap. The dispatcher then emulates
+  the blocked ones as `-ENOSYS` instead of re-issuing. This runs in the child's
+  normal flow (not nested), so it does not depend on nested SIGSYS delivery, and
+  off Android nothing is blocked so everything re-issues normally.
+- **Gate-net (last-resort backstop).** The `SA_NODEFER` gate-net still catches a
+  re-issue that the probe missed, but it needs nested seccomp SIGSYS delivery,
+  which some kernels don't honor — so it is only a backstop; correctness comes
+  from the two mechanisms above.
 
 For a real container you want `-0` (root emulation), which emulates the
 credential syscalls as succeeding instead of ENOSYS — mirroring proot's `-0` and

@@ -88,5 +88,8 @@ int cng_install_monitor(struct cng_fs *fs) {
     cng_g_fs = fs;
     if (cng_sig_install(CNG_SIGSYS, sigsys_handler) < 0)
         return -1;
+    /* Measure which syscalls Android blocks (before our own filter is active)
+     * so dispatch emulates them rather than trapping on a re-issue. */
+    cng_probe_blocked();
     return cng_install_seccomp();
 }
