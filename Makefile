@@ -39,17 +39,12 @@ endif
 # gcc's cc1) has a fixed load address of 0x400000 — the same place a -no-pie
 # executable defaults to — so if chroot-ng lived there, MAP_FIXED-loading such a
 # guest would overwrite our own monitor code. 0x1000000000 (64 GiB) is clear of
-# every guest's fixed vaddr yet well below the kernel's high mmap region. GNU ld
-# spells the base override -Ttext-segment; lld (Termux/NDK) spells it
-# --image-base and rejects the former.
+# every guest's fixed vaddr yet well below the kernel's high mmap region. -Ttext
+# is accepted by both GNU ld and lld (Termux/NDK), and moves every allocatable
+# section (.text/.rodata/.data/.bss) plus the ELF headers up together.
 CNG_BASE := 0x1000000000
-ifeq ($(CC_IS_CLANG),0)
-CNG_BASE_FLAG := -Wl,-Ttext-segment=$(CNG_BASE)
-else
-CNG_BASE_FLAG := -Wl,--image-base=$(CNG_BASE)
-endif
 LDFLAGS ?=
-LDFLAGS += -static -nostdlib -no-pie $(CNG_BASE_FLAG) \
+LDFLAGS += -static -nostdlib -no-pie -Wl,-Ttext=$(CNG_BASE) \
            -Wl,--build-id=none -Wl,-z,noexecstack \
            -Wl,--gc-sections -Wl,-e,_start
 
