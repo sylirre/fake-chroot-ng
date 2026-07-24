@@ -180,6 +180,16 @@ void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
      * before entering the new program. */
     cng_close_cloexec();
 
+    /* Track the running program for /proc/self/exe fixups. A real kernel updates
+     * /proc/self/exe on every execve (symlinks resolved); tools derive their
+     * install root from it — notably `go`, which computes GOROOT from
+     * os.Executable(). `host` is the resolved host path of the ELF we actually
+     * load (the shebang interpreter for scripts, matching the kernel); store its
+     * guest path in a persistent buffer. */
+    static char exe_guest[CNG_PATH_MAX];
+    if (cng_fs_untranslate(cng_g_fs, host, exe_guest, sizeof exe_guest) == 0)
+        cng_g_exe_guest = exe_guest;
+
     /* Rewrite the signal context to the new program's fresh entry state, then
      * return: rt_sigreturn resumes at `entry` with the new stack, handler and
      * filter still installed. */

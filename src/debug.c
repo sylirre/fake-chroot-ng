@@ -370,6 +370,8 @@ int cng_cmd_exectest(int argc, char **argv, char **envp, unsigned long *auxv) {
                     (long)uc.uc_mcontext.regs[0]);
         return 1;
     }
+    /* /proc/self/exe fixup tracks the exec'd program (symlinks resolved). */
+    cng_dprintf(2, "exectest: exe=%s\n", cng_g_exe_guest);
     cng_enter(sp, entry); /* never returns */
 }
 
