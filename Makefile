@@ -5,23 +5,36 @@
 # for the milestone roadmap.
 
 CROSS   ?= aarch64-linux-gnu-
-# CC has a built-in default of `cc`, so ?= won't override it. Only set our
-# cross-compiler when CC is still the make default; keep command-line/env wins.
+# CC has a built-in default of `cc`, so ?= won't override it. When CC is still
+# the make default, prefer the cross toolchain if present, otherwise keep the
+# native compiler (e.g. Termux/NDK clang building on-device). Command-line/env
+# CC always wins.
 ifeq ($(origin CC),default)
+ifneq ($(shell command -v $(CROSS)gcc-13 2>/dev/null),)
 CC      := $(CROSS)gcc-13
+else ifneq ($(shell command -v $(CROSS)gcc 2>/dev/null),)
+CC      := $(CROSS)gcc
+endif
 endif
 OBJCOPY ?= $(CROSS)objcopy
 QEMU    ?= qemu-aarch64-static
 BUILD   ?= build
 
-# Freestanding: no libc, no PIE, our own _start. -fno-tree-loop-distribute-
-# patterns stops gcc from turning our mem* loops into calls to themselves.
+# Is the compiler clang (Termux/NDK) rather than gcc? Some flags are gcc-only.
+CC_IS_CLANG := $(shell $(CC) --version 2>/dev/null | grep -ci clang)
+
+# Freestanding: no libc, no PIE, our own _start.
 CFLAGS  ?= -O2 -g
 CFLAGS  += -std=gnu11 -ffreestanding -nostdlib -static -fno-pie -no-pie \
-           -fno-stack-protector -fno-tree-loop-distribute-patterns \
+           -fno-stack-protector \
            -fno-asynchronous-unwind-tables -fno-builtin \
            -ffunction-sections -fdata-sections \
            -Wall -Wextra -Wno-unused-parameter -Iinclude
+# Stop gcc turning our mem* loops into calls to themselves. Clang rejects this
+# flag and instead honors -ffreestanding/-fno-builtin for the same effect.
+ifeq ($(CC_IS_CLANG),0)
+CFLAGS  += -fno-tree-loop-distribute-patterns
+endif
 LDFLAGS ?=
 LDFLAGS += -static -nostdlib -no-pie -Wl,--build-id=none -Wl,-z,noexecstack \
            -Wl,--gc-sections -Wl,-e,_start
