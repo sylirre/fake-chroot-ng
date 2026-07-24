@@ -50,10 +50,76 @@ static long reissue(long a0, long a1, long a2, long a3, long a4, long a5,
     return cng_syscall6(a0, a1, a2, a3, a4, a5, nr);
 }
 
-static const char *xlate(long dirfd, const char *gp, char *buf, size_t bufsz) {
+/* Resolve a guest path to a host path, following symlinks *within the guest*:
+ * an absolute symlink target is re-rooted into the rootfs rather than resolved
+ * against the host root (which is what breaks Alpine's busybox symlinks). Walks
+ * component by component, readlink()-ing each prefix; deref_final controls
+ * whether the last component's own symlink is followed. Returns 0/-errno. */
+int cng_resolve(const char *path, int deref_final, char *out, size_t outsz) {
+    char cur[CNG_PATH_MAX];
+    if (cng_fs_abscanon(cng_g_fs, path, cur, sizeof cur) < 0)
+        return -ENAMETOOLONG;
+
+    for (int iter = 0; iter < 40; iter++) {
+        size_t len = strlen(cur);
+        int found = 0;
+        for (size_t e = 1; e <= len; e++) {
+            if (e < len && cur[e] != '/')
+                continue;
+            int is_final = (e == len);
+            if (is_final && !deref_final)
+                break;
+
+            char prefix[CNG_PATH_MAX], host[CNG_PATH_MAX], link[CNG_PATH_MAX];
+            if (e >= sizeof prefix)
+                break;
+            memcpy(prefix, cur, e);
+            prefix[e] = '\0';
+            if (cng_fs_translate(cng_g_fs, prefix, host, sizeof host) != 0)
+                continue;
+            long n = sys_readlinkat(CNG_AT_FDCWD, host, link, sizeof link - 1);
+            if (n <= 0)
+                continue; /* not a symlink, or missing */
+            link[n] = '\0';
+
+            /* Rewrite cur = <link, re-rooted if absolute> + <suffix cur[e..]>. */
+            char tmp[CNG_PATH_MAX];
+            size_t p;
+            if (link[0] == '/') {
+                cng_strlcpy(tmp, link, sizeof tmp);
+                p = strlen(tmp);
+            } else {
+                size_t pe = e; /* parent dir of prefix */
+                while (pe > 0 && cur[pe - 1] != '/')
+                    pe--;
+                if (pe > 0)
+                    pe--;
+                memcpy(tmp, cur, pe);
+                p = pe;
+                if (p + 1 < sizeof tmp)
+                    tmp[p++] = '/';
+                cng_strlcpy(tmp + p, link, sizeof tmp - p);
+                p = strlen(tmp);
+            }
+            cng_strlcpy(tmp + p, cur + e, p < sizeof tmp ? sizeof tmp - p : 0);
+            if (cng_path_canon(tmp, cur, sizeof cur) < 0)
+                return -ENAMETOOLONG;
+            found = 1;
+            break;
+        }
+        if (!found)
+            return cng_fs_translate(cng_g_fs, cur, out, outsz);
+    }
+    return -ELOOP;
+}
+
+static const char *xlate(long dirfd, const char *gp, char *buf, size_t bufsz,
+                         int deref_final) {
     if (!gp)
         return gp;
     if (gp[0] == '/' || dirfd == CNG_AT_FDCWD) {
+        if (cng_resolve(gp, deref_final, buf, bufsz) == 0)
+            return buf;
         if (cng_fs_translate(cng_g_fs, gp, buf, bufsz) == 0)
             return buf;
     }
@@ -105,13 +171,16 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_name_to_handle_at:
 #endif
     {
-        const char *p = xlate(a0, (const char *)a1, b1, sizeof b1);
+        int deref = !(nr == __NR_unlinkat || nr == __NR_mkdirat ||
+                      nr == __NR_mknodat);
+        const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
         return reissue(a0, (long)p, a2, a3, a4, a5, nr);
     }
 
     /* stat: translate, reissue, then fake ownership if -0. */
     case __NR_newfstatat: {
-        const char *p = xlate(a0, (const char *)a1, b1, sizeof b1);
+        int deref = !((int)a3 & CNG_AT_SYMLINK_NOFOLLOW);
+        const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
         long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_newfstatat);
         if (r == 0 && cng_g_fake_id && a2) {
             *(unsigned *)((char *)a2 + STAT_UID_OFF) = cng_g_fake_uid;
@@ -120,7 +189,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         return r;
     }
     case __NR_statx: {
-        const char *p = xlate(a0, (const char *)a1, b1, sizeof b1);
+        int deref = !((int)a2 & CNG_AT_SYMLINK_NOFOLLOW);
+        const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
         long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_statx);
         if (r == 0 && cng_g_fake_id && a4) {
             *(unsigned *)((char *)a4 + STATX_UID_OFF) = cng_g_fake_uid;
@@ -133,7 +203,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_fchownat: {
         if (cng_g_fake_id)
             return 0;
-        const char *p = xlate(a0, (const char *)a1, b1, sizeof b1);
+        int deref = !((int)a4 & CNG_AT_SYMLINK_NOFOLLOW);
+        const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
         return reissue(a0, (long)p, a2, a3, a4, a5, __NR_fchownat);
     }
 
@@ -149,21 +220,21 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                     return fx;
             }
         }
-        const char *p = xlate(a0, gp, b1, sizeof b1);
+        const char *p = xlate(a0, gp, b1, sizeof b1, /*deref_final=*/0);
         return reissue(a0, (long)p, a2, a3, a4, a5, __NR_readlinkat);
     }
 
     /* symlinkat(target, newdirfd, linkpath): translate only the linkpath. */
     case __NR_symlinkat: {
-        const char *lp = xlate(a1, (const char *)a2, b2, sizeof b2);
+        const char *lp = xlate(a1, (const char *)a2, b2, sizeof b2, 0);
         return reissue(a0, a1, (long)lp, a3, a4, a5, __NR_symlinkat);
     }
 
     /* rename: two translated paths. */
     case __NR_renameat:
     case __NR_renameat2: {
-        const char *op = xlate(a0, (const char *)a1, b1, sizeof b1);
-        const char *np = xlate(a2, (const char *)a3, b2, sizeof b2);
+        const char *op = xlate(a0, (const char *)a1, b1, sizeof b1, 0);
+        const char *np = xlate(a2, (const char *)a3, b2, sizeof b2, 0);
         return reissue(a0, (long)op, a2, (long)np, a4, a5, nr);
     }
 
@@ -171,8 +242,9 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * (link2symlink, lightweight form: symlink target is the host path so the
      * kernel follows it correctly). */
     case __NR_linkat: {
-        const char *op = xlate(a0, (const char *)a1, b1, sizeof b1);
-        const char *np = xlate(a2, (const char *)a3, b2, sizeof b2);
+        int deref_old = ((int)a4 & CNG_AT_SYMLINK_FOLLOW) ? 1 : 0;
+        const char *op = xlate(a0, (const char *)a1, b1, sizeof b1, deref_old);
+        const char *np = xlate(a2, (const char *)a3, b2, sizeof b2, 0);
         long r = reissue(a0, (long)op, a2, (long)np, a4, a5, __NR_linkat);
         if (r == -EPERM || r == -EMLINK || r == -EXDEV || r == -ENOSYS ||
             r == -EACCES || r == -EOPNOTSUPP) {
@@ -187,13 +259,14 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     /* path = a0 */
     case __NR_truncate:
     case __NR_statfs: {
-        const char *p = xlate(CNG_AT_FDCWD, (const char *)a0, b1, sizeof b1);
+        const char *p =
+            xlate(CNG_AT_FDCWD, (const char *)a0, b1, sizeof b1, 1);
         return reissue((long)p, a1, a2, a3, a4, a5, nr);
     }
 
     case __NR_chdir: {
         const char *gp = (const char *)a0;
-        const char *hp = xlate(CNG_AT_FDCWD, gp, b1, sizeof b1);
+        const char *hp = xlate(CNG_AT_FDCWD, gp, b1, sizeof b1, 1);
         long r = reissue((long)hp, 0, 0, 0, 0, 0, __NR_chdir);
         if (r == 0) {
             char gc[CNG_PATH_MAX];

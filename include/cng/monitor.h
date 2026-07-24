@@ -42,6 +42,11 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
 /* One-shot-per-number diagnostic for a syscall we emulate away. */
 void cng_note_blocked(int nr);
 
+/* Resolve a guest path to a host path, following symlinks within the guest
+ * (absolute link targets re-rooted into the rootfs). deref_final follows the
+ * last component's own symlink. Returns 0/-errno. Uses cng_g_fs + readlink. */
+int cng_resolve(const char *path, int deref_final, char *out, size_t outsz);
+
 /* Ambient-seccomp block-list: cng_blocked[nr] != 0 means Android blocks that
  * syscall, so dispatch emulates ENOSYS instead of re-issuing it. Populated by
  * cng_probe_blocked() at monitor install (a no-op result off Android). */

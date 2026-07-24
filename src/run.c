@@ -111,10 +111,11 @@ int cng_cmd_run(int argc, char **argv, char **envp, unsigned long *auxv) {
      * the fs view even if the seccomp monitor never installs (e.g. -R only). */
     cng_g_fs = &g_fs;
 
-    /* Resolve the program itself through the map to find the host file. */
+    /* Resolve the program itself through the map (following symlinks) to find
+     * the host file. */
     char host_prog[CNG_PATH_MAX];
-    if (cng_fs_translate(&g_fs, prog_guest, host_prog, sizeof host_prog) != 0) {
-        cng_dprintf(2, "chroot-ng: path too long: %s\n", prog_guest);
+    if (cng_resolve(prog_guest, 1, host_prog, sizeof host_prog) != 0) {
+        cng_dprintf(2, "chroot-ng: cannot resolve %s\n", prog_guest);
         return 1;
     }
 
@@ -132,7 +133,7 @@ int cng_cmd_run(int argc, char **argv, char **envp, unsigned long *auxv) {
         const char *ip;
         if (libprefix)
             ip = join2(ipath, sizeof ipath, libprefix, prog.interp);
-        else if (cng_fs_translate(&g_fs, prog.interp, ipath, sizeof ipath) == 0)
+        else if (cng_resolve(prog.interp, 1, ipath, sizeof ipath) == 0)
             ip = ipath;
         else
             ip = prog.interp;

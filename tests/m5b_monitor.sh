@@ -28,3 +28,19 @@ check "signal round-trip + ucontext readable" 0 $?
 check_contains "sigtest handler ran" "handler ran" "$(run _sigtest 2>&1)"
 
 rm -rf "$ROOT"
+
+# symlink resolution: absolute guest-target symlinks re-rooted (Alpine busybox
+# style), relative symlinks, and no escape via a symlink target.
+SR=$(mktemp -d)
+mkdir -p "$SR/bin"
+printf REAL-BB > "$SR/bin/busybox"
+ln -s /bin/busybox "$SR/bin/ls"
+ln -s busybox "$SR/bin/cat"
+ln -s /../../../etc/passwd "$SR/bin/esc"
+check_contains "abs symlink re-rooted into rootfs" "read: REAL-BB" \
+    "$(run _dtest -r "$SR" open /bin/ls 2>&1)"
+check_contains "relative symlink resolved" "read: REAL-BB" \
+    "$(run _dtest -r "$SR" open /bin/cat 2>&1)"
+check_contains "symlink target cannot escape rootfs" "open: errno 2" \
+    "$(run _dtest -r "$SR" open /bin/esc 2>&1)"
+rm -rf "$SR"

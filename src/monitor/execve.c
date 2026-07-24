@@ -30,13 +30,14 @@ void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
         return;
     }
 
-    /* Resolve the target through the rootfs/bind map (absolute or AT_FDCWD);
-     * a real dirfd with a relative path is a rare case we pass through. */
+    /* Resolve the target through the rootfs/bind map, following symlinks
+     * (absolute or AT_FDCWD); a real dirfd with a relative path is a rare case
+     * we pass through. */
     char host[CNG_PATH_MAX];
     const char *resolved = path;
     if (path[0] == '/' || dirfd == CNG_AT_FDCWD) {
-        if (cng_fs_translate(cng_g_fs, path, host, sizeof host) != 0) {
-            r[0] = (unsigned long long)(long)-ENAMETOOLONG;
+        if (cng_resolve(path, 1, host, sizeof host) != 0) {
+            r[0] = (unsigned long long)(long)-ENOENT;
             return;
         }
         resolved = host;
@@ -45,6 +46,8 @@ void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
     struct cng_loaded prog;
     int rc = cng_load_elf(resolved, 0, &prog);
     if (rc != CNG_LOAD_OK) {
+        cng_dprintf(2, "chroot-ng: exec %s (%s): load failed rc=%d\n", path,
+                    resolved, rc);
         r[0] = (unsigned long long)(long)(rc == CNG_LOAD_EOPEN ? -ENOENT
                                                               : -ENOEXEC);
         return;
@@ -54,8 +57,10 @@ void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
     int have_interp = 0;
     if (prog.has_interp) {
         char ip[CNG_PATH_MAX];
-        if (cng_fs_translate(cng_g_fs, prog.interp, ip, sizeof ip) != 0 ||
+        if (cng_resolve(prog.interp, 1, ip, sizeof ip) != 0 ||
             cng_load_elf(ip, 0, &interp) != CNG_LOAD_OK) {
+            cng_dprintf(2, "chroot-ng: exec %s: interp %s load failed\n", path,
+                        prog.interp);
             r[0] = (unsigned long long)(long)-ENOENT;
             return;
         }
