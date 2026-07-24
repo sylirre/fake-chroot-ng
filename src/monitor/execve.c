@@ -34,20 +34,76 @@ void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
      * (absolute or AT_FDCWD); a real dirfd with a relative path is a rare case
      * we pass through. */
     char host[CNG_PATH_MAX];
-    const char *resolved = path;
     if (path[0] == '/' || dirfd == CNG_AT_FDCWD) {
         if (cng_resolve(path, 1, host, sizeof host) != 0) {
             r[0] = (unsigned long long)(long)-ENOENT;
             return;
         }
-        resolved = host;
+    } else {
+        cng_strlcpy(host, path, sizeof host);
+    }
+
+    /* Shebang: the kernel interprets `#!interp [arg]` scripts, but we bypass the
+     * kernel, so do it ourselves — exec the interpreter with
+     * [interp, arg?, script, orig-args...]. One level (interp is expected to be
+     * a real ELF, e.g. /bin/sh -> busybox). */
+    char interp_buf[256], arg_buf[256], *sheb_argv[128];
+    char **eff_argv = argv;
+    {
+        long fd = sys_openat(CNG_AT_FDCWD, host, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+        if (fd < 0) {
+            r[0] = (unsigned long long)(long)-ENOENT;
+            return;
+        }
+        char hdr[257];
+        long n = sys_pread64((int)fd, hdr, 256, 0);
+        sys_close((int)fd);
+        if (n >= 2 && hdr[0] == '#' && hdr[1] == '!') {
+            hdr[n < 256 ? n : 256] = '\0';
+            char *p = hdr + 2;
+            while (*p == ' ' || *p == '\t')
+                p++;
+            char *i0 = p;
+            while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
+                p++;
+            size_t ilen = (size_t)(p - i0);
+            while (*p == ' ' || *p == '\t')
+                p++;
+            char *a0 = p;
+            while (*p && *p != '\n' && *p != '\r')
+                p++;
+            size_t alen = (size_t)(p - a0);
+            if (ilen == 0 || ilen >= sizeof interp_buf) {
+                r[0] = (unsigned long long)(long)-ENOEXEC;
+                return;
+            }
+            memcpy(interp_buf, i0, ilen);
+            interp_buf[ilen] = '\0';
+            int k = 0;
+            sheb_argv[k++] = interp_buf;
+            if (alen > 0 && alen < sizeof arg_buf) {
+                memcpy(arg_buf, a0, alen);
+                arg_buf[alen] = '\0';
+                sheb_argv[k++] = arg_buf;
+            }
+            sheb_argv[k++] = (char *)path; /* the script path */
+            if (argv)
+                for (int j = 1; argv[j] && k < 126; j++)
+                    sheb_argv[k++] = argv[j];
+            sheb_argv[k] = 0;
+            eff_argv = sheb_argv;
+            if (cng_resolve(interp_buf, 1, host, sizeof host) != 0) {
+                r[0] = (unsigned long long)(long)-ENOENT;
+                return;
+            }
+        }
     }
 
     struct cng_loaded prog;
-    int rc = cng_load_elf(resolved, 0, &prog);
+    int rc = cng_load_elf(host, 0, &prog);
     if (rc != CNG_LOAD_OK) {
         cng_dprintf(2, "chroot-ng: exec %s (%s): load failed rc=%d\n", path,
-                    resolved, rc);
+                    host, rc);
         r[0] = (unsigned long long)(long)(rc == CNG_LOAD_EOPEN ? -ENOENT
                                                               : -ENOEXEC);
         return;
@@ -68,12 +124,13 @@ void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
     }
 
     int argc = 0;
-    if (argv)
-        while (argv[argc])
+    if (eff_argv)
+        while (eff_argv[argc])
             argc++;
 
-    unsigned long sp = cng_build_stack(argc, argv, envp, cng_host_auxv, &prog,
-                                       have_interp ? &interp : 0, path);
+    unsigned long sp = cng_build_stack(argc, eff_argv, envp, cng_host_auxv,
+                                       &prog, have_interp ? &interp : 0,
+                                       eff_argv ? eff_argv[0] : path);
     unsigned long entry = have_interp ? interp.entry : prog.entry;
 
     /* Rewrite the signal context to the new program's fresh entry state, then

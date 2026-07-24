@@ -330,6 +330,39 @@ int cng_cmd_loadtwice(int argc, char **argv, char **envp, unsigned long *auxv) {
     return (rc1 == 0 && rc2 == 0) ? 0 : 1;
 }
 
+/* _exectest -r ROOT PROG [args] — drive cng_emulate_execve (incl. shebang) and,
+ * on success, enter the loaded program. Exercises execve emulation under qemu
+ * where neither the SIGSYS nor trampoline route reaches it. */
+int cng_cmd_exectest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    const char *rootfs = "/";
+    int i = 1;
+    while (i < argc && !strcmp(argv[i], "-r") && i + 1 < argc) {
+        rootfs = argv[i + 1];
+        i += 2;
+    }
+    if (i >= argc) {
+        cng_dprintf(2, "usage: _exectest -r ROOT PROG [args]\n");
+        return 2;
+    }
+    static struct cng_fs fs;
+    cng_fs_init(&fs, rootfs);
+    cng_g_fs = &fs;
+    cng_host_auxv = auxv;
+
+    char **gargv = argv + i;
+    static struct cng_ucontext uc;
+    memset(&uc, 0, sizeof uc);
+    cng_emulate_execve(&uc, CNG_AT_FDCWD, gargv[0], gargv, envp);
+    unsigned long entry = (unsigned long)uc.uc_mcontext.pc;
+    unsigned long sp = (unsigned long)uc.uc_mcontext.sp;
+    if (entry == 0) {
+        cng_dprintf(2, "exectest: emulate_execve failed x0=%ld\n",
+                    (long)uc.uc_mcontext.regs[0]);
+        return 1;
+    }
+    cng_enter(sp, entry); /* never returns */
+}
+
 /* _l2stest ROOT — exercise link2symlink (target must be a guest/relative path,
  * not a host path) and fchdir cwd tracking. ROOT must contain a dir "w". */
 int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
