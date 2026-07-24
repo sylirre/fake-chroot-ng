@@ -35,16 +35,15 @@ CFLAGS  += -std=gnu11 -ffreestanding -nostdlib -static -fno-pie -no-pie \
 ifeq ($(CC_IS_CLANG),0)
 CFLAGS  += -fno-tree-loop-distribute-patterns
 endif
-# Link chroot-ng far above the guest ET_EXEC range. A non-PIE guest (notably
-# gcc's cc1) has a fixed load address of 0x400000 — the same place a -no-pie
-# executable defaults to — so if chroot-ng lived there, MAP_FIXED-loading such a
-# guest would overwrite our own monitor code. 0x1000000000 (64 GiB) is clear of
-# every guest's fixed vaddr yet well below the kernel's high mmap region. -Ttext
-# is accepted by both GNU ld and lld (Termux/NDK), and moves every allocatable
-# section (.text/.rodata/.data/.bss) plus the ELF headers up together.
-CNG_BASE := 0x1000000000
+# Link chroot-ng far above the guest ET_EXEC range via an explicit linker script
+# (scripts/chroot-ng.ld). A non-PIE guest (notably gcc's cc1) loads at the fixed
+# address 0x400000 — where a -no-pie executable also defaults to — so if
+# chroot-ng lived there, MAP_FIXED-loading such a guest would overwrite our own
+# monitor code. The script sets the location counter to 0x1000000000 (64 GiB) so
+# the first segment *starts* there; the -T*/--image-base flags don't relocate a
+# -no-pie binary cleanly on lld (they pad a segment up from 0x200000 instead).
 LDFLAGS ?=
-LDFLAGS += -static -nostdlib -no-pie -Wl,-Ttext=$(CNG_BASE) \
+LDFLAGS += -static -nostdlib -no-pie -Wl,-T,scripts/chroot-ng.ld \
            -Wl,--build-id=none -Wl,-z,noexecstack \
            -Wl,--gc-sections -Wl,-e,_start
 
