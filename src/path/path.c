@@ -121,3 +121,40 @@ int cng_fs_translate(const struct cng_fs *fs, const char *path, char *out,
     }
     return 0;
 }
+
+int cng_fs_untranslate(const struct cng_fs *fs, const char *host, char *out,
+                       size_t outsz) {
+    /* Longest host-prefix bind match, reversed. */
+    int best = -1;
+    size_t blen = 0;
+    for (int i = 0; i < fs->nbinds; i++) {
+        const char *bh = fs->binds[i].host;
+        size_t hl = strlen(bh);
+        if (hl && strncmp(host, bh, hl) == 0 &&
+            (host[hl] == '/' || host[hl] == '\0') && hl > blen) {
+            best = i;
+            blen = hl;
+        }
+    }
+    if (best >= 0) {
+        const char *suffix = host + blen;
+        size_t n = cng_strlcpy(out, fs->binds[best].guest, outsz);
+        cng_strlcpy(out + n, suffix, outsz > n ? outsz - n : 0);
+        if (out[0] == '\0')
+            cng_strlcpy(out, "/", outsz);
+        return 0;
+    }
+
+    size_t rl = strlen(fs->rootfs);
+    if (rl == 0) { /* identity rootfs */
+        cng_strlcpy(out, host, outsz);
+        return 0;
+    }
+    if (strncmp(host, fs->rootfs, rl) == 0 &&
+        (host[rl] == '/' || host[rl] == '\0')) {
+        const char *suffix = host + rl;
+        cng_strlcpy(out, suffix[0] ? suffix : "/", outsz);
+        return 0;
+    }
+    return -1; /* outside the guest view */
+}

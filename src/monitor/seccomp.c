@@ -26,7 +26,8 @@ static const int path_syscalls[] = {
     __NR_readlinkat, __NR_mkdirat, __NR_mknodat,   __NR_unlinkat,
     __NR_fchownat,   __NR_fchmodat, __NR_utimensat, __NR_symlinkat,
     __NR_linkat,     __NR_renameat, __NR_renameat2, __NR_truncate,
-    __NR_statfs,     __NR_chdir,    __NR_getcwd,    __NR_chroot,
+    __NR_statfs,     __NR_chdir,    __NR_fchdir,    __NR_getcwd,
+    __NR_chroot,
     /* signal control: keep SIGSYS unblocked / our handler in place */
     __NR_rt_sigprocmask, __NR_rt_sigaction,
     __NR_execve,

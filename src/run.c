@@ -107,9 +107,20 @@ int cng_cmd_run(int argc, char **argv, char **envp, unsigned long *auxv) {
     cng_fs_init(&g_fs, rootfs);
     for (int j = 0; j < nb; j++)
         cng_fs_add_bind(&g_fs, bind_g[j], bind_h[j]);
-    char cwd[CNG_PATH_MAX];
-    if (sys_getcwd(cwd, sizeof cwd) > 0)
-        cng_fs_set_cwd(&g_fs, cwd);
+    /* Initial guest cwd. With a real rootfs, default to "/" (never leak the host
+     * launch dir) and chdir the real process into the rootfs so untranslated
+     * relative access stays contained; a -w option can override later. With an
+     * identity rootfs, the host cwd is the guest cwd. */
+    if (strcmp(rootfs, "/") != 0) {
+        cng_fs_set_cwd(&g_fs, "/");
+        char rhost[CNG_PATH_MAX];
+        if (cng_fs_translate(&g_fs, "/", rhost, sizeof rhost) == 0)
+            sys_chdir(rhost);
+    } else {
+        char cwd[CNG_PATH_MAX];
+        if (sys_getcwd(cwd, sizeof cwd) > 0)
+            cng_fs_set_cwd(&g_fs, cwd);
+    }
 
     /* The dispatcher (used by both the SIGSYS handler and M8 trampolines) needs
      * the fs view even if the seccomp monitor never installs (e.g. -R only). */

@@ -25,7 +25,7 @@
 #define CNG_O_TRUNC     01000
 #define CNG_O_APPEND    02000
 #define CNG_O_NONBLOCK  04000
-#define CNG_O_DIRECTORY 0200000
+#define CNG_O_DIRECTORY 040000
 #define CNG_O_CLOEXEC   02000000
 
 /* mmap prot */

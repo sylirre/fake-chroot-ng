@@ -239,8 +239,9 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     }
 
     /* linkat: hardlink; fall back to a symlink where the fs forbids hardlinks
-     * (link2symlink, lightweight form: symlink target is the host path so the
-     * kernel follows it correctly). */
+     * (link2symlink). The symlink target is a GUEST path (bare basename when
+     * old and new share a directory, else the guest-absolute path) — never a
+     * host path — so readlink doesn't leak, and cng_resolve re-roots it. */
     case __NR_linkat: {
         int deref_old = ((int)a4 & CNG_AT_SYMLINK_FOLLOW) ? 1 : 0;
         const char *op = xlate(a0, (const char *)a1, b1, sizeof b1, deref_old);
@@ -248,10 +249,24 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         long r = reissue(a0, (long)op, a2, (long)np, a4, a5, __NR_linkat);
         if (r == -EPERM || r == -EMLINK || r == -EXDEV || r == -ENOSYS ||
             r == -EACCES || r == -EOPNOTSUPP) {
-            long s = reissue((long)op, CNG_AT_FDCWD, (long)np, 0, 0, 0,
-                                  __NR_symlinkat);
-            if (s == 0)
-                return 0;
+            char oldg[CNG_PATH_MAX], newg[CNG_PATH_MAX], tgt[CNG_PATH_MAX];
+            if (cng_fs_abscanon(cng_g_fs, (const char *)a1, oldg, sizeof oldg) ==
+                    0 &&
+                cng_fs_abscanon(cng_g_fs, (const char *)a3, newg,
+                                sizeof newg) == 0) {
+                char *os = strrchr(oldg, '/');
+                char *ns = strrchr(newg, '/');
+                size_t odl = os ? (size_t)(os - oldg) : 0;
+                size_t ndl = ns ? (size_t)(ns - newg) : 0;
+                if (odl == ndl && strncmp(oldg, newg, odl) == 0)
+                    cng_strlcpy(tgt, os ? os + 1 : oldg, sizeof tgt); /* same dir */
+                else
+                    cng_strlcpy(tgt, oldg, sizeof tgt); /* guest-absolute */
+                long s = reissue((long)tgt, CNG_AT_FDCWD, (long)np, 0, 0, 0,
+                                 __NR_symlinkat);
+                if (s == 0)
+                    return 0;
+            }
         }
         return r;
     }
@@ -271,6 +286,20 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         if (r == 0) {
             char gc[CNG_PATH_MAX];
             if (cng_fs_abscanon(cng_g_fs, gp, gc, sizeof gc) == 0)
+                cng_fs_set_cwd(cng_g_fs, gc);
+        }
+        return r;
+    }
+
+    /* fchdir: the fd already refers to a translated host dir, so perform it,
+     * then resync the virtual cwd from the real cwd (reverse-translated). This
+     * is what apk relies on when running package scripts. */
+    case __NR_fchdir: {
+        long r = cng_syscall6(a0, 0, 0, 0, 0, 0, __NR_fchdir);
+        if (r == 0) {
+            char hc[CNG_PATH_MAX], gc[CNG_PATH_MAX];
+            if (sys_getcwd(hc, sizeof hc) > 0 &&
+                cng_fs_untranslate(cng_g_fs, hc, gc, sizeof gc) == 0)
                 cng_fs_set_cwd(cng_g_fs, gc);
         }
         return r;

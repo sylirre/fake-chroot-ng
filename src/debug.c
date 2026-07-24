@@ -330,6 +330,54 @@ int cng_cmd_loadtwice(int argc, char **argv, char **envp, unsigned long *auxv) {
     return (rc1 == 0 && rc2 == 0) ? 0 : 1;
 }
 
+/* _l2stest ROOT — exercise link2symlink (target must be a guest/relative path,
+ * not a host path) and fchdir cwd tracking. ROOT must contain a dir "w". */
+int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)envp;
+    (void)auxv;
+    const char *rootfs = argc > 1 ? argv[1] : "/";
+    static struct cng_fs fs;
+    cng_fs_init(&fs, rootfs);
+    cng_g_fs = &fs;
+    int fails = 0;
+
+    /* link2symlink: force the fallback by marking linkat blocked. */
+    cng_blocked[__NR_linkat] = 1;
+    long fd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/a",
+                           CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (fd >= 0) {
+        sys_write((int)fd, "hi", 2);
+        sys_close((int)fd);
+    }
+    long lr = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/a", CNG_AT_FDCWD,
+                           (long)"/w/b", 0, 0, 0);
+    char buf[256];
+    long n = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD, (long)"/w/b",
+                          (long)buf, sizeof buf - 1, 0, 0, 0);
+    cng_blocked[__NR_linkat] = 0;
+    buf[n > 0 ? n : 0] = '\0';
+    int leak = (strncmp(buf, "/data", 5) == 0) ||
+               (strlen(rootfs) > 1 &&
+                strncmp(buf, rootfs, strlen(rootfs)) == 0);
+    int ok_l2s = (lr == 0 && n > 0 && !leak);
+    cng_dprintf(1, "l2s: link rc=%d target=%s leak=%d -> %s\n", (int)lr, buf,
+                leak, ok_l2s ? "OK" : "FAIL");
+    fails += !ok_l2s;
+
+    /* fchdir cwd tracking. */
+    long dfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w",
+                            CNG_O_RDONLY, 0, 0, 0, 0);
+    if (dfd >= 0) {
+        cng_dispatch(__NR_fchdir, dfd, 0, 0, 0, 0, 0, 0);
+        sys_close((int)dfd);
+    }
+    int ok_cwd = (strcmp(cng_g_fs->cwd, "/w") == 0);
+    cng_dprintf(1, "fchdir: cwd=%s -> %s\n", cng_g_fs->cwd,
+                ok_cwd ? "OK" : "FAIL");
+    fails += !ok_cwd;
+    return fails ? 1 : 0;
+}
+
 /* _nettest — drive cng_sigsys_body with synthetic seccomp contexts to validate
  * the Android SIGSYS net branching (no real seccomp needed). */
 int cng_cmd_nettest(int argc, char **argv, char **envp, unsigned long *auxv) {
