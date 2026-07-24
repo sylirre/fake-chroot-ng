@@ -5,6 +5,7 @@
  */
 #include "cng/monitor.h"
 #include "cng/path.h"
+#include "cng/rewrite.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
 #include "cng/uapi.h"
@@ -226,4 +227,53 @@ int cng_cmd_faketest(int argc, char **argv, char **envp, unsigned long *auxv) {
         cng_dprintf(1, "exe=%s\n", lb);
     }
     return 0;
+}
+
+/* _rwtest — copy a self-checking function containing an `svc #0`, rewrite the
+ * svc to a trampoline, run it, and confirm it returns the real pid with all
+ * caller registers preserved (validates M8's trampoline: x30/x18/args survive
+ * the C dispatch call). No seccomp involved. */
+extern char cng_rwtest_fn[];
+extern char cng_rwtest_fn_end[];
+
+int cng_cmd_rwtest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+
+    size_t fsz = (size_t)(cng_rwtest_fn_end - cng_rwtest_fn);
+    /* One mapping: [code page | trampoline pool], so the pool is adjacent and
+     * within a `b`'s reach (same reason the loader over-allocates). */
+    unsigned long total = 4096 + CNG_TRAMP_POOL;
+    void *region = sys_mmap(0, total, CNG_PROT_READ | CNG_PROT_WRITE,
+                            CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (region == CNG_MAP_FAILED || cng_is_err((long)region)) {
+        cng_dprintf(1, "rwtest: mmap failed\n");
+        return 1;
+    }
+    void *buf = region;
+    memcpy(buf, cng_rwtest_fn, fsz);
+    unsigned long pool = (unsigned long)region + 4096;
+    unsigned long used = 0;
+
+    static struct cng_fs fs;
+    cng_fs_init(&fs, "/");
+    cng_g_fs = &fs;
+    cng_g_rewrite = 1;
+
+    int n = cng_rewrite_seg((unsigned long)buf, (unsigned long)buf + fsz, pool,
+                            CNG_TRAMP_POOL, &used);
+    sys_mprotect(region, total, CNG_PROT_READ | CNG_PROT_EXEC);
+    cng_flush_icache(buf, (char *)buf + fsz);
+    cng_flush_icache((void *)pool, (void *)(pool + used));
+
+    long real = sys_getpid();
+    long (*fn)(void) = (long (*)(void))buf;
+    long got = fn();
+
+    int ok = (n >= 1 && got == real);
+    cng_dprintf(1, "rwtest: rewrote %d site(s); real_pid=%d fn_pid=%d -> %s\n",
+                n, (int)real, (int)got, ok ? "OK" : "FAIL");
+    return ok ? 0 : 1;
 }

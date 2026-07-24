@@ -14,6 +14,7 @@
 #include "cng/loader.h"
 #include "cng/monitor.h"
 #include "cng/path.h"
+#include "cng/rewrite.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
 
@@ -58,6 +59,8 @@ int cng_cmd_run(int argc, char **argv, char **envp, unsigned long *auxv) {
             cng_g_fake_id = 1;
             cng_g_fake_uid = 0;
             cng_g_fake_gid = 0;
+        } else if (!strcmp(argv[i], "-R")) {
+            cng_g_rewrite = 1;
         } else if (!strcmp(argv[i], "-r") && i + 1 < argc) {
             rootfs = argv[++i];
         } else if (!strcmp(argv[i], "-b") && i + 1 < argc && nb < CNG_MAX_BINDS) {
@@ -79,9 +82,11 @@ int cng_cmd_run(int argc, char **argv, char **envp, unsigned long *auxv) {
         i++;
     if (i >= argc) {
         cng_dprintf(2, "chroot-ng run: missing program\n"
-                       "usage: chroot-ng run [-r rootfs] [-b g:h] [-0] [-L dir]"
-                       " -- PROG [args]\n"
-                       "  -0   fake root (uid/gid 0, ownership, chown)\n");
+                       "usage: chroot-ng run [-r rootfs] [-b g:h] [-0] [-R]"
+                       " [-L dir] -- PROG [args]\n"
+                       "  -0   fake root (uid/gid 0, ownership, chown)\n"
+                       "  -R   rewrite svc sites to trampolines (faster; also\n"
+                       "       provides translation where seccomp is absent)\n");
         return 2;
     }
 
@@ -101,6 +106,10 @@ int cng_cmd_run(int argc, char **argv, char **envp, unsigned long *auxv) {
     char cwd[CNG_PATH_MAX];
     if (sys_getcwd(cwd, sizeof cwd) > 0)
         cng_fs_set_cwd(&g_fs, cwd);
+
+    /* The dispatcher (used by both the SIGSYS handler and M8 trampolines) needs
+     * the fs view even if the seccomp monitor never installs (e.g. -R only). */
+    cng_g_fs = &g_fs;
 
     /* Resolve the program itself through the map to find the host file. */
     char host_prog[CNG_PATH_MAX];
@@ -142,6 +151,7 @@ int cng_cmd_run(int argc, char **argv, char **envp, unsigned long *auxv) {
         sp = cng_build_stack(gargc, gargv, envp, auxv, &prog, 0, prog_guest);
         entry = prog.entry;
     }
+    /* (svc rewriting + its pool are handled inside the loader, per object.) */
 
     /* Install the monitor last, after all of our own path syscalls are done.
      * Only when translation was actually requested; identity needs none. */
@@ -151,10 +161,13 @@ int cng_cmd_run(int argc, char **argv, char **envp, unsigned long *auxv) {
         if (mrc < 0)
             cng_dprintf(2,
                         "chroot-ng: warning: could not install seccomp monitor "
-                        "(errno %d); path translation is INACTIVE\n"
-                        "           (expected under qemu-user; real AArch64 "
-                        "kernel required)\n",
-                        -mrc);
+                        "(errno %d); %s\n"
+                        "           (seccomp is inert under qemu-user; a real "
+                        "AArch64 kernel is required for the SIGSYS path)\n",
+                        -mrc,
+                        cng_g_rewrite
+                            ? "svc-rewriting (-R) still handles located sites"
+                            : "path translation is INACTIVE");
     }
 
     cng_enter(sp, entry);

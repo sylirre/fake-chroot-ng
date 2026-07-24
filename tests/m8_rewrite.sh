@@ -1,0 +1,32 @@
+# M8 svc-rewriting tests (sourced by tests/run.sh). Unlike the seccomp path,
+# rewriting needs no kernel support, so it is fully exercised under qemu — which
+# also gives the first end-to-end proof of path translation with a real glibc
+# guest.
+echo "== M8: svc rewriting =="
+
+run _rwtest >/dev/null 2>&1
+check "trampoline preserves regs + correct syscall" 0 $?
+check_contains "rewrote the svc site" "rewrote 1 site" "$(run _rwtest 2>&1)"
+
+GCC="${GUESTCC:-aarch64-linux-gnu-gcc-13}"
+GDIR=build/tests
+mkdir -p "$GDIR"
+ROOT=$(mktemp -d)
+mkdir -p "$ROOT/bin" "$ROOT/etc"
+printf 'GREETING-VIA-REWRITE' > "$ROOT/etc/greeting"
+
+if $GCC -static-pie -O2 -o "$ROOT/bin/readfile" tests/guests/readfile.c \
+        2>"$GDIR/readfile.log"; then
+    out=$(run run -R -r "$ROOT" -- /bin/readfile 2>/dev/null); rc=$?
+    check "rewrite-translated glibc guest exits 0" 0 $rc
+    check_contains "guest openat translated into rootfs via rewrite" \
+        "GREETING-VIA-REWRITE" "$out"
+    # Negative control: no -R + seccomp inert under qemu => no translation.
+    run run -r "$ROOT" -- /bin/readfile >/dev/null 2>&1
+    check "without -R under qemu: open not translated (rc 3)" 3 $?
+else
+    fail=$((fail + 1)); printf '  FAIL could not build readfile guest\n'
+    sed 's/^/    /' "$GDIR/readfile.log"
+fi
+
+rm -rf "$ROOT"

@@ -7,6 +7,7 @@
  */
 #include "cng/elf.h"
 #include "cng/loader.h"
+#include "cng/rewrite.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
 #include "cng/uapi.h"
@@ -104,6 +105,10 @@ int cng_load_elf(const char *path, unsigned long base_hint,
 
     unsigned long span = hi - lo;
     int is_dyn = (eh.e_type == ET_DYN);
+    /* When rewriting, reserve a trampoline pool contiguously after the guest so
+     * every site is within a `b`'s ±128 MiB reach (mmap hints aren't reliable,
+     * especially under qemu). */
+    unsigned long pool_extra = cng_g_rewrite ? CNG_TRAMP_POOL : 0;
     int mflags = CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS;
     void *want = 0;
     if (is_dyn) {
@@ -112,8 +117,8 @@ int cng_load_elf(const char *path, unsigned long base_hint,
         want = (void *)lo;
         mflags |= CNG_MAP_FIXED; /* ET_EXEC: fixed vaddrs (collision caveat) */
     }
-    void *seg = sys_mmap(want, span, CNG_PROT_READ | CNG_PROT_WRITE, mflags, -1,
-                         0);
+    void *seg = sys_mmap(want, span + pool_extra, CNG_PROT_READ | CNG_PROT_WRITE,
+                         mflags, -1, 0);
     if (seg == CNG_MAP_FAILED || cng_is_err((long)seg)) {
         rc = CNG_LOAD_EMAP;
         goto out;
@@ -135,6 +140,24 @@ int cng_load_elf(const char *path, unsigned long base_hint,
         if (eh.e_phoff >= ph[i].p_offset &&
             eh.e_phoff < ph[i].p_offset + ph[i].p_filesz)
             phdr_addr = bias + ph[i].p_vaddr + (eh.e_phoff - ph[i].p_offset);
+    }
+
+    /* M8: rewrite svc sites while the executable segments are still writable
+     * (before the RX flip below), into the pool reserved just past the guest. */
+    if (cng_g_rewrite) {
+        unsigned long pool = (unsigned long)seg + span;
+        unsigned long used = 0;
+        for (int i = 0; i < eh.e_phnum; i++) {
+            if (ph[i].p_type != PT_LOAD || !(ph[i].p_flags & PF_X))
+                continue;
+            unsigned long s = bias + ph[i].p_vaddr;
+            cng_rewrite_seg(s, s + ph[i].p_filesz, pool, CNG_TRAMP_POOL, &used);
+        }
+        if (used) {
+            sys_mprotect((void *)pool, cng_page_up(used),
+                         CNG_PROT_READ | CNG_PROT_EXEC);
+            cng_flush_icache((void *)pool, (void *)(pool + used));
+        }
     }
 
     /* Apply final protections + make code coherent.

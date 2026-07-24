@@ -89,14 +89,28 @@ Milestones are committed individually. Each builds on the previous.
   redirect not yet handled; link2symlink is the lightweight form (no nlink
   bookkeeping, symlink target is a host path so readlink can leak it).
 
-- [ ] **M8 — performance: AoT `svc` rewriting in the load/mmap hook** (designed,
-  deferred). Correctness already comes from the SIGSYS floor; this is the
-  speed tier. AArch64 specifics make it delicate: replacing `svc` (4 bytes) with
-  `bl trampoline` clobbers x30, which is live across the common libc wrapper
-  `svc; ret`, so it needs per-site `b`-reached trampolines (SaBRe-style) that
-  carry a hardcoded return branch, plus veneers when a site is beyond ±128 MiB.
-  Best done as a focused pass with real-AArch64 benchmarking against the SIGSYS
-  path; deferred so the shipped correctness floor isn't destabilized.
+- [x] **M8 — performance: AoT `svc` rewriting (`run -R`)**
+  At load time (while segments are still writable) each `svc #0` is rewritten to
+  `b <trampoline>`, skipping the kernel seccomp+SIGSYS round trip.
+  - `tramp.S`: per-site trampoline reached by `b` (preserves x30), saving the
+    syscall-preserved set (x0..x18 incl. Android's x18 SCS reg, and x30; x19..x29
+    are AAPCS-preserved by cng_dispatch), marshaling args, calling the
+    dispatcher, writing x0, and returning to S+4 via absolute literals (no ±128
+    MiB veneer for the return). Two literals (dispatcher, return) patched per copy.
+  - `rewrite.c`: scan + `b` encoding + emit. The pool is allocated **contiguous
+    with the guest** by the loader over-allocating its mapping (mmap hints aren't
+    honored, notably under qemu), so every site is within `b` reach; unreachable
+    or pool-exhausted sites fall back to the SIGSYS floor.
+  - Because a rewritten site needs **no seccomp**, `-R` also provides translation
+    where seccomp is unavailable (old kernels, qemu-user).
+  Validated under qemu: `_rwtest` (register preservation + correct syscall) and
+  an end-to-end run — a static-PIE glibc guest (101 svc sites rewritten) has its
+  `open()` translated into the rootfs, 10/10 deterministic, with a no-`-R`
+  negative control. This is also the first end-to-end proof of the full
+  translation pipeline with a real glibc guest. 50/50 tests.
+  Caveat: `svc`-immediate scan is exact (`0xD4000001`); rare data words equal to
+  it in an executable segment would be mis-rewritten — none in the glibc we
+  tested (101 words, all real svc), but `-R` stays opt-in for that reason.
 
 - [ ] **M9 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
