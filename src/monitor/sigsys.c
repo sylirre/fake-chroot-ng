@@ -104,9 +104,81 @@ void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si) {
     r[0] = (unsigned long long)res;
 }
 
+/* Per-thread scratch stacks for the handler. The path dispatcher needs tens of
+ * KiB (multiple PATH_MAX buffers deep); a seccomp SIGSYS can fire on any thread,
+ * and Go goroutine stacks are only ~8 KiB, so we run the dispatcher on a large
+ * stack of our own keyed by TID. Slots are claimed lock-free and never freed
+ * (a recycled TID safely reuses its slot; the table is sized well above any
+ * realistic live-thread count). If the table is full or mmap fails we fall back
+ * to the interrupted stack. */
+extern long cng_run_on_stack(void *newsp, void *fn, void *a0, void *a1);
+
+#define CNG_SCR_N  256
+#define CNG_SCR_SZ (256 * 1024)
+static struct {
+    long tid;
+    unsigned long lo, hi;
+} cng_scr[CNG_SCR_N];
+
+/* Claim `*p` from 0 to `tid` (inline LL/SC so we need no libgcc atomics helper;
+ * works on any ARMv8). Returns 1 if this call performed the store. */
+static int cng_claim_slot(volatile long *p, long tid) {
+    long old;
+    int fail;
+    __asm__ volatile("1: ldaxr %[old], [%[p]]\n"
+                     "   cbnz  %[old], 2f\n"     /* already taken */
+                     "   stlxr %w[f], %[tid], [%[p]]\n"
+                     "   cbnz  %w[f], 1b\n"      /* store lost; retry */
+                     "   b     3f\n"
+                     "2: clrex\n"
+                     "   mov   %w[f], #1\n"
+                     "3:\n"
+                     : [old] "=&r"(old), [f] "=&r"(fail)
+                     : [p] "r"(p), [tid] "r"(tid)
+                     : "cc", "memory");
+    return fail == 0;
+}
+
+/* Top of this thread's scratch stack, or 0 to keep the current stack (table
+ * full/alloc failed, or we are already running on the scratch stack — a nested
+ * gate-net trap, which is shallow and safe to run below the outer frame). */
+static void *cng_scratch_top(void) {
+    long tid = sys_gettid();
+    unsigned long sp;
+    __asm__ volatile("mov %0, sp" : "=r"(sp));
+    unsigned h = (unsigned)((unsigned long)tid * 2654435761u) % CNG_SCR_N;
+    for (unsigned k = 0; k < CNG_SCR_N; k++) {
+        unsigned i = (h + k) % CNG_SCR_N;
+        long t = cng_scr[i].tid;
+        if (t == tid) {
+            if (sp > cng_scr[i].lo && sp <= cng_scr[i].hi)
+                return 0; /* nested: already on this scratch stack */
+            return (void *)cng_scr[i].hi;
+        }
+        if (t == 0 && cng_claim_slot(&cng_scr[i].tid, tid)) {
+            void *base =
+                sys_mmap(0, CNG_SCR_SZ, CNG_PROT_READ | CNG_PROT_WRITE,
+                         CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+            if (base == CNG_MAP_FAILED || cng_is_err((long)base)) {
+                cng_scr[i].tid = 0;
+                return 0;
+            }
+            cng_scr[i].lo = (unsigned long)base;
+            cng_scr[i].hi = ((unsigned long)base + CNG_SCR_SZ) & ~15UL;
+            return (void *)cng_scr[i].hi;
+        }
+        /* slot taken by another thread (or we lost the CAS): keep probing */
+    }
+    return 0;
+}
+
 static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {
     (void)sig;
-    cng_sigsys_body((struct cng_ucontext *)ucv, si);
+    void *top = cng_scratch_top();
+    if (top)
+        cng_run_on_stack(top, (void *)cng_sigsys_body, ucv, si);
+    else
+        cng_sigsys_body((struct cng_ucontext *)ucv, si);
 }
 
 int cng_install_monitor(struct cng_fs *fs) {

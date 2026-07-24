@@ -293,7 +293,7 @@ static int l2s_materialize(const char *src, const char *dst) {
         sys_close((int)in);
         return (int)out;
     }
-    char buf[65536];
+    char buf[8192];
     long rc = 0, n;
     while ((n = sys_read((int)in, buf, sizeof buf)) > 0) {
         long off = 0;

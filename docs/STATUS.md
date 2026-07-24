@@ -138,6 +138,18 @@ Milestones are committed individually. Each builds on the previous.
   (would require trapping it); they are dotfiles and unrecorded in apk's db, so
   cosmetic only. Cross-directory hardlinks fall back to a content copy.
 
+- [x] **Handler stack isolation (Go/small-stack guests)**
+  The SIGSYS handler's path dispatcher is deep (multiple PATH_MAX buffers:
+  `cng_resolve` ~20 KiB, `cng_dispatch` ~16 KiB per `-fstack-usage`). C guests
+  survive on their multi-MiB main-thread stacks, but Go runs syscalls on ~8 KiB
+  goroutine stacks, so the handler smashed them — intermittent SIGSEGV, memory
+  corruption, and monitor crashes under `go build`/`make`. The handler now runs
+  the dispatcher on a large dedicated per-thread scratch stack (256 KiB, claimed
+  lock-free by TID, allocated on first use; `stackswitch.S` does the SP switch),
+  so its footprint is independent of the interrupted guest stack. Nested
+  gate-net traps run below the outer frame (no re-switch). Validated by
+  `_stackswtest`. 76/76.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

@@ -527,6 +527,40 @@ int cng_cmd_cloexectest(int argc, char **argv, char **envp, unsigned long *auxv)
     return ok ? 0 : 1;
 }
 
+/* _stackswtest — validate the handler's stack switch (cng_run_on_stack): the
+ * callee must run on the scratch stack, its result must propagate, and the
+ * caller's stack must be intact afterward. */
+extern long cng_run_on_stack(void *newsp, void *fn, void *a0, void *a1);
+
+static long sp_probe(void *lo, void *hi) {
+    unsigned long sp;
+    __asm__ volatile("mov %0, sp" : "=r"(sp));
+    /* return 1 iff we are running on the [lo,hi] scratch region */
+    return (sp > (unsigned long)lo && sp <= (unsigned long)hi) ? 0xC0DE : sp;
+}
+
+int cng_cmd_stackswtest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    unsigned long marker = 0xA5A5A5A5;
+    void *base = sys_mmap(0, 256 * 1024, CNG_PROT_READ | CNG_PROT_WRITE,
+                          CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    int mapped = !(base == CNG_MAP_FAILED || cng_is_err((long)base));
+    unsigned long top = mapped ? (((unsigned long)base + 256 * 1024) & ~15UL) : 0;
+    long r = mapped ? cng_run_on_stack((void *)top, (void *)sp_probe, base,
+                                       (void *)top)
+                    : -1;
+    /* If SP was corrupted by the switch, `marker` on our frame would be clobbered
+     * and subsequent use would crash; check it survived. */
+    int ok = (mapped && r == 0xC0DE && marker == 0xA5A5A5A5);
+    cng_dprintf(1, "stacksw: ran_on_scratch=%d ret=0x%lx caller_ok=%d -> %s\n",
+                r == 0xC0DE, (unsigned long)r, marker == 0xA5A5A5A5,
+                ok ? "OK" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 /* _nettest — drive cng_sigsys_body with synthetic seccomp contexts to validate
  * the Android SIGSYS net branching (no real seccomp needed). */
 int cng_cmd_nettest(int argc, char **argv, char **envp, unsigned long *auxv) {

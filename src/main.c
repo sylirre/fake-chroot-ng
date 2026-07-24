@@ -33,6 +33,7 @@ int cng_cmd_loadtwice(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_exectest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_cloexectest(int argc, char **argv, char **envp, unsigned long *auxv);
+int cng_cmd_stackswtest(int argc, char **argv, char **envp, unsigned long *auxv);
 
 int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
     const char *prog = argc > 0 ? argv[0] : "chroot-ng";
@@ -79,6 +80,8 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
         return cng_cmd_exectest(argc - 1, argv + 1, envp, auxv);
     if (!strcmp(sub, "_cloexectest"))
         return cng_cmd_cloexectest(argc - 1, argv + 1, envp, auxv);
+    if (!strcmp(sub, "_stackswtest"))
+        return cng_cmd_stackswtest(argc - 1, argv + 1, envp, auxv);
 
     cng_dprintf(2, "chroot-ng: unknown command '%s'\n", sub);
     usage(2, prog);

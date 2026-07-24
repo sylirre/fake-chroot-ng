@@ -44,3 +44,11 @@ check_contains "relative symlink resolved" "read: REAL-BB" \
 check_contains "symlink target cannot escape rootfs" "open: errno 2" \
     "$(run _dtest -r "$SR" open /bin/esc 2>&1)"
 rm -rf "$SR"
+
+# The SIGSYS handler runs the (stack-hungry) dispatcher on a large per-thread
+# scratch stack so it never smashes a small guest stack (e.g. Go's ~8 KiB
+# goroutine stacks). Validate the stack-switch trampoline itself.
+out=$(run _stackswtest 2>&1); rc=$?
+check "stackswtest exit 0" 0 "$rc"
+check_contains "handler stack switch runs on scratch and preserves caller" \
+    "stacksw: ran_on_scratch=1 ret=0xc0de caller_ok=1 -> OK" "$out"
