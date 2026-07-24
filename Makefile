@@ -69,9 +69,13 @@ $(BUILD)/%.S.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
-# Run the tool itself under the emulator: `make run ARGS="version"`
+# Run the tool itself under the emulator: `make run ARGS="--version"`
 run: $(BIN)
 	$(QEMU) $(BIN) $(ARGS)
+
+# Capability probe under the emulator (real kernel needed for the seccomp line).
+probe: $(BIN)
+	$(QEMU) $(BIN) --probe
 
 test: $(BIN)
 	@sh tests/run.sh

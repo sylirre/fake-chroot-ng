@@ -1,5 +1,5 @@
 # M3 loader tests (sourced by tests/run.sh). Compiles a static-PIE guest with
-# the cross toolchain and runs it through `chroot-ng run` under qemu.
+# the cross toolchain and runs it through `chroot-ng` under qemu.
 echo "== M3: ul_exec loader (static-PIE) =="
 
 GCC="${GUESTCC:-aarch64-linux-gnu-gcc-13}"
@@ -14,7 +14,7 @@ if $GCC -static-pie -O2 -o "$GDIR/hello" tests/guests/hello.c 2>"$GDIR/hello.log
         fail=$((fail + 1)); printf '  FAIL guest not PIE: %s\n' "$(file "$GDIR/hello")"
     fi
 
-    out=$(CNG_TEST=hello run run -- "$GDIR/hello" AA BB 2>&1); rc=$?
+    out=$(CNG_TEST=hello run / "$GDIR/hello" AA BB 2>&1); rc=$?
     check "loader exit code propagates (42)" 42 $rc
     check_contains "guest ran (argc)" "guest: argc=3" "$out"
     check_contains "argv0 forwarded" "argv0=$GDIR/hello" "$out"
@@ -30,7 +30,7 @@ fi
 
 # file-backed mapping path (-F): the fallback used on Android when NO_NEW_PRIVS
 # revokes anon executable memory. Must produce a working guest.
-out=$(run run -F -- "$GDIR/hello" FB 2>&1); rc=$?
+out=$(run -F / "$GDIR/hello" FB 2>&1); rc=$?
 check "file-backed (-F) exit code (42)" 42 $rc
 check_contains "file-backed guest ran" "guest: argc=2" "$out"
 check_contains "file-backed argv forwarded" "argv1=FB" "$out"
@@ -48,10 +48,10 @@ if $GCC -static -no-pie -O2 -o "$GDIR/hello_exec" tests/guests/hello.c \
         fail=$((fail + 1)); printf '  FAIL guest not ET_EXEC: %s\n' \
             "$(file "$GDIR/hello_exec")"
     fi
-    out=$(run run -- "$GDIR/hello_exec" NP 2>&1); rc=$?
+    out=$(run / "$GDIR/hello_exec" NP 2>&1); rc=$?
     check "ET_EXEC@0x400000 guest exit (42) — no collision with monitor" 42 $rc
     check_contains "ET_EXEC guest ran" "guest: argc=2" "$out"
-    out=$(run run -F -- "$GDIR/hello_exec" NPF 2>&1); rc=$?
+    out=$(run -F / "$GDIR/hello_exec" NPF 2>&1); rc=$?
     check "ET_EXEC@0x400000 file-backed exit (42)" 42 $rc
 else
     printf '  (skip ET_EXEC test: no -static -no-pie toolchain)\n'

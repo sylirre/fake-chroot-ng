@@ -1,15 +1,21 @@
-/* `chroot-ng run [opts] -- PROG [args]` — load PROG with the userland loader,
- * install the path-translation monitor, and transfer control.
+/* cng_run() — load the guest program with the userland loader, install the
+ * path-translation monitor, and transfer control. Command-line parsing lives in
+ * main.c; the parameters below arrive already resolved.
  *
- *   -r DIR   guest rootfs (host path); default "/" (identity)
- *   -b G:H   bind guest path G to host path H (repeatable)
- *   -L DIR   resolve the ELF interpreter under DIR (test aid; on real hardware
- *            the interpreter and libraries resolve through -r/-b + the monitor)
+ *   rootfs     guest rootfs (host path); "/" means identity (no translation)
+ *   libprefix  resolve the ELF interpreter under this dir (test aid; NULL on
+ *              real hardware, where the interpreter and libraries resolve
+ *              through the rootfs/bind map + the monitor)
+ *   bind_g/h   nb guest->host bind pairs (guest path G backed by host path H)
+ *   gargv/gargc  the guest program (gargv[0]) and its arguments
  *
- * PROG is a guest path resolved through the rootfs/bind map. The monitor traps
- * the guest's own path syscalls and translates them (see monitor.h). Under
- * qemu-user the seccomp filter is inert, so translation is only exercised on a
- * real AArch64 kernel (and via the `_dtest` self-test).
+ * The credential/rewrite/loader flags (cng_g_fake_id, cng_g_rewrite,
+ * cng_g_loader_file) are set by the option parser before this is called.
+ *
+ * gargv[0] is a guest path resolved through the rootfs/bind map. The monitor
+ * traps the guest's own path syscalls and translates them (see monitor.h).
+ * Under qemu-user the seccomp filter is inert, so translation is only exercised
+ * on a real AArch64 kernel (and via the `-t dtest` self-test).
  */
 #include "cng/loader.h"
 #include "cng/monitor.h"
@@ -44,58 +50,9 @@ static char *join2(char *dst, size_t size, const char *a, const char *b) {
     return dst;
 }
 
-int cng_cmd_run(int argc, char **argv, char **envp, unsigned long *auxv) {
-    int i = 1; /* argv[0] == "run" */
-    const char *libprefix = 0;
-    const char *rootfs = "/";
-    const char *bind_g[CNG_MAX_BINDS];
-    const char *bind_h[CNG_MAX_BINDS];
-    int nb = 0;
-
-    while (i < argc && argv[i][0] == '-' && strcmp(argv[i], "--") != 0) {
-        if (!strcmp(argv[i], "-L") && i + 1 < argc) {
-            libprefix = argv[++i];
-        } else if (!strcmp(argv[i], "-0")) {
-            cng_g_fake_id = 1;
-            cng_g_fake_uid = 0;
-            cng_g_fake_gid = 0;
-        } else if (!strcmp(argv[i], "-R")) {
-            cng_g_rewrite = 1;
-        } else if (!strcmp(argv[i], "-F")) {
-            cng_g_loader_file = 1;
-        } else if (!strcmp(argv[i], "-r") && i + 1 < argc) {
-            rootfs = argv[++i];
-        } else if (!strcmp(argv[i], "-b") && i + 1 < argc && nb < CNG_MAX_BINDS) {
-            char *spec = argv[++i];
-            char *c = strchr(spec, ':');
-            if (c) {
-                *c = '\0';
-                bind_g[nb] = spec;
-                bind_h[nb] = c + 1;
-                nb++;
-            }
-        } else {
-            cng_dprintf(2, "chroot-ng run: bad option %s\n", argv[i]);
-            return 2;
-        }
-        i++;
-    }
-    if (i < argc && !strcmp(argv[i], "--"))
-        i++;
-    if (i >= argc) {
-        cng_dprintf(2, "chroot-ng run: missing program\n"
-                       "usage: chroot-ng run [-r rootfs] [-b g:h] [-0] [-R]"
-                       " [-L dir] -- PROG [args]\n"
-                       "  -0   fake root (uid/gid 0, ownership, chown)\n"
-                       "  -R   rewrite svc sites to trampolines (faster; also\n"
-                       "       provides translation where seccomp is absent)\n"
-                       "  -F   force file-backed segment mapping (auto-selected\n"
-                       "       when anon exec memory is denied, e.g. Android NNP)\n");
-        return 2;
-    }
-
-    char **gargv = argv + i;
-    int gargc = argc - i;
+int cng_run(const char *rootfs, const char *libprefix,
+            const char *const *bind_g, const char *const *bind_h, int nb,
+            int gargc, char **gargv, char **envp, unsigned long *auxv) {
     const char *prog_guest = gargv[0];
 
     /* Capture host auxv (for emulated execve) and the guest exe path

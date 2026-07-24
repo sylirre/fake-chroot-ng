@@ -37,6 +37,9 @@ static inline long sys_read(int fd, void *b, size_t n) {
 static inline long sys_write(int fd, const void *b, size_t n) {
     return CNG_SYS(__NR_write, fd, b, n, 0, 0, 0);
 }
+static inline long sys_ioctl(int fd, unsigned long req, void *arg) {
+    return CNG_SYS(__NR_ioctl, fd, req, arg, 0, 0, 0);
+}
 static inline long sys_openat(int dfd, const char *p, int fl, int mode) {
     return CNG_SYS(__NR_openat, dfd, p, fl, mode, 0, 0);
 }

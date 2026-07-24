@@ -39,11 +39,17 @@ if [ ! -x "$BIN" ]; then
 fi
 
 echo "== M1: CLI =="
-out=$(run version 2>&1); check "version rc" 0 $?
+out=$(run --version 2>&1); check "version rc" 0 $?
 check_contains "version string" "chroot-ng 0.0.1" "$out"
-out=$(run help 2>&1); check "help rc" 0 $?
+out=$(run -v 2>&1); check_contains "short -v version" "chroot-ng 0.0.1" "$out"
+out=$(run --help 2>&1); check "help rc" 0 $?
+check_contains "help usage line" "chroot-ng [options] <rootfs> <program>" "$out"
+check_contains "help OPTIONS section" "OPTIONS" "$out"
+out=$(run -h 2>&1); check "short -h rc" 0 $?
 run >/dev/null 2>&1; check "no-args rc" 2 $?
-run frobnicate >/dev/null 2>&1; check "unknown-cmd rc" 2 $?
+run --frobnicate >/dev/null 2>&1; check "unknown-option rc" 2 $?
+run / >/dev/null 2>&1; check "rootfs but no program rc" 2 $?
+run -t frobnicate >/dev/null 2>&1; check "unknown test rc" 2 $?
 
 # M2+ tests are appended as milestones land.
 if [ -f tests/m2_probe.sh ]; then . tests/m2_probe.sh; fi

@@ -22,7 +22,7 @@ else
         fail=$((fail + 1)); printf '  FAIL guest not dynamic\n'
     fi
     out=$(CNG_TEST=dyn LD_LIBRARY_PATH="$SYSROOT/lib" \
-          run run -L "$SYSROOT" -- "$GDIR/hello_dyn" XX YY 2>&1); rc=$?
+          run -L "$SYSROOT" / "$GDIR/hello_dyn" XX YY 2>&1); rc=$?
     check "dynamic exit code (42)" 42 $rc
     check_contains "ld.so bootstrapped main (argc)" "guest: argc=3" "$out"
     check_contains "dynamic argv forwarded" "guest: argv1=XX" "$out"

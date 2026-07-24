@@ -3,7 +3,7 @@
 Milestones are committed individually. Each builds on the previous.
 
 ## Verified on-device (Android 15, kernel 5.15, rootless, SELinux, no userns)
-An Alpine aarch64 rootfs runs under `chroot-ng run -0` with no ptrace and no
+An Alpine aarch64 rootfs runs under `chroot-ng -0 <rootfs> <program>` with no ptrace and no
 user namespaces, on an execmem-denied mount:
 - interactive shell + coreutils/busybox, `su -l`
 - `apk` (full package manager: add/fix, incl. hardlinked packages via
@@ -25,10 +25,11 @@ vfork/`posix_spawn` child-stack handling.
 
 - [x] **M1 — scaffolding + freestanding runtime + CLI skeleton**
   Cross build (aarch64-linux-gnu) + qemu run. Own `_start`, syscall gate
-  (single `svc`), mem/str helpers, mini-printf, `version`/`help`/`probe`/`run`
-  dispatch. Verified under qemu-aarch64.
+  (single `svc`), mem/str helpers, mini-printf, and a GNU-style option parser
+  (`--version`/`--help`/`--probe`, positional `<rootfs> <program>`, `-t` for the
+  internal self-tests). Verified under qemu-aarch64.
 
-- [x] **M2 — capability probe** (`chroot-ng probe [path...]`)
+- [x] **M2 — capability probe** (`chroot-ng --probe [path...]`)
   Reports kernel version (uname parse), auxv/identity, seccomp filter
   availability (child-process RET_ERRNO functional test), `execmem` (anon
   `mmap` RW→RX→execute a thunk — the pivotal test, with AArch64 icache flush),
@@ -62,7 +63,7 @@ vfork/`posix_spawn` child-stack handling.
 
 - [x] **M5a — path-translation core**
   rootfs + longest-prefix component-aware binds, lexical `..` canonicalization
-  (no rootfs escape), cwd-relative resolution. `_xlate` debug cmd, 9 tests.
+  (no rootfs escape), cwd-relative resolution. `-t xlate` debug cmd, 9 tests.
 
 - [x] **M5b — seccomp filter + SIGSYS monitor + dispatcher**
   - `dispatch.c`: translate path args of the trapped syscall set (openat family,
@@ -74,8 +75,8 @@ vfork/`posix_spawn` child-stack handling.
     sigcontext and writing x0; own rt_sigreturn restorer (no vDSO dependency).
   - `run.c`: sets up the fs view and installs the monitor before entering the
     guest (only when translation is requested).
-  Validated under qemu via `_dtest` (dispatch translate+reissue, escape block)
-  and `_sigtest` (signal round-trip + sigcontext offsets). The seccomp *trap*
+  Validated under qemu via `-t dtest` (dispatch translate+reissue, escape block)
+  and `-t sigtest` (signal round-trip + sigcontext offsets). The seccomp *trap*
   itself is inert under qemu-user and MUST be confirmed on a real AArch64 kernel
   (the `probe` filter test covers install permission there).
 
@@ -85,7 +86,7 @@ vfork/`posix_spawn` child-stack handling.
   cleared regs) so rt_sigreturn resumes into it — keeping the seccomp filter and
   handler resident (a real execve would wipe the handler). Load failures set
   -errno for normal execve semantics. Validated: the redirect resume via
-  `_jmptest`; the load+stack half is the M3/M4 path. Real trap needs HW.
+  `-t jmptest`; the load+stack half is the M3/M4 path. Real trap needs HW.
   Caveat: old program mappings are not torn down (leak across repeated execve);
   the emulation runs on the main thread's large stack (multi-threaded execve
   would want a sigaltstack — tracked with the M5 signal-stack hazard).
@@ -98,13 +99,13 @@ vfork/`posix_spawn` child-stack handling.
   - `/proc/self/{exe,cwd,root}` readlink fixups return guest-visible targets.
   - link2symlink (lightweight): linkat falls back to a symlink when the fs
     forbids hardlinks (EPERM/EMLINK/EXDEV/ENOSYS/EACCES/EOPNOTSUPP).
-  Validated via `_faketest` (getuid=0, stat ownership=0, /proc/self/exe). 45/45.
+  Validated via `-t faketest` (getuid=0, stat ownership=0, /proc/self/exe). 45/45.
   Limitations (tracked): `/proc/<pid>/*` numeric form and open("/proc/self/exe")
   redirect not yet handled. (link2symlink was the lightweight form here — a
   same-directory symlink to the sibling name; superseded by M9's backing-file
   scheme, which fixes nlink/type/mtime fidelity.)
 
-- [x] **M8 — performance: AoT `svc` rewriting (`run -R`)**
+- [x] **M8 — performance: AoT `svc` rewriting (`-R`/`--rewrite`)**
   At load time (while segments are still writable) each `svc #0` is rewritten to
   `b <trampoline>`, skipping the kernel seccomp+SIGSYS round trip.
   - `tramp.S`: per-site trampoline reached by `b` (preserves x30), saving the
@@ -118,7 +119,7 @@ vfork/`posix_spawn` child-stack handling.
     or pool-exhausted sites fall back to the SIGSYS floor.
   - Because a rewritten site needs **no seccomp**, `-R` also provides translation
     where seccomp is unavailable (old kernels, qemu-user).
-  Validated under qemu: `_rwtest` (register preservation + correct syscall) and
+  Validated under qemu: `-t rwtest` (register preservation + correct syscall) and
   an end-to-end run — a static-PIE glibc guest (101 svc sites rewritten) has its
   `open()` translated into the rootfs, 10/10 deterministic, with a no-`-R`
   negative control. This is also the first end-to-end proof of the full
@@ -144,7 +145,7 @@ vfork/`posix_spawn` child-stack handling.
     paths and falls back to `cng_l2s_link`.
   - All in `src/monitor/l2s.c`, freestanding (raw syscalls), gated by
     `cng_l2s_active` so there is **zero** extra cost until a hardlink actually
-    falls back. Validated by `_l2stest`: regular-file presentation, shared
+    falls back. Validated by `-t l2stest`: regular-file presentation, shared
     inode, nlink=2, `readlink`→EINVAL, shared content, EEXIST on a dup link,
     mtime preserved through the backing, dirfd-relative links, and
     decref/reclaim. 72/72 tests.
@@ -175,7 +176,7 @@ vfork/`posix_spawn` child-stack handling.
     SIGURG async-preemption — would be placed by the kernel at the alt-stack top
     (SP is no longer on the alt-stack), clobbering that frame and crashing on
     return. Masking closes the window; the signals queue and fire on sigreturn.
-  Validated by `_stackswtest`. 80/80.
+  Validated by `-t stackswtest`. 80/80.
 
 - [x] **vfork-style clone → real fork (Go `os/exec`, posix_spawn)**
   Go's `os/exec` (and musl `posix_spawn`) spawn with
@@ -200,7 +201,7 @@ vfork/`posix_spawn` child-stack handling.
     after sigreturn, it resumes where the clone wrapper expects. Passing the
     child stack straight through set the child's SP into a frameless buffer and
     it died with a Bus error before ever reaching execve — the gcc→cc1 crash.
-  Validated by `_clonetest` (private VM) and `_clonestktest` (child resumes on
+  Validated by `-t clonetest` (private VM) and `-t clonestktest` (child resumes on
   its own stack, parent's untouched — driven through the real SIGSYS body). Gap:
   `clone3` with VFORK is not detected (flags live behind a pointer); Go/musl use
   `clone`, not `clone3`, for spawning.

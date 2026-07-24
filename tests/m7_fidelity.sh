@@ -4,7 +4,7 @@ echo "== M7: fidelity (uid/gid faking, /proc, link2symlink) =="
 
 ROOT=$(mktemp -d)
 printf hi > "$ROOT/f"
-out=$(run _faketest -r "$ROOT" /f 2>&1)
+out=$(run -t faketest -r "$ROOT" /f 2>&1)
 
 check_contains "getuid faked to 0"          "getuid=0"            "$out"
 check_contains "geteuid faked to 0"         "geteuid=0"           "$out"
@@ -18,7 +18,7 @@ rm -rf "$ROOT"
 # with a shared inode + st_nlink) + fchdir cwd tracking. Force the l2s fallback
 # via the block-list (tmpfs allows hardlinks).
 L2=$(mktemp -d); mkdir -p "$L2/w"
-out=$(run _l2stest "$L2" 2>&1); rc=$?
+out=$(run -t l2stest "$L2" 2>&1); rc=$?
 check "l2stest overall (l2s + fchdir)" 0 "$rc"
 check_contains "l2s presents the group as regular files (nlink, inode, content)" \
     "l2s: rc=0 eexist=1 reg=1 nlink2=1 sameino=1 noleak=1 content=1 -> OK" "$out"
