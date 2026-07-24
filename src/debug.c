@@ -392,12 +392,28 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
     char buf[256];
     long n = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD, (long)"/w/b",
                           (long)buf, sizeof buf - 1, 0, 0, 0);
-    cng_blocked[__NR_linkat] = 0;
     buf[n > 0 ? n : 0] = '\0';
     int leak = (strncmp(buf, "/data", 5) == 0) ||
                (strlen(rootfs) > 1 &&
                 strncmp(buf, rootfs, strlen(rootfs)) == 0);
-    int ok_l2s = (lr == 0 && lr2 == 0 && n > 0 && !leak);
+    /* dirfd-relative hardlink (as apk does): open /w, linkat(fd,"a",fd,"c") */
+    long wfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w", CNG_O_RDONLY,
+                            0, 0, 0, 0);
+    long lr3 = -1, n2 = -1;
+    char buf2[256];
+    buf2[0] = '\0';
+    if (wfd >= 0) {
+        lr3 = cng_dispatch(__NR_linkat, wfd, (long)"a", wfd, (long)"c", 0, 0, 0);
+        n2 = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD, (long)"/w/c",
+                          (long)buf2, sizeof buf2 - 1, 0, 0, 0);
+        sys_close((int)wfd);
+    }
+    buf2[n2 > 0 ? n2 : 0] = '\0';
+    cng_blocked[__NR_linkat] = 0;
+    cng_dprintf(1, "l2s-dirfd: linkat(fd,a,fd,c) rc=%d readlink(/w/c)=%s\n",
+                (int)lr3, buf2);
+
+    int ok_l2s = (lr == 0 && lr2 == 0 && lr3 == 0 && n > 0 && n2 > 0 && !leak);
     cng_dprintf(1, "l2s: link rc=%d rc2=%d target=%s leak=%d -> %s\n", (int)lr,
                 (int)lr2, buf, leak, ok_l2s ? "OK" : "FAIL");
     fails += !ok_l2s;

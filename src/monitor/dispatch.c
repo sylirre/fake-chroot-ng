@@ -132,6 +132,50 @@ int cng_resolve(const char *path, int deref_final, char *out, size_t outsz) {
     return -ELOOP;
 }
 
+/* Guest directory a real dirfd points at, via /proc/self/fd. Returns 0/-1. */
+static int fd_guest_dir(long fd, char *out, size_t sz) {
+    char proc[40];
+    size_t p = cng_strlcpy(proc, "/proc/self/fd/", sizeof proc);
+    char num[16];
+    int ni = 0;
+    long v = fd;
+    if (v <= 0)
+        return -1;
+    while (v > 0 && ni < 15) {
+        num[ni++] = (char)('0' + v % 10);
+        v /= 10;
+    }
+    while (ni > 0 && p < sizeof proc - 1)
+        proc[p++] = num[--ni];
+    proc[p] = '\0';
+    char host[CNG_PATH_MAX];
+    long n = sys_readlinkat(CNG_AT_FDCWD, proc, host, sizeof host - 1);
+    if (n <= 0)
+        return -1;
+    host[n] = '\0';
+    return cng_fs_untranslate(cng_g_fs, host, out, sz);
+}
+
+/* Resolve (dirfd, path) to a canonical guest absolute path. Handles absolute
+ * paths, AT_FDCWD, and real dirfds (via /proc/self/fd). Returns 0/-1. */
+static int resolve_at_guest(long dirfd, const char *path, char *out,
+                            size_t sz) {
+    if (!path)
+        return -1;
+    if (path[0] == '/' || dirfd == CNG_AT_FDCWD)
+        return cng_fs_abscanon(cng_g_fs, path, out, sz);
+    char gdir[CNG_PATH_MAX], tmp[CNG_PATH_MAX];
+    if (fd_guest_dir(dirfd, gdir, sizeof gdir) != 0)
+        return -1;
+    size_t n = cng_strlcpy(tmp, gdir, sizeof tmp);
+    if (n && tmp[n - 1] != '/' && n + 1 < sizeof tmp) {
+        tmp[n++] = '/';
+        tmp[n] = '\0';
+    }
+    cng_strlcpy(tmp + n, path, sizeof tmp - n);
+    return cng_path_canon(tmp, out, sz);
+}
+
 static const char *xlate(long dirfd, const char *gp, char *buf, size_t bufsz,
                          int deref_final) {
     if (!gp)
@@ -275,28 +319,33 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         long r = reissue(a0, (long)op, a2, (long)np, a4, a5, __NR_linkat);
         if (r == -EPERM || r == -EMLINK || r == -EXDEV || r == -ENOSYS ||
             r == -EACCES || r == -EOPNOTSUPP) {
-            char oldg[CNG_PATH_MAX], newg[CNG_PATH_MAX], tgt[CNG_PATH_MAX];
-            if (cng_fs_abscanon(cng_g_fs, (const char *)a1, oldg, sizeof oldg) ==
-                    0 &&
-                cng_fs_abscanon(cng_g_fs, (const char *)a3, newg,
-                                sizeof newg) == 0) {
+            /* Resolve both endpoints to guest paths (handling dirfds), and make
+             * a symlink at the new host path targeting the old guest path. */
+            char oldg[CNG_PATH_MAX], newg[CNG_PATH_MAX], newhost[CNG_PATH_MAX];
+            if (resolve_at_guest(a0, (const char *)a1, oldg, sizeof oldg) == 0 &&
+                resolve_at_guest(a2, (const char *)a3, newg, sizeof newg) == 0 &&
+                cng_fs_translate(cng_g_fs, newg, newhost, sizeof newhost) == 0) {
+                /* bare basename when old/new share a dir (b -> a), else the
+                 * guest-absolute path — both re-root correctly and don't leak. */
                 char *os = strrchr(oldg, '/');
                 char *ns = strrchr(newg, '/');
                 size_t odl = os ? (size_t)(os - oldg) : 0;
                 size_t ndl = ns ? (size_t)(ns - newg) : 0;
-                if (odl == ndl && strncmp(oldg, newg, odl) == 0)
-                    cng_strlcpy(tgt, os ? os + 1 : oldg, sizeof tgt); /* same dir */
-                else
-                    cng_strlcpy(tgt, oldg, sizeof tgt); /* guest-absolute */
-                long s = reissue((long)tgt, CNG_AT_FDCWD, (long)np, 0, 0, 0,
-                                 __NR_symlinkat);
-                if (s == -EEXIST) {
-                    /* Reinstall: the link name already exists — replace it. */
-                    cng_syscall6(CNG_AT_FDCWD, (long)np, 0, 0, 0, 0,
+                const char *tgt =
+                    (odl == ndl && strncmp(oldg, newg, odl) == 0)
+                        ? (os ? os + 1 : oldg)
+                        : oldg;
+                long s = cng_syscall6((long)tgt, CNG_AT_FDCWD, (long)newhost, 0,
+                                      0, 0, __NR_symlinkat);
+                if (s == -EEXIST) { /* reinstall: replace the existing entry */
+                    cng_syscall6(CNG_AT_FDCWD, (long)newhost, 0, 0, 0, 0,
                                  __NR_unlinkat);
-                    s = reissue((long)tgt, CNG_AT_FDCWD, (long)np, 0, 0, 0,
-                                __NR_symlinkat);
+                    s = cng_syscall6((long)tgt, CNG_AT_FDCWD, (long)newhost, 0,
+                                     0, 0, __NR_symlinkat);
                 }
+                if (cng_g_debug)
+                    cng_dprintf(2, "[cng] l2s %s -> %s sym=%ld\n", oldg, newg,
+                                s);
                 if (s == 0)
                     return 0;
             }
