@@ -381,6 +381,19 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             return 0;
         return cng_syscall6(a0, a1, a2, a3, a4, a5, __NR_fchown);
 
+    /* clone with CLONE_VFORK (only these are trapped; see seccomp.c): a
+     * vfork-style spawn shares the parent's address space and suspends the
+     * parent until the child execs. Our execve is emulated in-process, so a
+     * shared-VM child would load the new program over the parent's memory and
+     * never issue the real execve that resumes the parent. Strip CLONE_VM and
+     * CLONE_VFORK so it becomes an ordinary COW fork: the child gets a private
+     * copy, the emulated execve happens there, and the parent continues (the
+     * child's execve closes the O_CLOEXEC notify pipe, signalling success). */
+    case __NR_clone: {
+        long flags = a0 & ~(long)(CNG_CLONE_VM | CNG_CLONE_VFORK);
+        return cng_syscall6(flags, a1, a2, a3, a4, a5, __NR_clone);
+    }
+
     /* rename: two translated paths. If the destination is one of our
      * link2symlink names, it is replaced by the rename, so drop its group's
      * refcount (apk installs by renaming a temp file over the final name). */

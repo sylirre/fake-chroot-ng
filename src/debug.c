@@ -563,6 +563,36 @@ int cng_cmd_stackswtest(int argc, char **argv, char **envp, unsigned long *auxv)
     return ok ? 0 : 1;
 }
 
+/* _clonetest — a CLONE_VFORK|CLONE_VM clone must be converted to a real (COW)
+ * fork by the dispatcher, so the child gets a private address space (our
+ * emulated execve would otherwise corrupt the shared parent). Verify the child
+ * runs and exits, and that a write in the child is NOT visible in the parent. */
+int cng_cmd_clonetest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    static struct cng_fs fs;
+    cng_fs_init(&fs, "/");
+    cng_g_fs = &fs;
+    volatile long marker = 0;
+    long pid = cng_dispatch(__NR_clone,
+                            CNG_CLONE_VM | CNG_CLONE_VFORK | 17 /*SIGCHLD*/, 0, 0,
+                            0, 0, 0, /*trapped=*/1);
+    if (pid == 0) {        /* child */
+        marker = 1;        /* if the VM were shared, the parent would see this */
+        sys_exit_group(7);
+    }
+    int status = 0;
+    sys_wait4((int)pid, &status, 0, 0);
+    int exited7 = ((status & 0x7f) == 0 && ((status >> 8) & 0xff) == 7);
+    int private_vm = (marker == 0); /* real fork => parent's copy untouched */
+    int ok = (pid > 0 && exited7 && private_vm);
+    cng_dprintf(1, "clone: pid>0=%d child_exit7=%d private_vm=%d -> %s\n",
+                pid > 0, exited7, private_vm, ok ? "OK" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 /* _nettest — drive cng_sigsys_body with synthetic seccomp contexts to validate
  * the Android SIGSYS net branching (no real seccomp needed). */
 int cng_cmd_nettest(int argc, char **argv, char **envp, unsigned long *auxv) {

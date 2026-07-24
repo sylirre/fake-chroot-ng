@@ -33,6 +33,8 @@ struct sock_fprog {
 #define CNG_BPF_JGE 0x30
 #define CNG_BPF_K   0x00
 #define CNG_BPF_RET 0x06
+#define CNG_BPF_ALU 0x04
+#define CNG_BPF_AND 0x50
 
 #define CNG_BPF_STMT(code, k)                                                  \
     { (uint16_t)(code), 0, 0, (uint32_t)(k) }

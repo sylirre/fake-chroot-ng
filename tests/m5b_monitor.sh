@@ -52,3 +52,11 @@ out=$(run _stackswtest 2>&1); rc=$?
 check "stackswtest exit 0" 0 "$rc"
 check_contains "handler stack switch runs on scratch and preserves caller" \
     "stacksw: ran_on_scratch=1 ret=0xc0de caller_ok=1 -> OK" "$out"
+
+# A vfork-style clone (CLONE_VFORK|CLONE_VM, as Go's os/exec and posix_spawn use)
+# must be converted to a real COW fork, or the in-process emulated execve would
+# load the new program over the shared parent's memory.
+out=$(run _clonetest 2>&1); rc=$?
+check "clonetest exit 0" 0 "$rc"
+check_contains "vfork clone converted to private-VM fork" \
+    "clone: pid>0=1 child_exit7=1 private_vm=1 -> OK" "$out"

@@ -67,8 +67,8 @@ int cng_install_seccomp(void) {
         for (int i = 0; i < NID; i++)
             nr[nsys++] = id_syscalls[i];
 
-    /* Prologue (indices 0..8) + LD nr (9) + nsys checks + 2 RETs. */
-    struct sock_filter f[12 + NPATH + NID];
+    /* Prologue (0..8) + LD nr (9) + clone block (7) + nsys checks + 2 RETs. */
+    struct sock_filter f[20 + NPATH + NID];
     int n = 0;
 
     f[n++] = (struct sock_filter)CNG_BPF_STMT(
@@ -96,7 +96,30 @@ int cng_install_seccomp(void) {
     f[n++] = (struct sock_filter)CNG_BPF_STMT(
         CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* 9: A = nr */
 
-    /* nsys checks at indices 10..10+nsys-1; TRAP at 10+nsys+1. */
+    /* clone with CLONE_VFORK: a vfork-style spawn (Go's os/exec, posix_spawn)
+     * shares the parent's address space (CLONE_VM) and suspends the parent until
+     * the child's execve. Our execve is emulated in-process — loading the new
+     * program into a *shared* VM corrupts the parent — so trap these and convert
+     * them to a real fork in dispatch. Thread creation (no CLONE_VFORK) and plain
+     * fork are left to run natively. clone flags are in args[0] (low 32 bits). */
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, (uint32_t)__NR_clone, 0,
+        5); /* 10: nr==clone? no->16 (reload nr) */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_ARGS); /* 11: A=flags lo */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_ALU | CNG_BPF_AND | CNG_BPF_K, CNG_CLONE_VFORK); /* 12 */
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, 0, 1,
+        0); /* 13: (flags&VFORK)==0? yes->15 allow, no->14 trap */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
+                                              CNG_SECCOMP_RET_TRAP); /* 14 */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_RET | CNG_BPF_K, CNG_SECCOMP_RET_ALLOW); /* 15: non-vfork clone */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* 16: reload A=nr */
+
+    /* nsys checks; TRAP at the tail. */
     for (int i = 0; i < nsys; i++)
         f[n++] = (struct sock_filter)CNG_BPF_JUMP(
             CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, (uint32_t)nr[i],

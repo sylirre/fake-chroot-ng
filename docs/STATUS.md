@@ -156,6 +156,23 @@ Milestones are committed individually. Each builds on the previous.
     re-switching; the gate-net also records the blocked syscall so a re-issue
     can't trap twice. Validated by `_stackswtest`. 78/78.
 
+- [x] **vfork-style clone → real fork (Go `os/exec`, posix_spawn)**
+  Go's `os/exec` (and musl `posix_spawn`) spawn with
+  `clone(CLONE_VM|CLONE_VFORK|SIGCHLD)`: the child shares the parent's address
+  space and the parent is suspended until the child's `execve`. Our execve is
+  emulated in-process — loading the new image into a *shared* VM corrupts the
+  parent (and no real execve ever resumes the vfork parent) — which showed up as
+  intermittent `exec format error`/`no such file` for a valid tool plus a
+  monitor SIGSEGV during `go build`'s parallel compile. The seccomp filter now
+  traps `clone` *only when `CLONE_VFORK` is set* (a small `args[0] & CLONE_VFORK`
+  BPF test, so thread creation and plain fork run natively), and the dispatcher
+  strips `CLONE_VM|CLONE_VFORK` to make it an ordinary COW fork: the child gets a
+  private copy, the emulated execve happens there, and the parent continues
+  (the child's execve closes the O_CLOEXEC notify pipe to signal success).
+  Validated by `_clonetest` (child runs and exits; a child write is invisible to
+  the parent). 80/80. Gap: `clone3` with VFORK is not detected (flags live
+  behind a pointer); Go/musl use `clone` for spawning, not `clone3`.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

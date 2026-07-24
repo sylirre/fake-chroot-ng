@@ -43,6 +43,10 @@
 #define CNG_MAP_FIXED_NOREPLACE 0x100000
 #define CNG_MAP_FAILED          ((void *)-1L)
 
+/* clone(2) flags (subset). */
+#define CNG_CLONE_VM     0x00000100
+#define CNG_CLONE_VFORK  0x00004000
+
 /* lseek whence */
 #define CNG_SEEK_SET 0
 #define CNG_SEEK_CUR 1
