@@ -3,6 +3,7 @@
  * prints guest->host path translations. Used by the M5 unit tests (the path
  * core is pure logic, fully exercisable under qemu).
  */
+#include "cng/loader.h"
 #include "cng/monitor.h"
 #include "cng/path.h"
 #include "cng/rewrite.h"
@@ -310,6 +311,23 @@ int cng_cmd_blocktest(int argc, char **argv, char **envp, unsigned long *auxv) {
 
     cng_blocked[__NR_fchownat] = 0; /* reset */
     return fails ? 1 : 0;
+}
+
+/* _loadtwice PATH — load the same ELF twice into this address space (as execve
+ * emulation does, without tearing down the first) to surface re-load failures. */
+int cng_cmd_loadtwice(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)envp;
+    (void)auxv;
+    if (argc < 2) {
+        cng_dprintf(2, "usage: _loadtwice PATH\n");
+        return 2;
+    }
+    struct cng_loaded p1, p2;
+    int rc1 = cng_load_elf(argv[1], 0, &p1);
+    int rc2 = cng_load_elf(argv[1], 0, &p2);
+    cng_dprintf(1, "load1 rc=%d base=%lx; load2 rc=%d base=%lx\n", rc1,
+                p1.base, rc2, p2.base);
+    return (rc1 == 0 && rc2 == 0) ? 0 : 1;
 }
 
 /* _nettest — drive cng_sigsys_body with synthetic seccomp contexts to validate

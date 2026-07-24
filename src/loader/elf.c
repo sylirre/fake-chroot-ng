@@ -120,6 +120,11 @@ int cng_load_elf(const char *path, unsigned long base_hint,
     void *seg = sys_mmap(want, span + pool_extra, CNG_PROT_READ | CNG_PROT_WRITE,
                          mflags, -1, 0);
     if (seg == CNG_MAP_FAILED || cng_is_err((long)seg)) {
+        cng_dprintf(2,
+                    "chroot-ng: load: mmap(want=%lx span=%lu fl=%x) failed"
+                    " errno=%d\n",
+                    (unsigned long)want, (unsigned long)(span + pool_extra),
+                    mflags, cng_errno((long)seg));
         rc = CNG_LOAD_EMAP;
         goto out;
     }
@@ -168,7 +173,13 @@ int cng_load_elf(const char *path, unsigned long base_hint,
             continue;
         unsigned long ps = cng_page_down(bias + ph[i].p_vaddr);
         unsigned long pe = cng_page_up(bias + ph[i].p_vaddr + ph[i].p_memsz);
-        if (sys_mprotect((void *)ps, pe - ps, prot_of(ph[i].p_flags)) < 0) {
+        long mr = sys_mprotect((void *)ps, pe - ps, prot_of(ph[i].p_flags));
+        if (mr < 0) {
+            cng_dprintf(2,
+                        "chroot-ng: load: mprotect(%lx len=%lu prot=%d) failed"
+                        " errno=%d\n",
+                        ps, (unsigned long)(pe - ps), prot_of(ph[i].p_flags),
+                        (int)-mr);
             rc = CNG_LOAD_EMAP;
             goto out;
         }
