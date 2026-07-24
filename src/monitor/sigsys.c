@@ -44,6 +44,18 @@ int cng_sig_install(int signo, cng_sighandler_t h) {
      * stack — the alt-stack only has to hold the frame + handler prologue. */
     sa.flags = CNG_SA_SIGINFO | CNG_SA_RESTORER | CNG_SA_RESTART |
                CNG_SA_NODEFER | CNG_SA_ONSTACK;
+    /* Mask every other signal for the duration of the handler. With SA_ONSTACK
+     * the kernel delivers our frame on the alt-stack; we then switch SP to the
+     * scratch stack, leaving that frame behind on the alt-stack. If another
+     * signal (notably Go's very frequent SIGURG async-preemption) were delivered
+     * while we run on the scratch stack, the kernel — seeing SP no longer on the
+     * alt-stack — would place its frame at the alt-stack top, clobbering our
+     * abandoned frame; returning through it then crashes/corrupts. Blocking all
+     * signals during the handler closes that window (they queue and fire on
+     * sigreturn). SIGSYS stays unmasked (SA_NODEFER) so the gate-net can still
+     * catch a nested trap; our own re-issues avoid Android-blocked syscalls via
+     * the block-list, so a nested SIGSYS does not arise in practice. */
+    sa.mask.sig[0] = ~0UL & ~(1UL << (CNG_SIGSYS - 1));
     sa.restorer = (void *)cng_sigrestore;
     long r = cng_syscall6(signo, (long)&sa, 0, sizeof(cng_sigset_t), 0, 0,
                           __NR_rt_sigaction);

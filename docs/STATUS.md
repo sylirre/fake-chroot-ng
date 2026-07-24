@@ -154,7 +154,14 @@ Milestones are committed individually. Each builds on the previous.
     detects nested gate-net traps (which under SA_ONSTACK arrive on the
     alt-stack, not the scratch stack) and runs them in place without
     re-switching; the gate-net also records the blocked syscall so a re-issue
-    can't trap twice. Validated by `_stackswtest`. 78/78.
+    can't trap twice.
+  - **all signals masked during the handler** (`sa_mask`, SIGSYS excepted).
+    Once we switch SP to the scratch stack our frame is left behind on the
+    alt-stack; a signal delivered in that window — notably Go's very frequent
+    SIGURG async-preemption — would be placed by the kernel at the alt-stack top
+    (SP is no longer on the alt-stack), clobbering that frame and crashing on
+    return. Masking closes the window; the signals queue and fire on sigreturn.
+  Validated by `_stackswtest`. 80/80.
 
 - [x] **vfork-style clone → real fork (Go `os/exec`, posix_spawn)**
   Go's `os/exec` (and musl `posix_spawn`) spawn with
