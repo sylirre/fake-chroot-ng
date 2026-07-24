@@ -256,6 +256,10 @@ _Noreturn void cng_die(const char *msg, long err) {
 
 /* ---- process bootstrap ------------------------------------------------ */
 
+/* Actual page size, set from auxv AT_PAGESZ (declared in loader.h). Some
+ * Android devices use 16 KiB pages, so never assume 4096. */
+unsigned long cng_page_size = 4096;
+
 int cng_main(int argc, char **argv, char **envp, unsigned long *auxv);
 
 void cng_bootstrap(unsigned long *sp) {
@@ -266,6 +270,10 @@ void cng_bootstrap(unsigned long *sp) {
     while (*p)
         p++;
     unsigned long *auxv = (unsigned long *)(p + 1);
+
+    for (unsigned long *a = auxv; a[0] != 0; a += 2)
+        if (a[0] == 6 /* AT_PAGESZ */ && a[1])
+            cng_page_size = a[1];
 
     int rc = cng_main((int)argc, argv, envp, auxv);
     sys_exit_group(rc);

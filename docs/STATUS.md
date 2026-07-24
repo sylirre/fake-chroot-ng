@@ -22,10 +22,19 @@ Milestones are committed individually. Each builds on the previous.
   under qemu; the seccomp path is inert under qemu and must be confirmed on real
   hardware. Live `RET_TRAP`+SIGSYS validation deferred to M5.
 
-- [ ] **M3 — `ul_exec` loader: static binaries**
-  Parse ELF64, map `PT_LOAD` into anon RW→RX, build stack/auxv, jump to entry.
-  Runs a static AArch64 binary loaded as *data* (the `noexec` defeat). Testable
-  under qemu.
+- [x] **M3 — `ul_exec` loader: static binaries**
+  Parse ELF64, map `PT_LOAD` into anon RW→RX (via `pread`, no execve/file
+  PROT_EXEC), build the initial stack + synthesized auxv, clear registers, jump
+  to entry. A static-PIE glibc guest runs end-to-end under qemu: correct
+  argc/argv/env, live syscall, glibc init + self-relocation, exit code. This is
+  the `noexec` defeat (file only ever opened O_RDONLY + read).
+  Known limitations (tracked for later):
+  - ET_EXEC guests at a fixed vaddr that collides with the non-PIE loader
+    (0x400000) are unsupported; Android guests are PIE so this is moot. Fixing
+    needs a static-PIE self-relocating loader.
+  - Per-segment `mprotect` is page-granular; assumes segments don't share a
+    page (true for max-page-size-aligned AArch64 ELFs). Add per-page perm-union
+    if a counterexample appears.
 
 - [ ] **M4 — `ul_exec` loader: dynamic binaries**
   Load `PT_INTERP` (`ld.so`), set `AT_BASE`, hand control to the interpreter.
