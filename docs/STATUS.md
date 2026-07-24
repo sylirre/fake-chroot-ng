@@ -65,8 +65,16 @@ Milestones are committed individually. Each builds on the previous.
   itself is inert under qemu-user and MUST be confirmed on a real AArch64 kernel
   (the `probe` filter test covers install permission there).
 
-- [ ] **M6 — execve/execveat emulation**
-  Re-run the loader in-process so filter + handler survive program replacement.
+- [x] **M6 — execve/execveat emulation**
+  The SIGSYS handler special-cases execve/execveat: load the new program with
+  the loader, build its stack, and rewrite the trapped signal context (pc/sp,
+  cleared regs) so rt_sigreturn resumes into it — keeping the seccomp filter and
+  handler resident (a real execve would wipe the handler). Load failures set
+  -errno for normal execve semantics. Validated: the redirect resume via
+  `_jmptest`; the load+stack half is the M3/M4 path. Real trap needs HW.
+  Caveat: old program mappings are not torn down (leak across repeated execve);
+  the emulation runs on the main thread's large stack (multi-threaded execve
+  would want a sigaltstack — tracked with the M5 signal-stack hazard).
 
 - [ ] **M7 — fidelity: uid/gid faking, /proc self-path fixups, link2symlink**
 

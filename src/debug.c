@@ -146,3 +146,34 @@ int cng_cmd_sigtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     cng_dprintf(1, "sigtest: handler did not run cleanly\n");
     return 1;
 }
+
+/* _jmptest — validate the ucontext-redirect that M6's execve emulation relies
+ * on: a handler rewrites uc->pc so sigreturn resumes at a different function.
+ * If the redirect works we land in jmptest_landing and exit 7. */
+static void jmptest_landing(void) {
+    cng_dprintf(1, "jmptest: landed in redirected context\n");
+    sys_exit_group(7);
+}
+
+static void jmptest_handler(int s, cng_siginfo_t *si, void *ucv) {
+    (void)s;
+    (void)si;
+    struct cng_ucontext *uc = (struct cng_ucontext *)ucv;
+    uc->uc_mcontext.pc = (unsigned long long)(unsigned long)(void *)jmptest_landing;
+}
+
+int cng_cmd_jmptest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    if (cng_sig_install(CNG_SIGUSR1, jmptest_handler) < 0) {
+        cng_dprintf(1, "jmptest: sigaction failed\n");
+        return 1;
+    }
+    cng_syscall6(sys_getpid(), sys_gettid(), CNG_SIGUSR1, 0, 0, 0,
+                 __NR_tgkill);
+    /* Reached only if the redirect did NOT take effect. */
+    cng_dprintf(1, "jmptest: fell through (redirect failed)\n");
+    return 1;
+}

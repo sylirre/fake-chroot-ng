@@ -84,6 +84,9 @@ int cng_cmd_run(int argc, char **argv, char **envp, unsigned long *auxv) {
     int gargc = argc - i;
     const char *prog_guest = gargv[0];
 
+    /* Capture host auxv for programs started via emulated execve. */
+    cng_host_auxv = auxv;
+
     /* Filesystem view. */
     cng_fs_init(&g_fs, rootfs);
     for (int j = 0; j < nb; j++)

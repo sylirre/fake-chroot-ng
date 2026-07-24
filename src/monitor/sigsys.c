@@ -8,6 +8,7 @@
 #include "cng/monitor.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
+#include "cng/uapi.h"
 #include "cng/ucontext.h"
 
 #include <asm/unistd.h>
@@ -38,8 +39,24 @@ static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {
     (void)si;
     struct cng_ucontext *uc = (struct cng_ucontext *)ucv;
     unsigned long long *r = uc->uc_mcontext.regs;
-    long ret = cng_dispatch((long)r[8], (long)r[0], (long)r[1], (long)r[2],
-                            (long)r[3], (long)r[4], (long)r[5]);
+    long nr = (long)r[8];
+
+    /* execve/execveat are emulated in-process (they'd otherwise wipe us). */
+    if (nr == __NR_execve) {
+        cng_emulate_execve(uc, CNG_AT_FDCWD, (const char *)r[0],
+                           (char **)r[1], (char **)r[2]);
+        return;
+    }
+#ifdef __NR_execveat
+    if (nr == __NR_execveat) {
+        cng_emulate_execve(uc, (int)r[0], (const char *)r[1], (char **)r[2],
+                           (char **)r[3]);
+        return;
+    }
+#endif
+
+    long ret = cng_dispatch(nr, (long)r[0], (long)r[1], (long)r[2], (long)r[3],
+                            (long)r[4], (long)r[5]);
     r[0] = (unsigned long long)ret;
 }
 

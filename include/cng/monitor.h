@@ -12,6 +12,17 @@
 /* Active filesystem view used by the dispatcher (set before install). */
 extern struct cng_fs *cng_g_fs;
 
+/* Host auxv captured at startup, reused to synthesize the auxv of programs
+ * started via emulated execve. */
+extern unsigned long *cng_host_auxv;
+
+/* Emulate execve/execveat in-process: load the new program, build its stack,
+ * and rewrite the signal context (pc/sp/regs) to enter it — so the seccomp
+ * filter and SIGSYS handler survive (a real execve would wipe them). On failure
+ * it sets the return register to -errno and returns (normal execve semantics). */
+void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
+                        char **argv, char **envp);
+
 /* Emulate one trapped syscall: translate path args, re-issue via the gate,
  * return the kernel result. Directly callable for testing (no seccomp needed). */
 long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4,
