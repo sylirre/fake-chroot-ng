@@ -76,9 +76,27 @@ Milestones are committed individually. Each builds on the previous.
   the emulation runs on the main thread's large stack (multi-threaded execve
   would want a sigaltstack — tracked with the M5 signal-stack hazard).
 
-- [ ] **M7 — fidelity: uid/gid faking, /proc self-path fixups, link2symlink**
+- [x] **M7 — fidelity: uid/gid faking, /proc self-path fixups, link2symlink**
+  - `-0` credential faking: getuid/geteuid/getgid/getegid/getres[ug]id report 0,
+    setuid-family succeed silently, fchownat is faked, and stat/statx ownership
+    is rewritten to the fake uid/gid. Credential syscalls are trapped only when
+    `-0` is active (kept out of the filter otherwise).
+  - `/proc/self/{exe,cwd,root}` readlink fixups return guest-visible targets.
+  - link2symlink (lightweight): linkat falls back to a symlink when the fs
+    forbids hardlinks (EPERM/EMLINK/EXDEV/ENOSYS/EACCES/EOPNOTSUPP).
+  Validated via `_faketest` (getuid=0, stat ownership=0, /proc/self/exe). 45/45.
+  Limitations (tracked): `/proc/<pid>/*` numeric form and open("/proc/self/exe")
+  redirect not yet handled; link2symlink is the lightweight form (no nlink
+  bookkeeping, symlink target is a host path so readlink can leak it).
 
-- [ ] **M8 — performance: AoT `svc` rewriting in the load/mmap hook**
+- [ ] **M8 — performance: AoT `svc` rewriting in the load/mmap hook** (designed,
+  deferred). Correctness already comes from the SIGSYS floor; this is the
+  speed tier. AArch64 specifics make it delicate: replacing `svc` (4 bytes) with
+  `bl trampoline` clobbers x30, which is live across the common libc wrapper
+  `svc; ret`, so it needs per-site `b`-reached trampolines (SaBRe-style) that
+  carry a hardcoded return branch, plus veneers when a site is beyond ±128 MiB.
+  Best done as a focused pass with real-AArch64 benchmarking against the SIGSYS
+  path; deferred so the shipped correctness floor isn't destabilized.
 
 - [ ] **M9 — (optional) user_notif supervisor tier for kernels >= 5.0**
 

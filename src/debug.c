@@ -177,3 +177,53 @@ int cng_cmd_jmptest(int argc, char **argv, char **envp, unsigned long *auxv) {
     cng_dprintf(1, "jmptest: fell through (redirect failed)\n");
     return 1;
 }
+
+/* _faketest -r ROOT FILE — exercise the M7 fidelity fixups through the
+ * dispatcher: credential faking, stat ownership rewrite, /proc/self/exe. */
+int cng_cmd_faketest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)envp;
+    (void)auxv;
+    const char *rootfs = "/";
+    const char *file = 0;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-r") && i + 1 < argc)
+            rootfs = argv[++i];
+        else if (!file)
+            file = argv[i];
+    }
+    if (!file) {
+        cng_dprintf(2, "usage: _faketest -r ROOT FILE\n");
+        return 2;
+    }
+
+    static struct cng_fs fs;
+    cng_fs_init(&fs, rootfs);
+    cng_g_fs = &fs;
+    cng_g_fake_id = 1;
+    cng_g_fake_uid = 0;
+    cng_g_fake_gid = 0;
+    cng_g_exe_guest = "/bin/sh";
+
+    cng_dprintf(1, "getuid=%d\n",
+                (int)cng_dispatch(__NR_getuid, 0, 0, 0, 0, 0, 0));
+    cng_dprintf(1, "geteuid=%d\n",
+                (int)cng_dispatch(__NR_geteuid, 0, 0, 0, 0, 0, 0));
+
+    char sb[256];
+    long r = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)file, (long)sb,
+                          0, 0, 0);
+    if (r == 0)
+        cng_dprintf(1, "st_uid=%u st_gid=%u\n", *(unsigned *)(sb + 24),
+                    *(unsigned *)(sb + 28));
+    else
+        cng_dprintf(1, "stat errno %d\n", (int)-r);
+
+    char lb[256];
+    long n = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD,
+                          (long)"/proc/self/exe", (long)lb, sizeof lb, 0, 0);
+    if (n > 0) {
+        lb[n] = '\0';
+        cng_dprintf(1, "exe=%s\n", lb);
+    }
+    return 0;
+}

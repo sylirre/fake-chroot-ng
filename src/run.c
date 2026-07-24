@@ -54,6 +54,10 @@ int cng_cmd_run(int argc, char **argv, char **envp, unsigned long *auxv) {
     while (i < argc && argv[i][0] == '-' && strcmp(argv[i], "--") != 0) {
         if (!strcmp(argv[i], "-L") && i + 1 < argc) {
             libprefix = argv[++i];
+        } else if (!strcmp(argv[i], "-0")) {
+            cng_g_fake_id = 1;
+            cng_g_fake_uid = 0;
+            cng_g_fake_gid = 0;
         } else if (!strcmp(argv[i], "-r") && i + 1 < argc) {
             rootfs = argv[++i];
         } else if (!strcmp(argv[i], "-b") && i + 1 < argc && nb < CNG_MAX_BINDS) {
@@ -75,8 +79,9 @@ int cng_cmd_run(int argc, char **argv, char **envp, unsigned long *auxv) {
         i++;
     if (i >= argc) {
         cng_dprintf(2, "chroot-ng run: missing program\n"
-                       "usage: chroot-ng run [-r rootfs] [-b g:h] [-L dir]"
-                       " -- PROG [args]\n");
+                       "usage: chroot-ng run [-r rootfs] [-b g:h] [-0] [-L dir]"
+                       " -- PROG [args]\n"
+                       "  -0   fake root (uid/gid 0, ownership, chown)\n");
         return 2;
     }
 
@@ -84,8 +89,10 @@ int cng_cmd_run(int argc, char **argv, char **envp, unsigned long *auxv) {
     int gargc = argc - i;
     const char *prog_guest = gargv[0];
 
-    /* Capture host auxv for programs started via emulated execve. */
+    /* Capture host auxv (for emulated execve) and the guest exe path
+     * (for /proc/self/exe fixups). */
     cng_host_auxv = auxv;
+    cng_g_exe_guest = prog_guest;
 
     /* Filesystem view. */
     cng_fs_init(&g_fs, rootfs);
@@ -138,7 +145,7 @@ int cng_cmd_run(int argc, char **argv, char **envp, unsigned long *auxv) {
 
     /* Install the monitor last, after all of our own path syscalls are done.
      * Only when translation was actually requested; identity needs none. */
-    int want_xlate = (strcmp(rootfs, "/") != 0) || nb > 0;
+    int want_xlate = (strcmp(rootfs, "/") != 0) || nb > 0 || cng_g_fake_id;
     if (want_xlate) {
         int mrc = cng_install_monitor(&g_fs);
         if (mrc < 0)

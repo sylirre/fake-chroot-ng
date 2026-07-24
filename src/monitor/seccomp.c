@@ -36,7 +36,16 @@ static const int path_syscalls[] = {
 #endif
 };
 
-#define NSYS ((int)(sizeof(path_syscalls) / sizeof(path_syscalls[0])))
+#define NPATH ((int)(sizeof(path_syscalls) / sizeof(path_syscalls[0])))
+
+/* Credential syscalls: trapped only when -0 credential faking is active
+ * (see cng_g_fake_id), so we don't slow down getuid/etc otherwise. */
+static const int id_syscalls[] = {
+    __NR_getuid,    __NR_geteuid,    __NR_getgid,     __NR_getegid,
+    __NR_getresuid, __NR_getresgid,  __NR_setuid,     __NR_setgid,
+    __NR_setresuid, __NR_setresgid,
+};
+#define NID ((int)(sizeof(id_syscalls) / sizeof(id_syscalls[0])))
 
 int cng_install_seccomp(void) {
     unsigned long gs = (unsigned long)__cng_gate_start;
@@ -45,8 +54,17 @@ int cng_install_seccomp(void) {
     uint32_t gate_lo = (uint32_t)gs;
     uint32_t gate_end_lo = (uint32_t)ge;
 
-    /* Prologue (indices 0..8) + LD nr (9) + NSYS checks + 2 RETs. */
-    struct sock_filter f[12 + NSYS];
+    /* Build the trapped syscall list (path set, plus id set when faking). */
+    int nr[NPATH + NID];
+    int nsys = 0;
+    for (int i = 0; i < NPATH; i++)
+        nr[nsys++] = path_syscalls[i];
+    if (cng_g_fake_id)
+        for (int i = 0; i < NID; i++)
+            nr[nsys++] = id_syscalls[i];
+
+    /* Prologue (indices 0..8) + LD nr (9) + nsys checks + 2 RETs. */
+    struct sock_filter f[12 + NPATH + NID];
     int n = 0;
 
     f[n++] = (struct sock_filter)CNG_BPF_STMT(
@@ -74,11 +92,11 @@ int cng_install_seccomp(void) {
     f[n++] = (struct sock_filter)CNG_BPF_STMT(
         CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* 9: A = nr */
 
-    /* NSYS checks at indices 10..10+NSYS-1; TRAP at 10+NSYS+1. */
-    for (int i = 0; i < NSYS; i++)
+    /* nsys checks at indices 10..10+nsys-1; TRAP at 10+nsys+1. */
+    for (int i = 0; i < nsys; i++)
         f[n++] = (struct sock_filter)CNG_BPF_JUMP(
-            CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, (uint32_t)path_syscalls[i],
-            (uint8_t)(NSYS - i), 0);
+            CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, (uint32_t)nr[i],
+            (uint8_t)(nsys - i), 0);
     f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
                                               CNG_SECCOMP_RET_ALLOW); /* dflt */
     f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,

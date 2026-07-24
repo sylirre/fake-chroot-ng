@@ -16,6 +16,14 @@ extern struct cng_fs *cng_g_fs;
  * started via emulated execve. */
 extern unsigned long *cng_host_auxv;
 
+/* Fidelity config (M7). When cng_g_fake_id is set, credential syscalls report
+ * cng_g_fake_uid/gid, setuid-family calls succeed silently, chown is faked, and
+ * stat ownership is rewritten. cng_g_exe_guest is what /proc/self/exe reports. */
+extern int cng_g_fake_id;
+extern unsigned cng_g_fake_uid;
+extern unsigned cng_g_fake_gid;
+extern const char *cng_g_exe_guest;
+
 /* Emulate execve/execveat in-process: load the new program, build its stack,
  * and rewrite the signal context (pc/sp/regs) to enter it — so the seccomp
  * filter and SIGSYS handler survive (a real execve would wipe them). On failure

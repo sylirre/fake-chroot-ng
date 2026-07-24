@@ -52,6 +52,7 @@ if [ -f tests/m4_dynamic.sh ]; then . tests/m4_dynamic.sh; fi
 if [ -f tests/m5_xlate.sh ]; then . tests/m5_xlate.sh; fi
 if [ -f tests/m5b_monitor.sh ]; then . tests/m5b_monitor.sh; fi
 if [ -f tests/m6_execve.sh ]; then . tests/m6_execve.sh; fi
+if [ -f tests/m7_fidelity.sh ]; then . tests/m7_fidelity.sh; fi
 
 echo
 echo "== summary: $pass passed, $fail failed =="
