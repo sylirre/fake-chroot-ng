@@ -27,24 +27,54 @@ int cng_sig_install(int signo, cng_sighandler_t h) {
     struct cng_ksigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.handler = (void *)h;
-    sa.flags = CNG_SA_SIGINFO | CNG_SA_RESTORER | CNG_SA_RESTART;
+    /* SA_NODEFER keeps SIGSYS unmasked inside the handler: when we re-issue a
+     * translated syscall through the gate and Android's own seccomp filter
+     * blocks it, a *nested* SIGSYS must be deliverable (a masked seccomp SIGSYS
+     * force-kills). The nested trap is caught by the gate-net below. */
+    sa.flags = CNG_SA_SIGINFO | CNG_SA_RESTORER | CNG_SA_RESTART |
+               CNG_SA_NODEFER;
     sa.restorer = (void *)cng_sigrestore;
     long r = cng_syscall6(signo, (long)&sa, 0, sizeof(cng_sigset_t), 0, 0,
                           __NR_rt_sigaction);
     return (int)r;
 }
 
-static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {
-    (void)sig;
-    (void)si;
-    struct cng_ucontext *uc = (struct cng_ucontext *)ucv;
+/* One-shot-per-number notice that a host syscall was blocked by Android's
+ * seccomp filter and turned into ENOSYS. Diagnostic; async-signal-safe. */
+static void warn_blocked(int nr) {
+    static unsigned char warned[600];
+    if (nr < 0 || nr >= (int)sizeof warned || warned[nr])
+        return;
+    warned[nr] = 1;
+    cng_dprintf(2, "chroot-ng: host syscall %d blocked by Android seccomp"
+                   " -> ENOSYS\n", nr);
+}
+
+void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si) {
     unsigned long long *r = uc->uc_mcontext.regs;
+
+    /* Only seccomp traps are ours to emulate; a guest-directed kill(SIGSYS)
+     * (si_code != SYS_SECCOMP) is left alone. */
+    if (si->si_code != CNG_SYS_SECCOMP)
+        return;
+
+    /* Gate-net: the trapped svc is our own gate, i.e. Android blocked a syscall
+     * we re-issued. Return -ENOSYS instead of re-dispatching (which would loop
+     * or, if masked, force-kill). */
+    unsigned long ca = (unsigned long)si->_u._sigsys.call_addr;
+    if (ca >= (unsigned long)__cng_gate_start &&
+        ca < (unsigned long)__cng_gate_end) {
+        warn_blocked(si->_u._sigsys.syscall);
+        r[0] = (unsigned long long)(long)-ENOSYS;
+        return;
+    }
+
     long nr = (long)r[8];
 
     /* execve/execveat are emulated in-process (they'd otherwise wipe us). */
     if (nr == __NR_execve) {
-        cng_emulate_execve(uc, CNG_AT_FDCWD, (const char *)r[0],
-                           (char **)r[1], (char **)r[2]);
+        cng_emulate_execve(uc, CNG_AT_FDCWD, (const char *)r[0], (char **)r[1],
+                           (char **)r[2]);
         return;
     }
 #ifdef __NR_execveat
@@ -55,9 +85,14 @@ static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {
     }
 #endif
 
-    long ret = cng_dispatch(nr, (long)r[0], (long)r[1], (long)r[2], (long)r[3],
-                            (long)r[4], (long)r[5]);
-    r[0] = (unsigned long long)ret;
+    r[0] = (unsigned long long)cng_dispatch(nr, (long)r[0], (long)r[1],
+                                            (long)r[2], (long)r[3], (long)r[4],
+                                            (long)r[5]);
+}
+
+static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {
+    (void)sig;
+    cng_sigsys_body((struct cng_ucontext *)ucv, si);
 }
 
 int cng_install_monitor(struct cng_fs *fs) {

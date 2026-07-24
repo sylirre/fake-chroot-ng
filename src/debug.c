@@ -277,3 +277,68 @@ int cng_cmd_rwtest(int argc, char **argv, char **envp, unsigned long *auxv) {
                 n, (int)real, (int)got, ok ? "OK" : "FAIL");
     return ok ? 0 : 1;
 }
+
+/* _nettest — drive cng_sigsys_body with synthetic seccomp contexts to validate
+ * the Android SIGSYS net branching (no real seccomp needed). */
+int cng_cmd_nettest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    static struct cng_fs fs;
+    cng_fs_init(&fs, "/");
+    cng_g_fs = &fs;
+    int fails = 0;
+
+    /* 1) gate-net: a seccomp trap whose svc is our gate -> ENOSYS. */
+    {
+        struct cng_ucontext uc;
+        cng_siginfo_t si;
+        memset(&uc, 0, sizeof uc);
+        memset(&si, 0, sizeof si);
+        si.si_code = CNG_SYS_SECCOMP;
+        si._u._sigsys.call_addr = (void *)__cng_gate_start;
+        si._u._sigsys.syscall = 144; /* setgid */
+        uc.uc_mcontext.regs[8] = 144;
+        uc.uc_mcontext.regs[0] = 0x1234;
+        cng_sigsys_body(&uc, &si);
+        long got = (long)uc.uc_mcontext.regs[0];
+        int ok = (got == -ENOSYS);
+        cng_dprintf(1, "nettest gate-net: regs0=%d want=%d -> %s\n", (int)got,
+                    (int)-ENOSYS, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+    /* 2) non-gate seccomp trap of getpid -> dispatch -> real pid. */
+    {
+        struct cng_ucontext uc;
+        cng_siginfo_t si;
+        memset(&uc, 0, sizeof uc);
+        memset(&si, 0, sizeof si);
+        si.si_code = CNG_SYS_SECCOMP;
+        si._u._sigsys.call_addr = (void *)0x1000; /* not the gate */
+        uc.uc_mcontext.regs[8] = __NR_getpid;
+        cng_sigsys_body(&uc, &si);
+        long got = (long)uc.uc_mcontext.regs[0];
+        long real = sys_getpid();
+        int ok = (got == real);
+        cng_dprintf(1, "nettest dispatch: regs0=%d want-pid=%d -> %s\n",
+                    (int)got, (int)real, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+    /* 3) guest-directed SIGSYS (si_code != SYS_SECCOMP) -> untouched. */
+    {
+        struct cng_ucontext uc;
+        cng_siginfo_t si;
+        memset(&uc, 0, sizeof uc);
+        memset(&si, 0, sizeof si);
+        si.si_code = 0;
+        uc.uc_mcontext.regs[0] = 0xABCD;
+        cng_sigsys_body(&uc, &si);
+        long got = (long)uc.uc_mcontext.regs[0];
+        int ok = (got == 0xABCD);
+        cng_dprintf(1, "nettest passthrough: regs0=0x%lx -> %s\n",
+                    (unsigned long)got, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+    return fails ? 1 : 0;
+}

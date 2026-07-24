@@ -85,6 +85,29 @@ locatable `svc` sites in objects we load (not JIT/self-modifying code, and not
 `.so`s until the mmap hook lands), whereas the SIGSYS floor catches every raw
 syscall. The two compose: rewrite what we can find, trap the rest.
 
+### Coexisting with Android's own seccomp filter
+
+On Android our process already carries the zygote's app seccomp filter, whose
+action for non-allowlisted syscalls is `SECCOMP_RET_TRAP` (SIGSYS). Filters
+stack and the most restrictive action wins, so we cannot un-block what Android
+blocks (e.g. `setgid`/`setuid`/`setgroups` — apps may not change credentials).
+Two consequences:
+
+1. A guest syscall Android blocks traps to *our* SIGSYS handler (we own the
+   disposition). We must not forward it — the real syscall is blocked.
+2. When our handler re-issues a *translated* syscall through the gate, Android
+   may block that too. Since the re-issue happens inside the handler, a naive
+   design gets a masked seccomp SIGSYS → force-kill.
+
+The **gate-net** handles both: the handler runs with `SA_NODEFER` (SIGSYS stays
+deliverable), and its first check is "did the trapped `svc` come from our gate?"
+— if so, Android blocked something *we* issued, so we return `-ENOSYS` instead
+of re-dispatching. Any Android-blocked syscall (guest-issued or re-issued) thus
+becomes a clean `-ENOSYS`, no per-syscall list required. For a real container
+you additionally want `-0` (root emulation), which emulates the credential
+syscalls as succeeding instead of returning ENOSYS — mirroring proot's `-0` and
+the way the reference emulator recommends `--fake-id` for apt/dpkg.
+
 ### Known hazards (why the tiers exist)
 
 - `execve` erases the in-process handler → emulate `execve` via the loader.

@@ -39,6 +39,12 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4,
 /* Install a signal handler with our own rt_sigreturn restorer. Returns 0/-errno. */
 int cng_sig_install(int signo, cng_sighandler_t h);
 
+/* Core SIGSYS logic (exposed for testing): given the trapped signal context and
+ * info, either translate+dispatch the guest syscall, or — when the trap is
+ * Android's seccomp filter blocking a syscall WE re-issued from the gate —
+ * convert it to -ENOSYS. Writes the result into the context's x0. */
+void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si);
+
 /* Build and install the seccomp filter (traps the path syscall set, allows the
  * gate IP range, allows everything else). Returns 0 or -errno. */
 int cng_install_seccomp(void);
