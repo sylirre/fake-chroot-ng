@@ -210,6 +210,8 @@ int cng_cmd_faketest(int argc, char **argv, char **envp, unsigned long *auxv) {
                 (int)cng_dispatch(__NR_getuid, 0, 0, 0, 0, 0, 0, 0));
     cng_dprintf(1, "geteuid=%d\n",
                 (int)cng_dispatch(__NR_geteuid, 0, 0, 0, 0, 0, 0, 0));
+    cng_dprintf(1, "fchown=%d\n",
+                (int)cng_dispatch(__NR_fchown, 3, 0, 0, 0, 0, 0, 1));
 
     char sb[256];
     long r = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)file, (long)sb,

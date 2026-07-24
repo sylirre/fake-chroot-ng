@@ -230,6 +230,13 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         return reissue(a0, a1, (long)lp, a3, a4, a5, __NR_symlinkat);
     }
 
+    /* fchown(fd,...): no path, but under -0 fake success like fchownat — apk
+     * fchown()s each extracted file to root and a non-root app gets EPERM. */
+    case __NR_fchown:
+        if (cng_g_fake_id)
+            return 0;
+        return cng_syscall6(a0, a1, a2, a3, a4, a5, __NR_fchown);
+
     /* rename: two translated paths. */
     case __NR_renameat:
     case __NR_renameat2: {

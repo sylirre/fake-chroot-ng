@@ -10,6 +10,7 @@ check_contains "getuid faked to 0"          "getuid=0"            "$out"
 check_contains "geteuid faked to 0"         "geteuid=0"           "$out"
 check_contains "stat ownership faked to 0"  "st_uid=0 st_gid=0"   "$out"
 check_contains "/proc/self/exe fixup"       "exe=/bin/sh"         "$out"
+check_contains "fchown faked to success" "fchown=0" "$out"
 
 rm -rf "$ROOT"
 

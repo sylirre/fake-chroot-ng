@@ -47,7 +47,7 @@ static const int id_syscalls[] = {
     __NR_getuid,    __NR_geteuid,   __NR_getgid,    __NR_getegid,
     __NR_getresuid, __NR_getresgid, __NR_setuid,    __NR_setgid,
     __NR_setresuid, __NR_setresgid, __NR_setreuid,  __NR_setregid,
-    __NR_setgroups, __NR_setfsuid,  __NR_setfsgid,
+    __NR_setgroups, __NR_setfsuid,  __NR_setfsgid,  __NR_fchown,
 };
 #define NID ((int)(sizeof(id_syscalls) / sizeof(id_syscalls[0])))
 
