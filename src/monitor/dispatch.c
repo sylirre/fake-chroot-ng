@@ -41,13 +41,32 @@ void cng_note_blocked(int nr) {
 /* Re-issue the guest's (translated) syscall through the gate — but if Android's
  * filter blocks it (measured by cng_probe_blocked), emulate ENOSYS instead, so
  * we never trap on the re-issue. Same signature as cng_syscall6. */
+int cng_g_debug = 0;
+
+/* Best-effort path pointer among a0/a1 for logging (path syscalls put the path
+ * in a0 or a1). Guards against non-pointer scalars. */
+static const char *dbg_path(long a0, long a1) {
+    if (a1 > 0x1000 && *(const char *)a1 == '/')
+        return (const char *)a1;
+    if (a0 > 0x1000 && *(const char *)a0 == '/')
+        return (const char *)a0;
+    return "";
+}
+
 static long reissue(long a0, long a1, long a2, long a3, long a4, long a5,
                     long nr) {
     if (nr >= 0 && nr < CNG_NR_MAX && cng_blocked[nr]) {
         cng_note_blocked((int)nr);
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] nr=%ld %s -> BLOCKED ENOSYS\n", nr,
+                        dbg_path(a0, a1));
         return -ENOSYS;
     }
-    return cng_syscall6(a0, a1, a2, a3, a4, a5, nr);
+    long r = cng_syscall6(a0, a1, a2, a3, a4, a5, nr);
+    if (cng_g_debug && r < 0 && r != -ENOENT)
+        cng_dprintf(2, "[cng] nr=%ld %s -> errno=%ld\n", nr, dbg_path(a0, a1),
+                    -r);
+    return r;
 }
 
 /* Resolve a guest path to a host path, following symlinks *within the guest*:

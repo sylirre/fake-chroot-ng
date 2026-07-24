@@ -97,9 +97,11 @@ void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si) {
     }
 #endif
 
-    r[0] = (unsigned long long)cng_dispatch(nr, (long)r[0], (long)r[1],
-                                            (long)r[2], (long)r[3], (long)r[4],
-                                            (long)r[5], /*trapped=*/1);
+    long res = cng_dispatch(nr, (long)r[0], (long)r[1], (long)r[2], (long)r[3],
+                            (long)r[4], (long)r[5], /*trapped=*/1);
+    if (cng_g_debug && res < 0 && res != -ENOENT)
+        cng_dprintf(2, "[cng] dispatch nr=%ld -> errno=%ld\n", nr, -res);
+    r[0] = (unsigned long long)res;
 }
 
 static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {

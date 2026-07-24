@@ -103,6 +103,11 @@ int cng_cmd_run(int argc, char **argv, char **envp, unsigned long *auxv) {
     cng_host_auxv = auxv;
     cng_g_exe_guest = prog_guest;
 
+    /* CNG_DEBUG=1 in the environment enables verbose syscall-error logging. */
+    for (char **e = envp; e && *e; e++)
+        if (!strncmp(*e, "CNG_DEBUG=", 10) && (*e)[10] != '0')
+            cng_g_debug = 1;
+
     /* Filesystem view. */
     cng_fs_init(&g_fs, rootfs);
     for (int j = 0; j < nb; j++)

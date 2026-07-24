@@ -42,6 +42,10 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
 /* One-shot-per-number diagnostic for a syscall we emulate away. */
 void cng_note_blocked(int nr);
 
+/* Verbose diagnostic (set by CNG_DEBUG=1): log intercepted syscalls whose
+ * result is an error other than ENOENT, with the path where available. */
+extern int cng_g_debug;
+
 /* Resolve a guest path to a host path, following symlinks within the guest
  * (absolute link targets re-rooted into the rootfs). deref_final follows the
  * last component's own symlink. Returns 0/-errno. Uses cng_g_fs + readlink. */
