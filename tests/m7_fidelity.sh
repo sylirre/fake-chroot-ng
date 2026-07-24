@@ -14,11 +14,19 @@ check_contains "fchown faked to success" "fchown=0" "$out"
 
 rm -rf "$ROOT"
 
-# link2symlink (target is a guest/relative path, not a host path) + fchdir cwd
-# tracking. Force the l2s fallback via the block-list (tmpfs allows hardlinks).
+# link2symlink backing-file scheme (present emulated hardlinks as regular files
+# with a shared inode + st_nlink) + fchdir cwd tracking. Force the l2s fallback
+# via the block-list (tmpfs allows hardlinks).
 L2=$(mktemp -d); mkdir -p "$L2/w"
 out=$(run _l2stest "$L2" 2>&1); rc=$?
 check "l2stest overall (l2s + fchdir)" 0 "$rc"
-check_contains "link2symlink target is relative (b -> a)" "target=a leak=0" "$out"
+check_contains "l2s presents the group as regular files (nlink, inode, content)" \
+    "l2s: rc=0 eexist=1 reg=1 nlink2=1 sameino=1 noleak=1 content=1 -> OK" "$out"
+check_contains "l2s preserves mtime through the backing file" \
+    "l2s-mtime: set=0 mtime=287454020 -> OK" "$out"
+check_contains "l2s handles dirfd-relative links (apk's pattern)" \
+    "l2s-dirfd: rc=0 reg2=1 -> OK" "$out"
+check_contains "l2s decref reclaims the backing on last unlink" \
+    "l2s-decref: nlink_after1=1 gone=1 -> OK" "$out"
 check_contains "fchdir updates virtual cwd" "fchdir: cwd=/w -> OK" "$out"
 rm -rf "$L2"

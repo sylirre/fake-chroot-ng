@@ -86,8 +86,9 @@ Milestones are committed individually. Each builds on the previous.
     forbids hardlinks (EPERM/EMLINK/EXDEV/ENOSYS/EACCES/EOPNOTSUPP).
   Validated via `_faketest` (getuid=0, stat ownership=0, /proc/self/exe). 45/45.
   Limitations (tracked): `/proc/<pid>/*` numeric form and open("/proc/self/exe")
-  redirect not yet handled; link2symlink is the lightweight form (no nlink
-  bookkeeping, symlink target is a host path so readlink can leak it).
+  redirect not yet handled. (link2symlink was the lightweight form here — a
+  same-directory symlink to the sibling name; superseded by M9's backing-file
+  scheme, which fixes nlink/type/mtime fidelity.)
 
 - [x] **M8 — performance: AoT `svc` rewriting (`run -R`)**
   At load time (while segments are still writable) each `svc #0` is rewritten to
@@ -112,7 +113,32 @@ Milestones are committed individually. Each builds on the previous.
   it in an executable segment would be mis-rewritten — none in the glibc we
   tested (101 words, all real svc), but `-R` stays opt-in for that reason.
 
-- [ ] **M9 — (optional) user_notif supervisor tier for kernels >= 5.0**
+- [x] **M9 — robust link2symlink (backing-file scheme)**
+  Ported from `/home/sol/arm64chroot`. Where the host refuses `link(2)`
+  (Android/SELinux → EACCES/EXDEV, some EPERM), a guest hardlink group is
+  represented in the directory of the first-linked name by a hidden backing file
+  `.l2s.<ino>` holding the real contents, with every "hardlink" name a
+  same-directory **relative** symlink to it (never dangles, never leaks a host
+  path), plus a `.l2s.<ino>.<count>` marker file encoding the live link count.
+  - Transparency fixups so the group presents as ordinary regular files:
+    `newfstatat`/`statx` redirect to the backing file with `st_nlink` = count;
+    `readlinkat` on a name returns `EINVAL`; `utimensat` redirects to the backing
+    (so apk's set-mtime-then-verify — the "failed to preserve mtime" case —
+    succeeds); `unlinkat`/`renameat` decref and reclaim the backing on the last
+    reference. `linkat` resolves both endpoints (incl. real dirfds via
+    `/proc/self/fd`, and `/proc/self/fd/N` O_TMPFILE via a content copy) to host
+    paths and falls back to `cng_l2s_link`.
+  - All in `src/monitor/l2s.c`, freestanding (raw syscalls), gated by
+    `cng_l2s_active` so there is **zero** extra cost until a hardlink actually
+    falls back. Validated by `_l2stest`: regular-file presentation, shared
+    inode, nlink=2, `readlink`→EINVAL, shared content, EEXIST on a dup link,
+    mtime preserved through the backing, dirfd-relative links, and
+    decref/reclaim. 72/72 tests.
+  Limitation (tracked): backing files are not yet hidden from `getdents64`
+  (would require trapping it); they are dotfiles and unrecorded in apk's db, so
+  cosmetic only. Cross-directory hardlinks fall back to a content copy.
+
+- [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes
 - `make` cross-compiles; `make run ARGS="..."` runs under qemu-aarch64.

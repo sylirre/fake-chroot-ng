@@ -4,8 +4,9 @@
  * are directly readable — no cross-process memory access like proot needs.
  *
  * Also applies the M7 fidelity fixups: credential/ownership faking (-0),
- * /proc/self/* readlink fixups, and link2symlink fallback.
+ * /proc/self readlink fixups, and link2symlink fallback.
  */
+#include "cng/l2s.h"
 #include "cng/monitor.h"
 #include "cng/path.h"
 #include "cng/rt.h"
@@ -132,48 +133,52 @@ int cng_resolve(const char *path, int deref_final, char *out, size_t outsz) {
     return -ELOOP;
 }
 
-/* Guest directory a real dirfd points at, via /proc/self/fd. Returns 0/-1. */
-static int fd_guest_dir(long fd, char *out, size_t sz) {
+/* Resolve (dirfd, path) to a HOST path. Handles absolute paths and AT_FDCWD
+ * (through the rootfs, re-rooting guest symlinks), real dirfds (whose
+ * /proc/self/fd link is already a host path inside the rootfs, so the relative
+ * name needs no translation), and "/proc/self/fd/N" verbatim (it names this
+ * process's own fd regardless of rootfs). `deref` follows the final component's
+ * symlink for the absolute/AT_FDCWD case. Returns 0/-1. */
+static int resolve_at_host(long dirfd, const char *path, int deref, char *out,
+                           size_t sz) {
+    if (!path || !path[0])
+        return -1;
+    if (!strncmp(path, "/proc/self/fd/", 14)) {
+        cng_strlcpy(out, path, sz);
+        return 0;
+    }
+    if (path[0] == '/' || dirfd == CNG_AT_FDCWD) {
+        if (cng_resolve(path, deref, out, sz) == 0)
+            return 0;
+        return cng_fs_translate(cng_g_fs, path, out, sz) == 0 ? 0 : -1;
+    }
+    /* real dirfd: read its host directory path from /proc/self/fd/<dirfd>. */
     char proc[40];
     size_t p = cng_strlcpy(proc, "/proc/self/fd/", sizeof proc);
     char num[16];
     int ni = 0;
-    long v = fd;
-    if (v <= 0)
+    long v = dirfd;
+    if (v < 0)
         return -1;
-    while (v > 0 && ni < 15) {
+    do {
         num[ni++] = (char)('0' + v % 10);
         v /= 10;
-    }
+    } while (v > 0 && ni < 15);
     while (ni > 0 && p < sizeof proc - 1)
         proc[p++] = num[--ni];
     proc[p] = '\0';
-    char host[CNG_PATH_MAX];
-    long n = sys_readlinkat(CNG_AT_FDCWD, proc, host, sizeof host - 1);
+    char hdir[CNG_PATH_MAX];
+    long n = sys_readlinkat(CNG_AT_FDCWD, proc, hdir, sizeof hdir - 1);
     if (n <= 0)
         return -1;
-    host[n] = '\0';
-    return cng_fs_untranslate(cng_g_fs, host, out, sz);
-}
-
-/* Resolve (dirfd, path) to a canonical guest absolute path. Handles absolute
- * paths, AT_FDCWD, and real dirfds (via /proc/self/fd). Returns 0/-1. */
-static int resolve_at_guest(long dirfd, const char *path, char *out,
-                            size_t sz) {
-    if (!path)
-        return -1;
-    if (path[0] == '/' || dirfd == CNG_AT_FDCWD)
-        return cng_fs_abscanon(cng_g_fs, path, out, sz);
-    char gdir[CNG_PATH_MAX], tmp[CNG_PATH_MAX];
-    if (fd_guest_dir(dirfd, gdir, sizeof gdir) != 0)
-        return -1;
-    size_t n = cng_strlcpy(tmp, gdir, sizeof tmp);
-    if (n && tmp[n - 1] != '/' && n + 1 < sizeof tmp) {
-        tmp[n++] = '/';
-        tmp[n] = '\0';
+    hdir[n] = '\0';
+    size_t k = cng_strlcpy(out, hdir, sz);
+    if (k && out[k - 1] != '/' && k + 1 < sz) {
+        out[k++] = '/';
+        out[k] = '\0';
     }
-    cng_strlcpy(tmp + n, path, sizeof tmp - n);
-    return cng_path_canon(tmp, out, sz);
+    cng_strlcpy(out + k, path, sz > k ? sz - k : 0);
+    return 0;
 }
 
 static const char *xlate(long dirfd, const char *gp, char *buf, size_t bufsz,
@@ -227,21 +232,78 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
 #endif
     case __NR_mkdirat:
     case __NR_mknodat:
-    case __NR_unlinkat:
     case __NR_fchmodat:
-    case __NR_utimensat:
 #ifdef __NR_name_to_handle_at
     case __NR_name_to_handle_at:
 #endif
     {
-        int deref = !(nr == __NR_unlinkat || nr == __NR_mkdirat ||
-                      nr == __NR_mknodat);
+        int deref = !(nr == __NR_mkdirat || nr == __NR_mknodat);
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
         return reissue(a0, (long)p, a2, a3, a4, a5, nr);
     }
 
-    /* stat: translate, reissue, then fake ownership if -0. */
+    /* unlinkat: on removing one of our link2symlink names, drop the group's
+     * refcount (and reclaim the backing file on the last reference). */
+    case __NR_unlinkat: {
+        char data[CNG_PATH_MAX];
+        unsigned long cnt;
+        int dec = 0;
+        if (cng_l2s_active && !((int)a2 & CNG_AT_REMOVEDIR)) {
+            char hnf[CNG_PATH_MAX];
+            if (resolve_at_host(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0 &&
+                cng_l2s_resolve(hnf, data, sizeof data, &cnt) == 1)
+                dec = 1;
+        }
+        const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, 0);
+        long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_unlinkat);
+        if (r == 0 && dec)
+            cng_l2s_decref(data, cnt);
+        return r;
+    }
+
+    /* utimensat(dirfd, path, times, flags): if the target is one of our
+     * link2symlink entries, redirect to its backing file (the guest thinks it's
+     * a regular file, so a set-then-lstat-verify — as apk does to preserve mtime
+     * — must land on the backing, not the link). Setting an explicit time needs
+     * ownership; under -0 fake success on EPERM. */
+    case __NR_utimensat: {
+        char data[CNG_PATH_MAX];
+        unsigned long cnt;
+        if (cng_l2s_active) {
+            char hnf[CNG_PATH_MAX];
+            if (resolve_at_host(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0 &&
+                cng_l2s_resolve(hnf, data, sizeof data, &cnt) == 1) {
+                long r = cng_syscall6(CNG_AT_FDCWD, (long)data, a2, 0, 0, 0,
+                                      __NR_utimensat);
+                if (cng_g_fake_id && (r == -EPERM || r == -EACCES))
+                    return 0;
+                return r;
+            }
+        }
+        int deref = !((int)a3 & CNG_AT_SYMLINK_NOFOLLOW);
+        const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
+        long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_utimensat);
+        if (cng_g_fake_id && (r == -EPERM || r == -EACCES))
+            return 0;
+        return r;
+    }
+
+    /* stat: translate, reissue, then fake ownership if -0. A link2symlink entry
+     * is presented as its backing file (a regular file) with st_nlink = the live
+     * group count, regardless of the NOFOLLOW flag — so the guest never sees the
+     * emulation as a symlink. */
     case __NR_newfstatat: {
+        if (cng_l2s_active && a2) {
+            char hnf[CNG_PATH_MAX];
+            if (resolve_at_host(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0 &&
+                cng_l2s_stat(hnf, (void *)a2) == 1) {
+                if (cng_g_fake_id) {
+                    *(unsigned *)((char *)a2 + STAT_UID_OFF) = cng_g_fake_uid;
+                    *(unsigned *)((char *)a2 + STAT_GID_OFF) = cng_g_fake_gid;
+                }
+                return 0;
+            }
+        }
         int deref = !((int)a3 & CNG_AT_SYMLINK_NOFOLLOW);
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
         long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_newfstatat);
@@ -252,6 +314,17 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         return r;
     }
     case __NR_statx: {
+        if (cng_l2s_active && a4) {
+            char hnf[CNG_PATH_MAX];
+            if (resolve_at_host(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0 &&
+                cng_l2s_statx(hnf, (void *)a4) == 1) {
+                if (cng_g_fake_id) {
+                    *(unsigned *)((char *)a4 + STATX_UID_OFF) = cng_g_fake_uid;
+                    *(unsigned *)((char *)a4 + STATX_GID_OFF) = cng_g_fake_gid;
+                }
+                return 0;
+            }
+        }
         int deref = !((int)a2 & CNG_AT_SYMLINK_NOFOLLOW);
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
         long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_statx);
@@ -271,7 +344,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         return reissue(a0, (long)p, a2, a3, a4, a5, __NR_fchownat);
     }
 
-    /* readlinkat: /proc/self/* fixups, else translate + reissue. */
+    /* readlinkat: /proc/self magic-link fixups, else translate + reissue. */
     case __NR_readlinkat: {
         const char *gp = (const char *)a1;
         if (gp && (gp[0] == '/' || a0 == CNG_AT_FDCWD)) {
@@ -284,6 +357,14 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             }
         }
         const char *p = xlate(a0, gp, b1, sizeof b1, /*deref_final=*/0);
+        /* A link2symlink entry presents as a regular file: readlink must fail
+         * with EINVAL rather than leak the ".l2s.<ino>" backing name. */
+        if (cng_l2s_active) {
+            char data[CNG_PATH_MAX];
+            if (p && p[0] == '/' &&
+                cng_l2s_resolve(p, data, sizeof data, 0) == 1)
+                return -EINVAL;
+        }
         return reissue(a0, (long)p, a2, a3, a4, a5, __NR_readlinkat);
     }
 
@@ -300,55 +381,47 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             return 0;
         return cng_syscall6(a0, a1, a2, a3, a4, a5, __NR_fchown);
 
-    /* rename: two translated paths. */
+    /* rename: two translated paths. If the destination is one of our
+     * link2symlink names, it is replaced by the rename, so drop its group's
+     * refcount (apk installs by renaming a temp file over the final name). */
     case __NR_renameat:
     case __NR_renameat2: {
         const char *op = xlate(a0, (const char *)a1, b1, sizeof b1, 0);
         const char *np = xlate(a2, (const char *)a3, b2, sizeof b2, 0);
-        return reissue(a0, (long)op, a2, (long)np, a4, a5, nr);
+        char data[CNG_PATH_MAX];
+        unsigned long cnt;
+        int dec = 0;
+        if (cng_l2s_active && strcmp(op, np) != 0) {
+            char hnf[CNG_PATH_MAX];
+            if (resolve_at_host(a2, (const char *)a3, 0, hnf, sizeof hnf) == 0 &&
+                cng_l2s_resolve(hnf, data, sizeof data, &cnt) == 1)
+                dec = 1;
+        }
+        long r = reissue(a0, (long)op, a2, (long)np, a4, a5, nr);
+        if (r == 0 && dec)
+            cng_l2s_decref(data, cnt);
+        return r;
     }
 
-    /* linkat: hardlink; fall back to a symlink where the fs forbids hardlinks
-     * (link2symlink). The symlink target is a GUEST path (bare basename when
-     * old and new share a directory, else the guest-absolute path) — never a
-     * host path — so readlink doesn't leak, and cng_resolve re-roots it. */
+    /* linkat: hardlink; where the fs forbids hardlinks (Android/SELinux returns
+     * EACCES/EXDEV, some EPERM) fall back to the link2symlink backing-file scheme
+     * (see l2s.c): the contents move to a hidden ".l2s.<ino>" and every name
+     * becomes a same-directory relative symlink to it, so the group presents as
+     * regular files (via the stat fixups) with a shared inode. */
     case __NR_linkat: {
-        int deref_old = ((int)a4 & CNG_AT_SYMLINK_FOLLOW) ? 1 : 0;
-        const char *op = xlate(a0, (const char *)a1, b1, sizeof b1, deref_old);
-        const char *np = xlate(a2, (const char *)a3, b2, sizeof b2, 0);
-        long r = reissue(a0, (long)op, a2, (long)np, a4, a5, __NR_linkat);
+        int follow = ((int)a4 & CNG_AT_SYMLINK_FOLLOW) ? 1 : 0;
+        char srch[CNG_PATH_MAX], dsth[CNG_PATH_MAX];
+        if (resolve_at_host(a0, (const char *)a1, 0, srch, sizeof srch) != 0 ||
+            resolve_at_host(a2, (const char *)a3, 0, dsth, sizeof dsth) != 0)
+            return -ENOENT;
+        long r = reissue(CNG_AT_FDCWD, (long)srch, CNG_AT_FDCWD, (long)dsth,
+                         follow ? CNG_AT_SYMLINK_FOLLOW : 0, 0, __NR_linkat);
         if (r == -EPERM || r == -EMLINK || r == -EXDEV || r == -ENOSYS ||
             r == -EACCES || r == -EOPNOTSUPP) {
-            /* Resolve both endpoints to guest paths (handling dirfds), and make
-             * a symlink at the new host path targeting the old guest path. */
-            char oldg[CNG_PATH_MAX], newg[CNG_PATH_MAX], newhost[CNG_PATH_MAX];
-            if (resolve_at_guest(a0, (const char *)a1, oldg, sizeof oldg) == 0 &&
-                resolve_at_guest(a2, (const char *)a3, newg, sizeof newg) == 0 &&
-                cng_fs_translate(cng_g_fs, newg, newhost, sizeof newhost) == 0) {
-                /* bare basename when old/new share a dir (b -> a), else the
-                 * guest-absolute path — both re-root correctly and don't leak. */
-                char *os = strrchr(oldg, '/');
-                char *ns = strrchr(newg, '/');
-                size_t odl = os ? (size_t)(os - oldg) : 0;
-                size_t ndl = ns ? (size_t)(ns - newg) : 0;
-                const char *tgt =
-                    (odl == ndl && strncmp(oldg, newg, odl) == 0)
-                        ? (os ? os + 1 : oldg)
-                        : oldg;
-                long s = cng_syscall6((long)tgt, CNG_AT_FDCWD, (long)newhost, 0,
-                                      0, 0, __NR_symlinkat);
-                if (s == -EEXIST) { /* reinstall: replace the existing entry */
-                    cng_syscall6(CNG_AT_FDCWD, (long)newhost, 0, 0, 0, 0,
-                                 __NR_unlinkat);
-                    s = cng_syscall6((long)tgt, CNG_AT_FDCWD, (long)newhost, 0,
-                                     0, 0, __NR_symlinkat);
-                }
-                if (cng_g_debug)
-                    cng_dprintf(2, "[cng] l2s %s -> %s sym=%ld\n", oldg, newg,
-                                s);
-                if (s == 0)
-                    return 0;
-            }
+            int s = cng_l2s_link(srch, dsth);
+            if (cng_g_debug)
+                cng_dprintf(2, "[cng] l2s %s -> %s rc=%d\n", srch, dsth, s);
+            return s;
         }
         return r;
     }

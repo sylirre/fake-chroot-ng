@@ -3,6 +3,7 @@
  * prints guest->host path translations. Used by the M5 unit tests (the path
  * core is pure logic, fully exercisable under qemu).
  */
+#include "cng/l2s.h"
 #include "cng/loader.h"
 #include "cng/monitor.h"
 #include "cng/path.h"
@@ -13,6 +14,13 @@
 #include "cng/ucontext.h"
 
 #include <asm/unistd.h>
+
+/* aarch64 struct stat accessors (for _l2stest). */
+#define ST_INO(b)   (*(unsigned long long *)((char *)(b) + 8))
+#define ST_MODE(b)  (*(unsigned *)((char *)(b) + 16))
+#define ST_NLINK(b) (*(unsigned *)((char *)(b) + 20))
+#define ST_MTIME(b) (*(long long *)((char *)(b) + 88))
+#define ST_ISREG(b) ((ST_MODE(b) & 0170000) == 0100000)
 
 int cng_cmd_xlate(int argc, char **argv, char **envp, unsigned long *auxv) {
     (void)envp;
@@ -376,7 +384,9 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
     cng_g_fs = &fs;
     int fails = 0;
 
-    /* link2symlink: force the fallback by marking linkat blocked. */
+    /* link2symlink backing-file scheme. Force the fallback (tmpfs allows real
+     * hardlinks) by marking linkat blocked. The emulated "hardlink" must present
+     * as a regular file: shared inode, st_nlink counted, readlink refused. */
     cng_blocked[__NR_linkat] = 1;
     long fd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/a",
                            CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
@@ -386,37 +396,99 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
     }
     long lr = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/a", CNG_AT_FDCWD,
                            (long)"/w/b", 0, 0, 0);
-    /* second time must replace the existing symlink, not fail with EEXIST */
+    /* linking onto an existing name must fail with EEXIST, like real link(2) */
     long lr2 = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/a",
                             CNG_AT_FDCWD, (long)"/w/b", 0, 0, 0);
-    char buf[256];
-    long n = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD, (long)"/w/b",
-                          (long)buf, sizeof buf - 1, 0, 0, 0);
-    buf[n > 0 ? n : 0] = '\0';
-    int leak = (strncmp(buf, "/data", 5) == 0) ||
-               (strlen(rootfs) > 1 &&
-                strncmp(buf, rootfs, strlen(rootfs)) == 0);
-    /* dirfd-relative hardlink (as apk does): open /w, linkat(fd,"a",fd,"c") */
+
+    char sa[144], sb[144];
+    long ra = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/a",
+                           (long)sa, 0, 0, 0, 0);
+    long rb = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/b",
+                           (long)sb, 0, 0, 0, 0);
+    int reg = (ra == 0 && rb == 0 && ST_ISREG(sa) && ST_ISREG(sb));
+    int nlink = (reg && ST_NLINK(sa) == 2 && ST_NLINK(sb) == 2);
+    int sameino = (reg && ST_INO(sa) == ST_INO(sb));
+
+    char lb[256]; /* readlink must be transparent (EINVAL), never leak backing */
+    long rl = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD, (long)"/w/b",
+                           (long)lb, sizeof lb - 1, 0, 0, 0);
+    int noleak = (rl == -EINVAL);
+
+    char cbuf[8]; /* contents are shared through the backing file */
+    long bf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/b",
+                           CNG_O_RDONLY, 0, 0, 0, 0);
+    long rd = -1;
+    if (bf >= 0) {
+        rd = sys_read((int)bf, cbuf, sizeof cbuf);
+        sys_close((int)bf);
+    }
+    int content = (rd == 2 && cbuf[0] == 'h' && cbuf[1] == 'i');
+
+    int ok_l2s = (lr == 0 && lr2 == -EEXIST && reg && nlink && sameino &&
+                  noleak && content);
+    cng_dprintf(1,
+                "l2s: rc=%d eexist=%d reg=%d nlink2=%d sameino=%d noleak=%d "
+                "content=%d -> %s\n",
+                (int)lr, lr2 == -EEXIST, reg, nlink, sameino, noleak, content,
+                ok_l2s ? "OK" : "FAIL");
+    fails += !ok_l2s;
+
+    /* mtime preserve (apk's scenario): set an explicit mtime on one name, read
+     * it back through the other — must land on the shared backing file. */
+    long times[4] = {0x11223344, 0, 0x11223344, 0}; /* atime, mtime = T */
+    long um = cng_dispatch(__NR_utimensat, CNG_AT_FDCWD, (long)"/w/b",
+                           (long)times, 0, 0, 0, 0);
+    char sm[144];
+    long rm = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/a",
+                           (long)sm, 0, 0, 0, 0);
+    int mtime_ok = (um == 0 && rm == 0 && ST_MTIME(sm) == 0x11223344);
+    cng_dprintf(1, "l2s-mtime: set=%d mtime=%lld -> %s\n", (int)um,
+                rm == 0 ? ST_MTIME(sm) : -1, mtime_ok ? "OK" : "FAIL");
+    fails += !mtime_ok;
+
+    /* dirfd-relative link (as apk does): open /w, linkat(fd,"d",fd,"e"). */
+    long df = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/d",
+                           CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (df >= 0) {
+        sys_write((int)df, "x", 1);
+        sys_close((int)df);
+    }
     long wfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w", CNG_O_RDONLY,
                             0, 0, 0, 0);
-    long lr3 = -1, n2 = -1;
-    char buf2[256];
-    buf2[0] = '\0';
+    long lr3 = -1;
+    int dreg = 0;
     if (wfd >= 0) {
-        lr3 = cng_dispatch(__NR_linkat, wfd, (long)"a", wfd, (long)"c", 0, 0, 0);
-        n2 = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD, (long)"/w/c",
-                          (long)buf2, sizeof buf2 - 1, 0, 0, 0);
+        lr3 = cng_dispatch(__NR_linkat, wfd, (long)"d", wfd, (long)"e", 0, 0, 0);
+        char se[144];
+        long re = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/e",
+                               (long)se, 0, 0, 0, 0);
+        dreg = (re == 0 && ST_ISREG(se) && ST_NLINK(se) == 2);
         sys_close((int)wfd);
     }
-    buf2[n2 > 0 ? n2 : 0] = '\0';
-    cng_blocked[__NR_linkat] = 0;
-    cng_dprintf(1, "l2s-dirfd: linkat(fd,a,fd,c) rc=%d readlink(/w/c)=%s\n",
-                (int)lr3, buf2);
+    int ok_dirfd = (lr3 == 0 && dreg);
+    cng_dprintf(1, "l2s-dirfd: rc=%d reg2=%d -> %s\n", (int)lr3, dreg,
+                ok_dirfd ? "OK" : "FAIL");
+    fails += !ok_dirfd;
 
-    int ok_l2s = (lr == 0 && lr2 == 0 && lr3 == 0 && n > 0 && n2 > 0 && !leak);
-    cng_dprintf(1, "l2s: link rc=%d rc2=%d target=%s leak=%d -> %s\n", (int)lr,
-                (int)lr2, buf, leak, ok_l2s ? "OK" : "FAIL");
-    fails += !ok_l2s;
+    /* decref: removing one name drops st_nlink; removing the last reclaims the
+     * backing file (the name then no longer exists). */
+    long ub = cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/b", 0, 0, 0,
+                           0, 0);
+    char sa2[144];
+    long ra2 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/a",
+                            (long)sa2, 0, 0, 0, 0);
+    int after1 = (ub == 0 && ra2 == 0 && ST_NLINK(sa2) == 1);
+    long ua = cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/a", 0, 0, 0,
+                           0, 0);
+    long ra3 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/a",
+                            (long)sa2, 0, 0, 0, 0);
+    int gone = (ua == 0 && ra3 == -ENOENT);
+    int ok_dec = (after1 && gone);
+    cng_dprintf(1, "l2s-decref: nlink_after1=%d gone=%d -> %s\n", after1, gone,
+                ok_dec ? "OK" : "FAIL");
+    fails += !ok_dec;
+
+    cng_blocked[__NR_linkat] = 0;
 
     /* fchdir cwd tracking. */
     long dfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w",
