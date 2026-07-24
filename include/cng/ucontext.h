@@ -59,6 +59,7 @@ typedef void (*cng_sighandler_t)(int, cng_siginfo_t *, void *);
 
 /* sa_flags */
 #define CNG_SA_SIGINFO  0x00000004u
+#define CNG_SA_ONSTACK  0x08000000u
 #define CNG_SA_RESTART  0x10000000u
 #define CNG_SA_NODEFER  0x40000000u
 #define CNG_SA_RESTORER 0x04000000u

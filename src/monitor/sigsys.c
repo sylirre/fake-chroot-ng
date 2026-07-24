@@ -31,9 +31,19 @@ int cng_sig_install(int signo, cng_sighandler_t h) {
     /* SA_NODEFER keeps SIGSYS unmasked inside the handler: when we re-issue a
      * translated syscall through the gate and Android's own seccomp filter
      * blocks it, a *nested* SIGSYS must be deliverable (a masked seccomp SIGSYS
-     * force-kills). The nested trap is caught by the gate-net below. */
+     * force-kills). The nested trap is caught by the gate-net below.
+     *
+     * SA_ONSTACK delivers the signal on the thread's registered alt-stack. This
+     * matters for small-stack guests: the kernel pushes the ~4.5 KiB signal
+     * frame (siginfo + ucontext incl. the FP/SVE reserved area) onto the
+     * interrupted stack *before* our handler can switch to its scratch stack, so
+     * on Go's ~8 KiB goroutine stacks that delivery alone overflows. Go (and any
+     * runtime that calls sigaltstack) provides a per-thread alt-stack; where none
+     * is registered the flag is a no-op and delivery uses the (large) normal
+     * stack, as before. The heavy dispatcher still runs on our own scratch
+     * stack — the alt-stack only has to hold the frame + handler prologue. */
     sa.flags = CNG_SA_SIGINFO | CNG_SA_RESTORER | CNG_SA_RESTART |
-               CNG_SA_NODEFER;
+               CNG_SA_NODEFER | CNG_SA_ONSTACK;
     sa.restorer = (void *)cng_sigrestore;
     long r = cng_syscall6(signo, (long)&sa, 0, sizeof(cng_sigset_t), 0, 0,
                           __NR_rt_sigaction);
@@ -54,7 +64,13 @@ void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si) {
     unsigned long ca = (unsigned long)si->_u._sigsys.call_addr;
     if (ca >= (unsigned long)__cng_gate_start &&
         ca < (unsigned long)__cng_gate_end) {
-        cng_note_blocked(si->_u._sigsys.syscall);
+        int bnr = si->_u._sigsys.syscall;
+        cng_note_blocked(bnr);
+        /* Record it so `reissue` short-circuits future calls without going
+         * through the gate — a re-issue that traps here is the only source of a
+         * nested SIGSYS, so this keeps nesting to at most once per syscall. */
+        if (bnr >= 0 && bnr < CNG_NR_MAX)
+            cng_blocked[bnr] = 1;
         r[0] = (unsigned long long)(long)-ENOSYS;
         return;
     }
@@ -118,6 +134,7 @@ extern long cng_run_on_stack(void *newsp, void *fn, void *a0, void *a1);
 static struct {
     long tid;
     unsigned long lo, hi;
+    int busy;
 } cng_scr[CNG_SCR_N];
 
 /* Claim `*p` from 0 to `tid` (inline LL/SC so we need no libgcc atomics helper;
@@ -139,46 +156,50 @@ static int cng_claim_slot(volatile long *p, long tid) {
     return fail == 0;
 }
 
-/* Top of this thread's scratch stack, or 0 to keep the current stack (table
- * full/alloc failed, or we are already running on the scratch stack — a nested
- * gate-net trap, which is shallow and safe to run below the outer frame). */
-static void *cng_scratch_top(void) {
-    long tid = sys_gettid();
-    unsigned long sp;
-    __asm__ volatile("mov %0, sp" : "=r"(sp));
+/* Find this thread's scratch slot (allocating one on first use). Returns the
+ * slot index, or -1 if the table is full or mmap failed. */
+static int cng_scratch_slot(long tid) {
     unsigned h = (unsigned)((unsigned long)tid * 2654435761u) % CNG_SCR_N;
     for (unsigned k = 0; k < CNG_SCR_N; k++) {
         unsigned i = (h + k) % CNG_SCR_N;
         long t = cng_scr[i].tid;
-        if (t == tid) {
-            if (sp > cng_scr[i].lo && sp <= cng_scr[i].hi)
-                return 0; /* nested: already on this scratch stack */
-            return (void *)cng_scr[i].hi;
-        }
+        if (t == tid)
+            return (int)i;
         if (t == 0 && cng_claim_slot(&cng_scr[i].tid, tid)) {
             void *base =
                 sys_mmap(0, CNG_SCR_SZ, CNG_PROT_READ | CNG_PROT_WRITE,
                          CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
             if (base == CNG_MAP_FAILED || cng_is_err((long)base)) {
                 cng_scr[i].tid = 0;
-                return 0;
+                return -1;
             }
             cng_scr[i].lo = (unsigned long)base;
             cng_scr[i].hi = ((unsigned long)base + CNG_SCR_SZ) & ~15UL;
-            return (void *)cng_scr[i].hi;
+            return (int)i;
         }
         /* slot taken by another thread (or we lost the CAS): keep probing */
     }
-    return 0;
+    return -1;
 }
 
+/* Run the dispatcher on this thread's scratch stack. A nested trap (the outer
+ * invocation's slot is already busy) runs on the current stack instead — that
+ * is the shallow gate-net path, which does not touch the deep buffers, so it
+ * fits wherever the kernel delivered it. The busy flag (not an SP-range test) is
+ * what detects nesting: with SA_ONSTACK the nested signal is delivered on the
+ * alt-stack, not on the scratch stack, so a range test would miss it and wrongly
+ * re-switch, clobbering the outer dispatcher frame. */
 static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {
     (void)sig;
-    void *top = cng_scratch_top();
-    if (top)
-        cng_run_on_stack(top, (void *)cng_sigsys_body, ucv, si);
-    else
+    long tid = sys_gettid();
+    int i = cng_scratch_slot(tid);
+    if (i < 0 || cng_scr[i].busy) {
         cng_sigsys_body((struct cng_ucontext *)ucv, si);
+        return;
+    }
+    cng_scr[i].busy = 1;
+    cng_run_on_stack((void *)cng_scr[i].hi, (void *)cng_sigsys_body, ucv, si);
+    cng_scr[i].busy = 0;
 }
 
 int cng_install_monitor(struct cng_fs *fs) {

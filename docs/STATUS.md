@@ -143,12 +143,18 @@ Milestones are committed individually. Each builds on the previous.
   `cng_resolve` ~20 KiB, `cng_dispatch` ~16 KiB per `-fstack-usage`). C guests
   survive on their multi-MiB main-thread stacks, but Go runs syscalls on ~8 KiB
   goroutine stacks, so the handler smashed them — intermittent SIGSEGV, memory
-  corruption, and monitor crashes under `go build`/`make`. The handler now runs
-  the dispatcher on a large dedicated per-thread scratch stack (256 KiB, claimed
-  lock-free by TID, allocated on first use; `stackswitch.S` does the SP switch),
-  so its footprint is independent of the interrupted guest stack. Nested
-  gate-net traps run below the outer frame (no re-switch). Validated by
-  `_stackswtest`. 76/76.
+  corruption, and monitor crashes under `go build`/`make`. Two parts:
+  - **SA_ONSTACK** so the kernel delivers the ~4.5 KiB signal frame (siginfo +
+    ucontext incl. the FP/SVE reserved area) on the thread's registered
+    alt-stack (Go gives each thread one) rather than the tiny goroutine stack —
+    the frame delivery itself was overflowing before the handler could run.
+  - a large dedicated **per-thread scratch stack** (256 KiB, claimed lock-free
+    by TID, allocated on first use; `stackswitch.S` switches SP) for the
+    dispatcher, since it far exceeds a 32 KiB alt-stack. A per-thread busy flag
+    detects nested gate-net traps (which under SA_ONSTACK arrive on the
+    alt-stack, not the scratch stack) and runs them in place without
+    re-switching; the gate-net also records the blocked syscall so a re-issue
+    can't trap twice. Validated by `_stackswtest`. 78/78.
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
