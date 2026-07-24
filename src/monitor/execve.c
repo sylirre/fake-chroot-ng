@@ -90,6 +90,9 @@ void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
                         char **argv, char **envp) {
     unsigned long long *r = uc->uc_mcontext.regs;
 
+    if (cng_g_debug)
+        cng_dprintf(2, "[cng] execve enter path=%s\n", path ? path : "(null)");
+
     if (!path) {
         r[0] = (unsigned long long)(long)-EFAULT;
         return;

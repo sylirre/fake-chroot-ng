@@ -391,7 +391,11 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * child's execve closes the O_CLOEXEC notify pipe, signalling success). */
     case __NR_clone: {
         long flags = a0 & ~(long)(CNG_CLONE_VM | CNG_CLONE_VFORK);
-        return cng_syscall6(flags, a1, a2, a3, a4, a5, __NR_clone);
+        long r = cng_syscall6(flags, a1, a2, a3, a4, a5, __NR_clone);
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] clone vfork->fork a0=%lx stk=%lx ret=%ld\n",
+                        a0, a1, r);
+        return r;
     }
 
     /* rename: two translated paths. If the destination is one of our
