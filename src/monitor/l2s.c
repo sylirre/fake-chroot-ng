@@ -17,6 +17,13 @@ int cng_g_l2s_force = 0;
 #define L2S_PREFIX     ".l2s."
 #define L2S_PREFIX_LEN 5
 
+/* Failure-path diagnostics (CNG_DEBUG=1). */
+#define L2S_LOG(...)                                                          \
+    do {                                                                      \
+        if (cng_g_debug)                                                      \
+            cng_dprintf(2, __VA_ARGS__);                                      \
+    } while (0)
+
 /* aarch64 struct stat field offsets (see dispatch.c). */
 #define ST_INO_OFF   8
 #define ST_MODE_OFF  16
@@ -437,8 +444,10 @@ int cng_l2s_link(const char *src, const char *dst) {
     l2s_dirname(dst, ddir, sizeof ddir);
 
     int isl = cng_l2s_resolve(src, data, sizeof data, &count);
-    if (isl < 0)
+    if (isl < 0) {
+        L2S_LOG("[cng] l2s: src probe %s -> %d\n", src, isl);
         return isl;
+    }
     /* AT_SYMLINK_FOLLOW may have resolved src straight onto the data file. */
     if (isl == 0 && l2s_lstat(src, st) == 0 && is_reg(st) &&
         parse_data(l2s_basename(src), &ino)) {
@@ -474,6 +483,7 @@ int cng_l2s_link(const char *src, const char *dst) {
                       ? l2s_symlink(l2s_basename(data), dst)
                       : l2s_symlink(data, dst);
         if (sr < 0) { /* roll the bump back */
+            L2S_LOG("[cng] l2s: group dst symlink %s -> %d\n", dst, (int)sr);
             if (bumped)
                 l2s_rename(newm, oldm);
             else
@@ -486,8 +496,10 @@ int cng_l2s_link(const char *src, const char *dst) {
     }
 
     /* First link for a real file. */
-    if (l2s_lstat(src, st) < 0)
+    if (l2s_lstat(src, st) < 0) {
+        L2S_LOG("[cng] l2s: src %s missing\n", src);
         return -ENOENT;
+    }
     if (!is_reg(st)) /* e.g. /proc/self/fd/N O_TMPFILE: copy contents */
         return l2s_materialize(src, dst);
     ino = *(unsigned long long *)((char *)st + ST_INO_OFF);
@@ -498,14 +510,20 @@ int cng_l2s_link(const char *src, const char *dst) {
      * against reuse for the group's lifetime. */
     char store[CNG_PATH_MAX];
     long mv = -1;
-    if (l2s_store_dir(store, sizeof store) == 0) {
+    int sdr = l2s_store_dir(store, sizeof store);
+    if (sdr == 0) {
         if (build_name(data, sizeof data, store, ino, -1) < 0)
             return -ENAMETOOLONG;
         mv = l2s_rename(src, data);
     }
+    if (mv != 0)
+        L2S_LOG("[cng] l2s: store unavailable (dir=%d mv=%d), per-dir "
+                "fallback\n",
+                sdr, (int)mv);
     if (mv == 0) {
         long sr = l2s_symlink(data, src);
         if (sr < 0) {
+            L2S_LOG("[cng] l2s: src symlink %s -> %d\n", src, (int)sr);
             l2s_rename(data, src); /* rollback */
             return (int)sr;
         }
@@ -515,6 +533,7 @@ int cng_l2s_link(const char *src, const char *dst) {
             l2s_touch(newm);
         sr = l2s_symlink(data, dst);
         if (sr < 0) { /* full rollback */
+            L2S_LOG("[cng] l2s: dst symlink %s -> %d\n", dst, (int)sr);
             if (have_m)
                 l2s_unlink(newm);
             l2s_unlink(src);
@@ -532,10 +551,13 @@ int cng_l2s_link(const char *src, const char *dst) {
         return l2s_materialize(src, dst);
     if (build_name(data, sizeof data, sdir, ino, -1) < 0)
         return -ENAMETOOLONG;
-    if ((mv = l2s_rename(src, data)) < 0)
+    if ((mv = l2s_rename(src, data)) < 0) {
+        L2S_LOG("[cng] l2s: per-dir rename %s -> %d\n", src, (int)mv);
         return (int)mv;
+    }
     long sr = l2s_symlink(l2s_basename(data), src);
     if (sr < 0) {
+        L2S_LOG("[cng] l2s: per-dir src symlink %s -> %d\n", src, (int)sr);
         l2s_rename(data, src); /* rollback */
         return (int)sr;
     }

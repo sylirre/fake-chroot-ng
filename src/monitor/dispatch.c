@@ -693,18 +693,28 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * follow a guest symlink's target itself); the host call then runs
          * with no flags. Link-by-fd (AT_EMPTY_PATH, the O_TMPFILE publish
          * idiom) goes through /proc/self/fd, which the host must follow. */
-        if (empty)
+        if (empty) {
             proc_fd_path(a0, srch);
-        else if (resolve_at_host(a0, sp, follow, srch, sizeof srch) != 0)
+        } else if (resolve_at_host(a0, sp, follow, srch, sizeof srch) != 0) {
+            if (cng_g_debug)
+                cng_dprintf(2, "[cng] linkat: src unresolved (%s)\n",
+                            sp ? sp : "(null)");
             return -ENOENT;
-        if (resolve_at_host(a2, (const char *)a3, 0, dsth, sizeof dsth) != 0)
+        }
+        if (resolve_at_host(a2, (const char *)a3, 0, dsth, sizeof dsth) != 0) {
+            if (cng_g_debug)
+                cng_dprintf(2, "[cng] linkat: dst unresolved (%s)\n",
+                            a3 ? (const char *)a3 : "(null)");
             return -ENOENT;
+        }
         long r;
         if (cng_g_l2s && cng_g_l2s_force)
             r = -EPERM; /* CNG_L2S_FORCE: exercise the fallback directly */
         else
             r = reissue(CNG_AT_FDCWD, (long)srch, CNG_AT_FDCWD, (long)dsth,
                         empty ? CNG_AT_SYMLINK_FOLLOW : 0, 0, __NR_linkat);
+        if (cng_g_debug && r != 0)
+            cng_dprintf(2, "[cng] linkat %s -> %s real=%ld\n", srch, dsth, r);
         if (cng_g_l2s &&
             (r == -EPERM || r == -EMLINK || r == -EXDEV || r == -ENOSYS ||
              r == -EACCES || r == -EOPNOTSUPP)) {
