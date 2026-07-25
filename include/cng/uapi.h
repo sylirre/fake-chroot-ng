@@ -26,7 +26,13 @@
 #define CNG_O_APPEND    02000
 #define CNG_O_NONBLOCK  04000
 #define CNG_O_DIRECTORY 040000
+#define CNG_O_NOFOLLOW  0100000
 #define CNG_O_CLOEXEC   02000000
+#define CNG_O_TMPFILE   (020000000 | CNG_O_DIRECTORY)
+
+/* renameat2 flags */
+#define CNG_RENAME_NOREPLACE 1
+#define CNG_RENAME_EXCHANGE  2
 
 /* mmap prot */
 #define CNG_PROT_NONE   0x0
@@ -80,6 +86,7 @@
 /* statx mask bits we care about */
 #define CNG_STATX_TYPE  0x00000001U
 #define CNG_STATX_MODE  0x00000002U
+#define CNG_STATX_NLINK 0x00000004U
 #define CNG_STATX_BASIC_STATS 0x000007ffU
 
 #endif /* CNG_UAPI_H */

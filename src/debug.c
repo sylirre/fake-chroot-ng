@@ -21,6 +21,9 @@
 #define ST_NLINK(b) (*(unsigned *)((char *)(b) + 20))
 #define ST_MTIME(b) (*(long long *)((char *)(b) + 88))
 #define ST_ISREG(b) ((ST_MODE(b) & 0170000) == 0100000)
+/* struct statx accessors. */
+#define STX_MASK(b)  (*(unsigned *)(char *)(b))
+#define STX_NLINK(b) (*(unsigned *)((char *)(b) + 16))
 
 int cng_cmd_xlate(int argc, char **argv, char **envp, unsigned long *auxv) {
     (void)envp;
@@ -448,6 +451,57 @@ int cng_cmd_exectest(int argc, char **argv, char **envp, unsigned long *auxv) {
     cng_enter(sp, entry); /* never returns */
 }
 
+/* Host-path builder for the l2s store checks: "<a><b>" plus, when with_ino,
+ * the decimal of `ino` appended. */
+static void dbg_mkpath(char *out, size_t sz, const char *a, const char *b,
+                       unsigned long long ino, int with_ino) {
+    size_t n = cng_strlcpy(out, a, sz);
+    if (b && n < sz)
+        n += cng_strlcpy(out + n, b, sz - n);
+    if (with_ino) {
+        char tmp[24];
+        int t = 0;
+        do {
+            tmp[t++] = (char)('0' + (ino % 10));
+            ino /= 10;
+        } while (ino);
+        while (t > 0 && n + 1 < sz)
+            out[n++] = tmp[--t];
+        if (n < sz)
+            out[n] = '\0';
+    }
+}
+
+/* 1 if the host directory contains any ".l2s.*" entry, 0 if none, -1 on open
+ * failure. Raw getdents64 walk (linux_dirent64: reclen @16, name @19). */
+static int dbg_has_l2s(const char *dir) {
+    long fd = sys_openat(CNG_AT_FDCWD, dir,
+                         CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
+    if (fd < 0)
+        return -1;
+    char buf[4096];
+    int found = 0;
+    long n;
+    while (!found &&
+           (n = CNG_SYS(__NR_getdents64, (int)fd, buf, sizeof buf, 0, 0, 0)) >
+               0) {
+        long o = 0;
+        while (o + 19 <= n) {
+            unsigned short rl;
+            memcpy(&rl, buf + o + 16, 2);
+            if (rl == 0 || o + rl > n)
+                break;
+            if (!strncmp(buf + o + 19, ".l2s.", 5)) {
+                found = 1;
+                break;
+            }
+            o += rl;
+        }
+    }
+    sys_close((int)fd);
+    return found;
+}
+
 /* _l2stest ROOT — exercise link2symlink (target must be a guest/relative path,
  * not a host path) and fchdir cwd tracking. ROOT must contain a dir "w". The
  * emulation is opt-in on the command line, so the test drives cng_g_l2s itself:
@@ -479,7 +533,7 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
     char sz[144];
     long rz = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/z",
                            (long)sz, 0, 0, 0, 0);
-    int ok_off = (loff == -ENOSYS && rz == -ENOENT && !cng_l2s_active);
+    int ok_off = (loff == -ENOSYS && rz == -ENOENT);
     cng_dprintf(1, "l2s-off: rc=%d created=%d -> %s\n", (int)loff, rz == 0,
                 ok_off ? "OK" : "FAIL");
     fails += !ok_off;
@@ -523,6 +577,73 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
                 (int)lr, lr2 == -EEXIST, reg, nlink, sameino, noleak, content,
                 ok_l2s ? "OK" : "FAIL");
     fails += !ok_l2s;
+
+    /* Central store: the backing pair lives in "<root>/.l2s" (data keeping the
+     * original inode, marker at count 2), and nothing appears beside the
+     * names in /w. */
+    char hdata[CNG_PATH_MAX], hmark[CNG_PATH_MAX], hw[CNG_PATH_MAX];
+    dbg_mkpath(hdata, sizeof hdata, rootfs, "/.l2s/.l2s.", ST_INO(sa), 1);
+    dbg_mkpath(hmark, sizeof hmark, rootfs, "/.l2s/.l2s.", ST_INO(sa), 1);
+    size_t hml = strlen(hmark);
+    cng_strlcpy(hmark + hml, ".0002", sizeof hmark - hml);
+    dbg_mkpath(hw, sizeof hw, rootfs, "/w", 0, 0);
+    char sd[144];
+    long rsd = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, hdata, sd,
+                       CNG_AT_SYMLINK_NOFOLLOW, 0, 0);
+    long rsm = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, hmark, sd,
+                       CNG_AT_SYMLINK_NOFOLLOW, 0, 0);
+    int store_ok = (rsd == 0 && rsm == 0);
+    int user_clean = (dbg_has_l2s(hw) == 0);
+    int ok_store = (store_ok && user_clean);
+    cng_dprintf(1, "l2s-store: store=%d user_clean=%d -> %s\n", store_ok,
+                user_clean, ok_store ? "OK" : "FAIL");
+    fails += !ok_store;
+
+    /* fd-based stat: fstat and the AT_EMPTY_PATH forms must report the
+     * emulated st_nlink too (tar/rsync/coreutils stat open fds), and statx
+     * must pass the guest's mask through while advertising STATX_NLINK. */
+    int f_nlink = 0, ep_nlink = 0, epx = 0, xmask = 0;
+    long bf2 = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/b",
+                            CNG_O_RDONLY, 0, 0, 0, 0);
+    if (bf2 >= 0) {
+        char sfd[144];
+        long r1 = cng_dispatch(__NR_fstat, bf2, (long)sfd, 0, 0, 0, 0, 0);
+        f_nlink = (r1 == 0 && ST_NLINK(sfd) == 2);
+        long r2 = cng_dispatch(__NR_newfstatat, bf2, (long)"", (long)sfd,
+                               CNG_AT_EMPTY_PATH, 0, 0, 0);
+        ep_nlink = (r2 == 0 && ST_NLINK(sfd) == 2);
+        char sxb[256];
+        long r3 = cng_dispatch(__NR_statx, bf2, (long)"", CNG_AT_EMPTY_PATH,
+                               CNG_STATX_BASIC_STATS, (long)sxb, 0, 0);
+        epx = (r3 == 0 && STX_NLINK(sxb) == 2 &&
+               (STX_MASK(sxb) & CNG_STATX_NLINK));
+        sys_close((int)bf2);
+    }
+    char sxp[256];
+    long rxp = cng_dispatch(__NR_statx, CNG_AT_FDCWD, (long)"/w/b", 0,
+                            CNG_STATX_NLINK, (long)sxp, 0, 0);
+    xmask = (rxp == 0 && STX_NLINK(sxp) == 2 &&
+             (STX_MASK(sxp) & CNG_STATX_NLINK));
+    int ok_fd = (f_nlink && ep_nlink && epx && xmask);
+    cng_dprintf(1, "l2s-fstat: fd=%d empty=%d emptyx=%d mask=%d -> %s\n",
+                f_nlink, ep_nlink, epx, xmask, ok_fd ? "OK" : "FAIL");
+    fails += !ok_fd;
+
+    /* readlink through a real dirfd must also refuse (the emulated link is a
+     * regular file to the guest, wherever the name comes from). */
+    int rlrel = 0;
+    long wfd0 = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w",
+                             CNG_O_RDONLY, 0, 0, 0, 0);
+    if (wfd0 >= 0) {
+        char rb[64];
+        long rr = cng_dispatch(__NR_readlinkat, wfd0, (long)"b", (long)rb,
+                               sizeof rb, 0, 0, 0);
+        rlrel = (rr == -EINVAL);
+        sys_close((int)wfd0);
+    }
+    cng_dprintf(1, "l2s-dirfd-readlink: einval=%d -> %s\n", rlrel,
+                rlrel ? "OK" : "FAIL");
+    fails += !rlrel;
 
     /* mtime preserve (apk's scenario): set an explicit mtime on one name, read
      * it back through the other — must land on the shared backing file. */
@@ -578,6 +699,421 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
     cng_dprintf(1, "l2s-decref: nlink_after1=%d gone=%d -> %s\n", after1, gone,
                 ok_dec ? "OK" : "FAIL");
     fails += !ok_dec;
+
+    /* Cross-directory hardlink via the central store: shared inode and count,
+     * content reachable both through the guest resolver (absolute path walks
+     * the store target) and through the host kernel (dirfd-relative open
+     * follows the absolute target natively). */
+    long ff = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/f",
+                           CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (ff >= 0) {
+        sys_write((int)ff, "yo", 2);
+        sys_close((int)ff);
+    }
+    cng_dispatch(__NR_mkdirat, CNG_AT_FDCWD, (long)"/w/sub", 0755, 0, 0, 0, 0);
+    long xg = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/f",
+                           CNG_AT_FDCWD, (long)"/w/g", 0, 0, 0);
+    long xr = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/f",
+                           CNG_AT_FDCWD, (long)"/w/sub/x", 0, 0, 0);
+    char sf[144], sx[144];
+    long rf = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/f",
+                           (long)sf, 0, 0, 0, 0);
+    long rx = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/sub/x",
+                           (long)sx, 0, 0, 0, 0);
+    int x_ino = (rf == 0 && rx == 0 && ST_INO(sf) == ST_INO(sx));
+    int x_nlink = (rf == 0 && rx == 0 && ST_NLINK(sf) == 3 &&
+                   ST_NLINK(sx) == 3);
+    char xb[8];
+    long xrd = -1;
+    long xf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/sub/x",
+                           CNG_O_RDONLY, 0, 0, 0, 0);
+    if (xf >= 0) {
+        xrd = sys_read((int)xf, xb, sizeof xb);
+        sys_close((int)xf);
+    }
+    int x_abs = (xrd == 2 && xb[0] == 'y' && xb[1] == 'o');
+    long wfd2 = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w",
+                             CNG_O_RDONLY, 0, 0, 0, 0);
+    int x_rel = 0;
+    if (wfd2 >= 0) {
+        long xf2 = cng_dispatch(__NR_openat, wfd2, (long)"sub/x", CNG_O_RDONLY,
+                                0, 0, 0, 0);
+        if (xf2 >= 0) {
+            xrd = sys_read((int)xf2, xb, sizeof xb);
+            x_rel = (xrd == 2 && xb[0] == 'y' && xb[1] == 'o');
+            sys_close((int)xf2);
+        }
+        sys_close((int)wfd2);
+    }
+    int ok_xdir = (xg == 0 && xr == 0 && x_ino && x_nlink && x_abs && x_rel);
+    cng_dprintf(1, "l2s-xdir: rc=%d ino=%d nlink3=%d abs=%d rel=%d -> %s\n",
+                (int)xr, x_ino, x_nlink, x_abs, x_rel, ok_xdir ? "OK" : "FAIL");
+    fails += !ok_xdir;
+
+    /* Directory hiding: the ".l2s" store entry never shows in the root
+     * listing (while real entries do). */
+    int root_clean = 1, have_w = 0;
+    long rfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/",
+                            CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+    if (rfd >= 0) {
+        char db[4096];
+        long dn;
+        while ((dn = cng_dispatch(__NR_getdents64, rfd, (long)db, sizeof db, 0,
+                                  0, 0, 0)) > 0) {
+            long o = 0;
+            while (o + 19 <= dn) {
+                unsigned short rl;
+                memcpy(&rl, db + o + 16, 2);
+                if (rl == 0 || o + rl > dn)
+                    break;
+                const char *nm = db + o + 19;
+                if (!strncmp(nm, ".l2s", 4))
+                    root_clean = 0;
+                if (!strcmp(nm, "w"))
+                    have_w = 1;
+                o += rl;
+            }
+        }
+        sys_close((int)rfd);
+    }
+    int ok_hide = (root_clean && have_w);
+    cng_dprintf(1, "l2s-hide: root_clean=%d have_w=%d -> %s\n", root_clean,
+                have_w, ok_hide ? "OK" : "FAIL");
+    fails += !ok_hide;
+
+    /* Handcraft a dir holding only legacy hidden files (raw host syscalls
+     * bypass the guard), then list it through the dispatcher with a buffer so
+     * small each batch holds one record: every batch filters away and the
+     * listing must still terminate (the re-read loop, not a fake EOF). */
+    char hh[CNG_PATH_MAX], hf1[CNG_PATH_MAX], hf2[CNG_PATH_MAX];
+    dbg_mkpath(hh, sizeof hh, rootfs, "/w/h", 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, hh, 0755, 0, 0, 0);
+    dbg_mkpath(hf1, sizeof hf1, rootfs, "/w/h/.l2s.7", 0, 0);
+    dbg_mkpath(hf2, sizeof hf2, rootfs, "/w/h/.l2s.7.0002", 0, 0);
+    long tf = sys_openat(CNG_AT_FDCWD, hf1, CNG_O_CREAT | CNG_O_WRONLY, 0600);
+    if (tf >= 0)
+        sys_close((int)tf);
+    tf = sys_openat(CNG_AT_FDCWD, hf2, CNG_O_CREAT | CNG_O_WRONLY, 0600);
+    if (tf >= 0)
+        sys_close((int)tf);
+    int hb_clean = 1, hb_eof = 0;
+    long hfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/h",
+                            CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+    if (hfd >= 0) {
+        char sb[48];
+        for (int it = 0; it < 64; it++) {
+            long dn = cng_dispatch(__NR_getdents64, hfd, (long)sb, sizeof sb,
+                                   0, 0, 0, 0);
+            if (dn == 0) {
+                hb_eof = 1;
+                break;
+            }
+            if (dn < 0)
+                break;
+            long o = 0;
+            while (o + 19 <= dn) {
+                unsigned short rl;
+                memcpy(&rl, sb + o + 16, 2);
+                if (rl == 0 || o + rl > dn)
+                    break;
+                const char *nm = sb + o + 19;
+                if (strcmp(nm, ".") && strcmp(nm, ".."))
+                    hb_clean = 0;
+                o += rl;
+            }
+        }
+        sys_close((int)hfd);
+    }
+    int ok_hb = (hb_clean && hb_eof);
+    cng_dprintf(1, "l2s-hide-batch: clean=%d eof=%d -> %s\n", hb_clean, hb_eof,
+                ok_hb ? "OK" : "FAIL");
+    fails += !ok_hb;
+
+    /* The machinery must appear nonexistent by name: creating a grammar-
+     * matching file, statting the real data file, opening or chdir'ing into
+     * the store — all ENOENT. */
+    long dcr = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/.l2s.999",
+                            CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    char gd[CNG_PATH_MAX];
+    dbg_mkpath(gd, sizeof gd, "/.l2s/.l2s.", 0, ST_INO(sf), 1);
+    char sdn[144];
+    long dstt = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)gd,
+                             (long)sdn, 0, 0, 0, 0);
+    long dop = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/.l2s",
+                            CNG_O_RDONLY, 0, 0, 0, 0);
+    long dch = cng_dispatch(__NR_chdir, (long)"/.l2s", 0, 0, 0, 0, 0, 0);
+    int ok_deny = (dcr == -ENOENT && dstt == -ENOENT && dop == -ENOENT &&
+                   dch == -ENOENT);
+    cng_dprintf(1, "l2s-deny: create=%d data=%d store=%d chdir=%d -> %s\n",
+                dcr == -ENOENT, dstt == -ENOENT, dop == -ENOENT,
+                dch == -ENOENT, ok_deny ? "OK" : "FAIL");
+    fails += !ok_deny;
+
+    /* NOFOLLOW chown must land on the backing file: give the file setuid via
+     * chmod (follows to the data), then chown with NOFOLLOW — the kernel
+     * clears setuid on whichever inode it really chowned. */
+    cng_dispatch(__NR_fchmodat, CNG_AT_FDCWD, (long)"/w/g", 04755, 0, 0, 0, 0);
+    long cr = cng_dispatch(__NR_fchownat, CNG_AT_FDCWD, (long)"/w/g",
+                           (long)sys_getuid(), (long)sys_getgid(),
+                           CNG_AT_SYMLINK_NOFOLLOW, 0, 0);
+    char sg[144];
+    long rg = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/g",
+                           (long)sg, 0, 0, 0, 0);
+    int suid_cleared = (cr == 0 && rg == 0 && !(ST_MODE(sg) & 04000));
+    cng_dprintf(1, "l2s-chown: suid_cleared=%d -> %s\n", suid_cleared,
+                suid_cleared ? "OK" : "FAIL");
+    fails += !suid_cleared;
+
+    /* renameat2 flags: NOREPLACE refuses to clobber a link name (no decref);
+     * EXCHANGE swaps the names without touching the count. */
+    long pf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/p",
+                           CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (pf >= 0) {
+        sys_write((int)pf, "pp", 2);
+        sys_close((int)pf);
+    }
+    long nrr = cng_dispatch(__NR_renameat2, CNG_AT_FDCWD, (long)"/w/p",
+                            CNG_AT_FDCWD, (long)"/w/g", CNG_RENAME_NOREPLACE,
+                            0, 0);
+    char snr[144];
+    long rnr = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/f",
+                            (long)snr, 0, 0, 0, 0);
+    int nr_ok = (nrr == -EEXIST && rnr == 0 && ST_NLINK(snr) == 3);
+    cng_dprintf(1, "l2s-noreplace: eexist=%d nlink=%d -> %s\n", nrr == -EEXIST,
+                rnr == 0 && ST_NLINK(snr) == 3, nr_ok ? "OK" : "FAIL");
+    fails += !nr_ok;
+
+    long exr = cng_dispatch(__NR_renameat2, CNG_AT_FDCWD, (long)"/w/p",
+                            CNG_AT_FDCWD, (long)"/w/g", CNG_RENAME_EXCHANGE, 0,
+                            0);
+    char sp1[144], sf3[144];
+    long rp1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/p",
+                            (long)sp1, 0, 0, 0, 0);
+    long rf3 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/f",
+                            (long)sf3, 0, 0, 0, 0);
+    int swapped = (rp1 == 0 && rf3 == 0 && ST_INO(sp1) == ST_INO(sf3));
+    int ex_nlink = (rf3 == 0 && ST_NLINK(sf3) == 3);
+    int ex_ok = (exr == 0 && swapped && ex_nlink);
+    cng_dprintf(1, "l2s-exchange: rc=%d swapped=%d nlink3=%d -> %s\n",
+                (int)exr, swapped, ex_nlink, ex_ok ? "OK" : "FAIL");
+    fails += !ex_ok;
+
+    /* Legacy (bare-basename) group: mv one name to another directory — the
+     * dispatcher must repoint it at the unmoved data file. */
+    char ofdir[CNG_PATH_MAX], od[CNG_PATH_MAX], om[CNG_PATH_MAX],
+        ox[CNG_PATH_MAX], oy[CNG_PATH_MAX];
+    dbg_mkpath(ofdir, sizeof ofdir, rootfs, "/w/of", 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, ofdir, 0755, 0, 0, 0);
+    dbg_mkpath(od, sizeof od, rootfs, "/w/of/.l2s.11", 0, 0);
+    dbg_mkpath(om, sizeof om, rootfs, "/w/of/.l2s.11.0002", 0, 0);
+    dbg_mkpath(ox, sizeof ox, rootfs, "/w/of/x", 0, 0);
+    dbg_mkpath(oy, sizeof oy, rootfs, "/w/of/y", 0, 0);
+    long odf = sys_openat(CNG_AT_FDCWD, od, CNG_O_CREAT | CNG_O_WRONLY, 0644);
+    if (odf >= 0) {
+        sys_write((int)odf, "zz", 2);
+        sys_close((int)odf);
+    }
+    odf = sys_openat(CNG_AT_FDCWD, om, CNG_O_CREAT | CNG_O_WRONLY, 0600);
+    if (odf >= 0)
+        sys_close((int)odf);
+    CNG_SYS(__NR_symlinkat, ".l2s.11", CNG_AT_FDCWD, ox, 0, 0, 0);
+    CNG_SYS(__NR_symlinkat, ".l2s.11", CNG_AT_FDCWD, oy, 0, 0, 0);
+    long mvr = cng_dispatch(__NR_renameat, CNG_AT_FDCWD, (long)"/w/of/x",
+                            CNG_AT_FDCWD, (long)"/w/mvx", 0, 0, 0);
+    char smx[144];
+    long rmx = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/mvx",
+                            (long)smx, 0, 0, 0, 0);
+    int mv_reg = (mvr == 0 && rmx == 0 && ST_ISREG(smx));
+    int mv_nlink = (rmx == 0 && ST_NLINK(smx) == 2);
+    char mb[8];
+    long mrd = -1;
+    long mf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/mvx",
+                           CNG_O_RDONLY, 0, 0, 0, 0);
+    if (mf >= 0) {
+        mrd = sys_read((int)mf, mb, sizeof mb);
+        sys_close((int)mf);
+    }
+    int mv_content = (mrd == 2 && mb[0] == 'z' && mb[1] == 'z');
+    int ok_mv = (mv_reg && mv_nlink && mv_content);
+    cng_dprintf(1, "l2s-mvfix: reg=%d nlink2=%d content=%d -> %s\n", mv_reg,
+                mv_nlink, mv_content, ok_mv ? "OK" : "FAIL");
+    fails += !ok_mv;
+
+    /* O_TMPFILE + linkat(fd, "", ..., AT_EMPTY_PATH): the anonymous file is
+     * published (by content copy — nothing to symlink to). */
+    long tmf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w",
+                            CNG_O_TMPFILE | CNG_O_RDWR, 0644, 0, 0, 0);
+    long tlr = -1;
+    int t_reg = 0, t_content = 0;
+    if (tmf >= 0) {
+        sys_write((int)tmf, "tt", 2);
+        tlr = cng_dispatch(__NR_linkat, tmf, (long)"", CNG_AT_FDCWD,
+                           (long)"/w/t", CNG_AT_EMPTY_PATH, 0, 0);
+        sys_close((int)tmf);
+        char stt[144];
+        long rt = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/t",
+                               (long)stt, 0, 0, 0, 0);
+        t_reg = (rt == 0 && ST_ISREG(stt));
+        char tb[8];
+        long trd = -1;
+        long tf2 = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/t",
+                                CNG_O_RDONLY, 0, 0, 0, 0);
+        if (tf2 >= 0) {
+            trd = sys_read((int)tf2, tb, sizeof tb);
+            sys_close((int)tf2);
+        }
+        t_content = (trd == 2 && tb[0] == 't' && tb[1] == 't');
+    }
+    int ok_tmp = (tlr == 0 && t_reg && t_content);
+    cng_dprintf(1, "l2s-tmpfile: rc=%d reg=%d content=%d -> %s\n", (int)tlr,
+                t_reg, t_content, ok_tmp ? "OK" : "FAIL");
+    fails += !ok_tmp;
+
+    /* linkat by fd on a live group member bumps that group. */
+    long lff = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/f",
+                            CNG_O_RDONLY, 0, 0, 0, 0);
+    long flr = -1;
+    int fd_nl = 0;
+    if (lff >= 0) {
+        flr = cng_dispatch(__NR_linkat, lff, (long)"", CNG_AT_FDCWD,
+                           (long)"/w/j", CNG_AT_EMPTY_PATH, 0, 0);
+        sys_close((int)lff);
+        char sj[144];
+        long rj = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/j",
+                               (long)sj, 0, 0, 0, 0);
+        fd_nl = (rj == 0 && ST_NLINK(sj) == 4 && ST_INO(sj) == ST_INO(sf));
+    }
+    int ok_fdl = (flr == 0 && fd_nl);
+    cng_dprintf(1, "l2s-fdlink: rc=%d nlink4=%d -> %s\n", (int)flr, fd_nl,
+                ok_fdl ? "OK" : "FAIL");
+    fails += !ok_fdl;
+
+    /* O_NOFOLLOW: opening a link name through a dirfd succeeds on the backing
+     * file, while a real guest symlink still draws ELOOP. */
+    int nf_open = 0, nf_content = 0, nf_sym = 0;
+    long wfd3 = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w",
+                             CNG_O_RDONLY, 0, 0, 0, 0);
+    if (wfd3 >= 0) {
+        long nff = cng_dispatch(__NR_openat, wfd3, (long)"f",
+                                CNG_O_RDONLY | CNG_O_NOFOLLOW, 0, 0, 0, 0);
+        if (nff >= 0) {
+            nf_open = 1;
+            char nb[8];
+            long nrd = sys_read((int)nff, nb, sizeof nb);
+            nf_content = (nrd == 2 && nb[0] == 'y' && nb[1] == 'o');
+            sys_close((int)nff);
+        }
+        cng_dispatch(__NR_symlinkat, (long)"f", wfd3, (long)"sym", 0, 0, 0, 0);
+        long nfs = cng_dispatch(__NR_openat, wfd3, (long)"sym",
+                                CNG_O_RDONLY | CNG_O_NOFOLLOW, 0, 0, 0, 0);
+        nf_sym = (nfs == -ELOOP);
+        if (nfs >= 0)
+            sys_close((int)nfs);
+        sys_close((int)wfd3);
+    }
+    int ok_nf = (nf_open && nf_content && nf_sym);
+    cng_dprintf(1, "l2s-nofollow: open=%d content=%d sym_eloop=%d -> %s\n",
+                nf_open, nf_content, nf_sym, ok_nf ? "OK" : "FAIL");
+    fails += !ok_nf;
+
+    /* Legacy per-dir format end to end (what arm64chroot writes, and what a
+     * pre-store chroot-ng left behind): stat, same-dir bump keeping the
+     * legacy look, cross-dir join via absolute target, decref, readlink. */
+    char ogdir[CNG_PATH_MAX], od2[CNG_PATH_MAX], om2[CNG_PATH_MAX],
+        ou[CNG_PATH_MAX], ov[CNG_PATH_MAX], om3[CNG_PATH_MAX];
+    dbg_mkpath(ogdir, sizeof ogdir, rootfs, "/w/og", 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, ogdir, 0755, 0, 0, 0);
+    dbg_mkpath(od2, sizeof od2, rootfs, "/w/og/.l2s.13", 0, 0);
+    dbg_mkpath(om2, sizeof om2, rootfs, "/w/og/.l2s.13.0002", 0, 0);
+    dbg_mkpath(om3, sizeof om3, rootfs, "/w/og/.l2s.13.0003", 0, 0);
+    dbg_mkpath(ou, sizeof ou, rootfs, "/w/og/u", 0, 0);
+    dbg_mkpath(ov, sizeof ov, rootfs, "/w/og/v", 0, 0);
+    odf = sys_openat(CNG_AT_FDCWD, od2, CNG_O_CREAT | CNG_O_WRONLY, 0644);
+    if (odf >= 0) {
+        sys_write((int)odf, "qq", 2);
+        sys_close((int)odf);
+    }
+    odf = sys_openat(CNG_AT_FDCWD, om2, CNG_O_CREAT | CNG_O_WRONLY, 0600);
+    if (odf >= 0)
+        sys_close((int)odf);
+    CNG_SYS(__NR_symlinkat, ".l2s.13", CNG_AT_FDCWD, ou, 0, 0, 0);
+    CNG_SYS(__NR_symlinkat, ".l2s.13", CNG_AT_FDCWD, ov, 0, 0, 0);
+    char sdn2[144], su[144];
+    long rdn2 = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, od2, sdn2,
+                        CNG_AT_SYMLINK_NOFOLLOW, 0, 0);
+    long ru = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/og/u",
+                           (long)su, 0, 0, 0, 0);
+    int old_reg = (ru == 0 && ST_ISREG(su) && ST_NLINK(su) == 2);
+    int old_same = (rdn2 == 0 && ru == 0 && ST_INO(su) == ST_INO(sdn2));
+    long ol1 = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/og/u",
+                            CNG_AT_FDCWD, (long)"/w/og/z", 0, 0, 0);
+    char smk[144];
+    long rm3 = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, om3, smk,
+                       CNG_AT_SYMLINK_NOFOLLOW, 0, 0);
+    ru = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/og/z",
+                      (long)su, 0, 0, 0, 0);
+    int old_bump = (ol1 == 0 && rm3 == 0 && ru == 0 && ST_NLINK(su) == 3);
+    long ol2 = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/og/u",
+                            CNG_AT_FDCWD, (long)"/w/z2", 0, 0, 0);
+    ru = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/z2", (long)su,
+                      0, 0, 0, 0);
+    int old_xdir = (ol2 == 0 && ru == 0 && ST_NLINK(su) == 4 &&
+                    rdn2 == 0 && ST_INO(su) == ST_INO(sdn2));
+    cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/z2", 0, 0, 0, 0, 0);
+    cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/og/z", 0, 0, 0, 0, 0);
+    ru = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/og/u",
+                      (long)su, 0, 0, 0, 0);
+    int old_back = (ru == 0 && ST_NLINK(su) == 2);
+    char orb[64];
+    long orl = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD, (long)"/w/og/u",
+                            (long)orb, sizeof orb, 0, 0, 0);
+    int old_einval = (orl == -EINVAL);
+    int ok_old = (old_reg && old_same && old_bump && old_xdir && old_back &&
+                  old_einval);
+    cng_dprintf(1,
+                "l2s-old: reg=%d same=%d bump3=%d xdir4=%d back2=%d "
+                "einval=%d -> %s\n",
+                old_reg, old_same, old_bump, old_xdir, old_back, old_einval,
+                ok_old ? "OK" : "FAIL");
+    fails += !ok_old;
+
+    /* Store unusable (a plain file squats on "<root>/.l2s"): first links fall
+     * back to the per-dir scheme beside the source. Exercised under a second
+     * rootfs so the real store stays live. */
+    char fbroot[CNG_PATH_MAX], fbsq[CNG_PATH_MAX], fbw[CNG_PATH_MAX];
+    dbg_mkpath(fbroot, sizeof fbroot, rootfs, "/fb", 0, 0);
+    dbg_mkpath(fbsq, sizeof fbsq, rootfs, "/fb/.l2s", 0, 0);
+    dbg_mkpath(fbw, sizeof fbw, rootfs, "/fb/w", 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, fbroot, 0755, 0, 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, fbw, 0755, 0, 0, 0);
+    odf = sys_openat(CNG_AT_FDCWD, fbsq, CNG_O_CREAT | CNG_O_WRONLY, 0644);
+    if (odf >= 0)
+        sys_close((int)odf);
+    static struct cng_fs fs2;
+    cng_fs_init(&fs2, fbroot);
+    cng_g_fs = &fs2;
+    long fbf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/a",
+                            CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (fbf >= 0) {
+        sys_write((int)fbf, "ff", 2);
+        sys_close((int)fbf);
+    }
+    long fbl = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/a",
+                            CNG_AT_FDCWD, (long)"/w/b", 0, 0, 0);
+    char sfa[144], sfb[144];
+    long rfa = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/a",
+                            (long)sfa, 0, 0, 0, 0);
+    long rfb = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/b",
+                            (long)sfb, 0, 0, 0, 0);
+    int fb_reg = (fbl == 0 && rfa == 0 && rfb == 0 && ST_ISREG(sfa) &&
+                  ST_NLINK(sfa) == 2 && ST_NLINK(sfb) == 2);
+    int fb_same = (rfa == 0 && rfb == 0 && ST_INO(sfa) == ST_INO(sfb));
+    int fb_beside = (dbg_has_l2s(fbw) == 1);
+    cng_g_fs = &fs;
+    int ok_fb = (fb_reg && fb_same && fb_beside);
+    cng_dprintf(1, "l2s-storefail: rc=%d reg=%d sameino=%d beside=%d -> %s\n",
+                (int)fbl, fb_reg, fb_same, fb_beside, ok_fb ? "OK" : "FAIL");
+    fails += !ok_fb;
 
     cng_blocked[__NR_linkat] = 0;
     cng_g_l2s = 0;

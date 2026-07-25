@@ -45,5 +45,37 @@ check_contains "l2s handles dirfd-relative links (apk's pattern)" \
     "l2s-dirfd: rc=0 reg2=1 -> OK" "$out"
 check_contains "l2s decref reclaims the backing on last unlink" \
     "l2s-decref: nlink_after1=1 gone=1 -> OK" "$out"
+check_contains "l2s backing pair lives in the central store, names stay clean" \
+    "l2s-store: store=1 user_clean=1 -> OK" "$out"
+check_contains "l2s fstat/AT_EMPTY_PATH/statx-mask report emulated nlink" \
+    "l2s-fstat: fd=1 empty=1 emptyx=1 mask=1 -> OK" "$out"
+check_contains "l2s readlink via dirfd refuses with EINVAL" \
+    "l2s-dirfd-readlink: einval=1 -> OK" "$out"
+check_contains "l2s cross-directory link shares inode/count via the store" \
+    "l2s-xdir: rc=0 ino=1 nlink3=1 abs=1 rel=1 -> OK" "$out"
+check_contains "l2s store dir hidden from root listing" \
+    "l2s-hide: root_clean=1 have_w=1 -> OK" "$out"
+check_contains "l2s fully-filtered getdents batch re-reads (no fake EOF)" \
+    "l2s-hide-batch: clean=1 eof=1 -> OK" "$out"
+check_contains "l2s machinery is unreachable by name (ENOENT)" \
+    "l2s-deny: create=1 data=1 store=1 chdir=1 -> OK" "$out"
+check_contains "l2s NOFOLLOW chown lands on the backing file" \
+    "l2s-chown: suid_cleared=1 -> OK" "$out"
+check_contains "l2s RENAME_NOREPLACE refuses without decref" \
+    "l2s-noreplace: eexist=1 nlink=1 -> OK" "$out"
+check_contains "l2s RENAME_EXCHANGE keeps both names and the count" \
+    "l2s-exchange: rc=0 swapped=1 nlink3=1 -> OK" "$out"
+check_contains "l2s legacy link mv'ed cross-dir is repointed" \
+    "l2s-mvfix: reg=1 nlink2=1 content=1 -> OK" "$out"
+check_contains "l2s O_TMPFILE publish via AT_EMPTY_PATH linkat" \
+    "l2s-tmpfile: rc=0 reg=1 content=1 -> OK" "$out"
+check_contains "l2s linkat-by-fd bumps the group" \
+    "l2s-fdlink: rc=0 nlink4=1 -> OK" "$out"
+check_contains "l2s O_NOFOLLOW opens the link, still ELOOPs real symlinks" \
+    "l2s-nofollow: open=1 content=1 sym_eloop=1 -> OK" "$out"
+check_contains "l2s legacy per-dir format fully interoperates" \
+    "l2s-old: reg=1 same=1 bump3=1 xdir4=1 back2=1 einval=1 -> OK" "$out"
+check_contains "l2s unusable store falls back to the per-dir scheme" \
+    "l2s-storefail: rc=0 reg=1 sameino=1 beside=1 -> OK" "$out"
 check_contains "fchdir updates virtual cwd" "fchdir: cwd=/w -> OK" "$out"
 rm -rf "$L2"

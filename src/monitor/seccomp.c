@@ -5,6 +5,7 @@
  * the SIGSYS handler re-issues translated syscalls without re-trapping); else
  * if the syscall is one of the path-bearing set -> TRAP (SIGSYS); else ALLOW.
  */
+#include "cng/l2s.h"
 #include "cng/monitor.h"
 #include "cng/rt.h"
 #include "cng/seccomp.h"
@@ -53,6 +54,15 @@ static const int id_syscalls[] = {
 };
 #define NID ((int)(sizeof(id_syscalls) / sizeof(id_syscalls[0])))
 
+/* File syscalls trapped only when -l/--link2symlink is active: fstat must
+ * report the emulated st_nlink, getdents64 must hide the backing files. Must
+ * match the l2s hooks in dispatch.c. */
+static const int l2s_syscalls[] = {
+    __NR_fstat,
+    __NR_getdents64,
+};
+#define NL2S ((int)(sizeof(l2s_syscalls) / sizeof(l2s_syscalls[0])))
+
 int cng_install_seccomp(void) {
     unsigned long gs = (unsigned long)__cng_gate_start;
     unsigned long ge = (unsigned long)__cng_gate_end;
@@ -60,17 +70,21 @@ int cng_install_seccomp(void) {
     uint32_t gate_lo = (uint32_t)gs;
     uint32_t gate_end_lo = (uint32_t)ge;
 
-    /* Build the trapped syscall list (path set, plus id set when faking). */
-    int nr[NPATH + NID];
+    /* Build the trapped syscall list (path set, plus id set when faking, plus
+     * the l2s set when hardlink emulation is on). */
+    int nr[NPATH + NID + NL2S];
     int nsys = 0;
     for (int i = 0; i < NPATH; i++)
         nr[nsys++] = path_syscalls[i];
     if (cng_g_fake_id)
         for (int i = 0; i < NID; i++)
             nr[nsys++] = id_syscalls[i];
+    if (cng_g_l2s)
+        for (int i = 0; i < NL2S; i++)
+            nr[nsys++] = l2s_syscalls[i];
 
     /* Prologue (0..8) + LD nr (9) + clone block (7) + nsys checks + 2 RETs. */
-    struct sock_filter f[20 + NPATH + NID];
+    struct sock_filter f[20 + NPATH + NID + NL2S];
     int n = 0;
 
     f[n++] = (struct sock_filter)CNG_BPF_STMT(

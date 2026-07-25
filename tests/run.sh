@@ -61,6 +61,7 @@ if [ -f tests/m6_execve.sh ]; then . tests/m6_execve.sh; fi
 if [ -f tests/m7_fidelity.sh ]; then . tests/m7_fidelity.sh; fi
 if [ -f tests/m8_rewrite.sh ]; then . tests/m8_rewrite.sh; fi
 if [ -f tests/m9_androidnet.sh ]; then . tests/m9_androidnet.sh; fi
+if [ -f tests/m10_l2s_shell.sh ]; then . tests/m10_l2s_shell.sh; fi
 
 echo
 echo "== summary: $pass passed, $fail failed =="

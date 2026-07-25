@@ -11,6 +11,7 @@
  * fresh stack and a kernel-chosen load base, so they don't collide. Repeated
  * execve leaks the old images (acceptable for now; noted in STATUS).
  */
+#include "cng/l2s.h"
 #include "cng/loader.h"
 #include "cng/monitor.h"
 #include "cng/path.h"
@@ -98,6 +99,11 @@ static long execve_core(int dirfd, const char *path, char **argv, char **envp,
 
     if (!path)
         return -EFAULT;
+    /* l2s machinery is invisible to the guest — not executable either. Both
+     * tiers (SIGSYS cng_emulate_execve, -R cng_execve_tramp) come through
+     * here, so this covers every exec path. */
+    if (cng_g_l2s && cng_l2s_deny(dirfd, path))
+        return -ENOENT;
 
     /* Resolve the target through the rootfs/bind map, following symlinks
      * (absolute or AT_FDCWD); a real dirfd with a relative path is a rare case

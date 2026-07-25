@@ -166,9 +166,76 @@ vfork/`posix_spawn` child-stack handling.
     guest's own directories, so it only runs where a guest actually needs it
     (apk/dpkg unpacking hardlinked packages). Without the flag `linkat` reports
     the host's refusal to the guest unchanged, and `l2stest` checks that too.
-  Limitation (tracked): backing files are not yet hidden from `getdents64`
-  (would require trapping it); they are dotfiles and unrecorded in apk's db, so
-  cosmetic only. Cross-directory hardlinks fall back to a content copy.
+  Limitations at M9 (both resolved by M9b below): backing files were not
+  hidden from `getdents64`, and cross-directory hardlinks fell back to a
+  content copy.
+
+- [x] **M9b — l2s central hidden store (full hardlink fidelity in a guest shell)**
+  Reworked the on-disk scheme: new link groups keep data + marker in a
+  per-rootfs object store `<rootfs>/.l2s/`, and every "hardlink" name is a
+  symlink carrying the data file's **absolute host path**. The host kernel
+  follows those natively (dirfd-relative passthrough stays zero-cost) and the
+  guest resolver maps them back via `cng_l2s_untranslate_target` (self-healing
+  the prefix if the rootfs tree was moved). Consequences: hardlinks work
+  **across directories**, survive `mv` of names or whole directories, and
+  `rm -rf`/`rmdir` behave like the real thing — user directories never hold
+  l2s droppings. The first-link `rename` into the store keeps the original
+  inode (stable `st_ino`, pinned against reuse); on `EXDEV` (bind mount from
+  another filesystem) or an unusable store it falls back to the M9
+  per-directory scheme. The legacy format (what arm64chroot writes) stays
+  fully recognized: stat/decref/bump work on old groups, cross-dir links join
+  them via absolute targets, and a legacy name mv'ed to another directory is
+  repointed afterwards (`cng_l2s_rename_prep`/`_fixup`).
+  - Fidelity fixups on top of M9 (each with an `-t l2stest` check asserted by
+    `tests/m7_fidelity.sh`): `fstat` / `newfstatat(AT_EMPTY_PATH)` /
+    `statx(AT_EMPTY_PATH)` patch `st_nlink` by fd; `statx` honors the guest's
+    mask/flags and advertises `STATX_NLINK`; `readlinkat` refuses (`EINVAL`)
+    through real dirfds too; `getdents64` hides data/marker entries everywhere
+    plus the `.l2s` store dir at the root, re-reading when a whole batch was
+    filtered (a fully-hidden batch must not read as EOF); paths naming the
+    machinery return `ENOENT` from every path syscall including execve
+    (`cng_l2s_deny`); `fchownat`/`faccessat2` with `AT_SYMLINK_NOFOLLOW` land
+    on the backing file; `RENAME_EXCHANGE` no longer decrefs the surviving
+    name; `linkat(fd, "", …, AT_EMPTY_PATH)` works (live file → group bump,
+    O_TMPFILE → materialize); `openat(O_NOFOLLOW)` of a link name opens the
+    backing instead of `ELOOP` (real guest symlinks still `ELOOP`). `-l` is
+    active from startup (the on-disk state survives sessions) and installs the
+    monitor by itself; `fstat` + `getdents64` are trapped only under `-l`
+    (`l2s_syscalls[]` in seccomp.c). `CNG_L2S_FORCE=1` routes every `linkat`
+    through the emulation (test aid mirroring arm64chroot's `A64_L2S_FORCE`).
+  - Acceptance: `tests/m10_l2s_shell.sh` runs 13 shell scenarios in an Alpine
+    rootfs under `chroot-ng -R -l` + `CNG_L2S_FORCE=1` and compares stdout +
+    exit status **byte-for-byte** against stock arm64chroot creating REAL
+    hardlinks from the same scripts: ln basics (nlink/inode equality),
+    cross-dir ln, `ls -a` hiding, readlink refusal, write-through, cross-dir
+    `mv`, rm-one/rm-all + `rmdir`, `rm -rf` over groups, dup-`ln` EEXIST,
+    busybox tar round-trip, `cmp` on a linked binary, and two-session
+    persistence. A Debian/GNU leg (`find -samefile`, GNU stat) is gated on a
+    translation smoke test — it skips under qemu (ld.so-loaded libc.so has no
+    rewritten svc sites; the seccomp tier covers it on devices).
+  - Accepted divergences (deliberate, documented):
+    `readlink("/proc/self/fd/N")` on a link-opened fd can show the store path
+    when the guest has a live `/proc`; `ln -P` of a symlink copies the
+    target's contents instead of linking the symlink itself; the marker
+    read-modify-write is not atomic under concurrent link/unlink; a guest
+    cannot create files matching the `.l2s.` name grammar (denied `ENOENT`);
+    the rootfs root's own `st_nlink` is +1 once the store exists;
+    `openat2(RESOLVE_NO_SYMLINKS)` fails on emulated links; a legacy per-dir
+    group whose surviving names were all mv'ed away leaves its old dir
+    non-rmdir'able, and per-dir-fallback links don't survive a rootfs move
+    (store links self-heal); `/.l2s` stays reachable via dirfd `..`-walks;
+    cross-dir + EXDEV still copies; an emulated cross-filesystem link (bind
+    mount) *succeeds* where a real one would report `EXDEV`.
+
+- [x] **-R: signal-return svc sites left intact**
+  The AoT rewriter used to turn the sa_restorer's `mov x8,#139; svc 0` into a
+  trampoline call like any other site — but `rt_sigreturn` must execute with
+  sp still pointing at the kernel's signal frame, so the first delivered
+  signal (e.g. a shell's SIGCHLD after fork) made the kernel restore a
+  garbage context and SIGSEGV the process. `cng_rewrite_seg` now skips an
+  `svc 0` immediately preceded by `movz x8, #139`: sigreturn carries no path
+  and needs no translation. This is what makes forking shells (busybox ash
+  spawning applets) usable under `-R`; the seccomp tier never trapped it.
 
 - [x] **Handler stack isolation (Go/small-stack guests)**
   The SIGSYS handler's path dispatcher is deep (multiple PATH_MAX buffers:

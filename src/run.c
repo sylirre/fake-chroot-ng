@@ -17,6 +17,7 @@
  * Under qemu-user the seccomp filter is inert, so translation is only exercised
  * on a real AArch64 kernel (and via the `-t dtest` self-test).
  */
+#include "cng/l2s.h"
 #include "cng/loader.h"
 #include "cng/monitor.h"
 #include "cng/path.h"
@@ -60,10 +61,16 @@ int cng_run(const char *rootfs, const char *libprefix,
     cng_host_auxv = auxv;
     cng_g_exe_guest = prog_guest;
 
-    /* CNG_DEBUG=1 in the environment enables verbose syscall-error logging. */
-    for (char **e = envp; e && *e; e++)
+    /* CNG_DEBUG=1 in the environment enables verbose syscall-error logging;
+     * CNG_L2S_FORCE=1 routes every linkat through the -l emulation (test aid
+     * for hosts whose filesystem allows real hardlinks). */
+    for (char **e = envp; e && *e; e++) {
         if (!strncmp(*e, "CNG_DEBUG=", 10) && (*e)[10] != '0')
             cng_g_debug = 1;
+        if (!strncmp(*e, "CNG_L2S_FORCE=", 14) && (*e)[14] != '\0' &&
+            (*e)[14] != '0')
+            cng_g_l2s_force = 1;
+    }
 
     /* Fake identity (--fake-id): establish it from the real invoking ids (which
      * are also the stat-remap source). See cng_cred_setup for the implied-vs-
@@ -142,8 +149,8 @@ int cng_run(const char *rootfs, const char *libprefix,
 
     /* Install the monitor last, after all of our own path syscalls are done.
      * Only when translation was actually requested; identity needs none. */
-    int want_xlate =
-        (strcmp(rootfs, "/") != 0) || nb > 0 || cng_g_fake_id || cng_g_rewrite;
+    int want_xlate = (strcmp(rootfs, "/") != 0) || nb > 0 || cng_g_fake_id ||
+                     cng_g_rewrite || cng_g_l2s;
     if (want_xlate) {
         int mrc = cng_install_monitor(&g_fs);
         if (mrc < 0)

@@ -314,11 +314,13 @@ static void help(char **envp) {
                       "the group id (gid 0). Implies --fake-id (see above)."},
         {"-l, --link2symlink", "Emulate hardlinks with symlinks plus a hidden "
                       "backing file where the host refuses link(2) (Android / "
-                      "SELinux answers EACCES/EXDEV/EPERM). The group presents "
-                      "as ordinary regular files sharing one inode, which lets "
-                      "package managers such as apk/dpkg unpack. Off by "
-                      "default: without it the host's refusal is reported to "
-                      "the guest unchanged."},
+                      "SELinux answers EACCES/EXDEV/EPERM). Backing files live "
+                      "in a per-rootfs store '<rootfs>/.l2s', invisible to the "
+                      "guest; the group presents as ordinary regular files "
+                      "sharing one inode — across directories, through mv and "
+                      "rm — which lets package managers such as apk/dpkg "
+                      "unpack. Off by default: without it the host's refusal "
+                      "is reported to the guest unchanged."},
         {"-R, --rewrite", "Rewrite the guest's svc instruction sites to "
                       "trampolines ahead of time. Faster than trapping every "
                       "syscall, and also provides path translation where the "
@@ -342,6 +344,9 @@ static void help(char **envp) {
     static const struct help_def env[] = {
         {"CNG_DEBUG", "When set to a non-empty, non-zero value, log verbose "
                       "syscall-error diagnostics to stderr."},
+        {"CNG_L2S_FORCE", "With -l: route every linkat through the emulation "
+                      "without trying the real hardlink first. Test aid for "
+                      "hosts whose filesystem allows link(2)."},
     };
     static const char *const examples[] = {
         "chroot-ng --probe",

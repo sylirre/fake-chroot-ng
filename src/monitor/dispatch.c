@@ -137,11 +137,16 @@ int cng_resolve(const char *path, int deref_final, char *out, size_t outsz) {
                 continue; /* not a symlink, or missing */
             link[n] = '\0';
 
-            /* Rewrite cur = <link, re-rooted if absolute> + <suffix cur[e..]>. */
+            /* Rewrite cur = <link, re-rooted if absolute> + <suffix cur[e..]>.
+             * Exception: an absolute target naming an l2s data file is a HOST
+             * path (central store / cross-directory group) — map it into the
+             * guest view instead of re-rooting it. */
             char tmp[CNG_PATH_MAX];
             size_t p;
             if (link[0] == '/') {
-                cng_strlcpy(tmp, link, sizeof tmp);
+                if (!(cng_g_l2s &&
+                      cng_l2s_untranslate_target(link, tmp, sizeof tmp)))
+                    cng_strlcpy(tmp, link, sizeof tmp);
                 p = strlen(tmp);
             } else {
                 size_t pe = e; /* parent dir of prefix */
@@ -168,6 +173,21 @@ int cng_resolve(const char *path, int deref_final, char *out, size_t outsz) {
     return -ELOOP;
 }
 
+/* "/proc/self/fd/<fd>" into out[40]. */
+static void proc_fd_path(long fd, char *out) {
+    size_t p = cng_strlcpy(out, "/proc/self/fd/", 40);
+    char num[16];
+    int ni = 0;
+    long v = fd;
+    do {
+        num[ni++] = (char)('0' + v % 10);
+        v /= 10;
+    } while (v > 0 && ni < 15);
+    while (ni > 0 && p < 39)
+        out[p++] = num[--ni];
+    out[p] = '\0';
+}
+
 /* Resolve (dirfd, path) to a HOST path. Handles absolute paths and AT_FDCWD
  * (through the rootfs, re-rooting guest symlinks), real dirfds (whose
  * /proc/self/fd link is already a host path inside the rootfs, so the relative
@@ -188,20 +208,10 @@ static int resolve_at_host(long dirfd, const char *path, int deref, char *out,
         return cng_fs_translate(cng_g_fs, path, out, sz) == 0 ? 0 : -1;
     }
     /* real dirfd: read its host directory path from /proc/self/fd/<dirfd>. */
-    char proc[40];
-    size_t p = cng_strlcpy(proc, "/proc/self/fd/", sizeof proc);
-    char num[16];
-    int ni = 0;
-    long v = dirfd;
-    if (v < 0)
+    if (dirfd < 0)
         return -1;
-    do {
-        num[ni++] = (char)('0' + v % 10);
-        v /= 10;
-    } while (v > 0 && ni < 15);
-    while (ni > 0 && p < sizeof proc - 1)
-        proc[p++] = num[--ni];
-    proc[p] = '\0';
+    char proc[40];
+    proc_fd_path(dirfd, proc);
     char hdir[CNG_PATH_MAX];
     long n = sys_readlinkat(CNG_AT_FDCWD, proc, hdir, sizeof hdir - 1);
     if (n <= 0)
@@ -251,9 +261,78 @@ static long proc_self_fixup(const char *canon, char *buf, unsigned long bufsz) {
     return (long)len;
 }
 
+/* 1 if the open fd refers to the rootfs root directory (where the ".l2s"
+ * store entry itself must be hidden from listings). */
+static int fd_is_rootfs_root(long fd) {
+    if (!cng_g_fs)
+        return 0;
+    char proc[40], hp[CNG_PATH_MAX];
+    proc_fd_path(fd, proc);
+    long n = sys_readlinkat(CNG_AT_FDCWD, proc, hp, sizeof hp - 1);
+    if (n <= 0)
+        return 0;
+    hp[n] = '\0';
+    const char *root = cng_g_fs->rootfs[0] ? cng_g_fs->rootfs : "/";
+    return strcmp(hp, root) == 0;
+}
+
 long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                   int trapped) {
     char b1[CNG_PATH_MAX], b2[CNG_PATH_MAX];
+
+    /* -l: paths naming the l2s machinery (backing data/marker names anywhere,
+     * the "/.l2s" store dir) do not exist as far as the guest is concerned.
+     * Checked on the guest's own path argument, before any resolution, so the
+     * resolver's internal symlink-target expansion is unaffected. */
+    if (cng_g_l2s) {
+        const char *p1 = 0, *p2 = 0;
+        long d1 = CNG_AT_FDCWD, d2 = CNG_AT_FDCWD;
+        switch (nr) {
+        case __NR_openat:
+#ifdef __NR_openat2
+        case __NR_openat2:
+#endif
+        case __NR_mkdirat:
+        case __NR_mknodat:
+#ifdef __NR_name_to_handle_at
+        case __NR_name_to_handle_at:
+#endif
+        case __NR_faccessat:
+#ifdef __NR_faccessat2
+        case __NR_faccessat2:
+#endif
+        case __NR_fchmodat:
+        case __NR_unlinkat:
+        case __NR_utimensat:
+        case __NR_newfstatat:
+        case __NR_statx:
+        case __NR_fchownat:
+        case __NR_readlinkat:
+            d1 = a0;
+            p1 = (const char *)a1;
+            break;
+        case __NR_symlinkat: /* only the linkpath names something new */
+            d1 = a1;
+            p1 = (const char *)a2;
+            break;
+        case __NR_renameat:
+        case __NR_renameat2:
+        case __NR_linkat:
+            d1 = a0;
+            p1 = (const char *)a1;
+            d2 = a2;
+            p2 = (const char *)a3;
+            break;
+        case __NR_truncate:
+        case __NR_statfs:
+        case __NR_chdir:
+        case __NR_chroot:
+            p1 = (const char *)a0;
+            break;
+        }
+        if ((p1 && cng_l2s_deny(d1, p1)) || (p2 && cng_l2s_deny(d2, p2)))
+            return -ENOENT;
+    }
 
     switch (nr) {
     /* Simple translate + reissue: dirfd = a0, path = a1. */
@@ -269,7 +348,21 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     {
         int deref = !(nr == __NR_mkdirat || nr == __NR_mknodat);
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
-        return reissue(a0, (long)p, a2, a3, a4, a5, nr);
+        long r = reissue(a0, (long)p, a2, a3, a4, a5, nr);
+        /* O_NOFOLLOW through a real dirfd lands on the l2s symlink and draws
+         * ELOOP where a real hardlink would open. Retry on the backing file —
+         * never a symlink itself, so O_NOFOLLOW stays honored for real
+         * guest symlinks. */
+        if (r == -ELOOP && cng_g_l2s && nr == __NR_openat &&
+            ((int)a2 & CNG_O_NOFOLLOW)) {
+            char hnf[CNG_PATH_MAX], data[CNG_PATH_MAX];
+            if (resolve_at_host(a0, (const char *)a1, 0, hnf, sizeof hnf) ==
+                    0 &&
+                cng_l2s_resolve(hnf, data, sizeof data, 0) == 1)
+                r = reissue(CNG_AT_FDCWD, (long)data, a2, a3, a4, a5,
+                            __NR_openat);
+        }
+        return r;
     }
 
     /* access: translate + reissue; under fake-root apply root's DAC bypass when
@@ -282,10 +375,29 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
 #endif
     {
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, 1);
-        long r = reissue(a0, (long)p, a2, a3, a4, a5, nr);
+        long fl = a3;
+        long dfd = a0;
+#ifdef __NR_faccessat2
+        /* faccessat2 with AT_SYMLINK_NOFOLLOW on an l2s name must report on
+         * the backing file — to the guest, the name IS a regular file. */
+        char fdata[CNG_PATH_MAX];
+        if (nr == __NR_faccessat2 && cng_g_l2s &&
+            ((int)a3 & CNG_AT_SYMLINK_NOFOLLOW)) {
+            char hnf[CNG_PATH_MAX];
+            if (resolve_at_host(a0, (const char *)a1, 0, hnf, sizeof hnf) ==
+                    0 &&
+                cng_l2s_resolve(hnf, fdata, sizeof fdata, 0) == 1) {
+                p = fdata;
+                dfd = CNG_AT_FDCWD;
+                fl = a3 & ~CNG_AT_SYMLINK_NOFOLLOW;
+            }
+        }
+#endif
+        long r = reissue(dfd, (long)p, a2, fl, a4, a5, nr);
         if (r < 0 && cng_fake_root()) {
             char sb[128]; /* AArch64 struct stat is 128 bytes */
-            if (reissue(a0, (long)p, (long)sb, 0, 0, 0, __NR_newfstatat) == 0) {
+            if (reissue(dfd, (long)p, (long)sb, 0, 0, 0, __NR_newfstatat) ==
+                0) {
                 unsigned mode = *(unsigned *)(sb + STAT_MODE_OFF);
                 if (((int)a2 & CNG_X_OK) && !(mode & 0111))
                     return -EACCES;
@@ -308,7 +420,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         char data[CNG_PATH_MAX];
         unsigned long cnt;
         int dec = 0;
-        if (cng_l2s_active && !((int)a2 & CNG_AT_REMOVEDIR)) {
+        if (cng_g_l2s && !((int)a2 & CNG_AT_REMOVEDIR)) {
             char hnf[CNG_PATH_MAX];
             if (resolve_at_host(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0 &&
                 cng_l2s_resolve(hnf, data, sizeof data, &cnt) == 1)
@@ -329,7 +441,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_utimensat: {
         char data[CNG_PATH_MAX];
         unsigned long cnt;
-        if (cng_l2s_active) {
+        if (cng_g_l2s) {
             char hnf[CNG_PATH_MAX];
             if (resolve_at_host(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0 &&
                 cng_l2s_resolve(hnf, data, sizeof data, &cnt) == 1) {
@@ -353,7 +465,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * st_nlink = the live group count, regardless of the NOFOLLOW flag — so the
      * guest never sees the emulation as a symlink. */
     case __NR_newfstatat: {
-        if (cng_l2s_active && a2) {
+        if (cng_g_l2s && a2) {
             char hnf[CNG_PATH_MAX];
             if (resolve_at_host(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0 &&
                 cng_l2s_stat(hnf, (void *)a2) == 1) {
@@ -365,15 +477,21 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         int deref = !((int)a3 & CNG_AT_SYMLINK_NOFOLLOW);
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
         long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_newfstatat);
+        if (r == 0 && cng_g_l2s && a2 && ((int)a3 & CNG_AT_EMPTY_PATH)) {
+            const char *gp = (const char *)a1; /* fstat-by-fd form */
+            if (!gp || !gp[0])
+                cng_l2s_fix_fd(a0, (void *)a2);
+        }
         if (r == 0 && cng_g_fake_id && a2)
             stat_remap((void *)a2);
         return r;
     }
     case __NR_statx: {
-        if (cng_l2s_active && a4) {
+        if (cng_g_l2s && a4) {
             char hnf[CNG_PATH_MAX];
             if (resolve_at_host(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0 &&
-                cng_l2s_statx(hnf, (void *)a4) == 1) {
+                cng_l2s_statx(hnf, (void *)a4, (unsigned)a3, (unsigned)a2) ==
+                    1) {
                 if (cng_g_fake_id)
                     statx_remap((void *)a4);
                 return 0;
@@ -382,14 +500,29 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         int deref = !((int)a2 & CNG_AT_SYMLINK_NOFOLLOW);
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
         long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_statx);
+        if (r == 0 && cng_g_l2s && a4 && ((int)a2 & CNG_AT_EMPTY_PATH)) {
+            const char *gp = (const char *)a1; /* fstat-by-fd form */
+            if (!gp || !gp[0])
+                cng_l2s_fix_fd_statx(a0, (void *)a4);
+        }
         if (r == 0 && cng_g_fake_id && a4)
             statx_remap((void *)a4);
         return r;
     }
 
     /* chown: try the real change (a chown to your own id succeeds for real),
-     * then fake success under fake-root when the host denies it. */
+     * then fake success under fake-root when the host denies it. An l2s name
+     * redirects to its backing file even under AT_SYMLINK_NOFOLLOW — the
+     * guest thinks the name IS the file, so lchown must land on the data. */
     case __NR_fchownat: {
+        if (cng_g_l2s) {
+            char hnf[CNG_PATH_MAX], data[CNG_PATH_MAX];
+            if (resolve_at_host(a0, (const char *)a1, 0, hnf, sizeof hnf) ==
+                    0 &&
+                cng_l2s_resolve(hnf, data, sizeof data, 0) == 1)
+                return chattr_result(reissue(CNG_AT_FDCWD, (long)data, a2, a3,
+                                             0, a5, __NR_fchownat));
+        }
         int deref = !((int)a4 & CNG_AT_SYMLINK_NOFOLLOW);
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
         return chattr_result(reissue(a0, (long)p, a2, a3, a4, a5, __NR_fchownat));
@@ -409,11 +542,12 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         }
         const char *p = xlate(a0, gp, b1, sizeof b1, /*deref_final=*/0);
         /* A link2symlink entry presents as a regular file: readlink must fail
-         * with EINVAL rather than leak the ".l2s.<ino>" backing name. */
-        if (cng_l2s_active) {
-            char data[CNG_PATH_MAX];
-            if (p && p[0] == '/' &&
-                cng_l2s_resolve(p, data, sizeof data, 0) == 1)
+         * with EINVAL rather than leak the backing path — including through a
+         * real dirfd, which xlate passes through untranslated. */
+        if (cng_g_l2s) {
+            char hnf[CNG_PATH_MAX], data[CNG_PATH_MAX];
+            if (resolve_at_host(a0, gp, 0, hnf, sizeof hnf) == 0 &&
+                cng_l2s_resolve(hnf, data, sizeof data, 0) == 1)
                 return -EINVAL;
         }
         return reissue(a0, (long)p, a2, a3, a4, a5, __NR_readlinkat);
@@ -431,6 +565,57 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * than trapping from the handler (fchown is in the block-list probe set). */
     case __NR_fchown:
         return chattr_result(reissue(a0, a1, a2, a3, a4, a5, __NR_fchown));
+
+    /* fstat(fd): no path, but the fd may name an l2s backing file whose
+     * st_nlink must reflect the live group count (tar/rsync/ls stat open
+     * fds). Trapped only under -l; the fake-id remap rides along. */
+    case __NR_fstat: {
+        long r = reissue(a0, a1, a2, a3, a4, a5, __NR_fstat);
+        if (r == 0 && a1) {
+            if (cng_g_l2s)
+                cng_l2s_fix_fd(a0, (void *)a1);
+            if (cng_g_fake_id)
+                stat_remap((void *)a1);
+        }
+        return r;
+    }
+
+    /* getdents64: hide the l2s machinery from directory listings — backing
+     * data/marker names anywhere, and the ".l2s" store dir in the rootfs
+     * root. Filtered in place in the guest buffer; when a whole batch is
+     * ours, re-read so a filtered 0 isn't mistaken for end-of-directory. */
+    case __NR_getdents64: {
+        long n = reissue(a0, a1, a2, a3, a4, a5, __NR_getdents64);
+        if (!cng_g_l2s || n <= 0 || !a1)
+            return n;
+        int at_root = fd_is_rootfs_root(a0);
+        char *buf = (char *)a1;
+        for (;;) {
+            /* linux_dirent64: d_reclen u16 @16, d_name @19. d_off cookies are
+             * directory-stream positions, so compaction is seek-safe. */
+            long w = 0, o = 0;
+            while (o + 19 <= n) {
+                unsigned short reclen;
+                memcpy(&reclen, buf + o + 16, 2);
+                if (reclen == 0 || o + reclen > n)
+                    break;
+                const char *nm = buf + o + 19;
+                int hide =
+                    cng_l2s_hidden(nm) || (at_root && !strcmp(nm, ".l2s"));
+                if (!hide) {
+                    if (w != o)
+                        memmove(buf + w, buf + o, reclen);
+                    w += reclen;
+                }
+                o += reclen;
+            }
+            if (w > 0)
+                return w;
+            n = reissue(a0, a1, a2, a3, a4, a5, __NR_getdents64);
+            if (n <= 0)
+                return n;
+        }
+    }
 
     /* clone with CLONE_VFORK (only these are trapped; see seccomp.c): a
      * vfork-style spawn shares the parent's address space and suspends the
@@ -465,23 +650,31 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
 
     /* rename: two translated paths. If the destination is one of our
      * link2symlink names, it is replaced by the rename, so drop its group's
-     * refcount (apk installs by renaming a temp file over the final name). */
+     * refcount (apk installs by renaming a temp file over the final name) —
+     * except under RENAME_EXCHANGE, where both names live on. A legacy-format
+     * source (bare-basename target) moving to another directory is repointed
+     * at its (unmoved) data file afterwards. */
     case __NR_renameat:
     case __NR_renameat2: {
         const char *op = xlate(a0, (const char *)a1, b1, sizeof b1, 0);
         const char *np = xlate(a2, (const char *)a3, b2, sizeof b2, 0);
-        char data[CNG_PATH_MAX];
+        int exch = (nr == __NR_renameat2 && ((int)a4 & CNG_RENAME_EXCHANGE));
+        char data[CNG_PATH_MAX], absdata[CNG_PATH_MAX], dsth[CNG_PATH_MAX];
         unsigned long cnt;
-        int dec = 0;
-        if (cng_l2s_active && strcmp(op, np) != 0) {
-            char hnf[CNG_PATH_MAX];
-            if (resolve_at_host(a2, (const char *)a3, 0, hnf, sizeof hnf) == 0 &&
-                cng_l2s_resolve(hnf, data, sizeof data, &cnt) == 1)
+        int dec = 0, fix = 0;
+        if (cng_g_l2s && !exch && strcmp(op, np) != 0 &&
+            resolve_at_host(a2, (const char *)a3, 0, dsth, sizeof dsth) == 0) {
+            if (cng_l2s_resolve(dsth, data, sizeof data, &cnt) == 1)
                 dec = 1;
+            char hnf[CNG_PATH_MAX];
+            if (resolve_at_host(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0)
+                fix = cng_l2s_rename_prep(hnf, absdata, sizeof absdata);
         }
         long r = reissue(a0, (long)op, a2, (long)np, a4, a5, nr);
         if (r == 0 && dec)
             cng_l2s_decref(data, cnt);
+        if (r == 0 && fix)
+            cng_l2s_rename_fixup(dsth, absdata);
         return r;
     }
 
@@ -492,16 +685,45 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * it, so the group presents as regular files (via the stat fixups) with a
      * shared inode. Without -l the host's refusal reaches the guest unchanged. */
     case __NR_linkat: {
+        const char *sp = (const char *)a1;
         int follow = ((int)a4 & CNG_AT_SYMLINK_FOLLOW) ? 1 : 0;
+        int empty = ((int)a4 & CNG_AT_EMPTY_PATH) && (!sp || !sp[0]);
         char srch[CNG_PATH_MAX], dsth[CNG_PATH_MAX];
-        if (resolve_at_host(a0, (const char *)a1, 0, srch, sizeof srch) != 0 ||
-            resolve_at_host(a2, (const char *)a3, 0, dsth, sizeof dsth) != 0)
+        /* AT_SYMLINK_FOLLOW is applied at guest level (the host must never
+         * follow a guest symlink's target itself); the host call then runs
+         * with no flags. Link-by-fd (AT_EMPTY_PATH, the O_TMPFILE publish
+         * idiom) goes through /proc/self/fd, which the host must follow. */
+        if (empty)
+            proc_fd_path(a0, srch);
+        else if (resolve_at_host(a0, sp, follow, srch, sizeof srch) != 0)
             return -ENOENT;
-        long r = reissue(CNG_AT_FDCWD, (long)srch, CNG_AT_FDCWD, (long)dsth,
-                         follow ? CNG_AT_SYMLINK_FOLLOW : 0, 0, __NR_linkat);
+        if (resolve_at_host(a2, (const char *)a3, 0, dsth, sizeof dsth) != 0)
+            return -ENOENT;
+        long r;
+        if (cng_g_l2s && cng_g_l2s_force)
+            r = -EPERM; /* CNG_L2S_FORCE: exercise the fallback directly */
+        else
+            r = reissue(CNG_AT_FDCWD, (long)srch, CNG_AT_FDCWD, (long)dsth,
+                        empty ? CNG_AT_SYMLINK_FOLLOW : 0, 0, __NR_linkat);
         if (cng_g_l2s &&
             (r == -EPERM || r == -EMLINK || r == -EXDEV || r == -ENOSYS ||
              r == -EACCES || r == -EOPNOTSUPP)) {
+            if (empty) {
+                /* If the fd names a live file, link its real path — an fd
+                 * onto a group's data file then bumps that group. Anonymous
+                 * or deleted files keep the /proc path: the fallback's
+                 * materialize copies the contents. */
+                char tgt[CNG_PATH_MAX], stt[144];
+                long tn = sys_readlinkat(CNG_AT_FDCWD, srch, tgt,
+                                         sizeof tgt - 1);
+                if (tn > 0) {
+                    tgt[tn] = '\0';
+                    if (tgt[0] == '/' &&
+                        CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, tgt, stt,
+                                CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0)
+                        cng_strlcpy(srch, tgt, sizeof srch);
+                }
+            }
             int s = cng_l2s_link(srch, dsth);
             if (cng_g_debug)
                 cng_dprintf(2, "[cng] l2s %s -> %s rc=%d\n", srch, dsth, s);
