@@ -14,6 +14,7 @@
  * ioctl(TIOCGWINSZ). cng_dprintf has no width specifiers, so column alignment
  * is done with out_pad() rather than "%*s".
  */
+#include "cng/l2s.h"
 #include "cng/loader.h"
 #include "cng/monitor.h"
 #include "cng/path.h"
@@ -311,6 +312,13 @@ static void help(char **envp) {
                       "real uid/gid (not 0:0) unless -u/--fake-id sets one."},
         {"    --setgid-root", "As --setuid-root, but for setgid executables and "
                       "the group id (gid 0). Implies --fake-id (see above)."},
+        {"-l, --link2symlink", "Emulate hardlinks with symlinks plus a hidden "
+                      "backing file where the host refuses link(2) (Android / "
+                      "SELinux answers EACCES/EXDEV/EPERM). The group presents "
+                      "as ordinary regular files sharing one inode, which lets "
+                      "package managers such as apk/dpkg unpack. Off by "
+                      "default: without it the host's refusal is reported to "
+                      "the guest unchanged."},
         {"-R, --rewrite", "Rewrite the guest's svc instruction sites to "
                       "trampolines ahead of time. Faster than trapping every "
                       "syscall, and also provides path translation where the "
@@ -339,6 +347,7 @@ static void help(char **envp) {
         "chroot-ng --probe",
         "chroot-ng -u ./rootfs /bin/sh",
         "chroot-ng --fake-id 1000:1000 --setuid-root --setgid-root ./rootfs /bin/su -",
+        "chroot-ng -u -l ./rootfs /sbin/apk add busybox",
         "chroot-ng -R -b /tmp:/data/local/tmp ./rootfs /bin/busybox sh",
         "chroot-ng / /usr/bin/uname -a",
     };
@@ -513,6 +522,9 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
                 if (val) return err_noval(arg);
                 cng_g_fake_id = 1;
                 cng_g_setgid_root = 1;
+            } else if (!strcmp(n, "link2symlink")) {
+                if (val) return err_noval(arg);
+                cng_g_l2s = 1;
             } else if (!strcmp(n, "rewrite")) {
                 if (val) return err_noval(arg);
                 cng_g_rewrite = 1;
@@ -558,6 +570,7 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
                     }
                     break;   /* -u takes the rest of the cluster / next token */
                 }
+                else if (c == 'l') { cng_g_l2s = 1; }
                 else if (c == 'R') { cng_g_rewrite = 1; }
                 else if (c == 'F') { cng_g_loader_file = 1; }
                 else if (c == 'b') {

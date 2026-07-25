@@ -30,10 +30,13 @@ rm -rf "$ROOT"
 
 # link2symlink backing-file scheme (present emulated hardlinks as regular files
 # with a shared inode + st_nlink) + fchdir cwd tracking. Force the l2s fallback
-# via the block-list (tmpfs allows hardlinks).
+# via the block-list (tmpfs allows hardlinks); the test toggles the opt-in flag
+# (-l/--link2symlink) itself, checking the off state first.
 L2=$(mktemp -d); mkdir -p "$L2/w"
 out=$(run -t l2stest "$L2" 2>&1); rc=$?
 check "l2stest overall (l2s + fchdir)" 0 "$rc"
+check_contains "l2s is off by default (link refusal passes through)" \
+    "l2s-off: rc=-38 created=0 -> OK" "$out"
 check_contains "l2s presents the group as regular files (nlink, inode, content)" \
     "l2s: rc=0 eexist=1 reg=1 nlink2=1 sameino=1 noleak=1 content=1 -> OK" "$out"
 check_contains "l2s preserves mtime through the backing file" \

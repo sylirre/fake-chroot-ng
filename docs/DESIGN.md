@@ -18,7 +18,7 @@ paying `proot`'s per-syscall `ptrace` overhead.
   flow used by ART's JIT). **This is the pivotal prerequisite** — `probe`
   checks it.
 - **Fidelity beyond chroot+bind:** fake user identity (`-u`/`--fake-id`), `/proc`
-  self-path fixups, and `link2symlink`.
+  self-path fixups, and `link2symlink` (`-l`/`--link2symlink`).
 
 ## Why not the obvious approaches
 

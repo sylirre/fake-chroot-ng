@@ -4,7 +4,7 @@
  * are directly readable — no cross-process memory access like proot needs.
  *
  * Also applies the M7 fidelity fixups: credential/ownership faking (--fake-id),
- * /proc/self readlink fixups, and link2symlink fallback.
+ * /proc/self readlink fixups, and the link2symlink fallback (--link2symlink).
  */
 #include "cng/l2s.h"
 #include "cng/monitor.h"
@@ -486,10 +486,11 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     }
 
     /* linkat: hardlink; where the fs forbids hardlinks (Android/SELinux returns
-     * EACCES/EXDEV, some EPERM) fall back to the link2symlink backing-file scheme
-     * (see l2s.c): the contents move to a hidden ".l2s.<ino>" and every name
-     * becomes a same-directory relative symlink to it, so the group presents as
-     * regular files (via the stat fixups) with a shared inode. */
+     * EACCES/EXDEV, some EPERM) and -l/--link2symlink was given, fall back to the
+     * link2symlink backing-file scheme (see l2s.c): the contents move to a hidden
+     * ".l2s.<ino>" and every name becomes a same-directory relative symlink to
+     * it, so the group presents as regular files (via the stat fixups) with a
+     * shared inode. Without -l the host's refusal reaches the guest unchanged. */
     case __NR_linkat: {
         int follow = ((int)a4 & CNG_AT_SYMLINK_FOLLOW) ? 1 : 0;
         char srch[CNG_PATH_MAX], dsth[CNG_PATH_MAX];
@@ -498,8 +499,9 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             return -ENOENT;
         long r = reissue(CNG_AT_FDCWD, (long)srch, CNG_AT_FDCWD, (long)dsth,
                          follow ? CNG_AT_SYMLINK_FOLLOW : 0, 0, __NR_linkat);
-        if (r == -EPERM || r == -EMLINK || r == -EXDEV || r == -ENOSYS ||
-            r == -EACCES || r == -EOPNOTSUPP) {
+        if (cng_g_l2s &&
+            (r == -EPERM || r == -EMLINK || r == -EXDEV || r == -ENOSYS ||
+             r == -EACCES || r == -EOPNOTSUPP)) {
             int s = cng_l2s_link(srch, dsth);
             if (cng_g_debug)
                 cng_dprintf(2, "[cng] l2s %s -> %s rc=%d\n", srch, dsth, s);

@@ -6,8 +6,8 @@ Milestones are committed individually. Each builds on the previous.
 An Alpine aarch64 rootfs runs under `chroot-ng -u <rootfs> <program>` with no ptrace and no
 user namespaces, on an execmem-denied mount:
 - interactive shell + coreutils/busybox, `su -l`
-- `apk` (full package manager: add/fix, incl. hardlinked packages via
-  link2symlink)
+- `apk` (full package manager: add/fix, incl. hardlinked packages with
+  `-l`/`--link2symlink`)
 - `git clone` over https
 - **Go** builds end-to-end, including **cgo** (`go build` drives `gcc`→`cc1`)
 - **gcc** compiles and links a working binary
@@ -140,7 +140,7 @@ vfork/`posix_spawn` child-stack handling.
   it in an executable segment would be mis-rewritten — none in the glibc we
   tested (101 words, all real svc), but `-R` stays opt-in for that reason.
 
-- [x] **M9 — robust link2symlink (backing-file scheme)**
+- [x] **M9 — robust link2symlink (backing-file scheme, `-l`/`--link2symlink`)**
   Ported from `/home/sol/arm64chroot`. Where the host refuses `link(2)`
   (Android/SELinux → EACCES/EXDEV, some EPERM), a guest hardlink group is
   represented in the directory of the first-linked name by a hidden backing file
@@ -161,6 +161,11 @@ vfork/`posix_spawn` child-stack handling.
     inode, nlink=2, `readlink`→EINVAL, shared content, EEXIST on a dup link,
     mtime preserved through the backing, dirfd-relative links, and
     decref/reclaim. 72/72 tests.
+  - Opt-in via `-l`/`--link2symlink` (`cng_g_l2s`), **off by default**: the
+    scheme trades real hardlinks for symlinks plus hidden `.l2s.*` files in the
+    guest's own directories, so it only runs where a guest actually needs it
+    (apk/dpkg unpacking hardlinked packages). Without the flag `linkat` reports
+    the host's refusal to the guest unchanged, and `l2stest` checks that too.
   Limitation (tracked): backing files are not yet hidden from `getdents64`
   (would require trapping it); they are dotfiles and unrecorded in apk's db, so
   cosmetic only. Cross-directory hardlinks fall back to a content copy.

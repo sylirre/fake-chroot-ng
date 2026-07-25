@@ -10,6 +10,7 @@
 #include <asm/unistd.h>
 #include <asm-generic/errno.h>
 
+int cng_g_l2s = 0;
 int cng_l2s_active = 0;
 
 #define L2S_PREFIX     ".l2s."

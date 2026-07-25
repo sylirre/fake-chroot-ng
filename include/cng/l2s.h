@@ -18,13 +18,18 @@
  * lets programs that set+verify metadata (e.g. apk preserving mtime) succeed.
  *
  * All paths here are already rootfs-resolved *host* paths. Freestanding: raw
- * syscalls only, safe to call from the SIGSYS handler. Triggered purely as the
- * linkat fallback, so no separate enable flag.
+ * syscalls only, safe to call from the SIGSYS handler. Triggered as the linkat
+ * fallback, and only when opted into with -l/--link2symlink.
  */
 #ifndef CNG_L2S_H
 #define CNG_L2S_H
 
 #include <stddef.h>
+
+/* -l/--link2symlink: opt in to the emulation. Off by default — a host that
+ * refuses link(2) then reports that refusal to the guest verbatim, rather than
+ * silently substituting symlinks + hidden backing files for its hardlinks. */
+extern int cng_g_l2s;
 
 /* Set the first time a backing group is created, so the stat/utimensat fixups
  * can skip their extra path resolution entirely until link2symlink has fired. */

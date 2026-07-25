@@ -449,7 +449,9 @@ int cng_cmd_exectest(int argc, char **argv, char **envp, unsigned long *auxv) {
 }
 
 /* _l2stest ROOT — exercise link2symlink (target must be a guest/relative path,
- * not a host path) and fchdir cwd tracking. ROOT must contain a dir "w". */
+ * not a host path) and fchdir cwd tracking. ROOT must contain a dir "w". The
+ * emulation is opt-in on the command line, so the test drives cng_g_l2s itself:
+ * first off (the refusal must pass through), then on for the rest. */
 int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
     (void)envp;
     (void)auxv;
@@ -469,6 +471,20 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
         sys_write((int)fd, "hi", 2);
         sys_close((int)fd);
     }
+
+    /* The emulation is opt-in (-l/--link2symlink), so with the flag still off
+     * the host's refusal must reach the guest verbatim and no name appear. */
+    long loff = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/a",
+                             CNG_AT_FDCWD, (long)"/w/z", 0, 0, 0);
+    char sz[144];
+    long rz = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/z",
+                           (long)sz, 0, 0, 0, 0);
+    int ok_off = (loff == -ENOSYS && rz == -ENOENT && !cng_l2s_active);
+    cng_dprintf(1, "l2s-off: rc=%d created=%d -> %s\n", (int)loff, rz == 0,
+                ok_off ? "OK" : "FAIL");
+    fails += !ok_off;
+
+    cng_g_l2s = 1; /* everything below exercises the enabled emulation */
     long lr = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/a", CNG_AT_FDCWD,
                            (long)"/w/b", 0, 0, 0);
     /* linking onto an existing name must fail with EEXIST, like real link(2) */
@@ -564,6 +580,7 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
     fails += !ok_dec;
 
     cng_blocked[__NR_linkat] = 0;
+    cng_g_l2s = 0;
 
     /* fchdir cwd tracking. */
     long dfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w",

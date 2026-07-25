@@ -47,13 +47,15 @@ chroot-ng --help                                   # full option reference
 host-native binaries directly); `<program>` is an absolute path inside it.
 Common options: `-u/--fake-id[=ID]` (fake user identity — `ID` is a `uid` or
 `uid:gid`, defaulting to `0:0` root), `-b/--bind G:H` (bind guest path G to host
-H), `-R/--rewrite` (ahead-of-time `svc` rewriting).
+H), `-l/--link2symlink` (emulate hardlinks where the host refuses `link(2)`),
+`-R/--rewrite` (ahead-of-time `svc` rewriting).
 
 ```sh
 chroot-ng -u ./rootfs /bin/sh              # fake root (uid/gid 0)
 chroot-ng --fake-id 1000:1000 ./rootfs /bin/sh
 # non-root, but setuid-root `su` still works (--setuid/--setgid-root imply -u):
 chroot-ng --fake-id 1000:1000 --setuid-root --setgid-root ./rootfs /bin/su -
+chroot-ng -u -l ./rootfs /sbin/apk add busybox   # hardlinked packages
 ```
 
 Run `chroot-ng --probe` on any target device **first** — the whole in-process
