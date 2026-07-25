@@ -77,5 +77,7 @@ check_contains "l2s legacy per-dir format fully interoperates" \
     "l2s-old: reg=1 same=1 bump3=1 xdir4=1 back2=1 einval=1 -> OK" "$out"
 check_contains "l2s unusable store falls back to the per-dir scheme" \
     "l2s-storefail: rc=0 reg=1 sameino=1 beside=1 -> OK" "$out"
+check_contains "dirfd args tolerate dirty upper halves (glibc w-registers)" \
+    "l2s-dirtyfd: rc=0 nlink2=1 -> OK" "$out"
 check_contains "fchdir updates virtual cwd" "fchdir: cwd=/w -> OK" "$out"
 rm -rf "$L2"

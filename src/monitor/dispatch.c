@@ -173,12 +173,13 @@ int cng_resolve(const char *path, int deref_final, char *out, size_t outsz) {
     return -ELOOP;
 }
 
-/* "/proc/self/fd/<fd>" into out[40]. */
+/* "/proc/self/fd/<fd>" into out[40]. fd args are 32-bit: glibc passes ints in
+ * w-registers and may leave the x-register's top half dirty, so truncate. */
 static void proc_fd_path(long fd, char *out) {
     size_t p = cng_strlcpy(out, "/proc/self/fd/", 40);
     char num[16];
     int ni = 0;
-    long v = fd;
+    long v = (int)fd;
     do {
         num[ni++] = (char)('0' + v % 10);
         v /= 10;
@@ -196,22 +197,23 @@ static void proc_fd_path(long fd, char *out) {
  * symlink for the absolute/AT_FDCWD case. Returns 0/-1. */
 static int resolve_at_host(long dirfd, const char *path, int deref, char *out,
                            size_t sz) {
+    int dfd = (int)dirfd; /* int arg: the x-register's top half may be dirty */
     if (!path || !path[0])
         return -1;
     if (!strncmp(path, "/proc/self/fd/", 14)) {
         cng_strlcpy(out, path, sz);
         return 0;
     }
-    if (path[0] == '/' || dirfd == CNG_AT_FDCWD) {
+    if (path[0] == '/' || dfd == CNG_AT_FDCWD) {
         if (cng_resolve(path, deref, out, sz) == 0)
             return 0;
         return cng_fs_translate(cng_g_fs, path, out, sz) == 0 ? 0 : -1;
     }
     /* real dirfd: read its host directory path from /proc/self/fd/<dirfd>. */
-    if (dirfd < 0)
+    if (dfd < 0)
         return -1;
     char proc[40];
-    proc_fd_path(dirfd, proc);
+    proc_fd_path(dfd, proc);
     char hdir[CNG_PATH_MAX];
     long n = sys_readlinkat(CNG_AT_FDCWD, proc, hdir, sizeof hdir - 1);
     if (n <= 0)
@@ -230,7 +232,7 @@ static const char *xlate(long dirfd, const char *gp, char *buf, size_t bufsz,
                          int deref_final) {
     if (!gp)
         return gp;
-    if (gp[0] == '/' || dirfd == CNG_AT_FDCWD) {
+    if (gp[0] == '/' || (int)dirfd == CNG_AT_FDCWD) {
         if (cng_resolve(gp, deref_final, buf, bufsz) == 0)
             return buf;
         if (cng_fs_translate(cng_g_fs, gp, buf, bufsz) == 0)
@@ -535,7 +537,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     /* readlinkat: /proc/self magic-link fixups, else translate + reissue. */
     case __NR_readlinkat: {
         const char *gp = (const char *)a1;
-        if (gp && (gp[0] == '/' || a0 == CNG_AT_FDCWD)) {
+        if (gp && (gp[0] == '/' || (int)a0 == CNG_AT_FDCWD)) {
             char canon[CNG_PATH_MAX];
             if (cng_fs_abscanon(cng_g_fs, gp, canon, sizeof canon) == 0) {
                 long fx = proc_self_fixup(canon, (char *)a2,

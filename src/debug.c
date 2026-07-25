@@ -1115,6 +1115,29 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
                 (int)fbl, fb_reg, fb_same, fb_beside, ok_fb ? "OK" : "FAIL");
     fails += !ok_fb;
 
+    /* glibc passes int args (dirfds) in w-registers and may leave the
+     * x-register's top half dirty; the monitor must truncate before
+     * comparing (Debian `ln a b` regression: AT_FDCWD arrived garbage-topped
+     * and source resolution failed with ENOENT). */
+    long dirty = (long)0xdeadbeef00000000ULL | (unsigned)CNG_AT_FDCWD;
+    cng_dispatch(__NR_chdir, (long)"/w", 0, 0, 0, 0, 0, 0);
+    long dcf = cng_dispatch(__NR_openat, dirty, (long)"da",
+                            CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (dcf >= 0) {
+        sys_write((int)dcf, "dd", 2);
+        sys_close((int)dcf);
+    }
+    long dlr = cng_dispatch(__NR_linkat, dirty, (long)"da", dirty, (long)"db",
+                            0, 0, 0);
+    char sdd[144];
+    long drr = cng_dispatch(__NR_newfstatat, dirty, (long)"da", (long)sdd, 0,
+                            0, 0, 0);
+    int dirty_ok = (dlr == 0 && drr == 0 && ST_NLINK(sdd) == 2);
+    cng_dprintf(1, "l2s-dirtyfd: rc=%d nlink2=%d -> %s\n", (int)dlr,
+                drr == 0 && ST_NLINK(sdd) == 2, dirty_ok ? "OK" : "FAIL");
+    fails += !dirty_ok;
+    cng_dispatch(__NR_chdir, (long)"/", 0, 0, 0, 0, 0, 0);
+
     cng_blocked[__NR_linkat] = 0;
     cng_g_l2s = 0;
 

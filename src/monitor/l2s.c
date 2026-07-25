@@ -285,7 +285,7 @@ int cng_l2s_deny(long dirfd, const char *gp) {
      * absolute/cwd-relative paths — a ".l2s" entry elsewhere in the tree
      * stays usable, and a dirfd-relative walk can only reach the store
      * through ".." (accepted, documented). */
-    if ((gp[0] == '/' || dirfd == CNG_AT_FDCWD) && cng_g_fs) {
+    if ((gp[0] == '/' || (int)dirfd == CNG_AT_FDCWD) && cng_g_fs) {
         char canon[CNG_PATH_MAX];
         if (cng_fs_abscanon(cng_g_fs, gp, canon, sizeof canon) == 0 &&
             !strncmp(canon, "/.l2s", 5) &&
@@ -670,7 +670,8 @@ static int l2s_fd_count(long fd, unsigned long *count) {
     char link[64], *p = link;
     char *end = link + sizeof link - 1;
     p += cng_strlcpy(p, "/proc/self/fd/", (size_t)(end - p) + 1);
-    put_u64(&p, end, (unsigned long long)fd, 1);
+    /* int arg: the x-register's top half may be dirty (glibc). */
+    put_u64(&p, end, (unsigned long long)(unsigned)(int)fd, 1);
     *p = '\0';
     char path[CNG_PATH_MAX];
     long n = l2s_readlink(link, path, sizeof path - 1);
