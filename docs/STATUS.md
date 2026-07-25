@@ -349,9 +349,8 @@ vfork/`posix_spawn` child-stack handling.
   (both `errno 2` before), `m5a` covers the chroot rebasing (`_xlate -c`), and
   `l2s-tmpfile` asserts `mode=1`. 144/144.
   Accepted divergences: `/proc/self/fd/N` resolves even when the guest has no
-  `/proc` mounted, where a real chroot would report ENOENT; and `readlink`ing
-  one still reports the host path (the kernel renders it against our real root,
-  which is not the guest's) rather than the guest path.
+  `/proc` mounted, where a real chroot would report ENOENT. (`readlink`ing one
+  used to report the host path; M11 maps it back to the guest view.)
 
 - [x] **CNG_DEBUG must not change behaviour (wild read in the error log)**
   `dbg_path` picked the path to log by testing whether `a0`/`a1` "looks like a
@@ -421,11 +420,17 @@ vfork/`posix_spawn` child-stack handling.
   with two layers on top: a **hidden-process view** and **synthesized files**.
   Off with `--no-proc`; an explicit `-b /proc:DIR` still wins over the
   passthrough.
-  - **Hidden-process view.** A numeric `/proc/<pid>` that is not a guest process
-    resolves into the rootfs instead of the host — an ENOENT the guest reads as
-    "no such process". One choke point in `cng_fs_translate` covers
-    open/stat/readlink/execve and the `*at` forms, so a guest `ps` lists only
-    its own session.
+  - **Hidden-process view**, on both sides. A numeric `/proc/<pid>` that is not
+    a guest process is redirected to `/proc/0`, which never exists (pid 0 is the
+    idle task), so it reads as "no such process". The test is on the **resolved
+    host path**, not the guest one, so it holds however the path got there — the
+    passthrough, or an explicit `-b /proc:/proc`, which a proot habit makes
+    common and which would otherwise hand back the host's whole process list.
+    One choke point in `cng_fs_translate` covers open/stat/readlink/execve and
+    the `*at` forms. The listing side is a `getdents64` filter keyed the same
+    way (the fd's host path is `/proc`), because `ls /proc` and `ps` read the
+    directory rather than probing names; it costs a readlink only for a batch
+    that actually holds an all-digit name, which outside `/proc` is nothing.
   - **PID registry** (`src/monitor/procreg.c`, ported from `proctab.c` minus its
     broker): one `MAP_SHARED|MAP_ANONYMOUS` region, inherited across fork, in
     which each guest process publishes its argv, environ, auxv, exe and cwd.
@@ -471,13 +476,15 @@ vfork/`posix_spawn` child-stack handling.
   new rules are covered by `-t bpftest`, which builds the program and runs it
   through a BPF interpreter — qemu-user does not honor guest filters, so that is
   the only pre-device check for them. 186/186.
-  Accepted divergences: `/proc` **listings** are not filtered (host pids appear
-  as dirents; opening one still fails, which is why `ps` stays clean) — filtering
-  them would mean trapping every `getdents64`; `stat()` of a synthesized name
-  reports the host file, which on Android is the one being denied; `readlink` of
-  a synthesized fd shows `memfd:cng-proc`; and two separate chroot-ng
-  invocations over one rootfs do not share a registry, so each hides the other's
-  processes (the same degradation arm64chroot has without `-shared-proc`).
+  Accepted divergences: `stat()` of a synthesized name reports the host file,
+  which on Android is the one being denied; `readlink` of a synthesized fd shows
+  `memfd:cng-proc`; and two separate chroot-ng invocations over one rootfs do
+  not share a registry, so each hides the other's processes (the same
+  degradation arm64chroot has without `-shared-proc`). One place chroot-ng is
+  deliberately *stricter* than arm64chroot: there, a `-b /proc:/proc` bind wins
+  over the `/proc` zone in the path layer, so a host process stays reachable by
+  explicit path (only the listing is filtered); here the hidden view is keyed on
+  the resolved host path, so both routes are closed.
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 

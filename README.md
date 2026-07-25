@@ -52,7 +52,8 @@ H), `-l/--link2symlink` (emulate hardlinks where the host refuses `link(2)`),
 emulation described below).
 
 `/proc` is visible to the guest without a bind, and describes the guest rather
-than chroot-ng: host processes are hidden from it, `cmdline`/`environ`/`auxv`
+than chroot-ng: host processes are hidden from it (by path and from listings,
+including under an explicit `-b /proc:/proc`), `cmdline`/`environ`/`auxv`
 report the guest program (no real `execve` ever happens, so the kernel's copies
 would name the chroot-ng invocation), `mounts`/`mountinfo` describe the rootfs
 and its binds instead of the host's mount namespace, `maps` and the `fd` links

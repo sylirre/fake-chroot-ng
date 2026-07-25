@@ -16,6 +16,10 @@ out=$(run -t proctest -r "$PT" -b /usr:/usr 2>&1); rc=$?
 check "proctest overall" 0 "$rc"
 check_contains "/proc passes through, non-guest pids are hidden" \
     "proctest passthrough+hidden -> OK" "$out"
+check_contains "a -b /proc:/proc bind does not reopen the host process list" \
+    "proctest bound-proc hidden -> OK" "$out"
+check_contains "a /proc listing drops host pids, keeps guest ones" \
+    "proctest listing: self=1 own_pid=1 host_pids=0 -> OK" "$out"
 check_contains "cmdline is the guest argv, not the chroot-ng invocation" \
     "proctest cmdline: 24 bytes argv0=/bin/busybox -> OK" "$out"
 check_contains "environ is the guest environment" \
@@ -90,8 +94,27 @@ if [ "$m11_ready" -eq 1 ]; then
     # comm is the guest program, not chroot-ng (PR_SET_NAME, not synthesis).
     m11_sh "comm names the guest program" "busybox" 'cat /proc/self/comm'
 
-    # An explicit -b /proc:DIR is the user overriding the host view, and must
-    # outrank both the passthrough and the synthesis.
+    # Binding the host /proc at /proc is a common habit from proot; it must not
+    # hand the guest the host's process list back. The hidden view keys on where
+    # a path lands, not on which map rule put it there.
+    got=$(run -R -b /proc:/proc "$M11_ALPINE" /bin/busybox sh -c \
+        'ls /proc | grep -c "^[0-9]*$"' 2>/dev/null)
+    own=$(run -R "$M11_ALPINE" /bin/busybox sh -c \
+        'ls /proc | grep -c "^[0-9]*$"' 2>/dev/null)
+    if [ -n "$got" ] && [ "$got" = "$own" ]; then
+        pass=$((pass + 1)); echo "  ok   m11 -b /proc:/proc hides host pids like the default"
+    else
+        fail=$((fail + 1))
+        echo "  FAIL m11 -b /proc:/proc hides host pids like the default"
+        echo "    bound: $got  default: $own"
+    fi
+    got=$(run -R -b /proc:/proc "$M11_ALPINE" /bin/busybox sh -c \
+        '[ -e /proc/1/stat ] || echo hidden' 2>/dev/null)
+    check_contains "a host pid stays unreachable under a /proc bind" \
+        "hidden" "$got"
+
+    # An explicit -b /proc:DIR pointing somewhere else is the user overriding
+    # the host view, and must outrank both the passthrough and the synthesis.
     BP=$(mktemp -d); printf 'bound\n' > "$BP/loadavg"
     got=$(run -R -b /proc:"$BP" "$M11_ALPINE" /bin/busybox cat /proc/loadavg \
         2>/dev/null)

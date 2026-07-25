@@ -550,6 +550,54 @@ static int at_canon(long dirfd, const char *path, char *out, size_t sz) {
     return cng_fs_untranslate(cng_g_fs, host, out, sz);
 }
 
+/* 1 if the open fd refers to the host's real /proc — the directory whose
+ * numeric entries the hidden-process view has to filter out of a listing.
+ * Keyed on the fd's host path, so an explicit `-b /proc:/proc` (or the host
+ * /proc bound at some other guest path) is covered exactly like the built-in
+ * passthrough. */
+static int fd_is_host_proc(long fd) {
+    char proc[40], hp[CNG_PATH_MAX];
+    proc_fd_path(fd, proc);
+    long n = sys_readlinkat(CNG_AT_FDCWD, proc, hp, sizeof hp - 1);
+    if (n <= 0)
+        return 0;
+    hp[n] = '\0';
+    return strcmp(hp, "/proc") == 0;
+}
+
+/* Does this getdents64 batch contain an all-digit name? Only then can the
+ * hidden-process filter have anything to do, so this keeps the readlink in
+ * fd_is_host_proc off every ordinary directory listing. */
+static int dents_have_pid(const char *buf, long n) {
+    for (long o = 0; o + 19 <= n;) {
+        unsigned short reclen;
+        memcpy(&reclen, buf + o + 16, 2);
+        if (reclen == 0 || o + reclen > n)
+            break;
+        const char *nm = buf + o + 19;
+        if (*nm >= '0' && *nm <= '9')
+            return 1;
+        o += reclen;
+    }
+    return 0;
+}
+
+/* A /proc entry the guest may see: anything not all-digits (self, sys, net,
+ * version, ...), plus the guest processes' own pids. */
+static int proc_name_visible(const char *nm) {
+    if (*nm < '0' || *nm > '9')
+        return 1;
+    long pid = 0;
+    for (const char *p = nm; *p; p++) {
+        if (*p < '0' || *p > '9')
+            return 1; /* "1abc" is an ordinary name, not a pid */
+        pid = pid * 10 + (*p - '0');
+        if (pid > 0x7fffffff)
+            return 1;
+    }
+    return cng_procreg_has((int)pid);
+}
+
 /* 1 if the open fd refers to the rootfs root directory (where the ".l2s"
  * store entry itself must be hidden from listings). */
 static int fd_is_rootfs_root(long fd) {
@@ -939,9 +987,18 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * ours, re-read so a filtered 0 isn't mistaken for end-of-directory. */
     case __NR_getdents64: {
         long n = reissue(a0, a1, a2, a3, a4, a5, __NR_getdents64);
-        if (!cng_g_l2s || n <= 0 || !a1)
+        if (n <= 0 || !a1)
             return n;
-        int at_root = fd_is_rootfs_root(a0);
+        /* Hidden-process view, listing side: the path layer makes a host
+         * process's /proc entry unreachable, but `ls /proc` and `ps` read the
+         * directory, so the numeric entries have to go as well. Deciding that
+         * costs a readlink of the fd, so it is asked only when this batch
+         * actually holds a numeric name — outside /proc almost nothing does. */
+        int at_proc = !cng_g_no_proc && dents_have_pid((const char *)a1, n) &&
+                      fd_is_host_proc(a0);
+        if (!cng_g_l2s && !at_proc)
+            return n;
+        int at_root = cng_g_l2s && fd_is_rootfs_root(a0);
         char *buf = (char *)a1;
         for (;;) {
             /* linux_dirent64: d_reclen u16 @16, d_name @19. d_off cookies are
@@ -953,8 +1010,9 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 if (reclen == 0 || o + reclen > n)
                     break;
                 const char *nm = buf + o + 19;
-                int hide =
-                    cng_l2s_hidden(nm) || (at_root && !strcmp(nm, ".l2s"));
+                int hide = (cng_g_l2s && (cng_l2s_hidden(nm) ||
+                                          (at_root && !strcmp(nm, ".l2s")))) ||
+                           (at_proc && !proc_name_visible(nm));
                 if (!hide) {
                     if (w != o)
                         memmove(buf + w, buf + o, reclen);

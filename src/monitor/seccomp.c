@@ -57,10 +57,10 @@ static const int id_syscalls[] = {
 
 /* File syscalls trapped only when -l/--link2symlink is active: fstat must
  * report the emulated st_nlink, getdents64 must hide the backing files. Must
- * match the l2s hooks in dispatch.c. */
+ * match the l2s hooks in dispatch.c. (getdents64 is also trapped for the /proc
+ * hidden-process view — see below — so it is listed once, conditionally.) */
 static const int l2s_syscalls[] = {
     __NR_fstat,
-    __NR_getdents64,
 };
 #define NL2S ((int)(sizeof(l2s_syscalls) / sizeof(l2s_syscalls[0])))
 
@@ -73,7 +73,7 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
 
     /* Build the trapped syscall list (path set, plus id set when faking, plus
      * the l2s set when hardlink emulation is on). */
-    int nr[NPATH + NID + NL2S];
+    int nr[NPATH + NID + NL2S + 1]; /* +1: the conditional getdents64 */
     int nsys = 0;
     for (int i = 0; i < NPATH; i++)
         nr[nsys++] = path_syscalls[i];
@@ -83,6 +83,11 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
     if (cng_g_l2s)
         for (int i = 0; i < NL2S; i++)
             nr[nsys++] = l2s_syscalls[i];
+    /* getdents64: hides the l2s backing files, and — the reason it is trapped
+     * by default — filters host processes out of a /proc listing, which is
+     * what `ls /proc` and `ps` actually read. Listed once for either. */
+    if (cng_g_l2s || !cng_g_no_proc)
+        nr[nsys++] = __NR_getdents64;
 
     if (cap < CNG_SECCOMP_MAX_INSNS)
         return -1;

@@ -1607,11 +1607,74 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
         char mine[64];
         cng_snprintf(mine, sizeof mine, "/proc/%d/stat", self);
         ok &= cng_fs_translate(&fs, mine, out, sizeof out) == 0 &&
-              !strncmp(out, "/proc/", 6);
-        /* pid 1 is a host process: hidden, so it resolves into the rootfs */
+              !strcmp(out, mine);
+        /* pid 1 is a host process: redirected to /proc/0, which never exists */
         ok &= cng_fs_translate(&fs, "/proc/1/stat", out, sizeof out) == 0 &&
-              strncmp(out, "/proc/", 6) != 0;
+              !strcmp(out, "/proc/0/stat");
         cng_dprintf(1, "proctest passthrough+hidden -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 1b) the hidden view keys on where the path LANDS, not on which map rule
+     *     put it there: binding the host /proc at /proc must not hand the guest
+     *     the host's process list back. The listing side of the same rule is
+     *     proc_name_visible, driven through the getdents64 hook. */
+    {
+        static struct cng_fs pb;
+        cng_fs_init(&pb, rootfs);
+        cng_fs_add_bind(&pb, "/proc", "/proc");
+        char out[CNG_PATH_MAX];
+        int ok = 1;
+        ok &= cng_fs_translate(&pb, "/proc/1/stat", out, sizeof out) == 0 &&
+              !strcmp(out, "/proc/0/stat");
+        char mine[64];
+        cng_snprintf(mine, sizeof mine, "/proc/%d/stat", self);
+        ok &= cng_fs_translate(&pb, mine, out, sizeof out) == 0 &&
+              !strcmp(out, mine);
+        /* non-numeric names are unaffected by the bind */
+        ok &= cng_fs_translate(&pb, "/proc/version", out, sizeof out) == 0 &&
+              !strcmp(out, "/proc/version");
+        cng_dprintf(1, "proctest bound-proc hidden -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 1c) the listing filter itself: host pids are dropped from a /proc
+     *     listing, guest pids and named entries survive. */
+    {
+        long dfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/proc",
+                                CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC,
+                                0, 0, 0, /*trapped=*/0);
+        int ok = dfd >= 0, saw_self = 0, saw_mine = 0, saw_host = 0;
+        while (dfd >= 0) {
+            long n = cng_dispatch(__NR_getdents64, dfd, (long)buf, sizeof buf, 0,
+                                  0, 0, /*trapped=*/0);
+            if (n <= 0)
+                break;
+            for (long o = 0; o + 19 <= n;) {
+                unsigned short reclen;
+                memcpy(&reclen, buf + o + 16, 2);
+                if (reclen == 0 || o + reclen > n)
+                    break;
+                const char *nm = buf + o + 19;
+                if (!strcmp(nm, "self"))
+                    saw_self = 1;
+                if (nm[0] >= '0' && nm[0] <= '9') {
+                    long pid = 0;
+                    for (const char *p = nm; *p >= '0' && *p <= '9'; p++)
+                        pid = pid * 10 + (*p - '0');
+                    if (pid == self)
+                        saw_mine = 1;
+                    else if (!cng_procreg_has((int)pid))
+                        saw_host = 1;
+                }
+                o += reclen;
+            }
+        }
+        if (dfd >= 0)
+            sys_close((int)dfd);
+        ok = ok && saw_self && saw_mine && !saw_host;
+        cng_dprintf(1, "proctest listing: self=%d own_pid=%d host_pids=%d -> %s\n",
+                    saw_self, saw_mine, saw_host, ok ? "OK" : "FAIL");
         fails += !ok;
     }
 
