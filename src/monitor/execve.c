@@ -214,6 +214,11 @@ static long execve_core(int dirfd, const char *path, char **argv, char **envp,
     cng_close_cloexec();
     cng_reset_signals();
 
+    /* setuid/setgid-on-exec against the fake credential set (--setuid-root /
+     * --setgid-root): `host` is the ELF the kernel would honor the set-id bit on
+     * (the interpreter for a #! script, matching the kernel's script exception). */
+    cng_cred_exec(host);
+
     /* Track the running program for /proc/self/exe fixups. A real kernel updates
      * /proc/self/exe on every execve (symlinks resolved); tools derive their
      * install root from it — notably `go`, which computes GOROOT from

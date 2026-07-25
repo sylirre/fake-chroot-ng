@@ -103,6 +103,9 @@ int cng_run(const char *rootfs, const char *libprefix,
         cng_dprintf(2, "chroot-ng: cannot resolve %s\n", prog_guest);
         return 1;
     }
+    /* setuid/setgid-on-exec for the initial program (e.g. running /bin/su
+     * directly), mirroring the emulated-execve path. */
+    cng_cred_exec(host_prog);
 
     struct cng_loaded prog;
     int rc = cng_load_elf(host_prog, 0, &prog);

@@ -261,6 +261,36 @@ int cng_cmd_faketest(int argc, char **argv, char **envp, unsigned long *auxv) {
     long re = cng_dispatch(__NR_setuid, 0, 0, 0, 0, 0, 0, 1);
     cng_dprintf(1, "setuid_drop rc=%d uid=%d regain=%d\n", (int)su, (int)u2,
                 (int)re);
+
+    /* --setuid-root / --setgid-root: as a non-root fake id (1000), a setuid+
+     * setgid executable ("/suid", mode 6755) is shown as owned by root:root, and
+     * exec of it elevates euid/egid to 0 while ruid stays 1000 — after which the
+     * guest's own setuid(0) is privileged and sticks. This is the `su` chain. */
+    cng_g_fake_uid = 1000;
+    cng_g_fake_gid = 1000;
+    cng_cred_seed();
+    cng_g_setuid_root = 1;
+    cng_g_setgid_root = 1;
+
+    char sub[256];
+    long sr = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/suid",
+                           (long)sub, 0, 0, 0, /*trapped=*/0);
+    if (sr == 0)
+        cng_dprintf(1, "suid_stat st_uid=%u st_gid=%u\n",
+                    *(unsigned *)(sub + 24), *(unsigned *)(sub + 28));
+    else
+        cng_dprintf(1, "suid_stat errno %d\n", (int)-sr);
+
+    char suidhost[CNG_PATH_MAX];
+    if (cng_fs_translate(&fs, "/suid", suidhost, sizeof suidhost) == 0)
+        cng_cred_exec(suidhost);
+    cng_dprintf(1, "suid_exec ruid=%d euid=%d egid=%d\n",
+                (int)cng_dispatch(__NR_getuid, 0, 0, 0, 0, 0, 0, 1),
+                (int)cng_dispatch(__NR_geteuid, 0, 0, 0, 0, 0, 0, 1),
+                (int)cng_dispatch(__NR_getegid, 0, 0, 0, 0, 0, 0, 1));
+    long root = cng_dispatch(__NR_setuid, 0, 0, 0, 0, 0, 0, 1);
+    cng_dprintf(1, "su_to_root rc=%d uid=%d\n", (int)root,
+                (int)cng_dispatch(__NR_getuid, 0, 0, 0, 0, 0, 0, 1));
     return 0;
 }
 

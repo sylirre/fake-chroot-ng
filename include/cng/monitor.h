@@ -45,9 +45,29 @@ extern unsigned cng_g_host_gid;          /* real invoking gid */
 extern struct cng_cred cng_g_cred;       /* live credential set */
 extern const char *cng_g_exe_guest;
 
+/* Show setuid/setgid *executables* as owned by root (uid/gid 0), and — on exec —
+ * elevate the fake identity's effective id to 0. This is what lets a setuid-root
+ * binary such as `su` gain root under a non-root fake id. Both imply --fake-id
+ * (the credential subsystem they depend on). See cng_exec_vis_* / cng_cred_exec. */
+extern int cng_g_setuid_root;
+extern int cng_g_setgid_root;
+
+/* File-type / set-id mode bits used by the fake-id ownership fixups. */
+#define CNG_S_IFMT  0170000u
+#define CNG_S_IFREG 0100000u
+#define CNG_S_ISUID 0004000u
+#define CNG_S_ISGID 0002000u
+
 /* Seed the live credential set from cng_g_fake_uid/gid (r=e=s=fs, no groups).
  * Call once cng_g_fake_uid/gid (and cng_g_host_uid/gid) are set. */
 void cng_cred_seed(void);
+
+/* Apply setuid/setgid-on-exec to the fake credential set: if `host` (the ELF
+ * being exec'd) is a setuid/setgid regular file, its effective/saved/fs id
+ * becomes the file's visible owner/group — root under --setuid-root/--setgid-root
+ * (see cng_exec_vis_*). No-op unless a fake identity is active and at least one
+ * of the flags is set. Applied by the emulated execve and the initial run. */
+void cng_cred_exec(const char *host);
 
 /* Emulate a credential syscall (get/set uid/gid family, groups, capabilities)
  * against cng_g_cred. Only the first three args are consumed by any of them;
@@ -69,6 +89,23 @@ static inline unsigned cng_remap_uid(unsigned u) {
 }
 static inline unsigned cng_remap_gid(unsigned g) {
     return (cng_g_fake_id && g == cng_g_host_gid) ? cng_g_fake_gid : g;
+}
+
+/* Visible owner/group of a file with mode `mode`: a setuid/setgid *regular* file
+ * is shown as owned by root (0) when the matching --setuid-root/--setgid-root is
+ * set — so setuid-root binaries like `su` appear (and, on exec, act) as root;
+ * otherwise the plain host->fake remap applies. */
+static inline unsigned cng_exec_vis_uid(unsigned u, unsigned mode) {
+    if (cng_g_setuid_root && (mode & CNG_S_ISUID) &&
+        (mode & CNG_S_IFMT) == CNG_S_IFREG)
+        return 0;
+    return cng_remap_uid(u);
+}
+static inline unsigned cng_exec_vis_gid(unsigned g, unsigned mode) {
+    if (cng_g_setgid_root && (mode & CNG_S_ISGID) &&
+        (mode & CNG_S_IFMT) == CNG_S_IFREG)
+        return 0;
+    return cng_remap_gid(g);
 }
 
 /* Emulate execve/execveat in-process: load the new program, build its stack,

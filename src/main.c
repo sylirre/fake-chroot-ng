@@ -304,6 +304,12 @@ static void help(char **envp) {
                       "report and mutate this identity following POSIX rules, "
                       "and while its effective uid is 0 ownership/mode changes, "
                       "chown, and denied access() checks are faked as succeeding."},
+        {"    --setuid-root", "Show setuid executables as owned by root (uid 0), "
+                      "and on exec elevate the fake identity's effective uid to "
+                      "0. Lets a setuid-root binary such as 'su' gain root under "
+                      "a non-root --fake-id. Implies --fake-id."},
+        {"    --setgid-root", "As --setuid-root, but for setgid executables and "
+                      "the group id (gid 0). Implies --fake-id."},
         {"-R, --rewrite", "Rewrite the guest's svc instruction sites to "
                       "trampolines ahead of time. Faster than trapping every "
                       "syscall, and also provides path translation where the "
@@ -331,7 +337,7 @@ static void help(char **envp) {
     static const char *const examples[] = {
         "chroot-ng --probe",
         "chroot-ng -u ./rootfs /bin/sh",
-        "chroot-ng --fake-id 1000:1000 ./rootfs /bin/sh",
+        "chroot-ng --fake-id 1000:1000 --setuid-root --setgid-root ./rootfs /bin/su -",
         "chroot-ng -R -b /tmp:/data/local/tmp ./rootfs /bin/busybox sh",
         "chroot-ng / /usr/bin/uname -a",
     };
@@ -497,6 +503,14 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
                 } else if (i + 1 < argc && is_id_spec(argv[i + 1])) {
                     parse_id_spec(argv[++i]);   /* "--fake-id 1000:1000" form */
                 }
+            } else if (!strcmp(n, "setuid-root")) {
+                if (val) return err_noval(arg);
+                cng_g_fake_id = 1;   /* implies the fake-id subsystem */
+                cng_g_setuid_root = 1;
+            } else if (!strcmp(n, "setgid-root")) {
+                if (val) return err_noval(arg);
+                cng_g_fake_id = 1;
+                cng_g_setgid_root = 1;
             } else if (!strcmp(n, "rewrite")) {
                 if (val) return err_noval(arg);
                 cng_g_rewrite = 1;

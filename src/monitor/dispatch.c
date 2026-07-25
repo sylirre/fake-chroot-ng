@@ -22,27 +22,31 @@ const char *cng_g_exe_guest = "/";
 
 /* AArch64 struct stat / statx field offsets for ownership rewriting, plus the
  * st_mode offset used by the fake-root access() fallback. */
-#define STAT_MODE_OFF 16
-#define STAT_UID_OFF  24
-#define STAT_GID_OFF  28
-#define STATX_UID_OFF 20
-#define STATX_GID_OFF 24
-#define CNG_X_OK       1   /* access(2) X_OK */
+#define STAT_MODE_OFF  16
+#define STAT_UID_OFF   24
+#define STAT_GID_OFF   28
+#define STATX_UID_OFF  20
+#define STATX_GID_OFF  24
+#define STATX_MODE_OFF 28   /* stx_mode is a u16 at offset 28 */
+#define CNG_X_OK        1   /* access(2) X_OK */
 
 /* Rewrite a struct stat / statx buffer's ownership under a fake identity: files
- * owned by the real invoking user appear owned by the fake id (see cng_remap_*).
- * A no-op unless --fake-id is active. */
+ * owned by the real invoking user appear owned by the fake id, and a setuid/
+ * setgid executable appears root-owned under --setuid-root/--setgid-root (the
+ * st_mode drives that; see cng_exec_vis_*). A no-op unless --fake-id is active. */
 static void stat_remap(void *st) {
+    unsigned mode = *(unsigned *)((char *)st + STAT_MODE_OFF);
     unsigned *u = (unsigned *)((char *)st + STAT_UID_OFF);
     unsigned *g = (unsigned *)((char *)st + STAT_GID_OFF);
-    *u = cng_remap_uid(*u);
-    *g = cng_remap_gid(*g);
+    *u = cng_exec_vis_uid(*u, mode);
+    *g = cng_exec_vis_gid(*g, mode);
 }
 static void statx_remap(void *st) {
+    unsigned mode = *(unsigned short *)((char *)st + STATX_MODE_OFF);
     unsigned *u = (unsigned *)((char *)st + STATX_UID_OFF);
     unsigned *g = (unsigned *)((char *)st + STATX_GID_OFF);
-    *u = cng_remap_uid(*u);
-    *g = cng_remap_gid(*g);
+    *u = cng_exec_vis_uid(*u, mode);
+    *g = cng_exec_vis_gid(*g, mode);
 }
 
 /* Fake-root turns a privilege-denied ownership/mode change into success — the

@@ -16,6 +16,7 @@
 #include "cng/monitor.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
+#include "cng/uapi.h"
 
 #include <asm/unistd.h>
 
@@ -25,12 +26,42 @@ unsigned cng_g_fake_gid = 0;
 unsigned cng_g_host_uid = 0;
 unsigned cng_g_host_gid = 0;
 struct cng_cred cng_g_cred;
+int cng_g_setuid_root = 0;
+int cng_g_setgid_root = 0;
+
+/* AArch64 struct stat field offsets (st_mode/st_uid/st_gid). */
+#define ST_MODE_OFF 16
+#define ST_UID_OFF  24
+#define ST_GID_OFF  28
 
 void cng_cred_seed(void) {
     struct cng_cred *c = &cng_g_cred;
     c->ruid = c->euid = c->suid = c->fsuid = cng_g_fake_uid;
     c->rgid = c->egid = c->sgid = c->fsgid = cng_g_fake_gid;
     c->ngroups = 0;
+}
+
+void cng_cred_exec(const char *host) {
+    if (!cng_g_fake_id || !host ||
+        (!cng_g_setuid_root && !cng_g_setgid_root))
+        return;
+    unsigned char st[128]; /* AArch64 struct stat is 128 bytes */
+    if (cng_syscall6(CNG_AT_FDCWD, (long)host, (long)st, 0, 0, 0,
+                     __NR_newfstatat) != 0)
+        return;
+    unsigned mode = *(unsigned *)(st + ST_MODE_OFF);
+    struct cng_cred *c = &cng_g_cred;
+    /* setuid/setgid-on-exec: effective, saved, and fs id take the file's visible
+     * owner/group, which cng_exec_vis_* reports as 0 for a setuid/setgid regular
+     * file under the flags. ruid/rgid (the caller's real id) are unchanged. */
+    if (cng_g_setuid_root && (mode & CNG_S_ISUID) &&
+        (mode & CNG_S_IFMT) == CNG_S_IFREG)
+        c->euid = c->suid = c->fsuid =
+            cng_exec_vis_uid(*(unsigned *)(st + ST_UID_OFF), mode);
+    if (cng_g_setgid_root && (mode & CNG_S_ISGID) &&
+        (mode & CNG_S_IFMT) == CNG_S_IFREG)
+        c->egid = c->sgid = c->fsgid =
+            cng_exec_vis_gid(*(unsigned *)(st + ST_GID_OFF), mode);
 }
 
 #define ID_KEEP ((unsigned)-1) /* setres*id / setre*id "leave unchanged" */

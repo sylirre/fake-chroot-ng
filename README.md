@@ -52,6 +52,8 @@ H), `-R/--rewrite` (ahead-of-time `svc` rewriting).
 ```sh
 chroot-ng -u ./rootfs /bin/sh              # fake root (uid/gid 0)
 chroot-ng --fake-id 1000:1000 ./rootfs /bin/sh
+# non-root, but setuid-root `su` still works (--setuid/--setgid-root imply -u):
+chroot-ng --fake-id 1000:1000 --setuid-root --setgid-root ./rootfs /bin/su -
 ```
 
 Run `chroot-ng --probe` on any target device **first** — the whole in-process

@@ -4,6 +4,7 @@ echo "== M7: fidelity (uid/gid faking, /proc, link2symlink) =="
 
 ROOT=$(mktemp -d)
 printf hi > "$ROOT/f"
+printf x > "$ROOT/suid"; chmod 6755 "$ROOT/suid"   # setuid+setgid executable
 out=$(run -t faketest -r "$ROOT" /f 2>&1)
 
 check_contains "getuid faked to 0"          "getuid=0"            "$out"
@@ -15,6 +16,11 @@ check_contains "supplementary groups empty" "ngroups=0"           "$out"
 check_contains "capget reports full set under fake-root" "cap_eff=ffffffff" "$out"
 check_contains "privilege drop is real and irreversible" \
     "setuid_drop rc=0 uid=1000 regain=-1" "$out"
+check_contains "setuid-root shows setuid exec as root:root" \
+    "suid_stat st_uid=0 st_gid=0" "$out"
+check_contains "setuid-on-exec elevates euid/egid to 0 (ruid kept)" \
+    "suid_exec ruid=1000 euid=0 egid=0" "$out"
+check_contains "su can then become root" "su_to_root rc=0 uid=0" "$out"
 
 rm -rf "$ROOT"
 
