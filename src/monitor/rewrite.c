@@ -15,6 +15,9 @@ extern char cng_svc_tramp_ret[];
 #define SVC0_INSN    0xD4000001u /* `svc #0` */
 #define B_OPCODE     0x14000000u /* unconditional branch */
 #define BRANCH_REACH (1L << 27)  /* +-128 MiB */
+#define MOVZ_X8_MASK 0xFFE0001Fu /* movz x8, #imm16 (hw=0) */
+#define MOVZ_X8      0xD2800008u
+#define NR_RT_SIGRETURN 139u
 
 unsigned long cng_tramp_size(void) {
     return (unsigned long)(cng_svc_tramp_tpl_end - cng_svc_tramp_tpl);
@@ -45,6 +48,19 @@ int cng_rewrite_seg(unsigned long lo, unsigned long hi, unsigned long pool,
     for (unsigned long a = lo & ~3UL; a + 4 <= hi; a += 4) {
         if (*(uint32_t *)a != SVC0_INSN)
             continue;
+
+        /* Never rewrite a signal-return site (`mov x8,#139; svc 0` — the
+         * sa_restorer every handler returns through): rt_sigreturn must
+         * execute with sp still at the kernel's signal frame, which a
+         * trampoline call abandons — the kernel then restores a garbage
+         * context (SIGSEGV on the first signal, e.g. a shell's SIGCHLD).
+         * It carries no path anyway; leave it for the kernel. */
+        if (a >= lo + 4) {
+            uint32_t prev = *(uint32_t *)(a - 4);
+            if ((prev & MOVZ_X8_MASK) == MOVZ_X8 &&
+                ((prev >> 5) & 0xFFFFu) == NR_RT_SIGRETURN)
+                continue;
+        }
 
         /* Reachability of the next slot from this site via a `b`. */
         long delta = (long)(pool + *used) - (long)a;
