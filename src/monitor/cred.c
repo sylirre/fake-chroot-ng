@@ -21,6 +21,7 @@
 #include <asm/unistd.h>
 
 int cng_g_fake_id = 0;
+int cng_g_fake_id_explicit = 0;
 unsigned cng_g_fake_uid = 0;
 unsigned cng_g_fake_gid = 0;
 unsigned cng_g_host_uid = 0;
@@ -39,6 +40,19 @@ void cng_cred_seed(void) {
     c->ruid = c->euid = c->suid = c->fsuid = cng_g_fake_uid;
     c->rgid = c->egid = c->sgid = c->fsgid = cng_g_fake_gid;
     c->ngroups = 0;
+}
+
+void cng_cred_setup(unsigned host_uid, unsigned host_gid) {
+    cng_g_host_uid = host_uid;
+    cng_g_host_gid = host_gid;
+    /* An identity only implied by --setuid-root/--setgid-root defaults to the
+     * real invoking id, not 0:0 — so those flags enable setuid binaries without
+     * silently turning the guest into root. An explicit -u/--fake-id wins. */
+    if (!cng_g_fake_id_explicit) {
+        cng_g_fake_uid = host_uid;
+        cng_g_fake_gid = host_gid;
+    }
+    cng_cred_seed();
 }
 
 void cng_cred_exec(const char *host) {

@@ -65,13 +65,11 @@ int cng_run(const char *rootfs, const char *libprefix,
         if (!strncmp(*e, "CNG_DEBUG=", 10) && (*e)[10] != '0')
             cng_g_debug = 1;
 
-    /* Fake identity (--fake-id): capture the real invoking ids (the stat-remap
-     * source) and seed the live credential set from the configured uid:gid. */
-    if (cng_g_fake_id) {
-        cng_g_host_uid = (unsigned)sys_getuid();
-        cng_g_host_gid = (unsigned)sys_getgid();
-        cng_cred_seed();
-    }
+    /* Fake identity (--fake-id): establish it from the real invoking ids (which
+     * are also the stat-remap source). See cng_cred_setup for the implied-vs-
+     * explicit identity default. */
+    if (cng_g_fake_id)
+        cng_cred_setup((unsigned)sys_getuid(), (unsigned)sys_getgid());
 
     /* Filesystem view. */
     cng_fs_init(&g_fs, rootfs);

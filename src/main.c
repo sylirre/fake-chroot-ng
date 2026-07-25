@@ -307,9 +307,10 @@ static void help(char **envp) {
         {"    --setuid-root", "Show setuid executables as owned by root (uid 0), "
                       "and on exec elevate the fake identity's effective uid to "
                       "0. Lets a setuid-root binary such as 'su' gain root under "
-                      "a non-root --fake-id. Implies --fake-id."},
+                      "a non-root identity. Implies --fake-id, defaulting to your "
+                      "real uid/gid (not 0:0) unless -u/--fake-id sets one."},
         {"    --setgid-root", "As --setuid-root, but for setgid executables and "
-                      "the group id (gid 0). Implies --fake-id."},
+                      "the group id (gid 0). Implies --fake-id (see above)."},
         {"-R, --rewrite", "Rewrite the guest's svc instruction sites to "
                       "trampolines ahead of time. Faster than trapping every "
                       "syscall, and also provides path translation where the "
@@ -498,6 +499,7 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
                 return cng_cmd_probe(argc - i, argv + i, envp, auxv);
             } else if (!strcmp(n, "fake-id")) {
                 cng_g_fake_id = 1;   /* default 0:0 unless a spec follows */
+                cng_g_fake_id_explicit = 1;
                 if (val) {
                     if (parse_id_spec(val) < 0) return err_badid(val);
                 } else if (i + 1 < argc && is_id_spec(argv[i + 1])) {
@@ -548,6 +550,7 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
                 else if (c == 'v') { version(); return 0; }
                 else if (c == 'u') {
                     cng_g_fake_id = 1;   /* default 0:0 unless a spec follows */
+                    cng_g_fake_id_explicit = 1;
                     if (*p) {                                    /* -uID */
                         if (parse_id_spec(p) < 0) return err_badid(p);
                     } else if (i + 1 < argc && is_id_spec(argv[i + 1])) {

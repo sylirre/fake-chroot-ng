@@ -102,10 +102,11 @@ vfork/`posix_spawn` child-stack handling.
     capability set, and stat/statx ownership is remapped so files owned by the
     real invoking user appear owned by the fake id. Credential syscalls are
     trapped only when `--fake-id` is active (kept out of the filter otherwise).
-  - `--setuid-root` / `--setgid-root` (imply `--fake-id`): setuid/setgid
-    executables are shown as owned by root (uid/gid 0) and, on exec, elevate the
-    fake identity's effective/saved/fs id to 0 — so a setuid-root binary such as
-    `su` gains root under a non-root fake id (its own `setuid(0)` then sticks).
+  - `--setuid-root` / `--setgid-root` (imply `--fake-id`, defaulting to the real
+    invoking id rather than 0:0 when no explicit `-u`): setuid/setgid executables
+    are shown as owned by root (uid/gid 0) and, on exec, elevate the fake
+    identity's effective/saved/fs id to 0 — so a setuid-root binary such as `su`
+    gains root under a non-root identity (its own `setuid(0)` then sticks).
   - `/proc/self/{exe,cwd,root}` readlink fixups return guest-visible targets.
   - link2symlink (lightweight): linkat falls back to a symlink when the fs
     forbids hardlinks (EPERM/EMLINK/EXDEV/ENOSYS/EACCES/EOPNOTSUPP).

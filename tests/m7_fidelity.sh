@@ -21,6 +21,10 @@ check_contains "setuid-root shows setuid exec as root:root" \
 check_contains "setuid-on-exec elevates euid/egid to 0 (ruid kept)" \
     "suid_exec ruid=1000 euid=0 egid=0" "$out"
 check_contains "su can then become root" "su_to_root rc=0 uid=0" "$out"
+check_contains "implied identity defaults to real invoking id (not root)" \
+    "implied_id uid=4321 gid=8765" "$out"
+check_contains "explicit -u overrides the implied default" \
+    "explicit_id uid=1000 gid=1000" "$out"
 
 rm -rf "$ROOT"
 

@@ -291,6 +291,26 @@ int cng_cmd_faketest(int argc, char **argv, char **envp, unsigned long *auxv) {
     long root = cng_dispatch(__NR_setuid, 0, 0, 0, 0, 0, 0, 1);
     cng_dprintf(1, "su_to_root rc=%d uid=%d\n", (int)root,
                 (int)cng_dispatch(__NR_getuid, 0, 0, 0, 0, 0, 0, 1));
+
+    /* Identity resolution (cng_cred_setup): an id only implied by --setuid-root
+     * (explicit=0) defaults to the real invoking id, so those flags alone don't
+     * turn the guest into root; an explicit -u/--fake-id (explicit=1) wins. */
+    cng_g_setuid_root = 0;
+    cng_g_setgid_root = 0;
+    cng_g_fake_id_explicit = 0;
+    cng_g_fake_uid = 0;
+    cng_g_fake_gid = 0; /* CLI defaults before the run seeds the identity */
+    cng_cred_setup(4321, 8765);
+    cng_dprintf(1, "implied_id uid=%d gid=%d\n",
+                (int)cng_dispatch(__NR_getuid, 0, 0, 0, 0, 0, 0, 1),
+                (int)cng_dispatch(__NR_getgid, 0, 0, 0, 0, 0, 0, 1));
+    cng_g_fake_id_explicit = 1;
+    cng_g_fake_uid = 1000;
+    cng_g_fake_gid = 1000;
+    cng_cred_setup(4321, 8765);
+    cng_dprintf(1, "explicit_id uid=%d gid=%d\n",
+                (int)cng_dispatch(__NR_getuid, 0, 0, 0, 0, 0, 0, 1),
+                (int)cng_dispatch(__NR_getgid, 0, 0, 0, 0, 0, 0, 1));
     return 0;
 }
 

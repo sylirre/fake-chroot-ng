@@ -38,6 +38,10 @@ struct cng_cred {
 };
 
 extern int cng_g_fake_id;                /* --fake-id active */
+extern int cng_g_fake_id_explicit;       /* an id was requested via -u/--fake-id
+                                          * (vs. only implied by --setuid-root):
+                                          * when 0, the identity defaults to the
+                                          * real invoking id, not 0:0 */
 extern unsigned cng_g_fake_uid;          /* configured id = stat remap target */
 extern unsigned cng_g_fake_gid;          /* (fixed; live ids live in cng_g_cred) */
 extern unsigned cng_g_host_uid;          /* real invoking uid, captured at start */
@@ -61,6 +65,12 @@ extern int cng_g_setgid_root;
 /* Seed the live credential set from cng_g_fake_uid/gid (r=e=s=fs, no groups).
  * Call once cng_g_fake_uid/gid (and cng_g_host_uid/gid) are set. */
 void cng_cred_seed(void);
+
+/* Establish the fake identity at startup from the real invoking id: record it as
+ * the stat-remap source, and — when no id was requested explicitly (the identity
+ * is only implied by --setuid-root/--setgid-root) — default the fake id to it
+ * rather than 0:0, then seed the live set. Called once by cng_run. */
+void cng_cred_setup(unsigned host_uid, unsigned host_gid);
 
 /* Apply setuid/setgid-on-exec to the fake credential set: if `host` (the ELF
  * being exec'd) is a setuid/setgid regular file, its effective/saved/fs id
