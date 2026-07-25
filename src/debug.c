@@ -212,14 +212,20 @@ int cng_cmd_faketest(int argc, char **argv, char **envp, unsigned long *auxv) {
     cng_g_fake_id = 1;
     cng_g_fake_uid = 0;
     cng_g_fake_gid = 0;
+    /* The remap source is the real owner of the test file (this process). */
+    cng_g_host_uid = (unsigned)sys_getuid();
+    cng_g_host_gid = (unsigned)sys_getgid();
+    cng_cred_seed();
     cng_g_exe_guest = "/bin/sh";
 
     cng_dprintf(1, "getuid=%d\n",
                 (int)cng_dispatch(__NR_getuid, 0, 0, 0, 0, 0, 0, 0));
     cng_dprintf(1, "geteuid=%d\n",
                 (int)cng_dispatch(__NR_geteuid, 0, 0, 0, 0, 0, 0, 0));
+    /* fchown a real fd (stdout) to root: the unprivileged host can't, so
+     * fake-root must turn the denial into success. */
     cng_dprintf(1, "fchown=%d\n",
-                (int)cng_dispatch(__NR_fchown, 3, 0, 0, 0, 0, 0, 1));
+                (int)cng_dispatch(__NR_fchown, 1, 0, 0, 0, 0, 0, 1));
 
     char sb[256];
     long r = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)file, (long)sb,
@@ -238,6 +244,23 @@ int cng_cmd_faketest(int argc, char **argv, char **envp, unsigned long *auxv) {
         lb[n] = '\0';
         cng_dprintf(1, "exe=%s\n", lb);
     }
+
+    /* Full credential model. Supplementary groups start empty; capabilities are
+     * the full set while fake-root (euid still 0 at this point). */
+    cng_dprintf(1, "ngroups=%d\n",
+                (int)cng_dispatch(__NR_getgroups, 0, 0, 0, 0, 0, 0, 1));
+    unsigned caphdr[2] = { 0x20080522u, 0 };   /* _LINUX_CAPABILITY_VERSION_3 */
+    unsigned capdata[6] = { 0 };               /* two {eff,perm,inh} blocks */
+    cng_dispatch(__NR_capget, (long)caphdr, (long)capdata, 0, 0, 0, 0, 1);
+    cng_dprintf(1, "cap_eff=%x\n", capdata[0]);
+
+    /* A privilege drop is real and, for the resulting non-root id, irreversible:
+     * setuid(1000) succeeds, getuid then reports 1000, and setuid(0) is EPERM. */
+    long su = cng_dispatch(__NR_setuid, 1000, 0, 0, 0, 0, 0, 1);
+    long u2 = cng_dispatch(__NR_getuid, 0, 0, 0, 0, 0, 0, 1);
+    long re = cng_dispatch(__NR_setuid, 0, 0, 0, 0, 0, 0, 1);
+    cng_dprintf(1, "setuid_drop rc=%d uid=%d regain=%d\n", (int)su, (int)u2,
+                (int)re);
     return 0;
 }
 

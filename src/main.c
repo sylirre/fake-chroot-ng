@@ -298,9 +298,12 @@ static void help(char **envp) {
         {"-b, --bind G:H", "Bind guest path G to host path H (repeatable, up to "
                       "64). Guest accesses under G resolve to H on the host. "
                       "Neither side may contain ':'."},
-        {"-0, --fake-root", "Present a fake root identity (uid/gid 0): "
-                      "credential syscalls report 0, setuid-family calls "
-                      "succeed silently, and ownership / chown are faked."},
+        {"-u, --fake-id[=ID]", "Present a fake user identity. ID is a uid or "
+                      "uid:gid (a bare -u/--fake-id defaults to 0:0, root; a "
+                      "single number sets both uid and gid). Credential syscalls "
+                      "report and mutate this identity following POSIX rules, "
+                      "and while its effective uid is 0 ownership/mode changes, "
+                      "chown, and denied access() checks are faked as succeeding."},
         {"-R, --rewrite", "Rewrite the guest's svc instruction sites to "
                       "trampolines ahead of time. Faster than trapping every "
                       "syscall, and also provides path translation where the "
@@ -327,7 +330,8 @@ static void help(char **envp) {
     };
     static const char *const examples[] = {
         "chroot-ng --probe",
-        "chroot-ng -0 ./rootfs /bin/sh",
+        "chroot-ng -u ./rootfs /bin/sh",
+        "chroot-ng --fake-id 1000:1000 ./rootfs /bin/sh",
         "chroot-ng -R -b /tmp:/data/local/tmp ./rootfs /bin/busybox sh",
         "chroot-ng / /usr/bin/uname -a",
     };
@@ -387,6 +391,47 @@ static int err_noval(const char *opt) {
     usage(2);
     return 2;
 }
+static int err_badid(const char *spec) {
+    cng_dprintf(2, "chroot-ng: --fake-id '%s': expected UID or UID:GID\n", spec);
+    usage(2);
+    return 2;
+}
+
+/* Recognize a fake-id spec: "N" or "N:N" (decimal, non-empty on each side). */
+static int is_id_spec(const char *s) {
+    if (!s || !*s) return 0;
+    int seen_colon = 0, digits = 0;
+    for (const char *p = s; *p; p++) {
+        if (*p == ':') {
+            if (seen_colon || !digits) return 0;
+            seen_colon = 1; digits = 0;
+        } else if (*p >= '0' && *p <= '9') {
+            digits = 1;
+        } else {
+            return 0;
+        }
+    }
+    return digits;
+}
+
+/* Parse a validated "N" (gid defaults to uid) or "N:M" spec into the fake-id
+ * globals. Returns 0, or -1 if the spec is malformed. */
+static int parse_id_spec(const char *s) {
+    if (!is_id_spec(s)) return -1;
+    unsigned u = 0;
+    const char *p = s;
+    for (; *p >= '0' && *p <= '9'; p++) u = u * 10 + (unsigned)(*p - '0');
+    unsigned g;
+    if (*p == ':') {
+        g = 0;
+        for (p++; *p >= '0' && *p <= '9'; p++) g = g * 10 + (unsigned)(*p - '0');
+    } else {
+        g = u;   /* a single value applies to both uid and gid */
+    }
+    cng_g_fake_uid = u;
+    cng_g_fake_gid = g;
+    return 0;
+}
 
 /* Register a "-b GUEST:HOST" spec into the (guest, host) bind arrays. Returns 0,
  * or -1 (with a diagnostic) on a full table or a malformed spec. */
@@ -420,7 +465,7 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
 
     /* GNU-style options: single-letter short (-R), --word long. Value-taking
      * options accept "-b VAL"/"-bVAL" and "--bind VAL"/"--bind=VAL"; no-arg
-     * shorts bundle ("-0R"). Parsing stops at the first non-option, at "--", or
+     * shorts bundle ("-RF"). Parsing stops at the first non-option, at "--", or
      * at <rootfs>, so guest args are never consumed as options. The mode flags
      * --probe and -t hand the rest of argv to the probe / self-test verbatim. */
     int i = 1;
@@ -445,9 +490,13 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
                 if (val) return err_noval(arg);
                 argv[i] = (char *)"probe";             /* callee's argv[0] */
                 return cng_cmd_probe(argc - i, argv + i, envp, auxv);
-            } else if (!strcmp(n, "fake-root")) {
-                if (val) return err_noval(arg);
-                cng_g_fake_id = 1; cng_g_fake_uid = 0; cng_g_fake_gid = 0;
+            } else if (!strcmp(n, "fake-id")) {
+                cng_g_fake_id = 1;   /* default 0:0 unless a spec follows */
+                if (val) {
+                    if (parse_id_spec(val) < 0) return err_badid(val);
+                } else if (i + 1 < argc && is_id_spec(argv[i + 1])) {
+                    parse_id_spec(argv[++i]);   /* "--fake-id 1000:1000" form */
+                }
             } else if (!strcmp(n, "rewrite")) {
                 if (val) return err_noval(arg);
                 cng_g_rewrite = 1;
@@ -478,12 +527,20 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
             } else {
                 return err_unknown(arg);
             }
-        } else {                                       /* short cluster: -0Rb... */
+        } else {                                       /* short cluster: -RFb... */
             for (char *p = arg + 1; *p; ) {
                 char c = *p++;
                 if (c == 'h') { help(envp); return 0; }
                 else if (c == 'v') { version(); return 0; }
-                else if (c == '0') { cng_g_fake_id = 1; cng_g_fake_uid = 0; cng_g_fake_gid = 0; }
+                else if (c == 'u') {
+                    cng_g_fake_id = 1;   /* default 0:0 unless a spec follows */
+                    if (*p) {                                    /* -uID */
+                        if (parse_id_spec(p) < 0) return err_badid(p);
+                    } else if (i + 1 < argc && is_id_spec(argv[i + 1])) {
+                        parse_id_spec(argv[++i]);                /* -u ID */
+                    }
+                    break;   /* -u takes the rest of the cluster / next token */
+                }
                 else if (c == 'R') { cng_g_rewrite = 1; }
                 else if (c == 'F') { cng_g_loader_file = 1; }
                 else if (c == 'b') {

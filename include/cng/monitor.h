@@ -16,13 +16,60 @@ extern struct cng_fs *cng_g_fs;
  * started via emulated execve. */
 extern unsigned long *cng_host_auxv;
 
-/* Fidelity config (M7). When cng_g_fake_id is set, credential syscalls report
- * cng_g_fake_uid/gid, setuid-family calls succeed silently, chown is faked, and
- * stat ownership is rewritten. cng_g_exe_guest is what /proc/self/exe reports. */
-extern int cng_g_fake_id;
-extern unsigned cng_g_fake_uid;
-extern unsigned cng_g_fake_gid;
+/* Fidelity config (M7): fake user identity (--fake-id).
+ *
+ * When cng_g_fake_id is set the guest is presented a synthetic credential set
+ * (cng_g_cred) seeded from the configured uid:gid. Credential syscalls read and
+ * mutate this set following real POSIX privilege rules (so a privilege drop
+ * actually changes what getuid() reports, and a non-root fake id cannot regain
+ * uid 0); ownership/mode changes and denied access() checks are faked as
+ * succeeding while the effective uid is 0 (cng_fake_root); and stat ownership is
+ * remapped so files owned by the real invoking user (cng_g_host_uid/gid) appear
+ * owned by the fake id. The set is process-wide and, because the guest forks for
+ * real, is inherited across fork() exactly as the kernel would. cng_g_exe_guest
+ * is what /proc/self/exe reports. */
+#define CNG_NGROUPS_MAX 64
+
+struct cng_cred {
+    unsigned ruid, euid, suid, fsuid;    /* real, effective, saved-set, fs uid */
+    unsigned rgid, egid, sgid, fsgid;    /* real, effective, saved-set, fs gid */
+    unsigned groups[CNG_NGROUPS_MAX];    /* supplementary groups */
+    int ngroups;
+};
+
+extern int cng_g_fake_id;                /* --fake-id active */
+extern unsigned cng_g_fake_uid;          /* configured id = stat remap target */
+extern unsigned cng_g_fake_gid;          /* (fixed; live ids live in cng_g_cred) */
+extern unsigned cng_g_host_uid;          /* real invoking uid, captured at start */
+extern unsigned cng_g_host_gid;          /* real invoking gid */
+extern struct cng_cred cng_g_cred;       /* live credential set */
 extern const char *cng_g_exe_guest;
+
+/* Seed the live credential set from cng_g_fake_uid/gid (r=e=s=fs, no groups).
+ * Call once cng_g_fake_uid/gid (and cng_g_host_uid/gid) are set. */
+void cng_cred_seed(void);
+
+/* Emulate a credential syscall (get/set uid/gid family, groups, capabilities)
+ * against cng_g_cred. Only the first three args are consumed by any of them;
+ * the rest are forwarded for the (rare) non-faking re-issue path. */
+long cng_cred_handle(long nr, long a0, long a1, long a2, long a3, long a4,
+                     long a5);
+
+/* True when a fake identity is active AND its effective uid is 0: root's DAC
+ * bypass applies (ownership/mode changes and denied access() checks are faked). */
+static inline int cng_fake_root(void) {
+    return cng_g_fake_id && cng_g_cred.euid == 0;
+}
+
+/* Remap a host-side owner for stat results: a file owned by the real invoking
+ * user is shown as owned by the fake id; every other owner passes through. A
+ * no-op unless a fake identity is active. */
+static inline unsigned cng_remap_uid(unsigned u) {
+    return (cng_g_fake_id && u == cng_g_host_uid) ? cng_g_fake_uid : u;
+}
+static inline unsigned cng_remap_gid(unsigned g) {
+    return (cng_g_fake_id && g == cng_g_host_gid) ? cng_g_fake_gid : g;
+}
 
 /* Emulate execve/execveat in-process: load the new program, build its stack,
  * and rewrite the signal context (pc/sp/regs) to enter it — so the seccomp

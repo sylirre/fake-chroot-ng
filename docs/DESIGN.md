@@ -17,8 +17,8 @@ paying `proot`'s per-syscall `ptrace` overhead.
   SELinux `execmem` permission (the W^X-compliant `mmap(RW)` → `mprotect(RX)`
   flow used by ART's JIT). **This is the pivotal prerequisite** — `probe`
   checks it.
-- **Fidelity beyond chroot+bind:** uid/gid faking (`-0`/`-S`), `/proc` self-path
-  fixups, and `link2symlink`.
+- **Fidelity beyond chroot+bind:** fake user identity (`-u`/`--fake-id`), `/proc`
+  self-path fixups, and `link2symlink`.
 
 ## Why not the obvious approaches
 
@@ -118,8 +118,9 @@ Two layers handle this:
   dispatcher. Since our filter only traps syscalls we have explicit handlers
   for, anything reaching the dispatcher's `default` was trapped by *Android* —
   so we emulate `-ENOSYS` directly instead of re-issuing. Credential setters are
-  likewise emulated in place (fake success under `-0`, else `-ENOSYS`). Nothing
-  is re-issued, so this does not depend on nested signal delivery. (The M8
+  likewise emulated in place (against the fake-identity credential set under
+  `--fake-id`, else `-ENOSYS`). Nothing is re-issued, so this does not depend on
+  nested signal delivery. (The M8
   trampoline path passes `trapped=0`, where an unhandled syscall is an ordinary
   one to run, not a blocked one.)
 - **Block-list probe (for re-issued path syscalls).** Some syscalls we *do*
@@ -144,9 +145,10 @@ changes are applied with SIGSYS forced clear (in the SIGSYS handler we edit
 `sa_mask` on installed handlers has SIGSYS stripped, and `rt_sigaction(SIGSYS)`
 is ignored so the guest can't take over our slot.
 
-For a real container you want `-0` (root emulation), which emulates the
-credential syscalls as succeeding instead of ENOSYS — mirroring proot's `-0` and
-the way the reference emulator recommends `--fake-id` for apt/dpkg.
+For a real container you want `-u`/`--fake-id` (fake user identity, default
+`0:0` root), which emulates the credential syscalls against a synthetic
+credential set instead of returning ENOSYS — mirroring proot's `-0`/`-i` and the
+way the reference emulator recommends `--fake-id` for apt/dpkg.
 
 ### Known hazards (why the tiers exist)
 

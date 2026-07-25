@@ -3,7 +3,7 @@
  * seccomp filter allows so we don't re-trap. Runs in-process, so path pointers
  * are directly readable — no cross-process memory access like proot needs.
  *
- * Also applies the M7 fidelity fixups: credential/ownership faking (-0),
+ * Also applies the M7 fidelity fixups: credential/ownership faking (--fake-id),
  * /proc/self readlink fixups, and link2symlink fallback.
  */
 #include "cng/l2s.h"
@@ -17,16 +17,47 @@
 
 struct cng_fs *cng_g_fs = 0;
 
-int cng_g_fake_id = 0;
-unsigned cng_g_fake_uid = 0;
-unsigned cng_g_fake_gid = 0;
+/* The fake-identity globals (cng_g_fake_id, cng_g_cred, ...) live in cred.c. */
 const char *cng_g_exe_guest = "/";
 
-/* AArch64 struct stat / statx field offsets for ownership rewriting. */
+/* AArch64 struct stat / statx field offsets for ownership rewriting, plus the
+ * st_mode offset used by the fake-root access() fallback. */
+#define STAT_MODE_OFF 16
 #define STAT_UID_OFF  24
 #define STAT_GID_OFF  28
 #define STATX_UID_OFF 20
 #define STATX_GID_OFF 24
+#define CNG_X_OK       1   /* access(2) X_OK */
+
+/* Rewrite a struct stat / statx buffer's ownership under a fake identity: files
+ * owned by the real invoking user appear owned by the fake id (see cng_remap_*).
+ * A no-op unless --fake-id is active. */
+static void stat_remap(void *st) {
+    unsigned *u = (unsigned *)((char *)st + STAT_UID_OFF);
+    unsigned *g = (unsigned *)((char *)st + STAT_GID_OFF);
+    *u = cng_remap_uid(*u);
+    *g = cng_remap_gid(*g);
+}
+static void statx_remap(void *st) {
+    unsigned *u = (unsigned *)((char *)st + STATX_UID_OFF);
+    unsigned *g = (unsigned *)((char *)st + STATX_GID_OFF);
+    *u = cng_remap_uid(*u);
+    *g = cng_remap_gid(*g);
+}
+
+/* Fake-root turns a privilege-denied ownership/mode change into success — the
+ * real process is unprivileged, but the guest believes it is root. Denied
+ * (EPERM/EACCES/EINVAL) and Android-blocked (ENOSYS) results are faked; genuine
+ * errors (ENOENT, EROFS, ...) still propagate, as do all results when the
+ * identity is unprivileged or inactive. */
+static long chattr_result(long r) {
+    if (r == 0)
+        return 0;
+    if (cng_fake_root() &&
+        (r == -EPERM || r == -EACCES || r == -EINVAL || r == -ENOSYS))
+        return 0;
+    return r;
+}
 
 /* One-shot-per-number diagnostic that a syscall was emulated away (blocked by
  * Android's seccomp filter, or a credential change we can't perform). Shared
@@ -226,13 +257,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
 #ifdef __NR_openat2
     case __NR_openat2:
 #endif
-    case __NR_faccessat:
-#ifdef __NR_faccessat2
-    case __NR_faccessat2:
-#endif
     case __NR_mkdirat:
     case __NR_mknodat:
-    case __NR_fchmodat:
 #ifdef __NR_name_to_handle_at
     case __NR_name_to_handle_at:
 #endif
@@ -240,6 +266,36 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         int deref = !(nr == __NR_mkdirat || nr == __NR_mknodat);
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
         return reissue(a0, (long)p, a2, a3, a4, a5, nr);
+    }
+
+    /* access: translate + reissue; under fake-root apply root's DAC bypass when
+     * the real (unprivileged) check is denied — existence and R/W are granted,
+     * X requires at least one execute bit. mode is a2 for both variants. This is
+     * what "check-then-write" tools (package managers, `test -w`) rely on. */
+    case __NR_faccessat:
+#ifdef __NR_faccessat2
+    case __NR_faccessat2:
+#endif
+    {
+        const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, 1);
+        long r = reissue(a0, (long)p, a2, a3, a4, a5, nr);
+        if (r < 0 && cng_fake_root()) {
+            char sb[128]; /* AArch64 struct stat is 128 bytes */
+            if (reissue(a0, (long)p, (long)sb, 0, 0, 0, __NR_newfstatat) == 0) {
+                unsigned mode = *(unsigned *)(sb + STAT_MODE_OFF);
+                if (((int)a2 & CNG_X_OK) && !(mode & 0111))
+                    return -EACCES;
+                return 0;
+            }
+        }
+        return r;
+    }
+
+    /* chmod: translate + reissue; fake success under fake-root when the host
+     * denies the mode change (a chmod on a file you own still applies for real). */
+    case __NR_fchmodat: {
+        const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, 1);
+        return chattr_result(reissue(a0, (long)p, a2, a3, a4, a5, nr));
     }
 
     /* unlinkat: on removing one of our link2symlink names, drop the group's
@@ -265,7 +321,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * link2symlink entries, redirect to its backing file (the guest thinks it's
      * a regular file, so a set-then-lstat-verify — as apk does to preserve mtime
      * — must land on the backing, not the link). Setting an explicit time needs
-     * ownership; under -0 fake success on EPERM. */
+     * ownership; under fake-root fake success on EPERM. */
     case __NR_utimensat: {
         char data[CNG_PATH_MAX];
         unsigned long cnt;
@@ -275,7 +331,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 cng_l2s_resolve(hnf, data, sizeof data, &cnt) == 1) {
                 long r = cng_syscall6(CNG_AT_FDCWD, (long)data, a2, 0, 0, 0,
                                       __NR_utimensat);
-                if (cng_g_fake_id && (r == -EPERM || r == -EACCES))
+                if (cng_fake_root() && (r == -EPERM || r == -EACCES))
                     return 0;
                 return r;
             }
@@ -283,34 +339,30 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         int deref = !((int)a3 & CNG_AT_SYMLINK_NOFOLLOW);
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
         long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_utimensat);
-        if (cng_g_fake_id && (r == -EPERM || r == -EACCES))
+        if (cng_fake_root() && (r == -EPERM || r == -EACCES))
             return 0;
         return r;
     }
 
-    /* stat: translate, reissue, then fake ownership if -0. A link2symlink entry
-     * is presented as its backing file (a regular file) with st_nlink = the live
-     * group count, regardless of the NOFOLLOW flag — so the guest never sees the
-     * emulation as a symlink. */
+    /* stat: translate, reissue, then remap ownership under a fake id. A
+     * link2symlink entry is presented as its backing file (a regular file) with
+     * st_nlink = the live group count, regardless of the NOFOLLOW flag — so the
+     * guest never sees the emulation as a symlink. */
     case __NR_newfstatat: {
         if (cng_l2s_active && a2) {
             char hnf[CNG_PATH_MAX];
             if (resolve_at_host(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0 &&
                 cng_l2s_stat(hnf, (void *)a2) == 1) {
-                if (cng_g_fake_id) {
-                    *(unsigned *)((char *)a2 + STAT_UID_OFF) = cng_g_fake_uid;
-                    *(unsigned *)((char *)a2 + STAT_GID_OFF) = cng_g_fake_gid;
-                }
+                if (cng_g_fake_id)
+                    stat_remap((void *)a2);
                 return 0;
             }
         }
         int deref = !((int)a3 & CNG_AT_SYMLINK_NOFOLLOW);
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
         long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_newfstatat);
-        if (r == 0 && cng_g_fake_id && a2) {
-            *(unsigned *)((char *)a2 + STAT_UID_OFF) = cng_g_fake_uid;
-            *(unsigned *)((char *)a2 + STAT_GID_OFF) = cng_g_fake_gid;
-        }
+        if (r == 0 && cng_g_fake_id && a2)
+            stat_remap((void *)a2);
         return r;
     }
     case __NR_statx: {
@@ -318,30 +370,25 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             char hnf[CNG_PATH_MAX];
             if (resolve_at_host(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0 &&
                 cng_l2s_statx(hnf, (void *)a4) == 1) {
-                if (cng_g_fake_id) {
-                    *(unsigned *)((char *)a4 + STATX_UID_OFF) = cng_g_fake_uid;
-                    *(unsigned *)((char *)a4 + STATX_GID_OFF) = cng_g_fake_gid;
-                }
+                if (cng_g_fake_id)
+                    statx_remap((void *)a4);
                 return 0;
             }
         }
         int deref = !((int)a2 & CNG_AT_SYMLINK_NOFOLLOW);
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
         long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_statx);
-        if (r == 0 && cng_g_fake_id && a4) {
-            *(unsigned *)((char *)a4 + STATX_UID_OFF) = cng_g_fake_uid;
-            *(unsigned *)((char *)a4 + STATX_GID_OFF) = cng_g_fake_gid;
-        }
+        if (r == 0 && cng_g_fake_id && a4)
+            statx_remap((void *)a4);
         return r;
     }
 
-    /* chown: fake success under -0 (a non-root process can't really chown). */
+    /* chown: try the real change (a chown to your own id succeeds for real),
+     * then fake success under fake-root when the host denies it. */
     case __NR_fchownat: {
-        if (cng_g_fake_id)
-            return 0;
         int deref = !((int)a4 & CNG_AT_SYMLINK_NOFOLLOW);
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
-        return reissue(a0, (long)p, a2, a3, a4, a5, __NR_fchownat);
+        return chattr_result(reissue(a0, (long)p, a2, a3, a4, a5, __NR_fchownat));
     }
 
     /* readlinkat: /proc/self magic-link fixups, else translate + reissue. */
@@ -374,12 +421,12 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         return reissue(a0, a1, (long)lp, a3, a4, a5, __NR_symlinkat);
     }
 
-    /* fchown(fd,...): no path, but under -0 fake success like fchownat — apk
-     * fchown()s each extracted file to root and a non-root app gets EPERM. */
+    /* fchown(fd,...): no path — try the real change, fake success under fake-root
+     * (apk fchown()s each extracted file to root and a non-root app gets EPERM).
+     * Routed through reissue so an Android-blocked fchown emulates ENOSYS rather
+     * than trapping from the handler (fchown is in the block-list probe set). */
     case __NR_fchown:
-        if (cng_g_fake_id)
-            return 0;
-        return cng_syscall6(a0, a1, a2, a3, a4, a5, __NR_fchown);
+        return chattr_result(reissue(a0, a1, a2, a3, a4, a5, __NR_fchown));
 
     /* clone with CLONE_VFORK (only these are trapped; see seccomp.c): a
      * vfork-style spawn shares the parent's address space and suspends the
@@ -541,46 +588,31 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         return cng_syscall6(a0, a1, a2, a3, a4, a5, __NR_rt_sigprocmask);
     }
 
-    /* --- credential faking (only trapped when -0 is active) --- */
-    case __NR_getuid:
-    case __NR_geteuid:
-        return cng_g_fake_id ? (long)cng_g_fake_uid
-                             : cng_syscall6(0, 0, 0, 0, 0, 0, nr);
-    case __NR_getgid:
-    case __NR_getegid:
-        return cng_g_fake_id ? (long)cng_g_fake_gid
-                             : cng_syscall6(0, 0, 0, 0, 0, 0, nr);
-    case __NR_getresuid:
-    case __NR_getresgid: {
-        if (!cng_g_fake_id)
-            return reissue(a0, a1, a2, a3, a4, a5, nr);
-        unsigned v = (nr == __NR_getresuid) ? cng_g_fake_uid : cng_g_fake_gid;
-        if (a0)
-            *(unsigned *)a0 = v;
-        if (a1)
-            *(unsigned *)a1 = v;
-        if (a2)
-            *(unsigned *)a2 = v;
-        return 0;
-    }
-    /* Credential setters: under -0, fake success as the emulated identity.
-     * Otherwise emulate the result DIRECTLY — never re-issue: these are on
+    /* --- credential syscalls (trapped only when --fake-id is active) ---
+     * All get/set uid/gid family, groups, and capability calls are emulated
+     * against the synthetic credential set in cred.c, which enforces real POSIX
+     * privilege rules. These never re-issue under --fake-id: the setters sit on
      * Android's seccomp block-list, and a re-issue from inside this (SIGSYS)
      * handler force-kills the process (masked nested seccomp SIGSYS). */
+    case __NR_getuid:
+    case __NR_geteuid:
+    case __NR_getgid:
+    case __NR_getegid:
+    case __NR_getresuid:
+    case __NR_getresgid:
+    case __NR_getgroups:
     case __NR_setuid:
     case __NR_setgid:
-    case __NR_setresuid:
-    case __NR_setresgid:
     case __NR_setreuid:
     case __NR_setregid:
-    case __NR_setgroups:
-        if (cng_g_fake_id)
-            return 0;
-        cng_note_blocked((int)nr);
-        return -ENOSYS;
+    case __NR_setresuid:
+    case __NR_setresgid:
     case __NR_setfsuid:
     case __NR_setfsgid:
-        return 0; /* returns the previous fs id (0); never fails */
+    case __NR_setgroups:
+    case __NR_capget:
+    case __NR_capset:
+        return cng_cred_handle(nr, a0, a1, a2, a3, a4, a5);
 
     default:
         /* From a seccomp trap, an unhandled syscall was blocked by Android

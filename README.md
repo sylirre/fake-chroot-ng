@@ -45,11 +45,13 @@ chroot-ng --help                                   # full option reference
 
 `<rootfs>` is a host directory holding an AArch64 userland (`/` runs
 host-native binaries directly); `<program>` is an absolute path inside it.
-Common options: `-0/--fake-root` (fake uid/gid 0), `-b/--bind G:H` (bind guest
-path G to host H), `-R/--rewrite` (ahead-of-time `svc` rewriting).
+Common options: `-u/--fake-id[=ID]` (fake user identity — `ID` is a `uid` or
+`uid:gid`, defaulting to `0:0` root), `-b/--bind G:H` (bind guest path G to host
+H), `-R/--rewrite` (ahead-of-time `svc` rewriting).
 
 ```sh
-chroot-ng -0 ./rootfs /bin/sh
+chroot-ng -u ./rootfs /bin/sh              # fake root (uid/gid 0)
+chroot-ng --fake-id 1000:1000 ./rootfs /bin/sh
 ```
 
 Run `chroot-ng --probe` on any target device **first** — the whole in-process

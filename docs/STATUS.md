@@ -3,7 +3,7 @@
 Milestones are committed individually. Each builds on the previous.
 
 ## Verified on-device (Android 15, kernel 5.15, rootless, SELinux, no userns)
-An Alpine aarch64 rootfs runs under `chroot-ng -0 <rootfs> <program>` with no ptrace and no
+An Alpine aarch64 rootfs runs under `chroot-ng -u <rootfs> <program>` with no ptrace and no
 user namespaces, on an execmem-denied mount:
 - interactive shell + coreutils/busybox, `su -l`
 - `apk` (full package manager: add/fix, incl. hardlinked packages via
@@ -91,15 +91,22 @@ vfork/`posix_spawn` child-stack handling.
   the emulation runs on the main thread's large stack (multi-threaded execve
   would want a sigaltstack — tracked with the M5 signal-stack hazard).
 
-- [x] **M7 — fidelity: uid/gid faking, /proc self-path fixups, link2symlink**
-  - `-0` credential faking: getuid/geteuid/getgid/getegid/getres[ug]id report 0,
-    setuid-family succeed silently, fchownat is faked, and stat/statx ownership
-    is rewritten to the fake uid/gid. Credential syscalls are trapped only when
-    `-0` is active (kept out of the filter otherwise).
+- [x] **M7 — fidelity: fake user identity, /proc self-path fixups, link2symlink**
+  - `-u`/`--fake-id[=uid[:gid]]` fake user identity (default `0:0` root): the
+    guest sees a synthetic per-process credential set (r/e/s/fs uid+gid, plus
+    supplementary groups) that get/set uid/gid/groups syscalls read and mutate
+    following real POSIX privilege rules — so a privilege drop actually changes
+    what getuid() reports and a non-root fake id cannot regain uid 0. While the
+    effective uid is 0 (fake-root), ownership/mode changes (chown/chmod), utime,
+    and denied access() checks are faked as succeeding, capget reports the full
+    capability set, and stat/statx ownership is remapped so files owned by the
+    real invoking user appear owned by the fake id. Credential syscalls are
+    trapped only when `--fake-id` is active (kept out of the filter otherwise).
   - `/proc/self/{exe,cwd,root}` readlink fixups return guest-visible targets.
   - link2symlink (lightweight): linkat falls back to a symlink when the fs
     forbids hardlinks (EPERM/EMLINK/EXDEV/ENOSYS/EACCES/EOPNOTSUPP).
-  Validated via `-t faketest` (getuid=0, stat ownership=0, /proc/self/exe). 45/45.
+  Validated via `-t faketest` (fake ids, stat remap, groups, capget, privilege
+  drop, /proc/self/exe).
   Limitations (tracked): `/proc/<pid>/*` numeric form and open("/proc/self/exe")
   redirect not yet handled. (link2symlink was the lightweight form here — a
   same-directory symlink to the sibling name; superseded by M9's backing-file

@@ -41,13 +41,15 @@ static const int path_syscalls[] = {
 
 #define NPATH ((int)(sizeof(path_syscalls) / sizeof(path_syscalls[0])))
 
-/* Credential syscalls: trapped only when -0 credential faking is active
- * (see cng_g_fake_id), so we don't slow down getuid/etc otherwise. */
+/* Credential syscalls: trapped only when --fake-id credential faking is active
+ * (see cng_g_fake_id), so we don't slow down getuid/etc otherwise. Must match
+ * the set emulated in cred.c / dispatch.c. */
 static const int id_syscalls[] = {
     __NR_getuid,    __NR_geteuid,   __NR_getgid,    __NR_getegid,
-    __NR_getresuid, __NR_getresgid, __NR_setuid,    __NR_setgid,
-    __NR_setresuid, __NR_setresgid, __NR_setreuid,  __NR_setregid,
-    __NR_setgroups, __NR_setfsuid,  __NR_setfsgid,  __NR_fchown,
+    __NR_getresuid, __NR_getresgid, __NR_getgroups, __NR_setuid,
+    __NR_setgid,    __NR_setresuid, __NR_setresgid, __NR_setreuid,
+    __NR_setregid,  __NR_setgroups, __NR_setfsuid,  __NR_setfsgid,
+    __NR_fchown,    __NR_capget,    __NR_capset,
 };
 #define NID ((int)(sizeof(id_syscalls) / sizeof(id_syscalls[0])))
 
