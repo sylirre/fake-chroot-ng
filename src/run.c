@@ -57,10 +57,12 @@ int cng_run(const char *rootfs, const char *libprefix,
             int gargc, char **gargv, char **envp, unsigned long *auxv) {
     const char *prog_guest = gargv[0];
 
-    /* Capture host auxv (for emulated execve) and the guest exe path
-     * (for /proc/self/exe fixups). */
+    /* Capture host auxv (for emulated execve), the guest exe path (for
+     * /proc/self/exe fixups) and the environment (for env lookups after
+     * argv/envp are out of reach — procreg.c's shared_dir). */
     cng_host_auxv = auxv;
     cng_g_exe_guest = prog_guest;
+    cng_g_envp = envp;
 
     /* CNG_DEBUG=1 in the environment enables verbose syscall-error logging;
      * CNG_L2S_FORCE=1 routes every linkat through the -l emulation (test aid

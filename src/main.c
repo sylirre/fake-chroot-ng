@@ -18,6 +18,7 @@
 #include "cng/loader.h"
 #include "cng/monitor.h"
 #include "cng/path.h"
+#include "cng/procreg.h"
 #include "cng/rewrite.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
@@ -341,6 +342,14 @@ static void help(char **envp) {
                       "and stat where the host denies them. With this flag the "
                       "guest sees only whatever /proc its rootfs (or an "
                       "explicit -b) provides."},
+        {"    --shared-proc", "Share the guest process view between independent "
+                      "chroot-ng invocations of the same rootfs, so ps/top in "
+                      "one session see the guest processes of another. The "
+                      "registry is served diskless by a per-rootfs broker "
+                      "daemon (an anonymous memfd over an abstract socket) "
+                      "that exits by itself once the last guest is gone; "
+                      "without this flag each invocation has its own view and "
+                      "hides the others' processes."},
         {"-L, --lib-prefix DIR", "Resolve the ELF interpreter under DIR instead "
                       "of through the rootfs/bind map (test aid). On real "
                       "hardware the interpreter and libraries resolve through "
@@ -552,6 +561,9 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
             } else if (!strcmp(n, "no-proc")) {
                 if (val) return err_noval(arg);
                 cng_g_no_proc = 1;
+            } else if (!strcmp(n, "shared-proc")) {
+                if (val) return err_noval(arg);
+                cng_g_shared_proc = 1;
             } else if (!strcmp(n, "bind")) {
                 char *spec = val;
                 if (!spec) {

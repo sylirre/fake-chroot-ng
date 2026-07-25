@@ -729,7 +729,9 @@ static void fd_base_init(void) {
 }
 
 void cng_procfs_init(void) {
-    cng_procreg_init();
+    /* --shared-proc keys the registry by the rootfs, so independent
+     * invocations over the same tree share one process view. */
+    cng_procreg_init(cng_g_shared_proc && cng_g_fs ? cng_g_fs->rootfs : 0);
     fd_base_init();
 }
 

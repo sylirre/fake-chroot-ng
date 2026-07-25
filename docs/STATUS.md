@@ -431,9 +431,20 @@ vfork/`posix_spawn` child-stack handling.
     way (the fd's host path is `/proc`), because `ls /proc` and `ps` read the
     directory rather than probing names; it costs a readlink only for a batch
     that actually holds an all-digit name, which outside `/proc` is nothing.
-  - **PID registry** (`src/monitor/procreg.c`, ported from `proctab.c` minus its
-    broker): one `MAP_SHARED|MAP_ANONYMOUS` region, inherited across fork, in
-    which each guest process publishes its argv, environ, auxv, exe and cwd.
+  - **PID registry** (`src/monitor/procreg.c`, ported from `proctab.c`): a
+    `MAP_SHARED` table in which each guest process publishes its argv, environ,
+    auxv, exe and cwd. By default the backing is one anonymous region inherited
+    across fork (one invocation's view); with **`--shared-proc`** it is served
+    per-rootfs by arm64chroot's broker design — a detached daemon owning an
+    anonymous memfd (the table) and an abstract-namespace socket (the
+    rendezvous), handing the memfd to every joining invocation over
+    `SCM_RIGHTS`, so `ps`/`top` in one session see the guest processes of
+    another. Clients keep no persistent broker fd (host fd == guest fd here —
+    the guest would see it); the daemon uses the registry itself as its
+    liveness signal and exits ~10 s after the last guest of the rootfs dies,
+    leaving no file and no socket name. Fallbacks mirror the oracle's tiers: a
+    named 0600 file keyed by uid+rootfs in a writable dir (pre-memfd kernels),
+    then the anonymous per-invocation region.
     Slots are claimed by CAS and written under a seqlock whose odd count is
     itself taken by CAS — a child's slot can see two writers, the parent
     publishing the fork while the child publishes its own exec, and the loser
@@ -491,10 +502,14 @@ vfork/`posix_spawn` child-stack handling.
   untranslation, the fake-id status remap, `--no-proc`) and by
   `tests/m11_proc.sh`, which reruns the same ground in an Alpine guest shell
   (`cat /proc/self/cmdline` shows the guest's argv, `ps` sees only guest
-  processes, `/proc/1/stat` is absent, `comm` is `busybox`). The seccomp filter's
+  processes, `/proc/1/stat` is absent, `comm` is `busybox`) and adds the
+  two-invocation `--shared-proc` scenario: a backgrounded guest `sleep` shows
+  up in a second invocation's `ps` with its registry cmdline, and stays hidden
+  without the flag. `-t proctest` itself runs its registry broker-backed and
+  asserts that the broker (not a fallback tier) engaged. The seccomp filter's
   new rules are covered by `-t bpftest`, which builds the program and runs it
   through a BPF interpreter — qemu-user does not honor guest filters, so that is
-  the only pre-device check for them. 194/194.
+  the only pre-device check for them. 197/197.
   A later line-by-line parity audit against `sys_procfs.c`/`proctab.c`/
   `path.c`/`sys_file.c` closed the remaining gaps (the read-family refresh
   coverage, the pid-reuse and two-writer registry hardening, map_files
@@ -506,10 +521,9 @@ vfork/`posix_spawn` child-stack handling.
   step with the kernel identity its `uname` fakes; chroot-ng fakes neither);
   an explicit `-b /proc:DIR` outranks the synthesis (the user overriding the
   view — arm64chroot keys its synthesis on the guest path, so there it outlives
-  a bind); and two separate chroot-ng invocations over one rootfs do
-  not share a registry, so each hides the other's processes (the same
-  degradation arm64chroot has without `-shared-proc`; its opt-in per-rootfs
-  broker daemon is not ported). One place chroot-ng is
+  a bind); and without `--shared-proc` two separate chroot-ng invocations over
+  one rootfs do not share a registry, so each hides the other's processes
+  (matching arm64chroot's default). One place chroot-ng is
   deliberately *stricter* than arm64chroot: there, a `-b /proc:/proc` bind wins
   over the `/proc` zone in the path layer, so a host process stays reachable by
   explicit path (only the listing is filtered); here the hidden view is keyed on

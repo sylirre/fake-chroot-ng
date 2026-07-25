@@ -155,6 +155,10 @@ void cng_note_blocked(int nr);
  * result is an error other than ENOENT, with the path where available. */
 extern int cng_g_debug;
 
+/* The exec-time environment, stashed at startup for the few places that need
+ * an env lookup after argv/envp are out of reach (procreg.c's shared_dir). */
+extern char **cng_g_envp;
+
 /* Resolve a guest path to a host path, following symlinks within the guest
  * (absolute link targets re-rooted into the rootfs). deref_final follows the
  * last component's own symlink. Returns 0/-errno. Uses cng_g_fs + readlink. */

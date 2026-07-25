@@ -1589,11 +1589,25 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
     int self = (int)sys_getpid();
 
     /* The guest identity this process publishes; the registry-backed files must
-     * hand back exactly these bytes. */
+     * hand back exactly these bytes. The registry runs broker-backed
+     * (--shared-proc) so every check below also exercises that plumbing; the
+     * mktemp rootfs keys a fresh broker per run. */
     static char *gargv[] = {"/bin/busybox", "sh", "-c", "true", 0};
     static char *genvp[] = {"PATH=/usr/bin:/bin", "HOME=/root", 0};
+    cng_g_envp = envp; /* shared_dir env lookups (file-tier fallback) */
+    cng_g_shared_proc = 1;
     cng_procfs_init();
     cng_procreg_publish(gargv, genvp, 0, 0, cng_g_exe_guest, "/");
+
+    /* 0) the --shared-proc backing actually engaged: the broker daemon must
+     *    have spawned and handed us its memfd (a degrade to the file or
+     *    anonymous tier on a normal host is a broker bug). */
+    {
+        int ok = cng_g_procreg_backing == CNG_PROCREG_B_BROKER;
+        cng_dprintf(1, "proctest shared-proc backing: %d -> %s\n",
+                    cng_g_procreg_backing, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
 
     /* 1) passthrough + hidden-process view, at the path layer. */
     {

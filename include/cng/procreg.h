@@ -12,12 +12,24 @@
  * /proc/<pid> that is not registered is not a guest process, so the path layer
  * hides it (see cng_procreg_has).
  *
- * Ported from arm64chroot's proctab.c, minus its cross-invocation backing: a
- * guest process tree here is a real fork tree, so one MAP_SHARED|MAP_ANONYMOUS
- * region inherited across fork() covers every process in the session. Two
- * separate chroot-ng invocations on one rootfs do not share a registry (they
- * see each other's processes as host ones, i.e. hidden), which is the same
- * degradation arm64chroot has without -shared-proc.
+ * Ported from arm64chroot's proctab.c. By default the backing is one
+ * MAP_SHARED|MAP_ANONYMOUS region inherited across fork() — a guest process
+ * tree here is a real fork tree, so that covers every process of one
+ * invocation, and two separate invocations on one rootfs hide each other's
+ * processes. With --shared-proc the view spans independent invocations
+ * (ps/top in one session see the guest processes of another), via the first
+ * of these that works (arm64chroot's tiers):
+ *   1. broker — diskless, the normal path: a per-rootfs daemon owns an
+ *      anonymous memfd (the table) and an abstract-namespace socket (the
+ *      rendezvous) and hands the memfd to every invocation over SCM_RIGHTS.
+ *      Clients keep no persistent broker fd (host fd == guest fd here, so a
+ *      held fd would leak into the guest); the daemon uses the registry
+ *      itself as its liveness signal and exits once no guest of the rootfs
+ *      has been alive for a grace window — no file, no leftover socket name.
+ *   2. named file — when memfd or abstract sockets are unavailable (pre-3.17
+ *      kernel, a seccomp filter blocking memfd_create): a 0600 file keyed by
+ *      uid+rootfs on tmpfs or an app-writable dir.
+ *   3. anonymous — last resort, the per-invocation default above.
  *
  * Lock-free: slots are claimed by CAS on the pid, and the payload is written
  * under a seqlock — the writer is always the process the entry describes (or
@@ -48,10 +60,24 @@ struct cng_procsnap {
     u16 exe_len, cwd_len;
 };
 
+/* --shared-proc: back the registry per-rootfs so independent invocations share
+ * one view. Set by the option parser before cng_procfs_init runs. */
+extern int cng_g_shared_proc;
+
+/* Which backing cng_procreg_init ended up with (for tests and -t proctest). */
+#define CNG_PROCREG_B_NONE   0 /* no registry: /proc degrades to passthrough */
+#define CNG_PROCREG_B_ANON   1 /* per-invocation anonymous mapping */
+#define CNG_PROCREG_B_FILE   2 /* --shared-proc named-file fallback */
+#define CNG_PROCREG_B_BROKER 3 /* --shared-proc memfd from the broker daemon */
+extern int cng_g_procreg_backing;
+
 /* Map the shared region. Call once, before the monitor is installed and before
- * the guest can fork. A failure is not fatal: every entry point below then
- * no-ops and the /proc emulation degrades to host passthrough. */
-void cng_procreg_init(void);
+ * the guest can fork (with a key, the broker daemon is forked from here — that
+ * must happen while we are still single-threaded and unfiltered).
+ * `shared_key` is the rootfs path to share the registry by (--shared-proc), or
+ * NULL for the per-invocation table. A failure is not fatal: every entry point
+ * below then no-ops and the /proc emulation degrades to host passthrough. */
+void cng_procreg_init(const char *shared_key);
 
 /* Publish (or update) this process's own entry. `argv`/`envp` are NULL-
  * terminated vectors, `auxv` the raw tag/value block built for the guest stack

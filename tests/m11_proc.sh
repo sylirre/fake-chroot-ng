@@ -14,6 +14,8 @@ M11_ALPINE="${M11_ALPINE:-/home/sol/arm64chroot/tests/.cache/rootfs/alpine}"
 PT=$(mktemp -d)
 out=$(run -t proctest -r "$PT" -b /usr:/usr 2>&1); rc=$?
 check "proctest overall" 0 "$rc"
+check_contains "the registry runs broker-backed (--shared-proc plumbing)" \
+    "proctest shared-proc backing: 3 -> OK" "$out"
 check_contains "/proc passes through, non-guest pids are hidden" \
     "proctest passthrough+hidden -> OK" "$out"
 check_contains "a -b /proc:/proc bind does not reopen the host process list" \
@@ -132,4 +134,34 @@ if [ "$m11_ready" -eq 1 ]; then
     got=$(run -R --no-proc "$M11_ALPINE" /bin/busybox sh -c \
         'cat /proc/loadavg 2>/dev/null || echo none' 2>/dev/null)
     check_contains "--no-proc leaves the guest without /proc" "none" "$got"
+
+    # --shared-proc: two INDEPENDENT invocations over one rootfs share the
+    # process view through the per-rootfs broker — ps in the second lists the
+    # first's guest process, with the cmdline the sleeper published. Without
+    # the flag each invocation has its own registry and hides the other's
+    # processes (the pre-flag behavior, still the default).
+    run -R --shared-proc "$M11_ALPINE" /bin/busybox sleep 87.65 2>/dev/null &
+    m11_bg=$!
+    sleep 2
+    got=$(run -R --shared-proc "$M11_ALPINE" /bin/busybox ps 2>/dev/null)
+    case "$got" in
+    *"sleep 87.65"*)
+        pass=$((pass + 1))
+        echo "  ok   m11 --shared-proc: ps sees the other invocation's guest" ;;
+    *)
+        fail=$((fail + 1))
+        echo "  FAIL m11 --shared-proc: ps sees the other invocation's guest"
+        echo "    got: $got" ;;
+    esac
+    solo=$(run -R "$M11_ALPINE" /bin/busybox ps 2>/dev/null)
+    case "$solo" in
+    *"sleep 87.65"*)
+        fail=$((fail + 1))
+        echo "  FAIL m11 without --shared-proc the other invocation stays hidden" ;;
+    *)
+        pass=$((pass + 1))
+        echo "  ok   m11 without --shared-proc the other invocation stays hidden" ;;
+    esac
+    kill "$m11_bg" 2>/dev/null
+    wait "$m11_bg" 2>/dev/null
 fi

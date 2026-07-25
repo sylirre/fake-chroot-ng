@@ -91,8 +91,8 @@ void cng_close_cloexec(void) {
 /* Shared emulation core: resolve the target (shebang-aware), load it, build its
  * stack, and pass the commit point (close FD_CLOEXEC fds, reset signal
  * dispositions, retarget /proc/self/exe). Returns -errno on failure (all of
- * which occur before the commit point), or 0 with *out_sp/*out_entry set for
- * the caller to transfer control into the new program. */
+ * which occur before the commit point), or 0 with *out_sp and *out_entry set
+ * for the caller to transfer control into the new program. */
 static long execve_core(int dirfd, const char *path, char **argv, char **envp,
                         unsigned long *out_sp, unsigned long *out_entry) {
     if (cng_g_debug)

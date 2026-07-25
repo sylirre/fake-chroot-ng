@@ -111,4 +111,45 @@
 #define CNG_STATX_NLINK 0x00000004U
 #define CNG_STATX_BASIC_STATS 0x000007ffU
 
+/* AF_UNIX sockets + ppoll — the --shared-proc registry broker (procreg.c). */
+#define CNG_AF_UNIX      1
+#define CNG_SOCK_STREAM  1
+#define CNG_SOCK_CLOEXEC CNG_O_CLOEXEC
+#define CNG_SOL_SOCKET   1
+#define CNG_SO_RCVTIMEO  20 /* SO_RCVTIMEO_OLD: takes the 64-bit timeval */
+#define CNG_SCM_RIGHTS   1
+#define CNG_MSG_NOSIGNAL 0x4000
+#define CNG_POLLIN       1
+
+struct cng_sockaddr_un {
+    unsigned short family;
+    char path[108]; /* path[0] == NUL => abstract namespace */
+};
+struct cng_timeval {
+    long tv_sec;
+    long tv_usec;
+};
+struct cng_pollfd {
+    int fd;
+    short events, revents;
+};
+struct cng_iovec {
+    void *base;
+    unsigned long len;
+};
+/* LP64 syscall ABI layout; natural alignment supplies the kernel's padding. */
+struct cng_msghdr {
+    void *name;
+    unsigned namelen;
+    struct cng_iovec *iov;
+    unsigned long iovlen;
+    void *control;
+    unsigned long controllen;
+    unsigned flags;
+};
+struct cng_cmsghdr { /* 8-aligned header, payload follows in place */
+    unsigned long len; /* header + payload bytes (CMSG_LEN) */
+    int level, type;
+};
+
 #endif /* CNG_UAPI_H */

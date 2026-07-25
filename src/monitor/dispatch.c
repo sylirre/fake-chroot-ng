@@ -80,6 +80,7 @@ void cng_note_blocked(int nr) {
  * filter blocks it (measured by cng_probe_blocked), emulate ENOSYS instead, so
  * we never trap on the re-issue. Same signature as cng_syscall6. */
 int cng_g_debug = 0;
+char **cng_g_envp = 0;
 
 /* Is `p` safe to print as a path string? A magnitude test is not enough: the
  * args of a *failing* syscall include plain scalars (a uid, an offset, a
