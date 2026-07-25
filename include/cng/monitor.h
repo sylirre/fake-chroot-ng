@@ -164,6 +164,12 @@ int cng_resolve(const char *path, int deref_final, char *out, size_t outsz);
  * ("/proc/self/fd/<n>" and its thread-self / own-pid spellings), else -1. */
 int cng_proc_self_fd(const char *host);
 
+/* Serve an open the host refused (`err`) on a path naming one of our own fds,
+ * from that descriptor: a duplicate when the inode grants the access anyway
+ * (a non-DAC refusal, e.g. SELinux on a memfd), or a mode-borrowing reopen
+ * under fake-root. Returns the new fd, or `err`. */
+long cng_fd_reopen(const char *host, long flags, long mode, long err);
+
 /* Ambient-seccomp block-list: cng_blocked[nr] != 0 means Android blocks that
  * syscall, so dispatch emulates ENOSYS instead of re-issuing it. Populated by
  * cng_probe_blocked() at monitor install (a no-op result off Android). */

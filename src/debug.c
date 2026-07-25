@@ -312,6 +312,43 @@ int cng_cmd_faketest(int argc, char **argv, char **envp, unsigned long *auxv) {
                     (ofd >= 0 && mode_kept) ? "OK" : "FAIL");
     }
 
+    /* The other refusal kind, which no DAC change can fix: the inode grants
+     * the access and the open is still denied (on Android, SELinux on the
+     * tmpfs inode behind a memfd — where apk 3 keeps package scripts). The
+     * refusal cannot be provoked on a devbox, so drive cng_fd_reopen directly
+     * with a memfd and a simulated EACCES: it must hand back a usable
+     * duplicate, rewound to the start even though ours sits at EOF. */
+    {
+        long mfd = sys_memfd_create("cng-fdreopen", 1 /*MFD_CLOEXEC*/);
+        int dup_ok = 0, content = 0;
+        if (mfd >= 0) {
+            sys_write((int)mfd, "SCRIPT", 6); /* our offset is now at EOF */
+            char pfd[40];
+            size_t k = cng_strlcpy(pfd, "/proc/self/fd/", sizeof pfd);
+            char d[8];
+            int di = 0;
+            for (long v = mfd; di < 7; v /= 10) {
+                d[di++] = (char)('0' + v % 10);
+                if (v < 10)
+                    break;
+            }
+            while (di > 0 && k + 1 < sizeof pfd)
+                pfd[k++] = d[--di];
+            pfd[k] = '\0';
+            long nfd = cng_fd_reopen(pfd, CNG_O_RDONLY, 0, -EACCES);
+            if (nfd >= 0) {
+                dup_ok = 1;
+                char b[8];
+                long n = sys_read((int)nfd, b, sizeof b);
+                content = (n == 6 && b[0] == 'S' && b[5] == 'T');
+                sys_close((int)nfd);
+            }
+            sys_close((int)mfd);
+        }
+        cng_dprintf(1, "fd_reopen: dup=%d content=%d -> %s\n", dup_ok, content,
+                    (dup_ok && content) ? "OK" : "FAIL");
+    }
+
     /* Full credential model. Supplementary groups start empty; capabilities are
      * the full set while fake-root (euid still 0 at this point). */
     cng_dprintf(1, "ngroups=%d\n",

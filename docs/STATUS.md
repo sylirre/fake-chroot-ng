@@ -395,12 +395,25 @@ vfork/`posix_spawn` child-stack handling.
     an `openat` refused with EACCES on a path naming one of our fds now lends
     the inode the owner-read bit **through the fd** (no path race), reopens, and
     restores the mode — the DAC bypass real root would have had.
-  Both halves verified end-to-end under qemu: a `#!/bin/sh` script made
-  execute-only after opening, exec'd via `/proc/self/fd/N` in an Alpine guest,
-  now runs and leaves the mode `---x--x--x`. Checks: `-t exectest` on an
-  execute-only ELF via its fd, and `fakeroot_reopen` in `-t faketest`. 150/150.
-  Still unsupported: a file we do **not** own and cannot read — fake-root has no
-  way to borrow a bit there.
+  - A refusal that no DAC change can fix, seen next on the device: apk 3 keeps
+    package scripts in a **memfd** (`mode=777 uid=<app>`), and Android's SELinux
+    declines an app an `open` on that tmpfs inode — so the interpreter's reopen
+    is denied even though the inode grants read. There we hand the guest a
+    **duplicate of the descriptor we hold**, rewound to 0 (a fresh open starts
+    there; the duplicate shares our offset). `cng_fd_reopen` picks between the
+    two answers: inode grants the access → dup (any identity, the refusal was
+    never about credentials); inode denies it → the fake-root mode borrow.
+    Declined for `O_CREAT`/`O_EXCL`/`O_TRUNC`/`O_APPEND`/`O_DIRECTORY`, whose
+    semantics a dup cannot reproduce, and when our fd's access mode is too
+    narrow.
+  Verified end-to-end under qemu: a `#!/bin/sh` script made execute-only after
+  opening, exec'd via `/proc/self/fd/N` in an Alpine guest, now runs and leaves
+  the mode `---x--x--x`. Checks: `-t exectest` on an execute-only ELF via its
+  fd, `fakeroot_reopen` in `-t faketest`, and `fd_reopen`, which drives the dup
+  branch off a memfd with a simulated refusal (SELinux cannot be provoked on a
+  devbox). 151/151.
+  Still unsupported: a file we do **not** own and cannot read — there is no bit
+  to borrow and no descriptor to copy.
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 

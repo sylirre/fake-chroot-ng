@@ -357,27 +357,68 @@ static int resolve_at_host(long dirfd, const char *path, int deref, char *out,
     return 0;
 }
 
-/* Fake-root DAC bypass for an open the host refused: real root reads any file,
- * ours cannot. Scoped to a path naming one of our own fds — apk hands its
- * package scripts to the interpreter as "/proc/self/fd/N" and their inode
- * grants execute but not read, so the shebang interpreter's reopen is denied
- * where a real chroot's root sails through. Holding the fd, we can lend the
- * inode the owner-read bit across the open with no path race, and put the mode
- * straight back. Returns the reopened fd, or `fallback` if this isn't that
- * case. */
-static long fake_root_reopen(const char *host, long flags, long mode,
-                             long fallback) {
+/* An open the host refused on a path naming one of *our own* fds. We hold that
+ * descriptor, so the guest can still be served — two distinct refusals, two
+ * answers (apk 3 runs into both when it execs a package script and the shebang
+ * interpreter reopens it):
+ *
+ *  - the inode already grants us the access asked for, so the refusal did not
+ *    come from DAC. On Android that is SELinux declining an app an `open` on
+ *    the tmpfs inode behind a memfd — where apk 3 keeps its scripts (mode 0777,
+ *    owned by us). A fresh description of the same file is exactly what the
+ *    open would have produced: duplicate ours and rewind it. The duplicate
+ *    shares the original's file offset, hence the rewind — a real open always
+ *    starts at 0.
+ *  - the inode denies it and the guest is fake-root: real root would have
+ *    bypassed DAC, so lend the inode the owner bit *through the fd* (no path
+ *    race), reopen properly, and put the mode straight back.
+ *
+ * Returns the new fd, or `err` unchanged when this is not that case. */
+long cng_fd_reopen(const char *host, long flags, long mode, long err) {
     int fd = cng_proc_self_fd(host);
     if (fd < 0)
-        return fallback;
+        return err;
+    /* Nothing here reproduces creation/truncation/append semantics. */
+    if ((int)flags & (CNG_O_CREAT | CNG_O_EXCL | CNG_O_TRUNC | CNG_O_APPEND |
+                      CNG_O_DIRECTORY))
+        return err;
     char st[128];
     if (CNG_SYS(__NR_fstat, fd, st, 0, 0, 0, 0) != 0)
-        return fallback;
+        return err;
     unsigned m = *(unsigned *)(st + STAT_MODE_OFF);
-    if ((m & 0170000) != 0100000 || (m & 0400))
-        return fallback; /* not a plain file, or read was not the problem */
-    if (CNG_SYS(__NR_fchmod, fd, (m & 07777) | 0400, 0, 0, 0, 0) != 0)
-        return fallback;
+    if ((m & 0170000) != 0100000)
+        return err; /* plain files only */
+
+    int acc = (int)flags & 3; /* O_ACCMODE: RDONLY/WRONLY/RDWR */
+    unsigned need = (acc == CNG_O_WRONLY)  ? 0200u
+                    : (acc == CNG_O_RDWR)  ? 0600u
+                                           : 0400u;
+    int ours = (*(unsigned *)(st + STAT_UID_OFF) == (unsigned)sys_getuid());
+
+    if (ours && (m & need) == need) {
+        /* Not a DAC refusal: hand over a duplicate of the description. */
+        long cur = CNG_SYS(__NR_fcntl, fd, 3 /*F_GETFL*/, 0, 0, 0, 0);
+        if (cur < 0)
+            return err;
+        if ((cur & 3) != CNG_O_RDWR && (cur & 3) != acc)
+            return err; /* our fd cannot serve that access mode */
+        long nfd = CNG_SYS(__NR_fcntl, fd,
+                           ((int)flags & CNG_O_CLOEXEC) ? 1030 /*F_DUPFD_CLOEXEC*/
+                                                        : 0 /*F_DUPFD*/,
+                           0, 0, 0, 0);
+        if (nfd < 0)
+            return err;
+        sys_lseek((int)nfd, 0, CNG_SEEK_SET);
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] fd reopen %s -> dup %ld (mode %o)\n", host,
+                        nfd, m & 07777);
+        return nfd;
+    }
+
+    if (!cng_fake_root() || !ours)
+        return err;
+    if (CNG_SYS(__NR_fchmod, fd, (m & 07777) | need, 0, 0, 0, 0) != 0)
+        return err;
     long r = cng_syscall6(CNG_AT_FDCWD, (long)host, flags, mode, 0, 0,
                           __NR_openat);
     CNG_SYS(__NR_fchmod, fd, m & 07777, 0, 0, 0, 0);
@@ -527,8 +568,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 r = reissue(CNG_AT_FDCWD, (long)data, a2, a3, a4, a5,
                             __NR_openat);
         }
-        if (r == -EACCES && nr == __NR_openat && cng_fake_root())
-            r = fake_root_reopen(p, a2, a3, r);
+        if ((r == -EACCES || r == -EPERM) && nr == __NR_openat)
+            r = cng_fd_reopen(p, a2, a3, r);
         return r;
     }
 

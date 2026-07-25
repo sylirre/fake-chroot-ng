@@ -14,6 +14,8 @@ check_contains "/proc/self/exe fixup"       "exe=/bin/sh"         "$out"
 check_contains "fchown faked to success"    "fchown=0"            "$out"
 check_contains "fake-root reopens a file it may execute but not read" \
     "fakeroot_reopen: opened=1 mode_kept=1 -> OK" "$out"
+check_contains "a refused reopen is served from the fd we hold, rewound" \
+    "fd_reopen: dup=1 content=1 -> OK" "$out"
 check_contains "supplementary groups empty" "ngroups=0"           "$out"
 check_contains "capget reports full set under fake-root" "cap_eff=ffffffff" "$out"
 check_contains "privilege drop is real and irreversible" \
