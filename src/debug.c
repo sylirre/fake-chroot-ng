@@ -1735,6 +1735,59 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
         fails += !ok;
     }
 
+    /* 3b) two registry properties around a child's slot. First, ordering: an
+     *     exec the child has already published must survive the parent's
+     *     later fork-publish (cng_procreg_fork backs off from a slot already
+     *     stamped with the child's own incarnation). Second, death: once the
+     *     child is reaped its slot must stop answering, or a host process
+     *     that gets the pid next would inherit the dead guest's identity —
+     *     exit is not a trapped syscall, so the starttime check inside
+     *     cng_procreg_has is the only thing standing there. */
+    {
+        int pfd[2] = {-1, -1};
+        int ok = CNG_SYS(__NR_pipe2, pfd, 0, 0, 0, 0, 0) == 0;
+        long kid = ok ? sys_fork() : -1;
+        if (kid == 0) { /* the "exec": publish an identity of our own */
+            static char *kargv[] = {"/bin/kid-prog", 0};
+            static char *kenvp[] = {"K=1", 0};
+            cng_procreg_publish(kargv, kenvp, 0, 0, "/bin/kid-prog", "/");
+            sys_close(pfd[0]);
+            cng_write_all(pfd[1], "x", 1);
+            struct cng_timespec nap = {5, 0};
+            CNG_SYS(__NR_nanosleep, &nap, 0, 0, 0, 0, 0);
+            sys_exit_group(0);
+        }
+        ok &= kid > 0;
+        int st = 0; /* first failed stage, 0 = none */
+        if (ok) {
+            char c;
+            sys_close(pfd[1]);
+            if (sys_read(pfd[0], &c, 1) != 1)
+                st = 1; /* child never published its exec */
+            sys_close(pfd[0]);
+            cng_procreg_fork((int)kid); /* must not clobber it */
+            struct cng_procsnap snap;
+            if (!st && cng_procreg_get((int)kid, &snap) != 1)
+                st = 2;
+            if (!st && strcmp(snap.cmd, "/bin/kid-prog"))
+                st = 3; /* the fork publish overwrote the child's exec */
+            CNG_SYS(__NR_kill, kid, 9, 0, 0, 0, 0);
+            sys_wait4((int)kid, 0, 0, 0);
+            if (!st && cng_procreg_has((int)kid))
+                st = 4; /* a dead pid still answers */
+            if (!st && cng_procreg_get((int)kid, &snap))
+                st = 5;
+            ok &= !st;
+        }
+        if (st)
+            cng_dprintf(1, "proctest fork-guard+stale-pid: stage %d -> FAIL\n",
+                        st);
+        else
+            cng_dprintf(1, "proctest fork-guard+stale-pid: -> %s\n",
+                        ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
     /* 4) the mount table describes the rootfs and the binds, never the host's
      *    real mount namespace. */
     {
@@ -1783,6 +1836,21 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
             int fresh = m > 0 && again[0] >= '0' && again[0] <= '9';
             cng_dprintf(1, "proctest loadavg refresh: %ld bytes -> %s\n", m,
                         fresh ? "OK" : "FAIL");
+            fails += !fresh;
+            /* the same rewind through readv — the rest of the read family
+             * takes the identical pre-read hook, so one representative is
+             * enough at this layer (the filter side is bpftest's job) */
+            sys_lseek((int)fd, 0, CNG_SEEK_SET);
+            struct {
+                void *base;
+                unsigned long len;
+            } iov = {again, sizeof again - 1};
+            m = cng_dispatch(__NR_readv, fd, (long)&iov, 1, 0, 0, 0, 0);
+            if (m > 0)
+                again[m] = '\0';
+            fresh = m > 0 && again[0] >= '0' && again[0] <= '9';
+            cng_dprintf(1, "proctest loadavg readv refresh: %ld bytes -> %s\n",
+                        m, fresh ? "OK" : "FAIL");
             fails += !fresh;
             sys_close((int)fd);
         }
@@ -1841,6 +1909,78 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
         } else {
             cng_dprintf(1, "proctest fdlink: cannot open rootfs -> FAIL\n");
         }
+        fails += !ok;
+    }
+
+    /* 7b) a map_files link target is mapped back into the guest view, like an
+     *     fd link: map a file that lives inside the rootfs and readlink its
+     *     map_files entry. The range must come from the HOST's view of our
+     *     mappings — under qemu-user the guest-facing maps file is address-
+     *     translated, so its ranges don't name host map_files entries;
+     *     "/proc/self/../self/maps" dodges qemu's interception and is the
+     *     same file on a native kernel. A denied readlink (pre-4.3 kernels
+     *     want CAP_SYS_ADMIN) skips the assertion rather than failing it. */
+    {
+        int ok = 1, skipped = 0;
+        char fpath[CNG_PATH_MAX], range[64];
+        range[0] = '\0';
+        cng_snprintf(fpath, sizeof fpath, "%s/mf", rootfs);
+        long ffd = sys_openat(CNG_AT_FDCWD, fpath,
+                              CNG_O_RDWR | CNG_O_CREAT | CNG_O_CLOEXEC, 0644);
+        ok &= ffd >= 0;
+        if (ok) {
+            cng_write_all((int)ffd, "map_files probe\n", 16);
+            void *mp = sys_mmap(0, 4096, CNG_PROT_READ, CNG_MAP_PRIVATE,
+                                (int)ffd, 0);
+            ok &= mp != CNG_MAP_FAILED && !cng_is_err((long)mp);
+            if (ok) {
+                static char mbuf[32768];
+                long mfd = sys_openat(CNG_AT_FDCWD, "/proc/self/../self/maps",
+                                      CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+                long mn = pt_slurp(mfd, mbuf, sizeof mbuf);
+                if (mfd >= 0)
+                    sys_close((int)mfd);
+                const char *hit = 0;
+                size_t fl = strlen(fpath);
+                for (const char *p = mbuf; mn > 0 && *p; p++)
+                    if (!strncmp(p, fpath, fl)) {
+                        hit = p;
+                        break;
+                    }
+                ok &= hit != 0; /* our own mapping must be in the host maps */
+                if (hit) {
+                    const char *ls = hit;
+                    while (ls > mbuf && ls[-1] != '\n')
+                        ls--;
+                    unsigned ri = 0;
+                    while (ls[ri] && ls[ri] != ' ' && ri < sizeof range - 1) {
+                        range[ri] = ls[ri];
+                        ri++;
+                    }
+                    range[ri] = '\0';
+                }
+                if (ok && range[0]) { /* readlink while the mapping is live */
+                    char lp[CNG_PATH_MAX], lb[CNG_PATH_MAX];
+                    cng_snprintf(lp, sizeof lp, "/proc/self/map_files/%s",
+                                 range);
+                    long r = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD,
+                                          (long)lp, (long)lb, sizeof lb - 1,
+                                          0, 0, 0);
+                    if (r < 0) {
+                        skipped = 1; /* kernel or LSM policy: no verdict */
+                    } else {
+                        lb[r] = '\0'; /* r < sizeof lb - 1: the size arg */
+                        ok &= !strcmp(lb, "/mf");
+                    }
+                }
+                CNG_SYS(__NR_munmap, mp, 4096, 0, 0, 0, 0);
+            }
+            sys_close((int)ffd);
+            CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, fpath, 0, 0, 0, 0);
+        }
+        cng_dprintf(1, "proctest map_files: %s -> %s\n",
+                    skipped ? "(denied; skipped)" : range,
+                    ok ? "OK" : "FAIL");
         fails += !ok;
     }
 
@@ -1996,6 +2136,16 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
          0x1000, 0xdeadbeef00000005uL, CNG_SECCOMP_RET_ALLOW},
         {"pread of a synth fd traps", __NR_pread64, 0x1000, 1100,
          CNG_SECCOMP_RET_TRAP},
+        {"readv of a synth fd traps", __NR_readv, 0x1000, 1008,
+         CNG_SECCOMP_RET_TRAP},
+        {"readv of an ordinary fd runs native", __NR_readv, 0x1000, 4,
+         CNG_SECCOMP_RET_ALLOW},
+        {"preadv of a synth fd traps", __NR_preadv, 0x1000, 1023,
+         CNG_SECCOMP_RET_TRAP},
+#ifdef __NR_preadv2
+        {"preadv2 of an ordinary fd runs native", __NR_preadv2, 0x1000, 7,
+         CNG_SECCOMP_RET_ALLOW},
+#endif
         {"write is never trapped", __NR_write, 0x1000, 1008,
          CNG_SECCOMP_RET_ALLOW},
     };

@@ -477,13 +477,18 @@ static long proc_self_fixup(const char *canon, char *buf, unsigned long bufsz) {
                 return -1;
             unsigned n = rest[0] == 'e' ? snap.exe_len : snap.cwd_len;
             const char *src = rest[0] == 'e' ? snap.exe : snap.cwd;
-            if (!n)
-                return -1;
-            if (n > CNG_PROCREG_PATH)
-                n = CNG_PROCREG_PATH;
-            memcpy(own, src, n);
-            own[n] = '\0';
-            val = own;
+            if (!n) {
+                if (rest[0] == 'e')
+                    return -1; /* no recorded exe: nothing safe to report */
+                val = "/"; /* an empty cwd snapshot reads as the guest root —
+                            * falling through would leak the host path */
+            } else {
+                if (n > CNG_PROCREG_PATH)
+                    n = CNG_PROCREG_PATH;
+                memcpy(own, src, n);
+                own[n] = '\0';
+                val = own;
+            }
         }
     }
     if (!val)
@@ -513,11 +518,13 @@ static int leaf_may_synth(const char *p) {
     return 0;
 }
 
-/* Same idea for readlinkat: could this name be an fd link, whose target is a
- * host path that has to be mapped back into the guest view? An absolute name
- * must be under /proc; a cwd-relative one is cheap to canonicalize either way;
- * a dirfd-relative one only matters for the digit-named entries of a
- * /proc/<pid>/fd directory, which is what `ls -l /proc/self/fd` walks. */
+/* Same idea for readlinkat: could this name be an fd or map_files link, whose
+ * target is a host path that has to be mapped back into the guest view? An
+ * absolute name must be under /proc; a cwd-relative one is cheap to
+ * canonicalize either way; a dirfd-relative one only matters for the entries
+ * of a /proc/<pid>/fd directory (digit names, `ls -l /proc/self/fd`) or of
+ * /proc/<pid>/map_files ("<start>-<end>" in lowercase hex), so the basename
+ * must consist of hex digits and '-'. */
 static int rl_may_fdlink(long dirfd, const char *p) {
     if (!p)
         return 0;
@@ -527,11 +534,13 @@ static int rl_may_fdlink(long dirfd, const char *p) {
         return 1;
     const char *b = strrchr(p, '/');
     b = b ? b + 1 : p;
-    if (*b < '0' || *b > '9')
+    if (!*b)
         return 0;
-    while (*b >= '0' && *b <= '9')
-        b++;
-    return *b == '\0';
+    for (; *b; b++)
+        if (!((*b >= '0' && *b <= '9') || (*b >= 'a' && *b <= 'f') ||
+              *b == '-'))
+            return 0;
+    return 1;
 }
 
 /* The canonical GUEST path an (dirfd, path) pair names, for the /proc hooks.
@@ -925,16 +934,19 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         }
         long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_readlinkat);
         /* An fd link reports a HOST path (the kernel names the open file
-         * description). Map it back into the guest view so the guest never sees
-         * where its rootfs really lives — `ls -l /proc/self/fd`, and Alpine's
-         * /dev/fd, both land here. Targets outside the view (memfd:, pipe:[..],
-         * a host-only file) are left exactly as the kernel wrote them. */
+         * description), and a map_files link the host path of the mapped file.
+         * Map them back into the guest view so the guest never sees where its
+         * rootfs really lives — `ls -l /proc/self/fd`, Alpine's /dev/fd, and
+         * lsof's map_files walk all land here. Targets outside the view
+         * (memfd:, pipe:[..], a host-only file) are left exactly as the kernel
+         * wrote them. */
         if (r > 0 && r < (long)a3 && *(char *)a2 == '/' &&
             rl_may_fdlink(a0, gp)) {
             char canon[CNG_PATH_MAX];
             if (at_canon(a0, gp, canon, sizeof canon) == 0) {
                 size_t pl = proc_pid_prefix(canon, 0);
-                if (pl && !strncmp(canon + pl, "fd/", 3)) {
+                if (pl && (!strncmp(canon + pl, "fd/", 3) ||
+                           !strncmp(canon + pl, "map_files/", 10))) {
                     char tgt[CNG_PATH_MAX], guest[CNG_PATH_MAX];
                     if ((size_t)r < sizeof tgt) {
                         memcpy(tgt, (const char *)a2, (size_t)r);
@@ -1054,15 +1066,22 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         return r;
     }
 
-    /* read/pread64 are trapped only for fds in the reserved synthesized range
-     * (the seccomp filter compares fd against cng_g_synth_fd_base), where a
-     * read starting at offset 0 regenerates a time-varying file — procps opens
-     * /proc/loadavg once and lseek(0)+rereads it every cycle. Any other fd that
-     * lands in the range just gets re-issued. */
+    /* The read family is trapped only for fds in the reserved synthesized
+     * range (the seccomp filter compares fd against cng_g_synth_fd_base),
+     * where a read starting at offset 0 regenerates a time-varying file —
+     * procps opens /proc/loadavg once and lseek(0)+rereads it every cycle.
+     * Any other fd that lands in the range just gets re-issued. The p-variants
+     * carry their offset in a3 (LP64: the full offset in pos_l; -1 means the
+     * current position, which pre_read resolves with an lseek). */
     case __NR_read:
+    case __NR_readv:
         cng_procfs_pre_read((int)a0, -1);
         return cng_syscall6(a0, a1, a2, a3, a4, a5, nr);
     case __NR_pread64:
+    case __NR_preadv:
+#ifdef __NR_preadv2
+    case __NR_preadv2:
+#endif
         cng_procfs_pre_read((int)a0, a3);
         return cng_syscall6(a0, a1, a2, a3, a4, a5, nr);
 

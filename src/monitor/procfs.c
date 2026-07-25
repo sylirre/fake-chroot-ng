@@ -526,7 +526,7 @@ void cng_procfs_pre_read(int fd, long off) {
 
 /* Anonymous backing for a synthesized view, moved into the reserved high fd
  * range when the file needs refresh-on-rewind (that range is what the seccomp
- * filter traps read/lseek on). Returns the fd, or -1. */
+ * filter traps the read family on). Returns the fd, or -1. */
 static long synth_memfd(int refreshable) {
     long fd = sys_memfd_create("cng-proc", CNG_MFD_CLOEXEC);
     if (fd < 0)
@@ -698,7 +698,10 @@ int cng_procfs_open(const char *canon, long gflags, long *ret) {
     sys_lseek((int)fd, 0, CNG_SEEK_SET);
     if (!(gflags & CNG_O_CLOEXEC))
         sys_fcntl((int)fd, CNG_F_SETFD, 0); /* the guest did not ask for it */
-    if (refreshable)
+    /* Track only an fd that actually landed in the trapped range; one that
+     * didn't (F_DUPFD failed) keeps its open-time snapshot, and tracking it
+     * would waste a slot on reads that never reach us. */
+    if (refreshable && cng_g_synth_fd_base > 0 && fd >= cng_g_synth_fd_base)
         pf_track((int)fd, kind);
     if (cng_g_debug)
         cng_dprintf(2, "[cng] procfs %s -> fd %ld (kind %d)\n", canon, fd, kind);

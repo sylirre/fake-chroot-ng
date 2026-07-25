@@ -26,17 +26,23 @@ check_contains "environ is the guest environment" \
     "proctest environ: 30 bytes -> OK" "$out"
 check_contains "another guest process is described from the registry" \
     "proctest other-pid: -> OK" "$out"
+check_contains "a child's exec outranks the fork publish; a dead pid stops answering" \
+    "proctest fork-guard+stale-pid: -> OK" "$out"
 check_contains "mounts describes the rootfs and binds" "proctest mounts:" "$out"
 check_contains "mountinfo carries the root device row" "proctest mountinfo:" "$out"
 check_contains "loadavg has the kernel's five fields" "proctest loadavg:" "$out"
 check_contains "a held loadavg fd refreshes on rewind (top's pattern)" \
     "proctest loadavg refresh:" "$out"
+check_contains "the readv path takes the same refresh hook" \
+    "proctest loadavg readv refresh:" "$out"
 check_contains "uptime is synthesized" "proctest uptime:" "$out"
 check_contains "stat falls back to synthesis where the host denies it" \
     "proctest stat:" "$out"
 check_contains "maps leaks no host path" "proctest maps:" "$out"
 check_contains "an fd link reports the guest path" \
     "proctest fdlink: / -> OK" "$out"
+check_contains "a map_files link target is mapped into the guest view" \
+    "proctest map_files:" "$out"
 check_contains "status Uid/Gid remapped under --fake-id" \
     "proctest status remap:" "$out"
 check_contains "--no-proc disables passthrough and synthesis" \

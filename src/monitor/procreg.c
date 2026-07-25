@@ -26,7 +26,16 @@ static int g_tab_n;
 /* starttime, field 22 of /proc/<pid>/stat: skip past the last ')' (comm may
  * contain spaces and parens), then take the 20th field after it. 0 when the
  * process is gone or /proc is unreadable — which is also how a dead slot is
- * recognized, so a missing /proc only costs fidelity, never correctness. */
+ * recognized, so a missing /proc only costs fidelity, never correctness.
+ *
+ * Opened as dir-then-openat("stat") rather than by full path. On a real
+ * kernel that is the same file; under qemu-user (the dev workflow) it is the
+ * only route to the truth for our own pid: qemu realpath()s an open's path
+ * and serves every absolute spelling of the caller's own stat from a
+ * synthesized copy whose starttime is frozen at emulator startup — which a
+ * fork inherits, so a child's self-sample would disagree with every other
+ * process's read of the same pid and the registry's starttime checks would
+ * misjudge the child as stale. The relative form is never intercepted. */
 static u64 proc_starttime(int pid) {
     char path[64];
     size_t n = cng_strlcpy(path, "/proc/", sizeof path);
@@ -40,9 +49,13 @@ static u64 proc_starttime(int pid) {
     while (ni > 0 && n < sizeof path - 1)
         path[n++] = num[--ni];
     path[n] = '\0';
-    cng_strlcpy(path + n, "/stat", sizeof path - n);
 
-    long fd = sys_openat(CNG_AT_FDCWD, path, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    long dfd = sys_openat(CNG_AT_FDCWD, path,
+                          CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
+    if (dfd < 0)
+        return 0;
+    long fd = sys_openat((int)dfd, "stat", CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    sys_close((int)dfd);
     if (fd < 0)
         return 0;
     char buf[512];
@@ -85,8 +98,12 @@ void cng_procreg_init(void) {
 }
 
 /* Our slot: the one already holding `pid`, else a free one, else one whose
- * process is gone (a slot is only ever released by being reclaimed — we have no
- * exit hook, since exit_group is not a syscall we trap). */
+ * process is gone (a slot is released when cng_procreg_has catches a reused
+ * pid, or reclaimed here — there is no exit hook, since exit_group is not a
+ * syscall we trap and a SIGKILL never could be). The old starttime is zeroed
+ * before the pid CAS publishes the claim, so a reader that races the claim
+ * sees "not stamped yet" rather than judging the new pid against the previous
+ * occupant's starttime. */
 static struct proc_ent *slot_for(int pid) {
     if (!g_tab || pid <= 0)
         return 0;
@@ -94,6 +111,9 @@ static struct proc_ent *slot_for(int pid) {
         if (__atomic_load_n(&g_tab[i].pid, __ATOMIC_ACQUIRE) == pid)
             return &g_tab[i];
     for (int i = 0; i < g_tab_n; i++) {
+        if (__atomic_load_n(&g_tab[i].pid, __ATOMIC_ACQUIRE) != 0)
+            continue;
+        __atomic_store_n(&g_tab[i].start, 0, __ATOMIC_RELEASE);
         s32 expect = 0;
         if (__atomic_compare_exchange_n(&g_tab[i].pid, &expect, (s32)pid, 0,
                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
@@ -103,11 +123,34 @@ static struct proc_ent *slot_for(int pid) {
         s32 dead = __atomic_load_n(&g_tab[i].pid, __ATOMIC_ACQUIRE);
         if (dead <= 0 || proc_starttime(dead) != 0)
             continue;
+        __atomic_store_n(&g_tab[i].start, 0, __ATOMIC_RELEASE);
         if (__atomic_compare_exchange_n(&g_tab[i].pid, &dead, (s32)pid, 0,
                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
             return &g_tab[i];
     }
     return 0; /* full: this process stays invisible (host passthrough) */
+}
+
+/* Begin a seqlock write: CAS the count even -> odd. A child's slot can see two
+ * writers — the parent publishing the fork while the child already publishes
+ * its own exec — and interleaved plain stores could leave a torn payload
+ * behind an even count. With the CAS the loser backs off (its data is the
+ * older of the two). Returns the odd count, or 0 when the spin runs out. */
+static u32 seq_acquire(struct proc_ent *e, int spins) {
+    for (int t = 0; t < spins; t++) {
+        u32 s = __atomic_load_n(&e->seq, __ATOMIC_RELAXED);
+        if (!(s & 1) &&
+            __atomic_compare_exchange_n(&e->seq, &s, s + 1, 0,
+                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+            return s + 1; /* even + 1: never 0 */
+        __asm__ volatile("yield");
+    }
+    return 0;
+}
+
+static void seq_release(struct proc_ent *e, u32 odd) {
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(&e->seq, odd + 1, __ATOMIC_RELAXED); /* even: write done */
 }
 
 /* Flatten a NULL-terminated string vector into NUL-joined bytes, as the kernel
@@ -137,16 +180,27 @@ static u16 copy_path(char *dst, u32 cap, const char *s) {
 void cng_procreg_publish(char **argv, char **envp, const void *auxv,
                          unsigned auxv_len, const char *exe_guest,
                          const char *cwd_guest) {
+    /* Sampled before the write window so the critical section is syscall-free
+     * (a smaller kill-safe window, and nothing slow under the odd count). */
+    u64 start = proc_starttime((int)sys_getpid());
     struct proc_ent *e = slot_for((int)sys_getpid());
     if (!e)
         return;
     if (auxv_len > CNG_PROCREG_AUXV)
         auxv_len = CNG_PROCREG_AUXV;
 
-    u32 s = __atomic_load_n(&e->seq, __ATOMIC_RELAXED);
-    __atomic_store_n(&e->seq, s + 1, __ATOMIC_RELAXED); /* odd: write begins */
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    e->start = proc_starttime((int)sys_getpid());
+    u32 s = seq_acquire(e, 1 << 20);
+    if (!s) {
+        /* A writer died inside its window (only the forking parent ever
+         * writes another process's slot). We own this pid, the dead writer's
+         * data is stale either way: reset the count and take the lock. */
+        u32 cur = __atomic_load_n(&e->seq, __ATOMIC_RELAXED);
+        __atomic_store_n(&e->seq, (cur | 1) + 1, __ATOMIC_RELAXED);
+        s = seq_acquire(e, 1 << 20);
+        if (!s)
+            return;
+    }
+    e->start = start;
     e->cmd_len = join_vec(e->cmd, CNG_PROCREG_CMDLINE, argv);
     e->env_len = join_vec(e->env, CNG_PROCREG_ENVIRON, envp);
     e->auxv_len = auxv_len;
@@ -154,8 +208,7 @@ void cng_procreg_publish(char **argv, char **envp, const void *auxv,
         memcpy(e->auxv, auxv, auxv_len);
     e->exe_len = copy_path(e->exe, CNG_PROCREG_PATH, exe_guest);
     e->cwd_len = copy_path(e->cwd, CNG_PROCREG_PATH, cwd_guest);
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    __atomic_store_n(&e->seq, s + 2, __ATOMIC_RELAXED); /* even: write done */
+    seq_release(e, s);
 }
 
 void cng_procreg_fork(int child) {
@@ -164,15 +217,23 @@ void cng_procreg_fork(int child) {
     struct cng_procsnap snap;
     if (!cng_procreg_get((int)sys_getpid(), &snap))
         return; /* we are not registered: nothing to inherit */
+    /* The child may not be scheduled yet, but its stat file exists the moment
+     * clone() returns, so its starttime is already readable. */
+    u64 start = proc_starttime(child);
     struct proc_ent *e = slot_for(child);
     if (!e)
         return;
-    u32 s = __atomic_load_n(&e->seq, __ATOMIC_RELAXED);
-    __atomic_store_n(&e->seq, s + 1, __ATOMIC_RELAXED);
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    /* The child may not be scheduled yet, but its stat file exists the moment
-     * clone() returns, so its starttime is already readable. */
-    e->start = proc_starttime(child);
+    /* The child itself may have beaten us here: it publishes its own identity
+     * when it loads a program, and that is newer than this forked copy. A slot
+     * already stamped with the child's live starttime is its work — leave it.
+     * Failing to take the lock means the same thing (the child is the only
+     * other writer of its slot), so back off there too. */
+    if (start && __atomic_load_n(&e->start, __ATOMIC_ACQUIRE) == start)
+        return;
+    u32 s = seq_acquire(e, 4096);
+    if (!s)
+        return;
+    e->start = start;
     e->cmd_len = snap.cmd_len;
     e->env_len = snap.env_len;
     e->auxv_len = snap.auxv_len;
@@ -183,8 +244,7 @@ void cng_procreg_fork(int child) {
     memcpy(e->auxv, snap.auxv, snap.auxv_len);
     memcpy(e->exe, snap.exe, snap.exe_len);
     memcpy(e->cwd, snap.cwd, snap.cwd_len);
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    __atomic_store_n(&e->seq, s + 2, __ATOMIC_RELAXED);
+    seq_release(e, s);
 }
 
 void cng_procreg_set_cwd(const char *cwd_guest) {
@@ -199,12 +259,11 @@ void cng_procreg_set_cwd(const char *cwd_guest) {
         }
     if (!e)
         return;
-    u32 s = __atomic_load_n(&e->seq, __ATOMIC_RELAXED);
-    __atomic_store_n(&e->seq, s + 1, __ATOMIC_RELAXED);
-    __atomic_thread_fence(__ATOMIC_RELEASE);
+    u32 s = seq_acquire(e, 4096);
+    if (!s)
+        return; /* contended refresh: the next chdir writes the live value */
     e->cwd_len = copy_path(e->cwd, CNG_PROCREG_PATH, cwd_guest);
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    __atomic_store_n(&e->seq, s + 2, __ATOMIC_RELAXED);
+    seq_release(e, s);
 }
 
 int cng_procreg_has(int pid) {
@@ -214,9 +273,30 @@ int cng_procreg_has(int pid) {
         return 1; /* always ourselves, registry or not */
     if (!g_tab)
         return 0;
-    for (int i = 0; i < g_tab_n; i++)
-        if (__atomic_load_n(&g_tab[i].pid, __ATOMIC_ACQUIRE) == pid)
-            return 1;
+    for (int i = 0; i < g_tab_n; i++) {
+        if (__atomic_load_n(&g_tab[i].pid, __ATOMIC_ACQUIRE) != pid)
+            continue;
+        /* The pid-reuse guard. Exit is not a trapped syscall (and a SIGKILL
+         * never could be), so a slot outlives its process and the host may
+         * hand the number to a foreign process — which must not inherit guest
+         * visibility through the hidden view. An unstamped slot (a claim whose
+         * payload write hasn't landed, or never did) stays invisible: every
+         * completed publish stamps a starttime. */
+        u64 start = __atomic_load_n(&g_tab[i].start, __ATOMIC_ACQUIRE);
+        if (!start)
+            return 0;
+        u64 live = proc_starttime(pid);
+        if (live != start) {
+            if (live) { /* a true reuse: scrub the slot for the free list */
+                s32 expect = (s32)pid;
+                __atomic_compare_exchange_n(&g_tab[i].pid, &expect, 0, 0,
+                                            __ATOMIC_ACQ_REL,
+                                            __ATOMIC_RELAXED);
+            } /* gone (or unreadable): slot_for reclaims it lazily */
+            return 0;
+        }
+        return 1;
+    }
     return 0;
 }
 
@@ -260,9 +340,12 @@ int cng_procreg_get(int pid, struct cng_procsnap *out) {
         if (__atomic_load_n(&e->seq, __ATOMIC_RELAXED) != s1)
             continue; /* torn read: retry */
         /* A recycled pid would otherwise inherit the dead process's guest
-         * identity. Our own entry is exempt: we know we are alive, and
-         * publish() may have recorded 0 where /proc was unreadable. */
-        if (pid != (int)sys_getpid() && start && start != proc_starttime(pid))
+         * identity, and an unstamped slot has no incarnation to check against
+         * (cng_procreg_has treats it as invisible; agree with that). Our own
+         * entry is exempt: we know we are alive, and publish() may have
+         * recorded 0 where /proc was unreadable. */
+        if (pid != (int)sys_getpid() &&
+            (!start || start != proc_starttime(pid)))
             return 0;
         out->cmd_len = cl;
         out->env_len = el;

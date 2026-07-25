@@ -434,14 +434,28 @@ vfork/`posix_spawn` child-stack handling.
   - **PID registry** (`src/monitor/procreg.c`, ported from `proctab.c` minus its
     broker): one `MAP_SHARED|MAP_ANONYMOUS` region, inherited across fork, in
     which each guest process publishes its argv, environ, auxv, exe and cwd.
-    Slots are claimed by CAS and written under a seqlock (every access happens
-    inside the SIGSYS handler, where a sleeping lock could deadlock), and a
-    recycled host pid is caught by comparing the recorded `/proc/<pid>/stat`
-    starttime. Publish points mirror the kernel's: the initial stack build, and
-    every emulated `execve`. A fork is published **by the parent** — the seccomp
-    filter now traps process-creating `clone` (no `CLONE_VM`) for that, since a
-    forked child need not make another traced syscall before something reads its
-    `/proc` entry. Threads still run untrapped.
+    Slots are claimed by CAS and written under a seqlock whose odd count is
+    itself taken by CAS — a child's slot can see two writers, the parent
+    publishing the fork while the child publishes its own exec, and the loser
+    (always the parent: its copy is the older) backs off instead of
+    interleaving stores. Every access happens inside the SIGSYS handler, where
+    a sleeping lock could deadlock. A recycled host pid is caught by comparing
+    the recorded `/proc/<pid>/stat` starttime **on every membership check**:
+    exit is not a trapped syscall (and a SIGKILL never could be), so without
+    that a foreign process reusing a dead guest's pid would inherit its
+    visibility — this covers even the signal-killed case that arm64chroot's
+    exit-hook unregister cannot. The starttime itself is read dir-then-
+    `openat("stat")`: the same file on a real kernel, and under qemu-user (the
+    dev workflow) the only spelling that dodges qemu's realpath'd
+    interception, which otherwise serves the caller's own stat with a
+    starttime frozen at emulator start — a fork inherits that, and the child's
+    self-sample would disagree with everyone else's read of it. Publish points
+    mirror the kernel's: the initial stack build, and every emulated `execve`.
+    A fork is published **by the parent** — the seccomp filter now traps
+    process-creating `clone` (no `CLONE_VM`) for that, since a forked child
+    need not make another traced syscall before something reads its `/proc`
+    entry; a slot the child already stamped with its own exec is left alone.
+    Threads still run untrapped.
   - **Synthesized files** (`src/monitor/procfs.c`, from `sys_procfs.c`), served
     from an in-memory copy on a read-only open, for any guest pid:
     `cmdline`, `environ`, `auxv` (the kernel's copies describe the chroot-ng
@@ -453,34 +467,49 @@ vfork/`posix_spawn` child-stack handling.
   - **Refresh on rewind.** procps opens `/proc/loadavg` once and `lseek(0)`
     +rereads it every cycle, so a snapshot would freeze `top`. The refreshable
     files are moved to a reserved high fd range (the top 16 below `RLIMIT_NOFILE`)
-    and the filter traps `read`/`pread64` **only for fds in that range**, where
-    the dispatcher regenerates content read from offset 0. Ordinary reads stay
-    untrapped; a guest fd that lands in the range is just re-issued.
+    and the filter traps the whole read family — `read`, `readv`, `pread64`,
+    `preadv`, `preadv2`, the same set arm64chroot hooks — **only for fds in
+    that range**, where the dispatcher regenerates content read from offset 0.
+    Ordinary reads stay untrapped; a guest fd that lands in the range is just
+    re-issued.
   - **`maps` is rewritten, not fabricated.** The guest's mappings are this
     process's real mappings, so addresses, protections, device and inode are all
     true; only the pathname column is mapped back to guest spelling, with
     file-backed lines outside the guest view (chroot-ng's own image) dropped and
     anonymous lines kept.
   - Two fixes that fall out of the same machinery: `readlink` of an fd link
-    (`/proc/self/fd/N`, and Alpine's `/dev/fd`) now reports the **guest** path
-    instead of leaking the host one, and `comm` is set with `PR_SET_NAME` on
-    each exec, so `ps` names the guest program rather than `chroot-ng` — that
-    one makes the kernel's own record correct rather than synthesizing anything.
-  Validated by `-t proctest` (14 checks: passthrough + hidden pids, registry-
-  backed cmdline/environ, another process's files through a real fork, the mount
-  table, loadavg/uptime/stat shape and the refresh-on-rewind path, no host path
-  in `maps`, fd-link untranslation, the fake-id status remap, `--no-proc`) and by
+    (`/proc/self/fd/N`, and Alpine's `/dev/fd`) or of a `map_files/<range>`
+    entry now reports the **guest** path instead of leaking the host one, and
+    `comm` is set with `PR_SET_NAME` on each exec, so `ps` names the guest
+    program rather than `chroot-ng` — that one makes the kernel's own record
+    correct rather than synthesizing anything.
+  Validated by `-t proctest` (passthrough + hidden pids, registry-backed
+  cmdline/environ, another process's files through a real fork, the
+  fork-vs-exec publish ordering and the dead-pid invalidation, the mount
+  table, loadavg/uptime/stat shape and the refresh-on-rewind path through both
+  `read` and `readv`, no host path in `maps`, fd-link and map_files
+  untranslation, the fake-id status remap, `--no-proc`) and by
   `tests/m11_proc.sh`, which reruns the same ground in an Alpine guest shell
   (`cat /proc/self/cmdline` shows the guest's argv, `ps` sees only guest
   processes, `/proc/1/stat` is absent, `comm` is `busybox`). The seccomp filter's
   new rules are covered by `-t bpftest`, which builds the program and runs it
   through a BPF interpreter — qemu-user does not honor guest filters, so that is
-  the only pre-device check for them. 186/186.
+  the only pre-device check for them. 194/194.
+  A later line-by-line parity audit against `sys_procfs.c`/`proctab.c`/
+  `path.c`/`sys_file.c` closed the remaining gaps (the read-family refresh
+  coverage, the pid-reuse and two-writer registry hardening, map_files
+  untranslation, and an empty-cwd snapshot now answering `/` instead of
+  falling through to the host readlink).
   Accepted divergences: `stat()` of a synthesized name reports the host file,
   which on Android is the one being denied; `readlink` of a synthesized fd shows
-  `memfd:cng-proc`; and two separate chroot-ng invocations over one rootfs do
+  `memfd:cng-proc`; `/proc/version` passes through (arm64chroot must keep it in
+  step with the kernel identity its `uname` fakes; chroot-ng fakes neither);
+  an explicit `-b /proc:DIR` outranks the synthesis (the user overriding the
+  view — arm64chroot keys its synthesis on the guest path, so there it outlives
+  a bind); and two separate chroot-ng invocations over one rootfs do
   not share a registry, so each hides the other's processes (the same
-  degradation arm64chroot has without `-shared-proc`). One place chroot-ng is
+  degradation arm64chroot has without `-shared-proc`; its opt-in per-rootfs
+  broker daemon is not ported). One place chroot-ng is
   deliberately *stricter* than arm64chroot: there, a `-b /proc:/proc` bind wins
   over the `/proc` zone in the path layer, so a host process stays reachable by
   explicit path (only the listing is filtered); here the hidden view is keyed on

@@ -155,17 +155,26 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
      * time-varying /proc files (loadavg, uptime, stat) must reach the
      * dispatcher, which regenerates the content when the read starts at offset
      * 0 — otherwise top and vmstat, which lseek(0)+reread a held fd, would show
-     * frozen numbers. Filtering on "fd >= base" keeps every ordinary read
-     * untrapped; a guest fd that happens to land in the range is simply
-     * re-issued. The kernel truncates the fd argument to 32 bits, so the low
-     * word is exactly what it will use. */
+     * frozen numbers. The whole read family is covered (read, readv, pread64,
+     * preadv, preadv2), matching the refresh hooks arm64chroot applies.
+     * Filtering on "fd >= base" keeps every ordinary read untrapped; a guest
+     * fd that happens to land in the range is simply re-issued. The kernel
+     * truncates the fd argument to 32 bits, so the low word is exactly what it
+     * will use. */
     if (cng_g_synth_fd_base > 0) {
-        f[n++] = (struct sock_filter)CNG_BPF_JUMP(
-            CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, (uint32_t)__NR_read, 1,
-            0); /* nr==read? yes-> load fd, no-> next */
-        f[n++] = (struct sock_filter)CNG_BPF_JUMP(
-            CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, (uint32_t)__NR_pread64, 0,
-            4); /* nr==pread64? no-> the reload at the end of this block */
+        static const int read_family[] = {
+            __NR_read, __NR_pread64, __NR_readv, __NR_preadv,
+#ifdef __NR_preadv2
+            __NR_preadv2,
+#endif
+        };
+        int nrf = (int)(sizeof read_family / sizeof read_family[0]);
+        for (int i = 0; i < nrf; i++)
+            f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+                CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K,
+                (uint32_t)read_family[i], (uint8_t)(nrf - 1 - i),
+                /* last check: no-> skip fd test, trap, allow -> reload */
+                (uint8_t)(i == nrf - 1 ? 4 : 0));
         f[n++] = (struct sock_filter)CNG_BPF_STMT(
             CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_ARGS); /* A=fd lo */
         f[n++] = (struct sock_filter)CNG_BPF_JUMP(
