@@ -1,5 +1,39 @@
 #include "cng/path.h"
+#include "cng/procreg.h"
 #include "cng/rt.h"
+
+int cng_g_no_proc = 0;
+
+/* /proc passes through to the host rather than resolving inside the rootfs (a
+ * plain directory tree has no /proc, and we cannot mount one without
+ * privileges). The exception is the hidden-process view: a numeric
+ * /proc/<pid> that is not a guest process appears not to exist, so the guest
+ * sees only its own session's processes. Returning 0 leaves the caller to
+ * prefix the rootfs, where the name is absent — an ENOENT the guest reads as
+ * "no such process". Every path syscall funnels through here, so this one
+ * check covers open/stat/readlink/execve and the *at forms alike.
+ *
+ * Non-numeric names under /proc (self, sys, net, version, ...) always pass
+ * through: they are either global or already virtualized elsewhere. */
+static int proc_passthrough(const char *canon) {
+    if (cng_g_no_proc)
+        return 0;
+    if (strncmp(canon, "/proc", 5) != 0 || (canon[5] && canon[5] != '/'))
+        return 0;
+    if (canon[5] == '/' && canon[6] >= '0' && canon[6] <= '9') {
+        long pid = 0;
+        for (const char *p = canon + 6; *p && *p != '/'; p++) {
+            if (*p < '0' || *p > '9')
+                return 1; /* not a pid ("1abc"): an ordinary host name */
+            pid = pid * 10 + (*p - '0');
+            if (pid > 0x7fffffff)
+                return 1;
+        }
+        if (!cng_procreg_has((int)pid))
+            return 0; /* a host process: hidden */
+    }
+    return 1;
+}
 
 /* Strip a trailing '/'; treat "/" as "" (root of host). */
 static void normalize_root(char *dst, size_t dstsz, const char *src) {
@@ -166,6 +200,10 @@ int cng_fs_translate(const struct cng_fs *fs, const char *path, char *out,
         const char *suffix = canon + blen; /* "" or "/rest" */
         size_t n = cng_strlcpy(out, fs->binds[best].host, outsz);
         cng_strlcpy(out + n, suffix, outsz > n ? outsz - n : 0);
+    } else if (proc_passthrough(canon)) {
+        /* A bind wins over the passthrough (checked first, above): an explicit
+         * -b /proc:DIR is the user overriding the host view. */
+        cng_strlcpy(out, canon, outsz);
     } else {
         size_t n = cng_strlcpy(out, fs->rootfs, outsz); /* "" or "/root" */
         cng_strlcpy(out + n, canon, outsz > n ? outsz - n : 0);

@@ -8,7 +8,10 @@
 #include "cng/loader.h"
 #include "cng/monitor.h"
 #include "cng/path.h"
+#include "cng/procfs.h"
+#include "cng/procreg.h"
 #include "cng/rewrite.h"
+#include "cng/seccomp.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
 #include "cng/uapi.h"
@@ -1505,5 +1508,461 @@ int cng_cmd_nettest(int argc, char **argv, char **envp, unsigned long *auxv) {
                     (unsigned long)got, ok ? "OK" : "FAIL");
         fails += !ok;
     }
+    return fails ? 1 : 0;
+}
+
+/* _proctest -r ROOT [-b G:H] — exercise the /proc emulation through the
+ * dispatcher: the passthrough and its hidden-process view, the registry-backed
+ * files (cmdline, environ), the synthesized mount table, the time-varying
+ * files and their refresh-on-rewind, the fake-id status remap, and the fd-link
+ * untranslation. No seccomp needed: every check calls cng_dispatch directly. */
+
+/* Read a whole synthesized fd into `buf`; returns the byte count or -1. */
+static long pt_slurp(long fd, char *buf, size_t cap) {
+    if (fd < 0)
+        return -1;
+    long total = 0;
+    for (;;) {
+        long n = sys_read((int)fd, buf + total, cap - 1 - (size_t)total);
+        if (n <= 0)
+            break;
+        total += n;
+        if ((size_t)total >= cap - 1)
+            break;
+    }
+    buf[total] = '\0';
+    return total;
+}
+
+/* Open a guest path through the dispatcher (the openat the guest would make). */
+static long pt_open(const char *guest) {
+    return cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)guest,
+                        CNG_O_RDONLY | CNG_O_CLOEXEC, 0, 0, 0, /*trapped=*/0);
+}
+
+/* 1 if `hay` contains `needle`. */
+static int pt_has(const char *hay, const char *needle) {
+    size_t nl = strlen(needle);
+    for (const char *p = hay; *p; p++)
+        if (!strncmp(p, needle, nl))
+            return 1;
+    return 0;
+}
+
+/* Count of NUL-separated entries in a cmdline/environ blob. */
+static int pt_nul_fields(const char *b, long n) {
+    int c = 0;
+    for (long i = 0; i < n; i++)
+        if (!b[i])
+            c++;
+    return c;
+}
+
+int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)auxv;
+    const char *rootfs = "/";
+    const char *bind_spec = 0;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-r") && i + 1 < argc)
+            rootfs = argv[++i];
+        else if (!strcmp(argv[i], "-b") && i + 1 < argc)
+            bind_spec = argv[++i];
+    }
+
+    static struct cng_fs fs;
+    cng_fs_init(&fs, rootfs);
+    if (bind_spec) {
+        char spec[512];
+        cng_strlcpy(spec, bind_spec, sizeof spec);
+        char *c = strchr(spec, ':');
+        if (c) {
+            *c = '\0';
+            cng_fs_add_bind(&fs, spec, c + 1);
+        }
+    }
+    cng_g_fs = &fs;
+    cng_g_exe_guest = "/bin/busybox";
+    cng_g_procstat_synth = 1; /* exercise the fallback where the host allows /proc/stat */
+
+    int fails = 0;
+    char buf[8192];
+    int self = (int)sys_getpid();
+
+    /* The guest identity this process publishes; the registry-backed files must
+     * hand back exactly these bytes. */
+    static char *gargv[] = {"/bin/busybox", "sh", "-c", "true", 0};
+    static char *genvp[] = {"PATH=/usr/bin:/bin", "HOME=/root", 0};
+    cng_procfs_init();
+    cng_procreg_publish(gargv, genvp, 0, 0, cng_g_exe_guest, "/");
+
+    /* 1) passthrough + hidden-process view, at the path layer. */
+    {
+        char out[CNG_PATH_MAX];
+        int ok = 1;
+        ok &= cng_fs_translate(&fs, "/proc/self/status", out, sizeof out) == 0 &&
+              !strcmp(out, "/proc/self/status");
+        ok &= cng_fs_translate(&fs, "/proc/version", out, sizeof out) == 0 &&
+              !strcmp(out, "/proc/version");
+        /* our own pid is a guest process: visible */
+        char mine[64];
+        cng_snprintf(mine, sizeof mine, "/proc/%d/stat", self);
+        ok &= cng_fs_translate(&fs, mine, out, sizeof out) == 0 &&
+              !strncmp(out, "/proc/", 6);
+        /* pid 1 is a host process: hidden, so it resolves into the rootfs */
+        ok &= cng_fs_translate(&fs, "/proc/1/stat", out, sizeof out) == 0 &&
+              strncmp(out, "/proc/", 6) != 0;
+        cng_dprintf(1, "proctest passthrough+hidden -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 2) cmdline and environ come from the registry, not from our own exec. */
+    {
+        long fd = pt_open("/proc/self/cmdline");
+        long n = pt_slurp(fd, buf, sizeof buf);
+        int ok = n > 0 && !strcmp(buf, "/bin/busybox") &&
+                 pt_nul_fields(buf, n) == 4 && pt_has(buf + 13, "sh");
+        if (fd >= 0)
+            sys_close((int)fd);
+        cng_dprintf(1, "proctest cmdline: %ld bytes argv0=%s -> %s\n", n, buf,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+
+        fd = pt_open("/proc/self/environ");
+        n = pt_slurp(fd, buf, sizeof buf);
+        ok = n > 0 && pt_nul_fields(buf, n) == 2 && !strcmp(buf, genvp[0]);
+        if (fd >= 0)
+            sys_close((int)fd);
+        cng_dprintf(1, "proctest environ: %ld bytes -> %s\n", n,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 3) the same files for ANOTHER guest process, via a real fork the parent
+     *    registers exactly as the clone hook does. */
+    {
+        long kid = sys_fork();
+        if (kid == 0) { /* outlive the parent's checks, then go away */
+            struct cng_timespec nap = {5, 0};
+            CNG_SYS(__NR_nanosleep, &nap, 0, 0, 0, 0, 0);
+            sys_exit_group(0);
+        }
+        int ok = kid > 0;
+        if (ok) {
+            cng_procreg_fork((int)kid);
+            ok &= cng_procreg_has((int)kid);
+            char p[64];
+            cng_snprintf(p, sizeof p, "/proc/%d/cmdline", (int)kid);
+            long fd = pt_open(p);
+            long n = pt_slurp(fd, buf, sizeof buf);
+            ok &= n > 0 && !strcmp(buf, "/bin/busybox");
+            if (fd >= 0)
+                sys_close((int)fd);
+            /* and its exe/cwd links resolve in guest terms */
+            char lb[CNG_PATH_MAX];
+            cng_snprintf(p, sizeof p, "/proc/%d/exe", (int)kid);
+            long r = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD, (long)p,
+                                  (long)lb, sizeof lb - 1, 0, 0, 0);
+            if (r > 0)
+                lb[r] = '\0';
+            ok &= r > 0 && !strcmp(lb, "/bin/busybox");
+            CNG_SYS(__NR_kill, kid, 9, 0, 0, 0, 0);
+            sys_wait4((int)kid, 0, 0, 0);
+        }
+        cng_dprintf(1, "proctest other-pid: -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 4) the mount table describes the rootfs and the binds, never the host's
+     *    real mount namespace. */
+    {
+        long fd = pt_open("/proc/mounts");
+        long n = pt_slurp(fd, buf, sizeof buf);
+        int ok = n > 0 && pt_has(buf, "/dev/root / ") && pt_has(buf, "proc /proc proc ");
+        if (bind_spec)
+            ok &= pt_has(buf, fs.binds[0].guest);
+        if (fd >= 0)
+            sys_close((int)fd);
+        cng_dprintf(1, "proctest mounts: %ld bytes -> %s\n", n,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+
+        fd = pt_open("/proc/self/mountinfo");
+        n = pt_slurp(fd, buf, sizeof buf);
+        ok = n > 0 && pt_has(buf, "1 1 ") && pt_has(buf, " / / rw,relatime - ");
+        if (fd >= 0)
+            sys_close((int)fd);
+        cng_dprintf(1, "proctest mountinfo: %ld bytes -> %s\n", n,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 5) loadavg/uptime/stat: shape, and refresh-on-rewind (the same fd, read
+     *    twice from offset 0, must be regenerated — top holds its fd open). */
+    {
+        long fd = pt_open("/proc/loadavg");
+        long n = pt_slurp(fd, buf, sizeof buf);
+        int fields = 0;
+        for (long i = 0; i < n; i++)
+            if (buf[i] == ' ')
+                fields++;
+        int ok = n > 0 && fields == 4 && pt_has(buf, ".") && pt_has(buf, "/");
+        cng_dprintf(1, "proctest loadavg: %ld bytes 4-spaces=%d -> %s\n", n,
+                    fields == 4, ok ? "OK" : "FAIL");
+        fails += !ok;
+        if (fd >= 0) {
+            /* rewind + reread through the dispatcher, as procps does */
+            sys_lseek((int)fd, 0, CNG_SEEK_SET);
+            char again[512];
+            long m = cng_dispatch(__NR_read, fd, (long)again, sizeof again - 1,
+                                  0, 0, 0, 0);
+            if (m > 0)
+                again[m] = '\0';
+            int fresh = m > 0 && again[0] >= '0' && again[0] <= '9';
+            cng_dprintf(1, "proctest loadavg refresh: %ld bytes -> %s\n", m,
+                        fresh ? "OK" : "FAIL");
+            fails += !fresh;
+            sys_close((int)fd);
+        }
+
+        fd = pt_open("/proc/uptime");
+        n = pt_slurp(fd, buf, sizeof buf);
+        ok = n > 0 && buf[0] >= '0' && buf[0] <= '9' && pt_has(buf, ".");
+        if (fd >= 0)
+            sys_close((int)fd);
+        cng_dprintf(1, "proctest uptime: %ld bytes -> %s\n", n,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+
+        fd = pt_open("/proc/stat");
+        n = pt_slurp(fd, buf, sizeof buf);
+        ok = n > 0 && !strncmp(buf, "cpu  ", 5) && pt_has(buf, "\nbtime ") &&
+             pt_has(buf, "\nprocs_running 1\n");
+        if (fd >= 0)
+            sys_close((int)fd);
+        cng_dprintf(1, "proctest stat: %ld bytes -> %s\n", n, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 6) maps: the guest's own mappings, with no host path left in them. */
+    {
+        long fd = pt_open("/proc/self/maps");
+        long n = pt_slurp(fd, buf, sizeof buf);
+        int ok = n > 0;
+        if (fs.rootfs[0])
+            ok &= !pt_has(buf, fs.rootfs); /* no rootfs host prefix leaked */
+        if (fd >= 0)
+            sys_close((int)fd);
+        cng_dprintf(1, "proctest maps: %ld bytes no-host-prefix -> %s\n", n,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 7) an fd link reports the guest path, not the host one. */
+    {
+        char hp[CNG_PATH_MAX];
+        long ffd = -1;
+        int ok = 0;
+        if (cng_fs_translate(&fs, "/", hp, sizeof hp) == 0)
+            ffd = sys_openat(CNG_AT_FDCWD, hp, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+        if (ffd >= 0) {
+            char p[64], lb[CNG_PATH_MAX];
+            cng_snprintf(p, sizeof p, "/proc/self/fd/%d", (int)ffd);
+            long r = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD, (long)p,
+                                  (long)lb, sizeof lb - 1, 0, 0, 0);
+            if (r > 0)
+                lb[r] = '\0';
+            ok = r > 0 && !strcmp(lb, "/");
+            cng_dprintf(1, "proctest fdlink: %s -> %s\n", r > 0 ? lb : "(err)",
+                        ok ? "OK" : "FAIL");
+            sys_close((int)ffd);
+        } else {
+            cng_dprintf(1, "proctest fdlink: cannot open rootfs -> FAIL\n");
+        }
+        fails += !ok;
+    }
+
+    /* 8) under --fake-id the status Uid:/Gid: lines carry the fake identity. */
+    {
+        cng_g_fake_id = 1;
+        cng_g_fake_uid = 0;
+        cng_g_fake_gid = 0;
+        cng_g_host_uid = (unsigned)sys_getuid();
+        cng_g_host_gid = (unsigned)sys_getgid();
+        cng_cred_seed();
+        long fd = pt_open("/proc/self/status");
+        long n = pt_slurp(fd, buf, sizeof buf);
+        int ok = n > 0 && pt_has(buf, "\nUid:\t0\t0\t0\t0\n");
+        if (fd >= 0)
+            sys_close((int)fd);
+        cng_dprintf(1, "proctest status remap: %ld bytes -> %s\n", n,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+        cng_g_fake_id = 0;
+    }
+
+    /* 9) --no-proc turns all of it off. */
+    {
+        cng_g_no_proc = 1;
+        char out[CNG_PATH_MAX];
+        long pr = 0;
+        int ok = cng_procfs_open("/proc/loadavg", CNG_O_RDONLY, &pr) == 0;
+        ok &= cng_fs_translate(&fs, "/proc/self/status", out, sizeof out) == 0 &&
+              strncmp(out, "/proc/", 6) != 0;
+        cng_g_no_proc = 0;
+        cng_dprintf(1, "proctest no-proc -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    (void)envp;
+    cng_dprintf(1, "proctest: %d failure(s)\n", fails);
+    return fails ? 1 : 0;
+}
+
+/* _bpftest — build the seccomp filter and run it through a classic-BPF
+ * interpreter, checking the action for representative (nr, arg0, ip) triples.
+ * The filter itself only ever executes on a real AArch64 kernel (qemu-user does
+ * not honor a guest's seccomp filter), so this is the only place its logic can
+ * be verified before a build reaches a device. */
+
+/* Minimal classic-BPF interpreter over a seccomp_data buffer: the subset the
+ * filter uses (LD W ABS, JEQ/JGE K, ALU AND K, RET K). */
+static u32 bpf_run(const struct sock_filter *f, int n, const u32 *data,
+                   int *bad) {
+    u32 A = 0;
+    for (int pc = 0; pc < n;) {
+        const struct sock_filter *i = &f[pc];
+        switch (i->code) {
+        case CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS:
+            if (i->k & 3 || i->k >= 64) { /* seccomp_data is 64 bytes */
+                *bad = 1;
+                return 0;
+            }
+            A = data[i->k / 4];
+            pc++;
+            break;
+        case CNG_BPF_ALU | CNG_BPF_AND | CNG_BPF_K:
+            A &= i->k;
+            pc++;
+            break;
+        case CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K:
+            pc += 1 + (A == i->k ? i->jt : i->jf);
+            break;
+        case CNG_BPF_JMP | CNG_BPF_JGE | CNG_BPF_K:
+            pc += 1 + (A >= i->k ? i->jt : i->jf);
+            break;
+        case CNG_BPF_RET | CNG_BPF_K:
+            return i->k;
+        default:
+            *bad = 1; /* an opcode this interpreter does not model */
+            return 0;
+        }
+        if (pc < 0 || pc >= n) { /* fell off the end: the kernel rejects this */
+            *bad = 1;
+            return 0;
+        }
+    }
+    *bad = 1;
+    return 0;
+}
+
+/* Fill a seccomp_data image: nr, arch, instruction_pointer, args[0]. */
+static void bpf_data(u32 *d, int nr, unsigned long ip, unsigned long arg0) {
+    memset(d, 0, 64);
+    d[0] = (u32)nr;
+    d[1] = CNG_AUDIT_ARCH_AARCH64;
+    d[2] = (u32)ip;
+    d[3] = (u32)(ip >> 32);
+    d[4] = (u32)arg0;
+    d[5] = (u32)(arg0 >> 32);
+}
+
+int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    cng_g_synth_fd_base = 1008; /* as cng_procfs_init would compute it */
+
+    static struct sock_filter f[CNG_SECCOMP_MAX_INSNS];
+    int n = cng_build_seccomp(f, CNG_SECCOMP_MAX_INSNS);
+    if (n <= 0) {
+        cng_dprintf(1, "bpftest: build failed (%d) -> FAIL\n", n);
+        return 1;
+    }
+
+    /* Every jump must land inside the program, and the last instruction must be
+     * a RET — the two structural rules the kernel's verifier enforces. */
+    int fails = 0, structural = 1;
+    for (int i = 0; i < n; i++) {
+        int cls = f[i].code & 0x07;
+        if (cls == CNG_BPF_JMP) {
+            if (i + 1 + f[i].jt >= n || i + 1 + f[i].jf >= n)
+                structural = 0;
+        }
+    }
+    if ((f[n - 1].code & 0x07) != CNG_BPF_RET)
+        structural = 0;
+    cng_dprintf(1, "bpftest structure: %d insns jumps_in_range=%d -> %s\n", n,
+                structural, structural ? "OK" : "FAIL");
+    fails += !structural;
+
+    unsigned long gate = (unsigned long)__cng_gate_start;
+    struct {
+        const char *what;
+        int nr;
+        unsigned long ip, arg0;
+        u32 want;
+    } cases[] = {
+        {"openat traps", __NR_openat, 0x1000, 0, CNG_SECCOMP_RET_TRAP},
+        {"getpid runs native", __NR_getpid, 0x1000, 0, CNG_SECCOMP_RET_ALLOW},
+        {"in-gate reissue allowed", __NR_openat, gate, 0,
+         CNG_SECCOMP_RET_ALLOW},
+        /* clone: process creation traps, thread creation does not */
+        {"fork traps", __NR_clone, 0x1000, 17 /*SIGCHLD*/,
+         CNG_SECCOMP_RET_TRAP},
+        {"vfork traps", __NR_clone, 0x1000, CNG_CLONE_VM | CNG_CLONE_VFORK,
+         CNG_SECCOMP_RET_TRAP},
+        {"thread runs native", __NR_clone, 0x1000, CNG_CLONE_VM | 0x10000,
+         CNG_SECCOMP_RET_ALLOW},
+        /* read: only the reserved synthesized fd range traps */
+        {"ordinary read runs native", __NR_read, 0x1000, 5,
+         CNG_SECCOMP_RET_ALLOW},
+        {"read of a synth fd traps", __NR_read, 0x1000, 1008,
+         CNG_SECCOMP_RET_TRAP},
+        {"read with a dirty upper half is judged on the low word", __NR_read,
+         0x1000, 0xdeadbeef00000005uL, CNG_SECCOMP_RET_ALLOW},
+        {"pread of a synth fd traps", __NR_pread64, 0x1000, 1100,
+         CNG_SECCOMP_RET_TRAP},
+        {"write is never trapped", __NR_write, 0x1000, 1008,
+         CNG_SECCOMP_RET_ALLOW},
+    };
+    for (unsigned k = 0; k < sizeof cases / sizeof cases[0]; k++) {
+        u32 d[16];
+        int bad = 0;
+        bpf_data(d, cases[k].nr, cases[k].ip, cases[k].arg0);
+        u32 got = bpf_run(f, n, d, &bad);
+        int ok = !bad && got == cases[k].want;
+        cng_dprintf(1, "bpftest %s: %s -> %s\n", cases[k].what,
+                    bad             ? "malformed"
+                    : got == CNG_SECCOMP_RET_TRAP ? "TRAP"
+                    : got == CNG_SECCOMP_RET_ALLOW ? "ALLOW"
+                                                   : "other",
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* A foreign architecture must be killed, not allowed. */
+    {
+        u32 d[16];
+        int bad = 0;
+        bpf_data(d, __NR_openat, 0x1000, 0);
+        d[1] = 0xc000003e; /* AUDIT_ARCH_X86_64 */
+        u32 got = bpf_run(f, n, d, &bad);
+        int ok = !bad && got == CNG_SECCOMP_RET_KILL_THREAD;
+        cng_dprintf(1, "bpftest foreign arch killed -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    cng_dprintf(1, "bpftest: %d failure(s)\n", fails);
     return fails ? 1 : 0;
 }

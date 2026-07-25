@@ -15,6 +15,7 @@
 #include "cng/loader.h"
 #include "cng/monitor.h"
 #include "cng/path.h"
+#include "cng/procfs.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
 #include "cng/uapi.h"
@@ -294,6 +295,11 @@ static long execve_core(int dirfd, const char *path, char **argv, char **envp,
     }
     if (cng_fs_untranslate(cng_g_fs, exe_host, exe_guest, sizeof exe_guest) == 0)
         cng_g_exe_guest = exe_guest;
+
+    /* Republish the guest identity: a real execve replaces cmdline, environ,
+     * auxv and comm, and this is where those change for us too. */
+    if (!cng_g_no_proc)
+        cng_procfs_publish_stack(sp);
 
     *out_sp = sp;
     *out_entry = entry;

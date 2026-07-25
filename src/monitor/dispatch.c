@@ -9,6 +9,8 @@
 #include "cng/l2s.h"
 #include "cng/monitor.h"
 #include "cng/path.h"
+#include "cng/procfs.h"
+#include "cng/procreg.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
 #include "cng/uapi.h"
@@ -131,6 +133,8 @@ static long reissue(long a0, long a1, long a2, long a3, long a4, long a5,
 #define PROC_MAGIC_GUEST 1 /* rewritten to a guest path; keep resolving */
 #define PROC_MAGIC_HOST  2 /* already a host path; resolution is done */
 
+static long proc_self_fixup(const char *canon, char *buf, unsigned long bufsz);
+
 /* Length of a leading "/proc/<pid|self|thread-self>/" in a canonical guest
  * path, or 0. `self_only` matches only this process's own view. */
 static size_t proc_pid_prefix(const char *p, int self_only) {
@@ -176,30 +180,28 @@ static int proc_magic(char *cur, size_t sz) {
     /* exe/cwd/root: substitute the guest-visible target that readlink(2)
      * reports (proc_self_fixup), so exec'ing or opening one lands where the
      * guest expects. The host links point at chroot-ng itself (we never issue
-     * a real execve) or at host paths, so following them is never right. Only
-     * our own process: another pid's view isn't ours to fake. */
-    if (!proc_pid_prefix(cur, 1))
-        return PROC_MAGIC_NONE;
-    const char *val = 0;
+     * a real execve) or at host paths, so following them is never right. This
+     * covers another guest process too — its target comes from the registry —
+     * while a host process never reaches here (the path layer hides it). */
     size_t vl = 0;
-    if (strncmp(rest, "exe", 3) == 0) {
-        val = cng_g_exe_guest;
+    if (strncmp(rest, "exe", 3) == 0 || strncmp(rest, "cwd", 3) == 0)
         vl = 3;
-    } else if (strncmp(rest, "cwd", 3) == 0) {
-        val = cng_g_fs->cwd;
-        vl = 3;
-    } else if (strncmp(rest, "root", 4) == 0) {
-        val = "/";
+    else if (strncmp(rest, "root", 4) == 0)
         vl = 4;
-    }
-    if (!val || (rest[vl] != '\0' && rest[vl] != '/'))
+    if (!vl || (rest[vl] != '\0' && rest[vl] != '/'))
         return PROC_MAGIC_NONE;
 
-    char tmp[CNG_PATH_MAX];
-    size_t n = cng_strlcpy(tmp, val, sizeof tmp);
-    if (n >= sizeof tmp)
+    /* The link component alone, for the fixup; the rest rides along after. */
+    char link[CNG_PATH_MAX], tmp[CNG_PATH_MAX];
+    if (pl + vl >= sizeof link)
         return PROC_MAGIC_NONE;
-    cng_strlcpy(tmp + n, rest + vl, sizeof tmp - n);
+    memcpy(link, cur, pl + vl);
+    link[pl + vl] = '\0';
+    long n = proc_self_fixup(link, tmp, sizeof tmp - 1);
+    if (n < 0)
+        return PROC_MAGIC_NONE;
+    tmp[n] = '\0';
+    cng_strlcpy(tmp + n, rest + vl, sizeof tmp - (size_t)n);
     return cng_path_canon(tmp, cur, sz) == 0 ? PROC_MAGIC_GUEST
                                              : PROC_MAGIC_NONE;
 }
@@ -441,19 +443,49 @@ static const char *xlate(long dirfd, const char *gp, char *buf, size_t bufsz,
     return gp;
 }
 
-/* /proc/self/{exe,cwd,root} -> guest-visible link target. Returns bytes written
- * (no NUL, like readlink) or -1 if `canon` isn't one of these. */
+/* /proc/<pid>/{exe,cwd,root} -> guest-visible link target. Our own process
+ * answers from the live view; another guest process from the registry entry it
+ * published (a host process never gets here — the path layer hides it). Returns
+ * bytes written (no NUL, like readlink) or -1 if `canon` isn't one of these. */
 static long proc_self_fixup(const char *canon, char *buf, unsigned long bufsz) {
-    if (strncmp(canon, "/proc/self/", 11) != 0)
+    size_t pl = proc_pid_prefix(canon, 0);
+    if (!pl)
         return -1;
-    const char *rest = canon + 11;
+    const char *rest = canon + pl;
+    if (strcmp(rest, "exe") && strcmp(rest, "cwd") && strcmp(rest, "root"))
+        return -1;
+
     const char *val = 0;
-    if (!strcmp(rest, "exe"))
-        val = cng_g_exe_guest;
-    else if (!strcmp(rest, "cwd"))
-        val = cng_g_fs->cwd;
-    else if (!strcmp(rest, "root"))
-        val = "/";
+    char own[CNG_PROCREG_PATH + 1];
+    if (proc_pid_prefix(canon, 1)) { /* self / thread-self */
+        val = rest[0] == 'e' ? cng_g_exe_guest
+              : rest[0] == 'c' ? cng_g_fs->cwd
+                               : "/";
+    } else {
+        long pid = 0;
+        for (const char *q = canon + 6; *q >= '0' && *q <= '9'; q++)
+            pid = pid * 10 + (*q - '0');
+        if (pid == sys_getpid()) {
+            val = rest[0] == 'e' ? cng_g_exe_guest
+                  : rest[0] == 'c' ? cng_g_fs->cwd
+                                   : "/";
+        } else if (rest[0] == 'r') {
+            val = "/"; /* every guest process shares this session's root */
+        } else {
+            struct cng_procsnap snap;
+            if (!cng_procreg_get((int)pid, &snap))
+                return -1;
+            unsigned n = rest[0] == 'e' ? snap.exe_len : snap.cwd_len;
+            const char *src = rest[0] == 'e' ? snap.exe : snap.cwd;
+            if (!n)
+                return -1;
+            if (n > CNG_PROCREG_PATH)
+                n = CNG_PROCREG_PATH;
+            memcpy(own, src, n);
+            own[n] = '\0';
+            val = own;
+        }
+    }
     if (!val)
         return -1;
     size_t len = strlen(val);
@@ -461,6 +493,61 @@ static long proc_self_fixup(const char *canon, char *buf, unsigned long bufsz) {
         len = bufsz;
     memcpy(buf, val, len);
     return (long)len;
+}
+
+/* Cheap pre-filter for the /proc hooks on a dirfd-relative path: resolving one
+ * costs a readlink of the dirfd, which must not be paid by every openat a guest
+ * makes. Only a final component that could name a synthesized file is worth
+ * resolving — procps opens "<pid>/stat" and "status" against a /proc dirfd, so
+ * the test is on the basename, not the whole path. */
+static int leaf_may_synth(const char *p) {
+    static const char *const leafs[] = {
+        "cmdline", "environ",   "auxv",   "maps",  "mounts", "mountinfo",
+        "status",  "mountstats", "loadavg", "uptime", "stat",
+    };
+    const char *b = strrchr(p, '/');
+    b = b ? b + 1 : p;
+    for (unsigned i = 0; i < sizeof leafs / sizeof leafs[0]; i++)
+        if (!strcmp(b, leafs[i]))
+            return 1;
+    return 0;
+}
+
+/* Same idea for readlinkat: could this name be an fd link, whose target is a
+ * host path that has to be mapped back into the guest view? An absolute name
+ * must be under /proc; a cwd-relative one is cheap to canonicalize either way;
+ * a dirfd-relative one only matters for the digit-named entries of a
+ * /proc/<pid>/fd directory, which is what `ls -l /proc/self/fd` walks. */
+static int rl_may_fdlink(long dirfd, const char *p) {
+    if (!p)
+        return 0;
+    if (p[0] == '/')
+        return !strncmp(p, "/proc", 5);
+    if ((int)dirfd == CNG_AT_FDCWD)
+        return 1;
+    const char *b = strrchr(p, '/');
+    b = b ? b + 1 : p;
+    if (*b < '0' || *b > '9')
+        return 0;
+    while (*b >= '0' && *b <= '9')
+        b++;
+    return *b == '\0';
+}
+
+/* The canonical GUEST path an (dirfd, path) pair names, for the /proc hooks.
+ * A real dirfd is resolved through its host path and mapped back; a host /proc
+ * path is already the guest spelling (that zone passes through). Returns 0/-1. */
+static int at_canon(long dirfd, const char *path, char *out, size_t sz) {
+    if (!path || !path[0])
+        return -1;
+    if (path[0] == '/' || (int)dirfd == CNG_AT_FDCWD)
+        return cng_fs_abscanon(cng_g_fs, path, out, sz);
+    char host[CNG_PATH_MAX];
+    if (resolve_at_host(dirfd, path, 0, host, sizeof host) != 0)
+        return -1;
+    if (!strncmp(host, "/proc/", 6) || !strcmp(host, "/proc"))
+        return cng_path_canon(host, out, sz);
+    return cng_fs_untranslate(cng_g_fs, host, out, sz);
 }
 
 /* 1 if the open fd refers to the rootfs root directory (where the ".l2s"
@@ -553,6 +640,36 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
 #endif
     {
         int deref = !(nr == __NR_mkdirat || nr == __NR_mknodat);
+        /* A read-only open of a /proc file that would describe chroot-ng
+         * instead of the guest is served from an in-memory copy of the guest
+         * view (see procfs.c). openat2 carries its flags in the open_how it
+         * points at. */
+#ifdef __NR_openat2
+        int is_open = (nr == __NR_openat || nr == __NR_openat2);
+#else
+        int is_open = (nr == __NR_openat);
+#endif
+        if (is_open) {
+            long oflags = a2;
+#ifdef __NR_openat2
+            if (nr == __NR_openat2)
+                oflags = a2 ? (long)*(unsigned long *)a2 : 0;
+#endif
+            const char *gp = (const char *)a1;
+            char canon[CNG_PATH_MAX];
+            long pr;
+            /* Absolute and cwd-relative names canonicalize without a syscall;
+             * a real dirfd costs a readlink, so it is resolved only when the
+             * name could be a synthesized file at all. */
+            int have = 0;
+            if (gp && (gp[0] == '/' || (int)a0 == CNG_AT_FDCWD))
+                have = cng_fs_abscanon(cng_g_fs, gp, canon, sizeof canon) == 0;
+            else if (gp && leaf_may_synth(gp))
+                have = at_canon(a0, gp, canon, sizeof canon) == 0;
+            if (have && !strncmp(canon, "/proc", 5) &&
+                cng_procfs_open(canon, oflags, &pr))
+                return pr;
+        }
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
         long r = reissue(a0, (long)p, a2, a3, a4, a5, nr);
         /* O_NOFOLLOW through a real dirfd lands on the l2s symlink and draws
@@ -758,7 +875,35 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 cng_l2s_resolve(hnf, data, sizeof data, 0) == 1)
                 return -EINVAL;
         }
-        return reissue(a0, (long)p, a2, a3, a4, a5, __NR_readlinkat);
+        long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_readlinkat);
+        /* An fd link reports a HOST path (the kernel names the open file
+         * description). Map it back into the guest view so the guest never sees
+         * where its rootfs really lives — `ls -l /proc/self/fd`, and Alpine's
+         * /dev/fd, both land here. Targets outside the view (memfd:, pipe:[..],
+         * a host-only file) are left exactly as the kernel wrote them. */
+        if (r > 0 && r < (long)a3 && *(char *)a2 == '/' &&
+            rl_may_fdlink(a0, gp)) {
+            char canon[CNG_PATH_MAX];
+            if (at_canon(a0, gp, canon, sizeof canon) == 0) {
+                size_t pl = proc_pid_prefix(canon, 0);
+                if (pl && !strncmp(canon + pl, "fd/", 3)) {
+                    char tgt[CNG_PATH_MAX], guest[CNG_PATH_MAX];
+                    if ((size_t)r < sizeof tgt) {
+                        memcpy(tgt, (const char *)a2, (size_t)r);
+                        tgt[r] = '\0';
+                        if (cng_fs_untranslate(cng_g_fs, tgt, guest,
+                                               sizeof guest) == 0) {
+                            size_t gl = strlen(guest);
+                            if (gl > (size_t)a3)
+                                gl = (size_t)a3;
+                            memcpy((char *)a2, guest, gl);
+                            r = (long)gl;
+                        }
+                    }
+                }
+            }
+        }
+        return r;
     }
 
     /* symlinkat(target, newdirfd, linkpath): translate only the linkpath. */
@@ -836,10 +981,32 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     /* The SIGSYS path handles clone in cng_sigsys_body (it needs the ucontext to
      * fix the child's stack). This branch is only reached via an M8 trampoline
      * (-R); best-effort strip of the shared-VM flags. */
+    /* clone: trapped for process creation only (a thread keeps CLONE_VM and
+     * runs natively). CLONE_VM|CLONE_VFORK are stripped — our execve is
+     * emulated in-process, so a child sharing our address space would corrupt
+     * it — and the parent then publishes the child into the PID registry, which
+     * is what makes the new process visible as a guest one. The child cannot do
+     * this itself: nothing guarantees it makes another traced syscall before
+     * something reads its /proc entry. */
     case __NR_clone: {
         long flags = a0 & ~(long)(CNG_CLONE_VM | CNG_CLONE_VFORK);
-        return cng_syscall6(flags, a1, a2, a3, a4, a5, __NR_clone);
+        long r = cng_syscall6(flags, a1, a2, a3, a4, a5, __NR_clone);
+        if (r > 0)
+            cng_procreg_fork((int)r);
+        return r;
     }
+
+    /* read/pread64 are trapped only for fds in the reserved synthesized range
+     * (the seccomp filter compares fd against cng_g_synth_fd_base), where a
+     * read starting at offset 0 regenerates a time-varying file — procps opens
+     * /proc/loadavg once and lseek(0)+rereads it every cycle. Any other fd that
+     * lands in the range just gets re-issued. */
+    case __NR_read:
+        cng_procfs_pre_read((int)a0, -1);
+        return cng_syscall6(a0, a1, a2, a3, a4, a5, nr);
+    case __NR_pread64:
+        cng_procfs_pre_read((int)a0, a3);
+        return cng_syscall6(a0, a1, a2, a3, a4, a5, nr);
 
     /* execve/execveat: only reached via an M8 trampoline (-R); the SIGSYS path
      * intercepts them in cng_sigsys_body (it must rewrite the signal context).
@@ -975,8 +1142,10 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         long r = reissue((long)hp, 0, 0, 0, 0, 0, __NR_chdir);
         if (r == 0) {
             char gc[CNG_PATH_MAX];
-            if (cng_fs_abscanon(cng_g_fs, gp, gc, sizeof gc) == 0)
+            if (cng_fs_abscanon(cng_g_fs, gp, gc, sizeof gc) == 0) {
                 cng_fs_set_cwd(cng_g_fs, gc);
+                cng_procreg_set_cwd(cng_g_fs->cwd); /* /proc/<pid>/cwd */
+            }
         }
         return r;
     }
@@ -989,8 +1158,10 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         if (r == 0) {
             char hc[CNG_PATH_MAX], gc[CNG_PATH_MAX];
             if (sys_getcwd(hc, sizeof hc) > 0 &&
-                cng_fs_untranslate(cng_g_fs, hc, gc, sizeof gc) == 0)
+                cng_fs_untranslate(cng_g_fs, hc, gc, sizeof gc) == 0) {
                 cng_fs_set_cwd(cng_g_fs, gc);
+                cng_procreg_set_cwd(cng_g_fs->cwd);
+            }
         }
         return r;
     }

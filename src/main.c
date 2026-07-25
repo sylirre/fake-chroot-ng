@@ -11,8 +11,8 @@
  *
  * The runtime is freestanding (no libc), so the help renderer — ported from the
  * sibling arm64chroot project — is built on the cng_ I/O helpers plus a raw
- * ioctl(TIOCGWINSZ). cng_dprintf has no width specifiers, so column alignment
- * is done with out_pad() rather than "%*s".
+ * ioctl(TIOCGWINSZ). cng_dprintf has fixed widths only (no "%*s"), so column
+ * alignment is done with out_pad().
  */
 #include "cng/l2s.h"
 #include "cng/loader.h"
@@ -44,6 +44,8 @@ int cng_cmd_cloexectest(int argc, char **argv, char **envp, unsigned long *auxv)
 int cng_cmd_stackswtest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_clonetest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_clonestktest(int argc, char **argv, char **envp, unsigned long *auxv);
+int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv);
+int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv);
 
 /* Internal self-tests, exposed via `-t/--test NAME`. Hidden from --help; the
  * argument that would be a <rootfs> can never begin with '-', so there is no
@@ -62,6 +64,7 @@ static const struct test_entry g_tests[] = {
     {"exectest", cng_cmd_exectest},     {"cloexectest", cng_cmd_cloexectest},
     {"stackswtest", cng_cmd_stackswtest}, {"clonetest", cng_cmd_clonetest},
     {"clonestktest", cng_cmd_clonestktest},
+    {"proctest", cng_cmd_proctest},   {"bpftest", cng_cmd_bpftest},
 };
 
 static int dispatch_test(const char *name, int argc, char **argv, char **envp,
@@ -328,6 +331,16 @@ static void help(char **envp) {
         {"-F, --file-backed", "Force file-backed segment mapping. Auto-selected "
                       "when anonymous executable memory is denied (Android "
                       "no-new-privs / execmem); this forces it unconditionally."},
+        {"    --no-proc", "Disable /proc emulation. By default the host /proc "
+                      "is visible to the guest (a rootfs directory tree has "
+                      "none, and mounting one needs privileges we lack), host "
+                      "processes are hidden from it, and the files that would "
+                      "describe chroot-ng rather than the guest — cmdline, "
+                      "environ, auxv, maps, mounts, mountinfo, mountstats — are "
+                      "served from the guest's own view, as are loadavg, uptime "
+                      "and stat where the host denies them. With this flag the "
+                      "guest sees only whatever /proc its rootfs (or an "
+                      "explicit -b) provides."},
         {"-L, --lib-prefix DIR", "Resolve the ELF interpreter under DIR instead "
                       "of through the rootfs/bind map (test aid). On real "
                       "hardware the interpreter and libraries resolve through "
@@ -536,6 +549,9 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
             } else if (!strcmp(n, "file-backed")) {
                 if (val) return err_noval(arg);
                 cng_g_loader_file = 1;
+            } else if (!strcmp(n, "no-proc")) {
+                if (val) return err_noval(arg);
+                cng_g_no_proc = 1;
             } else if (!strcmp(n, "bind")) {
                 char *spec = val;
                 if (!spec) {

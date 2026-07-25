@@ -21,6 +21,7 @@
 #include "cng/loader.h"
 #include "cng/monitor.h"
 #include "cng/path.h"
+#include "cng/procfs.h"
 #include "cng/rewrite.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
@@ -70,6 +71,11 @@ int cng_run(const char *rootfs, const char *libprefix,
         if (!strncmp(*e, "CNG_L2S_FORCE=", 14) && (*e)[14] != '\0' &&
             (*e)[14] != '0')
             cng_g_l2s_force = 1;
+        /* CNG_PROCSTAT_SYNTH=1 forces the synthesized /proc/stat even where the
+         * host file is readable (Android denies it; test hosts do not). */
+        if (!strncmp(*e, "CNG_PROCSTAT_SYNTH=", 19) && (*e)[19] != '\0' &&
+            (*e)[19] != '0')
+            cng_g_procstat_synth = 1;
     }
     /* Stamp the build: this tree is copied to test devices by hand, so a trace
      * has to be able to say whether it came from the build you just made. */
@@ -151,6 +157,15 @@ int cng_run(const char *rootfs, const char *libprefix,
         entry = prog.entry;
     }
     /* (svc rewriting + its pool are handled inside the loader, per object.) */
+
+    /* /proc emulation: bring up the PID registry and reserve the synthesized fd
+     * range (both must be settled before the seccomp filter is built, which
+     * bakes the range in), then publish this process's guest identity from the
+     * stack we just built. */
+    if (!cng_g_no_proc) {
+        cng_procfs_init();
+        cng_procfs_publish_stack(sp);
+    }
 
     /* Install the monitor last, after all of our own path syscalls are done.
      * Only when translation was actually requested; identity needs none. */

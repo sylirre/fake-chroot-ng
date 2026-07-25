@@ -24,6 +24,10 @@ struct cng_fs {
     char cwd[CNG_PATH_MAX]; /* canonical guest cwd, default "/" */
 };
 
+/* --no-proc: disable the /proc passthrough and the synthesized /proc files, so
+ * the guest sees only whatever /proc its rootfs (or an explicit -b) provides. */
+extern int cng_g_no_proc;
+
 void cng_fs_init(struct cng_fs *fs, const char *rootfs);
 int cng_fs_add_bind(struct cng_fs *fs, const char *guest, const char *host);
 void cng_fs_set_cwd(struct cng_fs *fs, const char *guest_cwd);

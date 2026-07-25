@@ -18,7 +18,7 @@ paying `proot`'s per-syscall `ptrace` overhead.
   flow used by ART's JIT). **This is the pivotal prerequisite** — `probe`
   checks it.
 - **Fidelity beyond chroot+bind:** fake user identity (`-u`/`--fake-id`), `/proc`
-  self-path fixups, and `link2symlink` (`-l`/`--link2symlink`).
+  emulation (`--no-proc` to disable), and `link2symlink` (`-l`/`--link2symlink`).
 
 ## Why not the obvious approaches
 
@@ -64,8 +64,16 @@ a backstop). This single component also:
 
 The well-trodden `proot`-equivalent logic, independent of interception
 mechanism: enumerate the ~40 path-bearing syscalls, canonicalize, apply the
-bind list + guest rootfs, guard against symlink escape, special-case
-`/proc/self/{exe,cwd,root,maps}`, and track the virtual cwd/root.
+bind list + guest rootfs, guard against symlink escape, and track the virtual
+cwd/root. `/proc` is its own zone: it passes through to the host (a rootfs
+directory tree has none), non-guest pids are hidden, the magic links
+(`exe`/`cwd`/`root`, and the `fd` links' targets) are answered in guest terms,
+and the files that would otherwise describe chroot-ng — `cmdline`, `environ`,
+`auxv`, `maps`, the mount tables — are served from the guest's own view. Because
+we run the guest in this process and never `execve`, those files are the kernel's
+record of *our* invocation, so this is a correctness requirement, not polish.
+See `src/monitor/procfs.c` (synthesis) and `src/monitor/procreg.c` (the
+fork-inherited registry that tells a guest pid from a host one).
 
 ### Interception mechanism — tiered, auto-selected
 

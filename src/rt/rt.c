@@ -132,13 +132,15 @@ void cng_puts(int fd, const char *s) { cng_write_all(fd, s, strlen(s)); }
 
 /* ---- minimal printf --------------------------------------------------- */
 
-void cng_vdprintf(int fd, const char *fmt, va_list ap) {
-    char buf[1024];
+/* The formatter. Writes at most `cap` bytes into `buf` (NUL-terminated when
+ * cap > 0) and returns the byte count written, excluding the terminator. */
+size_t cng_vsnprintf(char *buf, size_t cap, const char *fmt, va_list ap) {
     size_t n = 0;
 #define PUT(ch)                                                                \
     do {                                                                       \
-        if (n < sizeof(buf))                                                   \
-            buf[n++] = (char)(ch);                                             \
+        if (n + 1 < cap)                                                       \
+            buf[n] = (char)(ch);                                               \
+        n++;                                                                   \
     } while (0)
 
     for (const char *f = fmt; *f; f++) {
@@ -147,6 +149,18 @@ void cng_vdprintf(int fd, const char *fmt, va_list ap) {
             continue;
         }
         f++;
+        /* Flags/width: "0" (zero-pad) then a decimal field width. Needed by the
+         * /proc synthesis, whose formats are fixed-width ("%02lu" in loadavg,
+         * "%08llx" in maps) — a real reader parses them by column. */
+        int zero = 0, width = 0;
+        while (*f == '0') {
+            zero = 1;
+            f++;
+        }
+        while (*f >= '0' && *f <= '9') {
+            width = width * 10 + (*f - '0');
+            f++;
+        }
         int lng = 0;
         while (*f == 'l') {
             lng++;
@@ -156,11 +170,18 @@ void cng_vdprintf(int fd, const char *fmt, va_list ap) {
             lng = 2;
             f++;
         }
+#define PAD(have)                                                              \
+    do {                                                                       \
+        for (int p_ = (have); p_ < width; p_++)                                \
+            PUT(zero ? '0' : ' ');                                             \
+    } while (0)
         switch (*f) {
         case 's': {
             const char *s = va_arg(ap, const char *);
             if (!s)
                 s = "(null)";
+            size_t sl = strlen(s);
+            PAD((int)sl);
             while (*s)
                 PUT(*s++);
             break;
@@ -189,8 +210,15 @@ void cng_vdprintf(int fd, const char *fmt, va_list ap) {
                 t[i++] = (char)('0' + uv % 10);
                 uv /= 10;
             }
-            if (neg)
-                PUT('-');
+            if (zero) { /* sign first, then the zero fill: "-007" */
+                if (neg)
+                    PUT('-');
+                PAD(i + neg);
+            } else {
+                PAD(i + neg);
+                if (neg)
+                    PUT('-');
+            }
             while (i)
                 PUT(t[--i]);
             break;
@@ -228,6 +256,7 @@ void cng_vdprintf(int fd, const char *fmt, va_list ap) {
                 t[i++] = dig[uv % base];
                 uv /= base;
             }
+            PAD(i); /* %p pads its digits, after the "0x" */
             while (i)
                 PUT(t[--i]);
             break;
@@ -237,9 +266,29 @@ void cng_vdprintf(int fd, const char *fmt, va_list ap) {
             PUT(*f);
             break;
         }
+#undef PAD
     }
-    cng_write_all(fd, buf, n);
+    if (cap) {
+        if (n >= cap)
+            n = cap - 1; /* truncated */
+        buf[n] = '\0';
+    }
+    return n;
 #undef PUT
+}
+
+size_t cng_snprintf(char *buf, size_t cap, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    size_t n = cng_vsnprintf(buf, cap, fmt, ap);
+    va_end(ap);
+    return n;
+}
+
+void cng_vdprintf(int fd, const char *fmt, va_list ap) {
+    char buf[1024];
+    size_t n = cng_vsnprintf(buf, sizeof buf, fmt, ap);
+    cng_write_all(fd, buf, n);
 }
 
 void cng_dprintf(int fd, const char *fmt, ...) {

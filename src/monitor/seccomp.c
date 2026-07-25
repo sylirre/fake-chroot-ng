@@ -7,6 +7,7 @@
  */
 #include "cng/l2s.h"
 #include "cng/monitor.h"
+#include "cng/procfs.h"
 #include "cng/rt.h"
 #include "cng/seccomp.h"
 #include "cng/syscall.h"
@@ -63,7 +64,7 @@ static const int l2s_syscalls[] = {
 };
 #define NL2S ((int)(sizeof(l2s_syscalls) / sizeof(l2s_syscalls[0])))
 
-int cng_install_seccomp(void) {
+int cng_build_seccomp(struct sock_filter *f, int cap) {
     unsigned long gs = (unsigned long)__cng_gate_start;
     unsigned long ge = (unsigned long)__cng_gate_end;
     uint32_t gate_hi = (uint32_t)(gs >> 32);
@@ -83,8 +84,8 @@ int cng_install_seccomp(void) {
         for (int i = 0; i < NL2S; i++)
             nr[nsys++] = l2s_syscalls[i];
 
-    /* Prologue (0..8) + LD nr (9) + clone block (7) + nsys checks + 2 RETs. */
-    struct sock_filter f[20 + NPATH + NID + NL2S];
+    if (cap < CNG_SECCOMP_MAX_INSNS)
+        return -1;
     int n = 0;
 
     f[n++] = (struct sock_filter)CNG_BPF_STMT(
@@ -112,28 +113,66 @@ int cng_install_seccomp(void) {
     f[n++] = (struct sock_filter)CNG_BPF_STMT(
         CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* 9: A = nr */
 
-    /* clone with CLONE_VFORK: a vfork-style spawn (Go's os/exec, posix_spawn)
-     * shares the parent's address space (CLONE_VM) and suspends the parent until
-     * the child's execve. Our execve is emulated in-process — loading the new
-     * program into a *shared* VM corrupts the parent — so trap these and convert
-     * them to a real fork in dispatch. Thread creation (no CLONE_VFORK) and plain
-     * fork are left to run natively. clone flags are in args[0] (low 32 bits). */
+    /* clone: trap process creation, let thread creation run natively.
+     *  - without CLONE_VM the clone makes a new process, and the parent must
+     *    publish it into the PID registry (procreg) for the /proc view;
+     *  - with CLONE_VFORK (Go's os/exec, posix_spawn) the child shares our
+     *    address space and suspends us until its execve — but our execve is
+     *    emulated in-process, so a shared VM would corrupt the parent; dispatch
+     *    converts it to a real fork.
+     * A thread (CLONE_VM, no CLONE_VFORK) is neither, and runs untrapped.
+     * clone flags are in args[0] (low 32 bits). */
     f[n++] = (struct sock_filter)CNG_BPF_JUMP(
         CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, (uint32_t)__NR_clone, 0,
-        5); /* 10: nr==clone? no->16 (reload nr) */
+        8); /* 10: nr==clone? no->19 (reload nr) */
     f[n++] = (struct sock_filter)CNG_BPF_STMT(
         CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_ARGS); /* 11: A=flags lo */
     f[n++] = (struct sock_filter)CNG_BPF_STMT(
-        CNG_BPF_ALU | CNG_BPF_AND | CNG_BPF_K, CNG_CLONE_VFORK); /* 12 */
+        CNG_BPF_ALU | CNG_BPF_AND | CNG_BPF_K, CNG_CLONE_VM); /* 12 */
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, 0, 3,
+        0); /* 13: (flags&VM)==0? yes->17 trap (new process), no->14 */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_ARGS); /* 14: reload flags */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_ALU | CNG_BPF_AND | CNG_BPF_K, CNG_CLONE_VFORK); /* 15 */
     f[n++] = (struct sock_filter)CNG_BPF_JUMP(
         CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, 0, 1,
-        0); /* 13: (flags&VFORK)==0? yes->15 allow, no->14 trap */
+        0); /* 16: (flags&VFORK)==0? yes->18 allow (thread), no->17 trap */
     f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
-                                              CNG_SECCOMP_RET_TRAP); /* 14 */
+                                              CNG_SECCOMP_RET_TRAP); /* 17 */
     f[n++] = (struct sock_filter)CNG_BPF_STMT(
-        CNG_BPF_RET | CNG_BPF_K, CNG_SECCOMP_RET_ALLOW); /* 15: non-vfork clone */
+        CNG_BPF_RET | CNG_BPF_K, CNG_SECCOMP_RET_ALLOW); /* 18: plain thread */
     f[n++] = (struct sock_filter)CNG_BPF_STMT(
-        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* 16: reload A=nr */
+        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* 19: reload A=nr */
+
+    /* Synthesized-file refresh: a read on one of the high fds reserved for the
+     * time-varying /proc files (loadavg, uptime, stat) must reach the
+     * dispatcher, which regenerates the content when the read starts at offset
+     * 0 — otherwise top and vmstat, which lseek(0)+reread a held fd, would show
+     * frozen numbers. Filtering on "fd >= base" keeps every ordinary read
+     * untrapped; a guest fd that happens to land in the range is simply
+     * re-issued. The kernel truncates the fd argument to 32 bits, so the low
+     * word is exactly what it will use. */
+    if (cng_g_synth_fd_base > 0) {
+        f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+            CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, (uint32_t)__NR_read, 1,
+            0); /* nr==read? yes-> load fd, no-> next */
+        f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+            CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, (uint32_t)__NR_pread64, 0,
+            4); /* nr==pread64? no-> the reload at the end of this block */
+        f[n++] = (struct sock_filter)CNG_BPF_STMT(
+            CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_ARGS); /* A=fd lo */
+        f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+            CNG_BPF_JMP | CNG_BPF_JGE | CNG_BPF_K,
+            (uint32_t)cng_g_synth_fd_base, 0, 1); /* fd>=base? yes->trap */
+        f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
+                                                  CNG_SECCOMP_RET_TRAP);
+        f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
+                                                  CNG_SECCOMP_RET_ALLOW);
+        f[n++] = (struct sock_filter)CNG_BPF_STMT(
+            CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* reload A=nr */
+    }
 
     /* nsys checks; TRAP at the tail. */
     for (int i = 0; i < nsys; i++)
@@ -145,6 +184,14 @@ int cng_install_seccomp(void) {
     f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
                                               CNG_SECCOMP_RET_TRAP);
 
+    return n;
+}
+
+int cng_install_seccomp(void) {
+    struct sock_filter f[CNG_SECCOMP_MAX_INSNS];
+    int n = cng_build_seccomp(f, (int)(sizeof f / sizeof f[0]));
+    if (n < 0)
+        return -1;
     struct sock_fprog prog = {.len = (uint16_t)n, .filter = f};
 
     if (sys_prctl(CNG_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)

@@ -35,6 +35,12 @@ CFLAGS  += -std=gnu11 -ffreestanding -nostdlib -static -fno-pie -no-pie \
 ifeq ($(CC_IS_CLANG),0)
 CFLAGS  += -fno-tree-loop-distribute-patterns
 endif
+# GCC 13+ defaults to -moutline-atomics, which routes every __atomic builtin
+# through a libgcc helper (__aarch64_cas4_acq_rel) that a -nostdlib link has no
+# way to resolve. The PID registry uses CAS, so ask for inline atomics — the
+# LL/SC form works on every ARMv8. Probed, since not every compiler has it.
+CFLAGS  += $(shell $(CC) -mno-outline-atomics -E -x c /dev/null >/dev/null 2>&1 \
+             && echo -mno-outline-atomics)
 # Link chroot-ng far above the guest ET_EXEC range via an explicit linker script
 # (scripts/chroot-ng.ld). A non-PIE guest (notably gcc's cc1) loads at the fixed
 # address 0x400000 — where a -no-pie executable also defaults to — so if

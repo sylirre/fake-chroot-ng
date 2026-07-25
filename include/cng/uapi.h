@@ -53,6 +53,27 @@
 #define CNG_CLONE_VM     0x00000100
 #define CNG_CLONE_VFORK  0x00004000
 
+/* fcntl ops (the subset the monitor issues) */
+#define CNG_F_DUPFD          0
+#define CNG_F_GETFD          1
+#define CNG_F_SETFD          2
+#define CNG_F_GETFL          3
+#define CNG_F_DUPFD_CLOEXEC  1030
+
+/* memfd_create flags */
+#define CNG_MFD_CLOEXEC 1
+
+/* clock_gettime clocks. BOOTTIME counts suspend, which is what /proc/uptime
+ * reports (CLOCK_MONOTONIC does not). */
+#define CNG_CLOCK_REALTIME  0
+#define CNG_CLOCK_BOOTTIME  7
+
+/* getrlimit/prlimit64 resources */
+#define CNG_RLIMIT_NOFILE 7
+
+/* sysinfo() load averages are fixed-point, scaled by 1 << SI_LOAD_SHIFT. */
+#define CNG_SI_LOAD_SHIFT 16
+
 /* lseek whence */
 #define CNG_SEEK_SET 0
 #define CNG_SEEK_CUR 1
@@ -65,6 +86,7 @@
 #define CNG_ST_NOEXEC 0x0008
 
 /* prctl */
+#define CNG_PR_SET_NAME         15
 #define CNG_PR_SET_NO_NEW_PRIVS 38
 #define CNG_PR_GET_NO_NEW_PRIVS 39
 #define CNG_PR_SET_SECCOMP      22

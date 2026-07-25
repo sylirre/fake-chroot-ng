@@ -88,3 +88,24 @@ out=$(run -t clonestktest 2>&1); rc=$?
 check "clonestktest exit 0" 0 "$rc"
 check_contains "converted clone resumes child on its own stack" \
     "clonestk: pid>0=1 child_sp=childstk=1 parent_sp=orig=1 -> OK" "$out"
+
+# The BPF filter itself: qemu-user does not honor a guest's seccomp filter, so
+# its logic is verified by building it and running it through an interpreter —
+# the only pre-device check available for it.
+out=$(run -t bpftest 2>&1); rc=$?
+check "bpftest exit 0" 0 "$rc"
+check_contains "filter is structurally valid (jumps in range, ends in RET)" \
+    "jumps_in_range=1 -> OK" "$out"
+check_contains "path syscalls trap, others run native" \
+    "bpftest openat traps: TRAP -> OK" "$out"
+check_contains "in-gate reissue is allowed (no re-trap)" \
+    "bpftest in-gate reissue allowed: ALLOW -> OK" "$out"
+check_contains "fork traps (registry publish), threads do not" \
+    "bpftest thread runs native: ALLOW -> OK" "$out"
+check_contains "reads trap only for the reserved synthesized fd range" \
+    "bpftest read of a synth fd traps: TRAP -> OK" "$out"
+check_contains "an fd arg with a dirty upper half is judged on its low word" \
+    "bpftest read with a dirty upper half is judged on the low word: ALLOW -> OK" \
+    "$out"
+check_contains "a foreign architecture is killed" \
+    "bpftest foreign arch killed -> OK" "$out"

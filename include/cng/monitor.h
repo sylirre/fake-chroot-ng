@@ -190,6 +190,18 @@ void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si);
  * gate IP range, allows everything else). Returns 0 or -errno. */
 int cng_install_seccomp(void);
 
+/* Upper bound on the filter's instruction count: prologue + clone block +
+ * synthesized-fd block + one check per trapped syscall + the two tail RETs. */
+#define CNG_SECCOMP_MAX_INSNS 128
+
+/* Emit the filter into `f` (which must hold CNG_SECCOMP_MAX_INSNS entries) and
+ * return its length, or -1 if the buffer is too small. Split out of the install
+ * so a self-test can inspect and simulate it: the filter only ever runs on a
+ * real AArch64 kernel (qemu-user does not honor guest seccomp), so this is the
+ * only place its behaviour can be checked before shipping to a device. */
+struct sock_filter;
+int cng_build_seccomp(struct sock_filter *f, int cap);
+
 /* Point the dispatcher at fs, install the SIGSYS handler, then the filter.
  * Returns 0 on success or a negative errno (e.g. under qemu, where guest
  * seccomp filters are inert). */

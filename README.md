@@ -48,7 +48,16 @@ host-native binaries directly); `<program>` is an absolute path inside it.
 Common options: `-u/--fake-id[=ID]` (fake user identity — `ID` is a `uid` or
 `uid:gid`, defaulting to `0:0` root), `-b/--bind G:H` (bind guest path G to host
 H), `-l/--link2symlink` (emulate hardlinks where the host refuses `link(2)`),
-`-R/--rewrite` (ahead-of-time `svc` rewriting).
+`-R/--rewrite` (ahead-of-time `svc` rewriting), `--no-proc` (turn off the `/proc`
+emulation described below).
+
+`/proc` is visible to the guest without a bind, and describes the guest rather
+than chroot-ng: host processes are hidden from it, `cmdline`/`environ`/`auxv`
+report the guest program (no real `execve` ever happens, so the kernel's copies
+would name the chroot-ng invocation), `mounts`/`mountinfo` describe the rootfs
+and its binds instead of the host's mount namespace, `maps` and the `fd` links
+are mapped back to guest paths, and `loadavg`/`uptime`/`stat` are synthesized
+where the host denies them (as Android does).
 
 ```sh
 chroot-ng -u ./rootfs /bin/sh              # fake root (uid/gid 0)

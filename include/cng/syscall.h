@@ -97,6 +97,46 @@ static inline long sys_seccomp(unsigned op, unsigned flags, void *args) {
 static inline long sys_memfd_create(const char *name, unsigned flags) {
     return CNG_SYS(__NR_memfd_create, name, flags, 0, 0, 0, 0);
 }
+static inline long sys_fcntl(int fd, int op, long arg) {
+    return CNG_SYS(__NR_fcntl, fd, op, arg, 0, 0, 0);
+}
+static inline long sys_fstat(int fd, void *buf) {
+    return CNG_SYS(__NR_fstat, fd, buf, 0, 0, 0, 0);
+}
+static inline long sys_ftruncate(int fd, long len) {
+    return CNG_SYS(__NR_ftruncate, fd, len, 0, 0, 0, 0);
+}
+
+/* Kernel 64-bit layout of struct sysinfo (uapi/linux/sysinfo.h). Only uptime,
+ * loads and procs are consumed; the rest is here to size the buffer right. */
+struct cng_sysinfo {
+    long uptime;
+    unsigned long loads[3];
+    unsigned long totalram, freeram, sharedram, bufferram;
+    unsigned long totalswap, freeswap;
+    unsigned short procs, pad;
+    unsigned long totalhigh, freehigh;
+    unsigned mem_unit;
+    char _f[20 - 2 * sizeof(unsigned long) - sizeof(unsigned)];
+};
+static inline long sys_sysinfo(struct cng_sysinfo *si) {
+    return CNG_SYS(__NR_sysinfo, si, 0, 0, 0, 0, 0);
+}
+
+struct cng_timespec {
+    long tv_sec, tv_nsec;
+};
+static inline long sys_clock_gettime(int clk, struct cng_timespec *ts) {
+    return CNG_SYS(__NR_clock_gettime, clk, ts, 0, 0, 0, 0);
+}
+
+struct cng_rlimit {
+    unsigned long cur, max;
+};
+static inline long sys_prlimit64(int pid, int res, const struct cng_rlimit *new_,
+                                 struct cng_rlimit *old) {
+    return CNG_SYS(__NR_prlimit64, pid, res, new_, old, 0, 0);
+}
 static inline long sys_getuid(void) {
     return CNG_SYS(__NR_getuid, 0, 0, 0, 0, 0, 0);
 }

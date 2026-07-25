@@ -37,10 +37,17 @@ size_t cng_strlcpy(char *dst, const char *src, size_t size);
 long cng_write_all(int fd, const void *buf, size_t n);
 void cng_puts(int fd, const char *s);
 
-/* Minimal printf: %s %c %d %u %o %x %X %p %% ; length modifiers l, ll, z. */
+/* Minimal printf: %s %c %d %u %o %x %X %p %% ; length modifiers l, ll, z;
+ * a leading "0" flag and a decimal field width ("%08lx", "%02u"). */
 void cng_dprintf(int fd, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 void cng_vdprintf(int fd, const char *fmt, va_list ap);
+
+/* Same formatter into a buffer (NUL-terminated, truncating). Returns the byte
+ * count written, excluding the terminator. */
+size_t cng_snprintf(char *buf, size_t cap, const char *fmt, ...)
+    __attribute__((format(printf, 3, 4)));
+size_t cng_vsnprintf(char *buf, size_t cap, const char *fmt, va_list ap);
 
 /* Print "<msg>: <errno-name-or-number>\n" to stderr and exit(1). */
 _Noreturn void cng_die(const char *msg, long err);
