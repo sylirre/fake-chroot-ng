@@ -204,6 +204,32 @@ static int proc_magic(char *cur, size_t sz) {
                                              : PROC_MAGIC_NONE;
 }
 
+/* If `host` names one of *this* process's own open fds — "/proc/self/fd/<n>",
+ * the thread-self spelling, or our own pid — return that fd, else -1. We run
+ * in-process, so the guest's fds are ours: the caller can use the open file
+ * description directly instead of reopening the magic link. Trailing
+ * components (a directory fd) are not this, and neither is another process. */
+int cng_proc_self_fd(const char *host) {
+    size_t pl = proc_pid_prefix(host, 0);
+    if (!pl || strncmp(host + pl, "fd/", 3) != 0)
+        return -1;
+    if (!proc_pid_prefix(host, 1)) { /* numeric form: must be our own pid */
+        long pid = 0;
+        const char *q = host + 6;
+        for (; *q >= '0' && *q <= '9'; q++)
+            pid = pid * 10 + (*q - '0');
+        if (pid != sys_getpid())
+            return -1;
+    }
+    const char *d = host + pl + 3;
+    if (*d < '0' || *d > '9')
+        return -1;
+    int fd = 0;
+    for (; *d >= '0' && *d <= '9'; d++)
+        fd = fd * 10 + (*d - '0');
+    return *d == '\0' ? fd : -1;
+}
+
 /* Resolve a guest path to a host path, following symlinks *within the guest*:
  * an absolute symlink target is re-rooted into the rootfs rather than resolved
  * against the host root (which is what breaks Alpine's busybox symlinks). Walks
@@ -329,6 +355,36 @@ static int resolve_at_host(long dirfd, const char *path, int deref, char *out,
     }
     cng_strlcpy(out + k, path, sz > k ? sz - k : 0);
     return 0;
+}
+
+/* Fake-root DAC bypass for an open the host refused: real root reads any file,
+ * ours cannot. Scoped to a path naming one of our own fds — apk hands its
+ * package scripts to the interpreter as "/proc/self/fd/N" and their inode
+ * grants execute but not read, so the shebang interpreter's reopen is denied
+ * where a real chroot's root sails through. Holding the fd, we can lend the
+ * inode the owner-read bit across the open with no path race, and put the mode
+ * straight back. Returns the reopened fd, or `fallback` if this isn't that
+ * case. */
+static long fake_root_reopen(const char *host, long flags, long mode,
+                             long fallback) {
+    int fd = cng_proc_self_fd(host);
+    if (fd < 0)
+        return fallback;
+    char st[128];
+    if (CNG_SYS(__NR_fstat, fd, st, 0, 0, 0, 0) != 0)
+        return fallback;
+    unsigned m = *(unsigned *)(st + STAT_MODE_OFF);
+    if ((m & 0170000) != 0100000 || (m & 0400))
+        return fallback; /* not a plain file, or read was not the problem */
+    if (CNG_SYS(__NR_fchmod, fd, (m & 07777) | 0400, 0, 0, 0, 0) != 0)
+        return fallback;
+    long r = cng_syscall6(CNG_AT_FDCWD, (long)host, flags, mode, 0, 0,
+                          __NR_openat);
+    CNG_SYS(__NR_fchmod, fd, m & 07777, 0, 0, 0, 0);
+    if (cng_g_debug)
+        cng_dprintf(2, "[cng] fake-root reopen %s (mode %o) -> %ld\n", host,
+                    m & 07777, r);
+    return r;
 }
 
 static const char *xlate(long dirfd, const char *gp, char *buf, size_t bufsz,
@@ -471,6 +527,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 r = reissue(CNG_AT_FDCWD, (long)data, a2, a3, a4, a5,
                             __NR_openat);
         }
+        if (r == -EACCES && nr == __NR_openat && cng_fake_root())
+            r = fake_root_reopen(p, a2, a3, r);
         return r;
     }
 

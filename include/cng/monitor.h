@@ -160,6 +160,10 @@ extern int cng_g_debug;
  * last component's own symlink. Returns 0/-errno. Uses cng_g_fs + readlink. */
 int cng_resolve(const char *path, int deref_final, char *out, size_t outsz);
 
+/* The fd behind a host path that names one of this process's own descriptors
+ * ("/proc/self/fd/<n>" and its thread-self / own-pid spellings), else -1. */
+int cng_proc_self_fd(const char *host);
+
 /* Ambient-seccomp block-list: cng_blocked[nr] != 0 means Android blocks that
  * syscall, so dispatch emulates ENOSYS instead of re-issuing it. Populated by
  * cng_probe_blocked() at monitor install (a no-op result off Android). */

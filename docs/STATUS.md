@@ -376,6 +376,32 @@ vfork/`posix_spawn` child-stack handling.
   - `--version` and a `CNG_DEBUG` startup banner stamp the build time: this tree
     reaches devices by hand-copy, so traces must identify their build. 147/147.
 
+- [x] **exec a file the guest may execute but not read (apk scripts, part 2)**
+  With the magic links resolving, apk's scripts then failed as
+  `execve open /proc/self/fd/7 -> errno=13`. `execve(2)` checks **execute**
+  permission on the inode; reopening a path checks **read** — and apk's script
+  fd names an inode granting exactly `--x`. Real root reopens it anyway through
+  its DAC bypass; our `--fake-id` root cannot, so the userland loader (which
+  must *read* the image) was strictly more restrictive than the kernel.
+  - `cng_load_elf_fd()` splits the loader's fd core out of `cng_load_elf`, and
+    an exec whose target names one of our own fds (`cng_proc_self_fd`) loads
+    **from that fd** instead of reopening the magic link: we run in-process, so
+    the guest's fds are ours. No permission check at all, and it covers the
+    anonymous files (memfd, `O_TMPFILE`, deleted) that have no readable name.
+    Everything reads through pread/mmap, so the file offset — shared with the
+    parent across fork — is untouched.
+  - The shebang interpreter then reopens that same path *itself* (busybox `sh`
+    reading the script), which fails for the same reason. Under fake-root only,
+    an `openat` refused with EACCES on a path naming one of our fds now lends
+    the inode the owner-read bit **through the fd** (no path race), reopens, and
+    restores the mode — the DAC bypass real root would have had.
+  Both halves verified end-to-end under qemu: a `#!/bin/sh` script made
+  execute-only after opening, exec'd via `/proc/self/fd/N` in an Alpine guest,
+  now runs and leaves the mode `---x--x--x`. Checks: `-t exectest` on an
+  execute-only ELF via its fd, and `fakeroot_reopen` in `-t faketest`. 150/150.
+  Still unsupported: a file we do **not** own and cannot read — fake-root has no
+  way to borrow a bit there.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

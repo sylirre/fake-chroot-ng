@@ -37,7 +37,7 @@ size_t cng_strlcpy(char *dst, const char *src, size_t size);
 long cng_write_all(int fd, const void *buf, size_t n);
 void cng_puts(int fd, const char *s);
 
-/* Minimal printf: %s %c %d %u %x %X %p %% ; length modifiers l, ll, z. */
+/* Minimal printf: %s %c %d %u %o %x %X %p %% ; length modifiers l, ll, z. */
 void cng_dprintf(int fd, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 void cng_vdprintf(int fd, const char *fmt, va_list ap);

@@ -196,6 +196,7 @@ void cng_vdprintf(int fd, const char *fmt, va_list ap) {
             break;
         }
         case 'u':
+        case 'o':
         case 'x':
         case 'X':
         case 'p': {
@@ -210,7 +211,9 @@ void cng_vdprintf(int fd, const char *fmt, va_list ap) {
             } else {
                 uv = lng ? va_arg(ap, unsigned long)
                          : (unsigned long)va_arg(ap, unsigned int);
-                if (*f == 'x')
+                if (*f == 'o')
+                    base = 8;
+                else if (*f == 'x')
                     base = 16;
                 else if (*f == 'X') {
                     base = 16;

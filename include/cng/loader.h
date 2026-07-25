@@ -56,6 +56,13 @@ void cng_loader_check_execmem(void);
 int cng_load_elf(const char *path, unsigned long base_hint,
                  struct cng_loaded *out);
 
+/* Same, from an already-open fd (left open, and its file offset untouched —
+ * everything is pread/mmap). Lets an exec of "/proc/self/fd/N" load the open
+ * file description itself rather than reopening the magic link: the kernel
+ * checks *execute* permission for execve where a reopen needs *read*, and the
+ * file may have no readable name at all (memfd, O_TMPFILE, deleted). */
+int cng_load_elf_fd(int fd, unsigned long base_hint, struct cng_loaded *out);
+
 /* Build the initial process stack (argc/argv/envp/auxv) for the loaded program
  * (and optional interpreter) and return the guest stack pointer. */
 unsigned long cng_build_stack(int argc, char **argv, char **envp,

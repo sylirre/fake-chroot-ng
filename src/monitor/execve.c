@@ -133,19 +133,41 @@ static long execve_core(int dirfd, const char *path, char **argv, char **envp,
      * kernel, so do it ourselves — exec the interpreter with
      * [interp, arg?, script, orig-args...]. One level (interp is expected to be
      * a real ELF, e.g. /bin/sh -> busybox). */
+    /* When the target names one of our own fds ("/proc/self/fd/N", how apk runs
+     * package scripts) work from that open file description instead of
+     * reopening the magic link. execve(2) checks *execute* permission on the
+     * inode; a reopen checks *read* — so a script a real (root) chroot execs
+     * happily can come back EACCES here, since our fake root has no DAC bypass.
+     * The fd we already hold needs no permission check at all, and covers the
+     * anonymous files (memfd, O_TMPFILE, deleted) that have no readable name.
+     * Everything below reads it with pread/mmap, so the guest's file offset —
+     * shared with its parent through fork — is left alone. */
+    int gfd = cng_proc_self_fd(host); /* the guest's fd: never close it */
+    if (gfd >= 0 && cng_g_debug) {
+        char st[128]; /* AArch64 struct stat: mode@16, uid@24, gid@28 */
+        if (CNG_SYS(__NR_fstat, gfd, st, 0, 0, 0, 0) == 0)
+            cng_dprintf(2, "[cng] execve fd=%d mode=%o uid=%u gid=%u\n", gfd,
+                        *(unsigned *)(st + 16) & 07777, *(unsigned *)(st + 24),
+                        *(unsigned *)(st + 28));
+    }
+
     char interp_buf[256], arg_buf[256], *sheb_argv[128];
     char **eff_argv = argv;
     {
-        long fd = sys_openat(CNG_AT_FDCWD, host, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
-        if (fd < 0) {
-            if (cng_g_debug)
-                cng_dprintf(2, "[cng] execve open %s -> errno=%d\n", host,
-                            (int)-fd);
-            return fd; /* the real errno (EACCES, ELOOP, ENOENT, ...) */
+        long fd = gfd;
+        if (gfd < 0) {
+            fd = sys_openat(CNG_AT_FDCWD, host, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+            if (fd < 0) {
+                if (cng_g_debug)
+                    cng_dprintf(2, "[cng] execve open %s -> errno=%d\n", host,
+                                (int)-fd);
+                return fd; /* the real errno (EACCES, ELOOP, ENOENT, ...) */
+            }
         }
         char hdr[257];
         long n = sys_pread64((int)fd, hdr, 256, 0);
-        sys_close((int)fd);
+        if (gfd < 0)
+            sys_close((int)fd);
         if (n >= 2 && hdr[0] == '#' && hdr[1] == '!') {
             hdr[n < 256 ? n : 256] = '\0';
             char *p = hdr + 2;
@@ -181,6 +203,7 @@ static long execve_core(int dirfd, const char *path, char **argv, char **envp,
                     sheb_argv[k++] = argv[j];
             sheb_argv[k] = 0;
             eff_argv = sheb_argv;
+            gfd = -1; /* the image to load is now the interpreter, by path */
             if (cng_resolve(interp_buf, 1, host, sizeof host) != 0) {
                 if (cng_g_debug)
                     cng_dprintf(2, "[cng] execve interp %s -> unresolved\n",
@@ -195,7 +218,7 @@ static long execve_core(int dirfd, const char *path, char **argv, char **envp,
                     cng_g_loader_file);
 
     struct cng_loaded prog;
-    int rc = cng_load_elf(host, 0, &prog);
+    int rc = gfd >= 0 ? cng_load_elf_fd(gfd, 0, &prog) : cng_load_elf(host, 0, &prog);
     if (rc != CNG_LOAD_OK) {
         cng_dprintf(2, "chroot-ng: exec %s (%s): load failed rc=%d\n", path,
                     host, rc);

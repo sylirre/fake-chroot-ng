@@ -184,17 +184,12 @@ static int map_file(int fd, const Elf64_Ehdr *eh, const Elf64_Phdr *ph,
     return CNG_LOAD_OK;
 }
 
-int cng_load_elf(const char *path, unsigned long base_hint,
-                 struct cng_loaded *out) {
+int cng_load_elf_fd(int fd, unsigned long base_hint, struct cng_loaded *out) {
     memset(out, 0, sizeof *out);
-
-    long fd = sys_openat(CNG_AT_FDCWD, path, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
-    if (fd < 0)
-        return CNG_LOAD_EOPEN;
 
     int rc = CNG_LOAD_OK;
     Elf64_Ehdr eh;
-    if (read_exact((int)fd, &eh, sizeof eh, 0) != (long)sizeof eh) {
+    if (read_exact(fd, &eh, sizeof eh, 0) != (long)sizeof eh) {
         rc = CNG_LOAD_EIO;
         goto out;
     }
@@ -214,7 +209,7 @@ int cng_load_elf(const char *path, unsigned long base_hint,
 
     Elf64_Phdr ph[MAX_PHDR];
     size_t phsz = (size_t)eh.e_phnum * sizeof(Elf64_Phdr);
-    if (read_exact((int)fd, ph, phsz, (long)eh.e_phoff) != (long)phsz) {
+    if (read_exact(fd, ph, phsz, (long)eh.e_phoff) != (long)phsz) {
         rc = CNG_LOAD_EIO;
         goto out;
     }
@@ -225,7 +220,7 @@ int cng_load_elf(const char *path, unsigned long base_hint,
     for (int i = 0; i < eh.e_phnum; i++) {
         if (ph[i].p_type == PT_INTERP && ph[i].p_filesz > 0 &&
             ph[i].p_filesz < sizeof out->interp) {
-            if (read_exact((int)fd, out->interp, ph[i].p_filesz,
+            if (read_exact(fd, out->interp, ph[i].p_filesz,
                            (long)ph[i].p_offset) == (long)ph[i].p_filesz) {
                 out->interp[ph[i].p_filesz] = '\0';
                 out->has_interp = 1;
@@ -251,14 +246,14 @@ int cng_load_elf(const char *path, unsigned long base_hint,
     unsigned long bias = 0;
 
     rc = cng_g_loader_file
-             ? map_file((int)fd, &eh, ph, is_dyn, lo, span, base_hint, &bias)
-             : map_anon((int)fd, &eh, ph, is_dyn, lo, span, base_hint, &bias);
+             ? map_file(fd, &eh, ph, is_dyn, lo, span, base_hint, &bias)
+             : map_anon(fd, &eh, ph, is_dyn, lo, span, base_hint, &bias);
     if (rc == CNG_LOAD_EEXEC) {
         /* Anonymous executable memory was denied (e.g. NO_NEW_PRIVS revoking
          * execmem on Android). Fall back to file-backed exec mapping, which
          * works on an exec-permitted mount, and remember it for next time. */
         cng_g_loader_file = 1;
-        rc = map_file((int)fd, &eh, ph, is_dyn, lo, span, base_hint, &bias);
+        rc = map_file(fd, &eh, ph, is_dyn, lo, span, base_hint, &bias);
     }
     if (rc != CNG_LOAD_OK)
         goto out;
@@ -285,6 +280,17 @@ int cng_load_elf(const char *path, unsigned long base_hint,
     rc = CNG_LOAD_OK;
 
 out:
+    return rc;
+}
+
+int cng_load_elf(const char *path, unsigned long base_hint,
+                 struct cng_loaded *out) {
+    long fd = sys_openat(CNG_AT_FDCWD, path, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    if (fd < 0) {
+        memset(out, 0, sizeof *out);
+        return CNG_LOAD_EOPEN;
+    }
+    int rc = cng_load_elf_fd((int)fd, base_hint, out);
     sys_close((int)fd);
     return rc;
 }

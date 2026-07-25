@@ -47,6 +47,20 @@ if $GCC -static-pie -O2 -o "$ER/hello" tests/guests/hello.c 2>/dev/null; then
         "exe=/hello" "$out"
     exec 9<&-
 
+    # execve(2) checks *execute* permission; only a reopen needs read. apk's
+    # package scripts are exec'd through an fd whose inode grants exactly that,
+    # so the image has to come from the fd we already hold.
+    if [ "$(id -u)" -ne 0 ]; then
+        cp "$ER/hello" "$ER/xonly"
+        exec 9< "$ER/xonly"
+        chmod 111 "$ER/xonly"
+        out=$(run -t exectest -r "$ER" /proc/self/fd/9 X 2>&1); rc=$?
+        check "exec via fd of a file the guest may not read" 42 $rc
+        check_contains "loaded from the fd, not a reopen" \
+            "argv0=/proc/self/fd/9" "$out"
+        exec 9<&-
+    fi
+
     # a failed exec must report why, like the kernel does: an unreadable target
     # is EACCES, not a blanket ENOENT.
     if [ "$(id -u)" -ne 0 ]; then

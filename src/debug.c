@@ -273,6 +273,45 @@ int cng_cmd_faketest(int argc, char **argv, char **envp, unsigned long *auxv) {
         cng_dprintf(1, "exe=%s\n", lb);
     }
 
+    /* Fake-root reads what real root could. apk hands its package scripts to
+     * the shebang interpreter as "/proc/self/fd/N", and their inode grants
+     * execute but not read — real root reopens it anyway, we get EACCES. Take
+     * the read bits off the test file and the reopen must still succeed, with
+     * the file's mode put back exactly as it was. */
+    {
+        char hp[CNG_PATH_MAX], pfd[40];
+        long ffd = -1, ofd = -1;
+        int mode_kept = 0;
+        if (cng_fs_translate(&fs, file, hp, sizeof hp) == 0)
+            ffd = sys_openat(CNG_AT_FDCWD, hp, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+        if (ffd >= 0) {
+            CNG_SYS(__NR_fchmod, (int)ffd, 0111, 0, 0, 0, 0);
+            size_t k = cng_strlcpy(pfd, "/proc/self/fd/", sizeof pfd);
+            char d[8];
+            int di = 0;
+            for (long v = ffd; di < 7; v /= 10) {
+                d[di++] = (char)('0' + v % 10);
+                if (v < 10)
+                    break;
+            }
+            while (di > 0 && k + 1 < sizeof pfd)
+                pfd[k++] = d[--di];
+            pfd[k] = '\0';
+            ofd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)pfd,
+                               CNG_O_RDONLY, 0, 0, 0, /*trapped=*/0);
+            char st[128];
+            mode_kept = (CNG_SYS(__NR_fstat, (int)ffd, st, 0, 0, 0, 0) == 0 &&
+                         (ST_MODE(st) & 07777) == 0111);
+            CNG_SYS(__NR_fchmod, (int)ffd, 0644, 0, 0, 0, 0);
+            if (ofd >= 0)
+                sys_close((int)ofd);
+            sys_close((int)ffd);
+        }
+        cng_dprintf(1, "fakeroot_reopen: opened=%d mode_kept=%d -> %s\n",
+                    ofd >= 0, mode_kept,
+                    (ofd >= 0 && mode_kept) ? "OK" : "FAIL");
+    }
+
     /* Full credential model. Supplementary groups start empty; capabilities are
      * the full set while fake-root (euid still 0 at this point). */
     cng_dprintf(1, "ngroups=%d\n",
