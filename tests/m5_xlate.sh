@@ -37,3 +37,25 @@ check_contains "no-chroot rootfs / is identity" \
 check_contains "bind prefix is component-aware (no /devextra match)" \
     "/devextra/x -> /root/devextra/x" \
     "$(run -t xlate -r /root -b /dev:/hostdev /devextra/x)"
+
+# chroot(2) moves the root; it unmounts nothing. Binds under the new root are
+# rebased onto it (apk runs every package script under chroot(".")).
+check_contains "chroot to / keeps the binds" \
+    "/dev/null -> /hostdev/null" \
+    "$(run -t xlate -r /root -b /dev:/hostdev -c / /dev/null)"
+
+check_contains "chroot moves the rootfs" \
+    "/etc -> /root/a/etc" \
+    "$(run -t xlate -r /root -c /a /etc)"
+
+check_contains "chroot rebases a bind under the new root" \
+    "/dev/null -> /hostdev/null" \
+    "$(run -t xlate -r /root -b /a/dev:/hostdev -c /a /dev/null)"
+
+check_contains "chroot drops a bind outside the new root" \
+    "/dev/null -> /root/a/dev/null" \
+    "$(run -t xlate -r /root -b /dev:/hostdev -c /a /dev/null)"
+
+check_contains "chroot rebases the cwd" \
+    "x -> /root/a/b/x" \
+    "$(run -t xlate -r /root -C /a/b -c /a x)"

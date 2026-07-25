@@ -105,6 +105,91 @@ static long reissue(long a0, long a1, long a2, long a3, long a4, long a5,
     return r;
 }
 
+/* --- /proc magic links ---------------------------------------------------
+ *
+ * Links under /proc/<pid|self|thread-self>/ belong to the HOST namespace: what
+ * readlink() reports for them is a host path — and for an fd link it may name
+ * no path at all (memfd, O_TMPFILE, a deleted file). Re-rooting such a target
+ * into the rootfs, the way an ordinary guest symlink target must be, produces
+ * a path that does not exist: that is how apk's script runner, which execve()s
+ * "/proc/self/fd/N", came out as ENOENT. */
+#define PROC_MAGIC_NONE  0 /* not a magic link */
+#define PROC_MAGIC_GUEST 1 /* rewritten to a guest path; keep resolving */
+#define PROC_MAGIC_HOST  2 /* already a host path; resolution is done */
+
+/* Length of a leading "/proc/<pid|self|thread-self>/" in a canonical guest
+ * path, or 0. `self_only` matches only this process's own view. */
+static size_t proc_pid_prefix(const char *p, int self_only) {
+    if (strncmp(p, "/proc/", 6) != 0)
+        return 0;
+    const char *q = p + 6;
+    size_t n = 0;
+    if (strncmp(q, "self/", 5) == 0)
+        n = 5;
+    else if (strncmp(q, "thread-self/", 12) == 0)
+        n = 12;
+    else if (!self_only) {
+        while (q[n] >= '0' && q[n] <= '9')
+            n++;
+        if (n == 0 || q[n] != '/')
+            return 0;
+        n++;
+    }
+    return n ? (size_t)(q - p) + n : 0;
+}
+
+/* Classify (and for the guest-visible links rewrite in place) a canonical
+ * guest path that starts with a /proc magic link. See PROC_MAGIC_*. */
+static int proc_magic(char *cur, size_t sz) {
+    size_t pl = proc_pid_prefix(cur, 0);
+    if (!pl)
+        return PROC_MAGIC_NONE;
+    const char *rest = cur + pl;
+
+    /* "fd/<n>": the magic path *is* the host path — the kernel takes it
+     * straight to the open file description, including the anonymous and
+     * deleted files no re-rooted target could ever name. Any trailing
+     * components (a directory fd) ride along, as they do for a real dirfd. */
+    if (strncmp(rest, "fd/", 3) == 0) {
+        const char *d = rest + 3;
+        while (*d >= '0' && *d <= '9')
+            d++;
+        if (d > rest + 3 && (*d == '\0' || *d == '/'))
+            return PROC_MAGIC_HOST;
+        return PROC_MAGIC_NONE;
+    }
+
+    /* exe/cwd/root: substitute the guest-visible target that readlink(2)
+     * reports (proc_self_fixup), so exec'ing or opening one lands where the
+     * guest expects. The host links point at chroot-ng itself (we never issue
+     * a real execve) or at host paths, so following them is never right. Only
+     * our own process: another pid's view isn't ours to fake. */
+    if (!proc_pid_prefix(cur, 1))
+        return PROC_MAGIC_NONE;
+    const char *val = 0;
+    size_t vl = 0;
+    if (strncmp(rest, "exe", 3) == 0) {
+        val = cng_g_exe_guest;
+        vl = 3;
+    } else if (strncmp(rest, "cwd", 3) == 0) {
+        val = cng_g_fs->cwd;
+        vl = 3;
+    } else if (strncmp(rest, "root", 4) == 0) {
+        val = "/";
+        vl = 4;
+    }
+    if (!val || (rest[vl] != '\0' && rest[vl] != '/'))
+        return PROC_MAGIC_NONE;
+
+    char tmp[CNG_PATH_MAX];
+    size_t n = cng_strlcpy(tmp, val, sizeof tmp);
+    if (n >= sizeof tmp)
+        return PROC_MAGIC_NONE;
+    cng_strlcpy(tmp + n, rest + vl, sizeof tmp - n);
+    return cng_path_canon(tmp, cur, sz) == 0 ? PROC_MAGIC_GUEST
+                                             : PROC_MAGIC_NONE;
+}
+
 /* Resolve a guest path to a host path, following symlinks *within the guest*:
  * an absolute symlink target is re-rooted into the rootfs rather than resolved
  * against the host root (which is what breaks Alpine's busybox symlinks). Walks
@@ -116,6 +201,14 @@ int cng_resolve(const char *path, int deref_final, char *out, size_t outsz) {
         return -ENAMETOOLONG;
 
     for (int iter = 0; iter < 40; iter++) {
+        /* Checked every round, not just up front: the guest can reach these
+         * through a symlink of its own (Alpine's /dev/fd -> /proc/self/fd). */
+        int magic = proc_magic(cur, sizeof cur);
+        if (magic == PROC_MAGIC_HOST)
+            return cng_strlcpy(out, cur, outsz) < outsz ? 0 : -ENAMETOOLONG;
+        if (magic == PROC_MAGIC_GUEST)
+            continue;
+
         size_t len = strlen(cur);
         int found = 0;
         for (size_t e = 1; e <= len; e++) {
@@ -190,20 +283,16 @@ static void proc_fd_path(long fd, char *out) {
 }
 
 /* Resolve (dirfd, path) to a HOST path. Handles absolute paths and AT_FDCWD
- * (through the rootfs, re-rooting guest symlinks), real dirfds (whose
- * /proc/self/fd link is already a host path inside the rootfs, so the relative
- * name needs no translation), and "/proc/self/fd/N" verbatim (it names this
- * process's own fd regardless of rootfs). `deref` follows the final component's
+ * (through the rootfs, re-rooting guest symlinks — except the /proc magic
+ * links, which cng_resolve keeps in the host namespace), and real dirfds
+ * (whose /proc/self/fd link is already a host path inside the rootfs, so the
+ * relative name needs no translation). `deref` follows the final component's
  * symlink for the absolute/AT_FDCWD case. Returns 0/-1. */
 static int resolve_at_host(long dirfd, const char *path, int deref, char *out,
                            size_t sz) {
     int dfd = (int)dirfd; /* int arg: the x-register's top half may be dirty */
     if (!path || !path[0])
         return -1;
-    if (!strncmp(path, "/proc/self/fd/", 14)) {
-        cng_strlcpy(out, path, sz);
-        return 0;
-    }
     if (path[0] == '/' || dfd == CNG_AT_FDCWD) {
         if (cng_resolve(path, deref, out, sz) == 0)
             return 0;
@@ -803,15 +892,34 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         return (long)len;
     }
 
+    /* chroot: move the guest root, keeping the rest of the view. The binds and
+     * the cwd are rebased onto the new root (cng_fs_chroot), not discarded — a
+     * real chroot unmounts nothing, and apk runs every package script under
+     * chroot("."), which would otherwise strip that child of /proc, /dev and
+     * every other bind. */
     case __NR_chroot: {
-        char hp[CNG_PATH_MAX];
-        if (cng_fs_translate(cng_g_fs, (const char *)a0, hp, sizeof hp) != 0)
+        const char *gp = (const char *)a0;
+        if (!gp)
+            return -EFAULT;
+        char gc[CNG_PATH_MAX], hp[CNG_PATH_MAX];
+        if (cng_fs_abscanon(cng_g_fs, gp, gc, sizeof gc) != 0)
             return -ENAMETOOLONG;
-        long r = cng_syscall6(CNG_AT_FDCWD, (long)hp, 0, 0, 0, 0,
-                              __NR_faccessat);
+        if (cng_resolve(gc, 1, hp, sizeof hp) != 0 &&
+            cng_fs_translate(cng_g_fs, gc, hp, sizeof hp) != 0)
+            return -ENAMETOOLONG;
+        /* Name the new root by where the symlinks led, so the guest and host
+         * sides of the new view describe the same directory. */
+        char resolved[CNG_PATH_MAX];
+        if (cng_fs_untranslate(cng_g_fs, hp, resolved, sizeof resolved) == 0)
+            cng_strlcpy(gc, resolved, sizeof gc);
+        char sb[128]; /* AArch64 struct stat is 128 bytes */
+        long r = cng_syscall6(CNG_AT_FDCWD, (long)hp, (long)sb, 0, 0, 0,
+                              __NR_newfstatat);
         if (r < 0)
             return r;
-        cng_fs_init(cng_g_fs, hp);
+        if ((*(unsigned *)(sb + STAT_MODE_OFF) & 0170000) != 0040000)
+            return -ENOTDIR;
+        cng_fs_chroot(cng_g_fs, gc, hp);
         return 0;
     }
 

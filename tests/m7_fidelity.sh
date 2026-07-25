@@ -68,7 +68,7 @@ check_contains "l2s RENAME_EXCHANGE keeps both names and the count" \
 check_contains "l2s legacy link mv'ed cross-dir is repointed" \
     "l2s-mvfix: reg=1 nlink2=1 content=1 -> OK" "$out"
 check_contains "l2s O_TMPFILE publish via AT_EMPTY_PATH linkat" \
-    "l2s-tmpfile: rc=0 reg=1 content=1 -> OK" "$out"
+    "l2s-tmpfile: rc=0 reg=1 content=1 mode=1 -> OK" "$out"
 check_contains "l2s linkat-by-fd bumps the group" \
     "l2s-fdlink: rc=0 nlink4=1 -> OK" "$out"
 check_contains "l2s O_NOFOLLOW opens the link, still ELOOPs real symlinks" \

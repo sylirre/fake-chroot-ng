@@ -232,7 +232,20 @@ static long execve_core(int dirfd, const char *path, char **argv, char **envp,
      * load (the shebang interpreter for scripts, matching the kernel); store its
      * guest path in a persistent buffer. */
     static char exe_guest[CNG_PATH_MAX];
-    if (cng_fs_untranslate(cng_g_fs, host, exe_guest, sizeof exe_guest) == 0)
+    const char *exe_host = host;
+    char linked[CNG_PATH_MAX];
+    /* Exec through a /proc/self/fd/N path (how apk runs package scripts) keeps
+     * that path as `host`; the kernel would record the file the fd names, so
+     * ask the magic link for it. */
+    if (!strncmp(host, "/proc/", 6)) {
+        long n = sys_readlinkat(CNG_AT_FDCWD, host, linked, sizeof linked - 1);
+        if (n > 0) {
+            linked[n] = '\0';
+            if (linked[0] == '/')
+                exe_host = linked;
+        }
+    }
+    if (cng_fs_untranslate(cng_g_fs, exe_host, exe_guest, sizeof exe_guest) == 0)
         cng_g_exe_guest = exe_guest;
 
     *out_sp = sp;

@@ -35,6 +35,57 @@ int cng_fs_add_bind(struct cng_fs *fs, const char *guest, const char *host) {
     return 0;
 }
 
+/* Rebase a canonical guest path onto a new root: under root "/a", "/a/b"
+ * becomes "/b" and "/a" itself becomes "/". Returns 0 when `p` falls outside
+ * the new root (a real chroot makes it unreachable). `rlen` is 0 for "/". */
+static int rebase(char *dst, size_t dstsz, const char *p, const char *root,
+                  size_t rlen) {
+    if (rlen == 0) {
+        cng_strlcpy(dst, p, dstsz);
+        return 1;
+    }
+    if (strncmp(p, root, rlen) != 0 || (p[rlen] && p[rlen] != '/'))
+        return 0;
+    cng_strlcpy(dst, p[rlen] ? p + rlen : "/", dstsz);
+    return 1;
+}
+
+void cng_fs_chroot(struct cng_fs *fs, const char *guest_root,
+                   const char *host_root) {
+    char root[CNG_PATH_MAX];
+    if (cng_path_canon(guest_root, root, sizeof root) < 0)
+        return;
+    size_t rlen = strlen(root);
+    if (rlen == 1) /* "/": everything stays where it is */
+        rlen = 0;
+
+    /* Binds are mounts: chroot doesn't unmount them, it only moves the root
+     * they are named from. Those under the new root keep working (rebased);
+     * the rest fall out of the guest's view. A bind *at* the new root needs no
+     * entry — its host side becomes the rootfs below. */
+    int w = 0;
+    for (int i = 0; i < fs->nbinds; i++) {
+        char g[sizeof fs->binds[0].guest];
+        if (!rebase(g, sizeof g, fs->binds[i].guest, root, rlen) ||
+            strcmp(g, "/") == 0)
+            continue;
+        if (w != i)
+            fs->binds[w] = fs->binds[i];
+        cng_strlcpy(fs->binds[w].guest, g, sizeof fs->binds[w].guest);
+        fs->binds[w].glen = (unsigned)strlen(fs->binds[w].guest);
+        w++;
+    }
+    fs->nbinds = w;
+
+    char cwd[CNG_PATH_MAX];
+    if (rebase(cwd, sizeof cwd, fs->cwd, root, rlen))
+        cng_strlcpy(fs->cwd, cwd, sizeof fs->cwd);
+    else
+        cng_strlcpy(fs->cwd, "/", sizeof fs->cwd);
+
+    normalize_root(fs->rootfs, sizeof fs->rootfs, host_root);
+}
+
 void cng_fs_set_cwd(struct cng_fs *fs, const char *guest_cwd) {
     char canon[CNG_PATH_MAX];
     if (guest_cwd[0] == '/' &&

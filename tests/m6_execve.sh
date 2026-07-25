@@ -29,6 +29,23 @@ if $GCC -static-pie -O2 -o "$ER/hello" tests/guests/hello.c 2>/dev/null; then
     ln -s /hello "$ER/go"
     out=$(run -t exectest -r "$ER" /go X 2>&1)
     check_contains "exec resolves symlink for /proc/self/exe" "exe=/hello" "$out"
+
+    # apk runs package scripts as execve("/proc/self/fd/N"). That magic link
+    # names an open file of *this* process: its target is a host path (or no
+    # path at all — memfd/O_TMPFILE/deleted), so it must not be re-rooted into
+    # the rootfs the way a guest symlink target is.
+    exec 9< "$ER/script"
+    out=$(run -t exectest -r "$ER" /proc/self/fd/9 AA 2>&1); rc=$?
+    check "shebang script exec'd via /proc/self/fd" 42 $rc
+    check_contains "interp gets the fd path as the script" \
+        "argv2=/proc/self/fd/9" "$out"
+    exec 9<&-
+    exec 9< "$ER/hello"
+    out=$(run -t exectest -r "$ER" /proc/self/fd/9 X 2>&1); rc=$?
+    check "plain ELF exec'd via /proc/self/fd" 42 $rc
+    check_contains "exec via fd path names the real file for /proc/self/exe" \
+        "exe=/hello" "$out"
+    exec 9<&-
 fi
 rm -rf "$ER"
 

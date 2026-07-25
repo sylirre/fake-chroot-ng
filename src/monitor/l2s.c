@@ -395,15 +395,21 @@ static int l2s_materialize(const char *src, const char *dst) {
     long in = sys_openat(CNG_AT_FDCWD, src, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
     if (in < 0)
         return (int)in;
+    /* A real hardlink shares the source's mode; the copy must too (apk
+     * publishes its database files this way — 0644, not 0755). */
     char st[ST_SIZE];
-    if (CNG_SYS(__NR_fstat, (int)in, st, 0, 0, 0, 0) == 0 && !is_reg(st)) {
-        sys_close((int)in);
-        return -EPERM; /* link(2) on a directory etc. */
+    unsigned mode = 0644;
+    if (CNG_SYS(__NR_fstat, (int)in, st, 0, 0, 0, 0) == 0) {
+        if (!is_reg(st)) {
+            sys_close((int)in);
+            return -EPERM; /* link(2) on a directory etc. */
+        }
+        mode = st_mode(st) & 07777;
     }
     long out = sys_openat(CNG_AT_FDCWD, dst,
                           CNG_O_WRONLY | CNG_O_CREAT | CNG_O_EXCL |
                               CNG_O_CLOEXEC,
-                          0755);
+                          (int)mode);
     if (out < 0) {
         sys_close((int)in);
         return (int)out;
@@ -425,6 +431,8 @@ static int l2s_materialize(const char *src, const char *dst) {
     }
     if (n < 0 && rc == 0)
         rc = n;
+    if (rc == 0) /* the open mode went through umask; the link's does not */
+        CNG_SYS(__NR_fchmod, (int)out, mode, 0, 0, 0, 0);
     sys_close((int)in);
     sys_close((int)out);
     if (rc != 0)

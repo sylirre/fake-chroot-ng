@@ -112,8 +112,9 @@ vfork/`posix_spawn` child-stack handling.
     forbids hardlinks (EPERM/EMLINK/EXDEV/ENOSYS/EACCES/EOPNOTSUPP).
   Validated via `-t faketest` (fake ids, stat remap, groups, capget, privilege
   drop, setuid-root exec elevation, /proc/self/exe).
-  Limitations (tracked): `/proc/<pid>/*` numeric form and open("/proc/self/exe")
-  redirect not yet handled. (link2symlink was the lightweight form here — a
+  Limitations (tracked): only the magic links are virtualized (see "apk package
+  scripts" below); the contents of `/proc/<pid>/*` (`maps`, `mountinfo`, ...)
+  still describe the host. (link2symlink was the lightweight form here — a
   same-directory symlink to the sibling name; superseded by M9's backing-file
   scheme, which fixes nlink/type/mtime fidelity.)
 
@@ -311,6 +312,46 @@ vfork/`posix_spawn` child-stack handling.
   With this, Go builds run end-to-end (incl. cgo -> gcc -> cc1); pure-Go builds
   (`CGO_ENABLED=0`) were already working once the handler-stack and clone fixes
   landed.
+
+- [x] **apk package scripts: /proc magic links + chroot() keeps the view**
+  `apk fix` in an Alpine rootfs failed every package script with
+  `execve: No such file or directory` → `exited with error 127`, because apk
+  runs them as `execve("/proc/self/fd/N")` (after `fchdir(root_fd); chroot(".")`)
+  and the resolver treated that magic link like any guest symlink: it
+  `readlink`ed it and **re-rooted the host target into the rootfs**, producing
+  `<rootfs>/data/data/com.termux/.../rootfs/lib/apk/exec/<script>` → ENOENT.
+  Three parts, all on that path:
+  - `cng_resolve` now recognizes the `/proc/<pid|self|thread-self>/` magic links
+    (checked each round, so a guest symlink into them — Alpine's
+    `/dev/fd` → `/proc/self/fd` — is covered too). An `fd/<n>` link resolves to
+    **itself**: it is already a host path, and the kernel takes it straight to
+    the open file description, including the anonymous/deleted files
+    (memfd, `O_TMPFILE`) no re-rooted target could name at all. `exe`/`cwd`/
+    `root` for our own process resolve to the guest-visible values `readlink`
+    already reports (`proc_self_fixup`), so exec'ing or opening one lands where
+    the guest expects instead of on chroot-ng's own binary or a host path.
+    `resolve_at_host`'s private `/proc/self/fd/` special case is gone — one rule
+    now covers `openat`/`stat`/… as well as `execve`, and the numeric-pid form.
+    An exec through an fd path also names the file behind the fd for
+    `/proc/self/exe`, as the kernel would.
+  - `chroot(2)` **rebases** binds and the cwd onto the new root
+    (`cng_fs_chroot`) instead of `cng_fs_init`-ing them away: a real chroot
+    unmounts nothing, and apk chroots before *every* script — which used to
+    strip that child of `/proc`, `/dev` and every other `-b`. Binds under the
+    new root keep working, ones outside it fall out of the view (as they must),
+    and the target is now stat'ed so a non-directory gets `ENOTDIR`.
+  - l2s `materialize` keeps the **source's mode**: a real hardlink shares it, so
+    the O_TMPFILE-publish copy that writes apk's database (`etc/apk/world`,
+    `lib/apk/db/*`, reached through `linkat` → EXDEV → the `-l` fallback) no
+    longer lands as 0755 instead of 0644.
+  Regression tests: `m6` execs a shebang script and a plain ELF through
+  `/proc/self/fd/N`, `m5b` opens through `/proc/self/fd` and `/proc/self/cwd`
+  (both `errno 2` before), `m5a` covers the chroot rebasing (`_xlate -c`), and
+  `l2s-tmpfile` asserts `mode=1`. 144/144.
+  Accepted divergences: `/proc/self/fd/N` resolves even when the guest has no
+  `/proc` mounted, where a real chroot would report ENOENT; and `readlink`ing
+  one still reports the host path (the kernel renders it against our real root,
+  which is not the guest's) rather than the guest path.
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 

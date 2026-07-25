@@ -28,6 +28,13 @@ void cng_fs_init(struct cng_fs *fs, const char *rootfs);
 int cng_fs_add_bind(struct cng_fs *fs, const char *guest, const char *host);
 void cng_fs_set_cwd(struct cng_fs *fs, const char *guest_cwd);
 
+/* Emulate chroot(2): make the guest directory `guest_root` (canonical, with
+ * `host_root` its already-translated host path) the new guest root. Bind
+ * mounts and the cwd are rebased onto it rather than dropped — a real chroot
+ * unmounts nothing (apk runs every package script under chroot(".")). */
+void cng_fs_chroot(struct cng_fs *fs, const char *guest_root,
+                   const char *host_root);
+
 /* Lexically canonicalize an absolute guest path (collapse //, ., ..). `..` at
  * the root stays at the root. Returns 0 on success, -1 on overflow. */
 int cng_path_canon(const char *abs, char *out, size_t outsz);

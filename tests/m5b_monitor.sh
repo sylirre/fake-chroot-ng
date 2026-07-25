@@ -23,6 +23,18 @@ check_contains "dispatch blocks .. escape" \
     "$(run -t dtest -r "$ROOT" open "/../esc_$$" 2>&1)"
 rm -f "$ROOT/../esc_$$"
 
+# /proc magic links live in the host namespace: an fd link names this process's
+# own open file whatever the rootfs is, and /proc/self/cwd is the *guest* cwd,
+# not the host one. Re-rooting either readlink target lands on nothing.
+exec 7< "$ROOT/etc/greeting"
+check_contains "dispatch openat through /proc/self/fd" \
+    "read: HELLO-FROM-ROOTFS" \
+    "$(run -t dtest -r "$ROOT" open /proc/self/fd/7 2>&1)"
+exec 7<&-
+check_contains "dispatch openat through /proc/self/cwd" \
+    "read: HELLO-FROM-ROOTFS" \
+    "$(run -t dtest -r "$ROOT" open /proc/self/cwd/etc/greeting 2>&1)"
+
 run -t sigtest >/dev/null 2>&1
 check "signal round-trip + ucontext readable" 0 $?
 check_contains "sigtest handler ran" "handler ran" "$(run -t sigtest 2>&1)"

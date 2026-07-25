@@ -1,7 +1,8 @@
 /* Hidden debug subcommands for testing internals without a real kernel.
- *   _xlate -r ROOT [-b GUEST:HOST]... [-C CWD] PATH...
- * prints guest->host path translations. Used by the M5 unit tests (the path
- * core is pure logic, fully exercisable under qemu).
+ *   _xlate -r ROOT [-b GUEST:HOST]... [-C CWD] [-c CHROOT] PATH...
+ * prints guest->host path translations (-c first emulates a chroot to CHROOT).
+ * Used by the M5 unit tests (the path core is pure logic, fully exercisable
+ * under qemu).
  */
 #include "cng/l2s.h"
 #include "cng/loader.h"
@@ -31,6 +32,7 @@ int cng_cmd_xlate(int argc, char **argv, char **envp, unsigned long *auxv) {
 
     const char *rootfs = "/";
     const char *cwd = 0;
+    const char *chroot_to = 0;
     const char *bind_g[CNG_MAX_BINDS];
     const char *bind_h[CNG_MAX_BINDS];
     int nb = 0;
@@ -51,6 +53,8 @@ int cng_cmd_xlate(int argc, char **argv, char **envp, unsigned long *auxv) {
             }
         } else if (!strcmp(argv[i], "-C") && i + 1 < argc) {
             cwd = argv[++i];
+        } else if (!strcmp(argv[i], "-c") && i + 1 < argc) {
+            chroot_to = argv[++i];
         } else if (np < 256) {
             paths[np++] = argv[i];
         }
@@ -62,6 +66,12 @@ int cng_cmd_xlate(int argc, char **argv, char **envp, unsigned long *auxv) {
         cng_fs_add_bind(&fs, bind_g[i], bind_h[i]);
     if (cwd)
         cng_fs_set_cwd(&fs, cwd);
+    if (chroot_to) { /* what cng_dispatch does for chroot(2), minus the stat */
+        char canon[CNG_PATH_MAX], hp[CNG_PATH_MAX];
+        if (cng_fs_abscanon(&fs, chroot_to, canon, sizeof canon) == 0 &&
+            cng_fs_translate(&fs, canon, hp, sizeof hp) == 0)
+            cng_fs_chroot(&fs, canon, hp);
+    }
 
     char out[CNG_PATH_MAX];
     for (int i = 0; i < np; i++) {
@@ -944,7 +954,7 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
     long tmf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w",
                             CNG_O_TMPFILE | CNG_O_RDWR, 0644, 0, 0, 0);
     long tlr = -1;
-    int t_reg = 0, t_content = 0;
+    int t_reg = 0, t_content = 0, t_mode = 0;
     if (tmf >= 0) {
         sys_write((int)tmf, "tt", 2);
         tlr = cng_dispatch(__NR_linkat, tmf, (long)"", CNG_AT_FDCWD,
@@ -954,6 +964,8 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
         long rt = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/t",
                                (long)stt, 0, 0, 0, 0);
         t_reg = (rt == 0 && ST_ISREG(stt));
+        /* a real link shares the inode's mode, so the copy must keep 0644 */
+        t_mode = (rt == 0 && (ST_MODE(stt) & 07777) == 0644);
         char tb[8];
         long trd = -1;
         long tf2 = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/t",
@@ -964,9 +976,9 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
         }
         t_content = (trd == 2 && tb[0] == 't' && tb[1] == 't');
     }
-    int ok_tmp = (tlr == 0 && t_reg && t_content);
-    cng_dprintf(1, "l2s-tmpfile: rc=%d reg=%d content=%d -> %s\n", (int)tlr,
-                t_reg, t_content, ok_tmp ? "OK" : "FAIL");
+    int ok_tmp = (tlr == 0 && t_reg && t_content && t_mode);
+    cng_dprintf(1, "l2s-tmpfile: rc=%d reg=%d content=%d mode=%d -> %s\n",
+                (int)tlr, t_reg, t_content, t_mode, ok_tmp ? "OK" : "FAIL");
     fails += !ok_tmp;
 
     /* linkat by fd on a live group member bumps that group. */
