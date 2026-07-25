@@ -330,8 +330,12 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             p1 = (const char *)a0;
             break;
         }
-        if ((p1 && cng_l2s_deny(d1, p1)) || (p2 && cng_l2s_deny(d2, p2)))
+        if ((p1 && cng_l2s_deny(d1, p1)) || (p2 && cng_l2s_deny(d2, p2))) {
+            if (cng_g_debug)
+                cng_dprintf(2, "[cng] l2s deny nr=%ld (%s)\n", nr,
+                            p1 ? p1 : "");
             return -ENOENT;
+        }
     }
 
     switch (nr) {
@@ -715,6 +719,17 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                         empty ? CNG_AT_SYMLINK_FOLLOW : 0, 0, __NR_linkat);
         if (cng_g_debug && r != 0)
             cng_dprintf(2, "[cng] linkat %s -> %s real=%ld\n", srch, dsth, r);
+        /* Some Android builds deny app-data hardlinks with ENOENT rather
+         * than EACCES/EPERM. ENOENT is only believable when the source is
+         * really absent — if it exists, treat the refusal like any other
+         * denial. (A genuinely missing dst parent still surfaces as ENOENT
+         * from the fallback's own symlink step.) */
+        if (cng_g_l2s && r == -ENOENT) {
+            char stt[144];
+            if (CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, srch, stt,
+                        CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0)
+                r = -EPERM;
+        }
         if (cng_g_l2s &&
             (r == -EPERM || r == -EMLINK || r == -EXDEV || r == -ENOSYS ||
              r == -EACCES || r == -EOPNOTSUPP)) {
