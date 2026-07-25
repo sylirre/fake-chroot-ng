@@ -353,6 +353,29 @@ vfork/`posix_spawn` child-stack handling.
   one still reports the host path (the kernel renders it against our real root,
   which is not the guest's) rather than the guest path.
 
+- [x] **CNG_DEBUG must not change behaviour (wild read in the error log)**
+  `dbg_path` picked the path to log by testing whether `a0`/`a1` "looks like a
+  string" — `> 0x1000`, then dereference. The args of a *failing* syscall are
+  not all pointers: `ioctl`'s request (`TCGETS` = 0x5401), `truncate`'s length,
+  `fchown`'s uid all clear that bar, so logging one read a wild address. Inside
+  the SIGSYS handler, where every signal but SIGSYS is masked, the resulting
+  SIGSEGV is unblockable-fatal: the guest died. Reproduced 5/5 with a real
+  `apk del` under `-R` (which dispatches *every* syscall, so `ioctl` reaches it)
+  and 0/5 with `CNG_DEBUG` off — i.e. only debug runs were affected, which are
+  exactly the runs used to chase device bugs. The candidate is now validated
+  through the kernel (`faccessat` copies the path in from user space first, so
+  EFAULT/ENAMETOOLONG mean "not a readable string"), skipped if Android blocks
+  `faccessat`. `-t dtest dbgpath` drives a failing `truncate` with a
+  pointer-sized length under debug and asserts the dispatch survives (SIGSEGV
+  before the fix).
+  - Every silent `-ENOENT` in `execve_core` now traces under `CNG_DEBUG`
+    (l2s-hidden / unresolved / open errno / bad shebang / interp unresolved),
+    plus the resolved host path on success — an exec failure on a device says
+    which stage produced it. A failed open now returns its **real** errno
+    (EACCES, ELOOP, ...) instead of a blanket ENOENT, as the kernel does.
+  - `--version` and a `CNG_DEBUG` startup banner stamp the build time: this tree
+    reaches devices by hand-copy, so traces must identify their build. 147/147.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

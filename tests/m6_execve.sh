@@ -46,6 +46,15 @@ if $GCC -static-pie -O2 -o "$ER/hello" tests/guests/hello.c 2>/dev/null; then
     check_contains "exec via fd path names the real file for /proc/self/exe" \
         "exe=/hello" "$out"
     exec 9<&-
+
+    # a failed exec must report why, like the kernel does: an unreadable target
+    # is EACCES, not a blanket ENOENT.
+    if [ "$(id -u)" -ne 0 ]; then
+        cp "$ER/hello" "$ER/noperm"; chmod 000 "$ER/noperm"
+        check_contains "unreadable exec target reports EACCES" \
+            "emulate_execve failed x0=-13" \
+            "$(run -t exectest -r "$ER" /noperm 2>&1)"
+    fi
 fi
 rm -rf "$ER"
 

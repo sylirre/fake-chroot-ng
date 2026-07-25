@@ -100,7 +100,8 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
             gpath = argv[i];
     }
     if (!op || !gpath) {
-        cng_dprintf(2, "usage: _dtest -r ROOT (open|access) GUESTPATH\n");
+        cng_dprintf(2,
+                    "usage: _dtest -r ROOT (open|access|dbgpath) GUESTPATH\n");
         return 2;
     }
 
@@ -125,6 +126,20 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
         buf[n] = '\0';
         cng_dprintf(1, "read: %s\n", buf);
         return 0;
+    }
+    /* CNG_DEBUG error logging must never dereference a syscall arg that is a
+     * scalar rather than a path: truncate's length here is large enough to look
+     * like a pointer, and reading it killed the guest (SIGSEGV in the handler,
+     * with SIGSEGV masked). The dispatch must survive and report EISDIR. */
+    if (!strcmp(op, "dbgpath")) {
+        int save = cng_g_debug;
+        cng_g_debug = 1;
+        long r = cng_dispatch(__NR_truncate, (long)gpath, 0x7ffffff0, 0, 0, 0, 0,
+                              /*trapped=*/0);
+        cng_g_debug = save;
+        cng_dprintf(1, "dbgpath: survived rc=%d -> %s\n", (int)r,
+                    r == -EISDIR ? "OK" : "FAIL");
+        return r == -EISDIR ? 0 : 1;
     }
     if (!strcmp(op, "access")) {
         long r = cng_dispatch(__NR_faccessat, CNG_AT_FDCWD, (long)gpath, 0, 0, 0,

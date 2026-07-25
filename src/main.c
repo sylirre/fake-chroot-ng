@@ -22,7 +22,6 @@
 #include "cng/rt.h"
 #include "cng/syscall.h"
 
-#define CNG_VERSION "0.0.1"
 
 /* --- the run + probe + self-test entry points (own translation units) ----- */
 int cng_run(const char *rootfs, const char *libprefix,
@@ -100,7 +99,8 @@ static void usage(int fd) {
 }
 
 static void version(void) {
-    cng_dprintf(1, "chroot-ng %s\n", CNG_VERSION);
+    cng_dprintf(1, "chroot-ng %s (built %s %s)\n", CNG_VERSION, __DATE__,
+                __TIME__);
 }
 
 /* --- help renderer: reflow the reference to the terminal width ------------

@@ -71,6 +71,11 @@ int cng_run(const char *rootfs, const char *libprefix,
             (*e)[14] != '0')
             cng_g_l2s_force = 1;
     }
+    /* Stamp the build: this tree is copied to test devices by hand, so a trace
+     * has to be able to say whether it came from the build you just made. */
+    if (cng_g_debug)
+        cng_dprintf(2, "[cng] chroot-ng %s (built %s %s)\n", CNG_VERSION,
+                    __DATE__, __TIME__);
 
     /* Fake identity (--fake-id): establish it from the real invoking ids (which
      * are also the stat-remap source). See cng_cred_setup for the implied-vs-

@@ -102,19 +102,32 @@ static long execve_core(int dirfd, const char *path, char **argv, char **envp,
     /* l2s machinery is invisible to the guest — not executable either. Both
      * tiers (SIGSYS cng_emulate_execve, -R cng_execve_tramp) come through
      * here, so this covers every exec path. */
-    if (cng_g_l2s && cng_l2s_deny(dirfd, path))
+    if (cng_g_l2s && cng_l2s_deny(dirfd, path)) {
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] execve %s -> l2s-hidden\n", path);
         return -ENOENT;
+    }
 
     /* Resolve the target through the rootfs/bind map, following symlinks
      * (absolute or AT_FDCWD); a real dirfd with a relative path is a rare case
      * we pass through. */
     char host[CNG_PATH_MAX];
     if (path[0] == '/' || dirfd == CNG_AT_FDCWD) {
-        if (cng_resolve(path, 1, host, sizeof host) != 0)
+        long rr = cng_resolve(path, 1, host, sizeof host);
+        if (rr != 0) {
+            if (cng_g_debug)
+                cng_dprintf(2, "[cng] execve %s -> unresolved errno=%ld\n", path,
+                            -rr);
             return -ENOENT;
+        }
     } else {
         cng_strlcpy(host, path, sizeof host);
     }
+    /* Every failure below this point is silent otherwise, and the guest only
+     * sees an errno — trace the resolution so a device-side failure says which
+     * stage produced it (and which build is running). */
+    if (cng_g_debug)
+        cng_dprintf(2, "[cng] execve resolve %s -> %s\n", path, host);
 
     /* Shebang: the kernel interprets `#!interp [arg]` scripts, but we bypass the
      * kernel, so do it ourselves — exec the interpreter with
@@ -124,8 +137,12 @@ static long execve_core(int dirfd, const char *path, char **argv, char **envp,
     char **eff_argv = argv;
     {
         long fd = sys_openat(CNG_AT_FDCWD, host, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
-        if (fd < 0)
-            return -ENOENT;
+        if (fd < 0) {
+            if (cng_g_debug)
+                cng_dprintf(2, "[cng] execve open %s -> errno=%d\n", host,
+                            (int)-fd);
+            return fd; /* the real errno (EACCES, ELOOP, ENOENT, ...) */
+        }
         char hdr[257];
         long n = sys_pread64((int)fd, hdr, 256, 0);
         sys_close((int)fd);
@@ -144,8 +161,11 @@ static long execve_core(int dirfd, const char *path, char **argv, char **envp,
             while (*p && *p != '\n' && *p != '\r')
                 p++;
             size_t alen = (size_t)(p - a0);
-            if (ilen == 0 || ilen >= sizeof interp_buf)
+            if (ilen == 0 || ilen >= sizeof interp_buf) {
+                if (cng_g_debug)
+                    cng_dprintf(2, "[cng] execve %s -> bad shebang\n", path);
                 return -ENOEXEC;
+            }
             memcpy(interp_buf, i0, ilen);
             interp_buf[ilen] = '\0';
             int k = 0;
@@ -161,8 +181,12 @@ static long execve_core(int dirfd, const char *path, char **argv, char **envp,
                     sheb_argv[k++] = argv[j];
             sheb_argv[k] = 0;
             eff_argv = sheb_argv;
-            if (cng_resolve(interp_buf, 1, host, sizeof host) != 0)
+            if (cng_resolve(interp_buf, 1, host, sizeof host) != 0) {
+                if (cng_g_debug)
+                    cng_dprintf(2, "[cng] execve interp %s -> unresolved\n",
+                                interp_buf);
                 return -ENOENT;
+            }
         }
     }
 

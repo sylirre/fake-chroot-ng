@@ -9,6 +9,11 @@
 #include "cng/path.h"
 #include "cng/ucontext.h"
 
+/* Shared by --version and the CNG_DEBUG startup banner (which also stamps the
+ * build time: this repo is copied to devices by hand, so "am I running the
+ * build I just made?" is a question every device-side trace has to answer). */
+#define CNG_VERSION "0.0.1"
+
 /* Active filesystem view used by the dispatcher (set before install). */
 extern struct cng_fs *cng_g_fs;
 

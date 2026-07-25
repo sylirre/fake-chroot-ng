@@ -35,6 +35,14 @@ check_contains "dispatch openat through /proc/self/cwd" \
     "read: HELLO-FROM-ROOTFS" \
     "$(run -t dtest -r "$ROOT" open /proc/self/cwd/etc/greeting 2>&1)"
 
+# CNG_DEBUG error logging must not read a scalar syscall arg as a path pointer:
+# truncate's length is large enough to look like one, and dereferencing it is a
+# wild read inside the handler (SIGSEGV masked there => the guest is killed).
+out=$(run -t dtest -r "$ROOT" dbgpath /etc 2>&1); rc=$?
+check "debug logging survives a scalar syscall arg" 0 "$rc"
+check_contains "debug logging still reports the real error" \
+    "dbgpath: survived rc=-21 -> OK" "$out"
+
 run -t sigtest >/dev/null 2>&1
 check "signal round-trip + ucontext readable" 0 $?
 check_contains "sigtest handler ran" "handler ran" "$(run -t sigtest 2>&1)"

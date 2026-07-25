@@ -79,12 +79,26 @@ void cng_note_blocked(int nr) {
  * we never trap on the re-issue. Same signature as cng_syscall6. */
 int cng_g_debug = 0;
 
+/* Is `p` safe to print as a path string? A magnitude test is not enough: the
+ * args of a *failing* syscall include plain scalars (a uid, an offset, a
+ * length) that are large enough to look like pointers, and dereferencing one
+ * reads a wild address — a SIGSEGV inside the handler, with SIGSEGV masked,
+ * kills the guest outright. CNG_DEBUG must never change behaviour, so ask the
+ * kernel instead: faccessat() copies the path in from user space before doing
+ * anything else, and EFAULT/ENAMETOOLONG mean "not a readable C string". */
+static int dbg_str(long p) {
+    if (p <= 0x1000 || cng_blocked[__NR_faccessat])
+        return 0;
+    long r = CNG_SYS(__NR_faccessat, CNG_AT_FDCWD, p, 0 /*F_OK*/, 0, 0, 0);
+    return r != -EFAULT && r != -ENAMETOOLONG;
+}
+
 /* Best-effort path pointer among a0/a1 for logging (path syscalls put the path
- * in a0 or a1). Guards against non-pointer scalars. */
+ * in a0 or a1). */
 static const char *dbg_path(long a0, long a1) {
-    if (a1 > 0x1000 && *(const char *)a1 == '/')
+    if (dbg_str(a1) && *(const char *)a1 == '/')
         return (const char *)a1;
-    if (a0 > 0x1000 && *(const char *)a0 == '/')
+    if (dbg_str(a0) && *(const char *)a0 == '/')
         return (const char *)a0;
     return "";
 }
