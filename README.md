@@ -21,11 +21,13 @@ mounts. See [docs/DESIGN.md](docs/DESIGN.md) for the full rationale and
 
 ## Build
 
-Requires an `aarch64-linux-gnu` cross toolchain and `qemu-aarch64` for testing:
+On an x86_64 host: an `aarch64-linux-gnu` cross toolchain plus `qemu-aarch64`
+for running what it builds. On an AArch64 host (native Linux, or Termux with
+`clang`): just the native compiler — no emulator is involved.
 
 ```sh
-make                       # cross-compile -> build/chroot-ng
-make run ARGS="--version"  # run under qemu-aarch64
+make                       # -> build/chroot-ng
+make run ARGS="--version"  # run it (under qemu only where the host needs one)
 make test                  # run the test harness
 ```
 
@@ -34,6 +36,15 @@ Override the compiler/emulator if needed:
 ```sh
 make CC=aarch64-linux-gnu-gcc-12 QEMU=qemu-aarch64
 ```
+
+The test harness runs on all three hosts and adapts to each: it picks the
+emulator (or none), finds an AArch64 guest toolchain and the link mode that
+works there, and asks the binary which translation tier is actually live —
+the seccomp/SIGSYS tier only exists on a real AArch64 kernel, so on a cross
+host `-R` svc-rewriting is what carries translation. Legs that a host cannot
+support (no guest toolchain, no rootfs image, no SysV shm to diff against) are
+reported as `skip` and counted separately from passes. See
+[tests/README.md](tests/README.md) for the environment knobs.
 
 ## Usage (evolving)
 

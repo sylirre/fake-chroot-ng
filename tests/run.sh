@@ -1,14 +1,18 @@
-#!/bin/sh
-# chroot-ng test harness. Runs the cross-built binary under qemu-aarch64 and
-# checks behaviour. Extend per milestone.
+#!/usr/bin/env sh
+# chroot-ng test harness. Runs the AArch64 binary — natively on an AArch64 host,
+# under qemu-aarch64 on a cross host — and checks behaviour. Extend per
+# milestone. Everything host-dependent (emulator, guest toolchain, which
+# translation tier is live, rootfs images) is resolved in tests/lib.sh; see the
+# header there for the environment knobs.
 set -u
 
-BIN="${BIN:-build/chroot-ng}"
-QEMU="${QEMU:-qemu-aarch64-static}"
-pass=0
-fail=0
+cd "$(dirname "$0")/.." || exit 1
+. tests/lib.sh
 
-run() { "$QEMU" "$BIN" "$@"; }
+if [ ! -x "$BIN" ]; then
+    echo "build first: make" >&2
+    exit 1
+fi
 
 check() { # desc, expected_rc, actual_rc
     if [ "$2" = "$3" ]; then
@@ -33,10 +37,15 @@ check_contains() { # desc, needle, haystack
     esac
 }
 
-if [ ! -x "$BIN" ]; then
-    echo "build first: make" >&2
+cng_platform_init
+trap 'rm -rf "$CNG_TMP"' EXIT INT TERM
+cng_platform_banner
+if [ "$CNG_EMU_MISSING" = 1 ]; then
+    echo "no qemu-aarch64 emulator found on a $HOST_ARCH host: install" \
+        "qemu-user-static, or set QEMU= if AArch64 binaries run here anyway" >&2
     exit 1
 fi
+echo
 
 echo "== M1: CLI =="
 out=$(run --version 2>&1); check "version rc" 0 $?
@@ -69,5 +78,5 @@ if [ -f tests/m15_unixsock.sh ]; then . tests/m15_unixsock.sh; fi
 if [ -f tests/m16_netlink.sh ]; then . tests/m16_netlink.sh; fi
 
 echo
-echo "== summary: $pass passed, $fail failed =="
+echo "== summary: $pass passed, $fail failed, $skipped skipped =="
 [ "$fail" -eq 0 ]

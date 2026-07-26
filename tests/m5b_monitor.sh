@@ -66,16 +66,32 @@ check_contains "dirfd-relative absolute symlink re-roots into the rootfs" \
 
 # The xattr family was never trapped, so a guest's absolute path reached the HOST
 # filesystem: getxattr answered existence questions about it and setxattr wrote
-# it. Translation shows up in the errno -- ENODATA (61) means a real file was
-# reached, ENOENT (2) means the name was resolved inside the rootfs and is not
-# there. /etc/passwd exists on the host and not in this rootfs, so it separates
-# the two: errno 61 here is the pre-fix escape.
-check_contains "xattr on a host-only path is contained" \
-    "getxa: errno 2" \
-    "$(run -t dtest -r "$ROOT" getxa /etc/passwd 2>&1)"
-check_contains "xattr reaches the rootfs file, so it is translated not blocked" \
-    "getxa: errno 61" \
-    "$(run -t dtest -r "$ROOT" getxa /etc/greeting 2>&1)"
+# it. Translation shows up in the errno: a name that resolves inside the rootfs
+# reaches a real file and answers "no such attribute", while an untranslated path
+# lands on a host name that is not there -> ENOENT (2).
+#
+# Which errno "reached a real file" is depends on the filesystem holding it --
+# ENODATA (61) where user.* xattrs are supported, EOPNOTSUPP (95) where they are
+# not (tmpfs before 6.6), or an SELinux refusal on a device -- so take it from an
+# identity-rootfs control run over the very same file instead of pinning a
+# number. All that matters is that it is distinguishable from ENOENT.
+xa_ctl=$(run -t dtest -r / getxa "$ROOT/etc/greeting" 2>&1)
+xa_real=$(printf '%s\n' "$xa_ctl" |
+    sed -n 's/.*getxa: errno \([0-9]*\).*/\1/p' | head -1)
+# The host-only path is one we create outside the rootfs: absolute, present on
+# the host, and absent from the rootfs, which is the shape of the pre-fix escape.
+XAH=$(mktemp); printf x >"$XAH"
+if [ -z "$xa_real" ] || [ "$xa_real" = 2 ]; then
+    skip "xattr legs: no errno on this filesystem distinguishes reached from contained"
+else
+    check_contains "xattr on a host-only path is contained" \
+        "getxa: errno 2" \
+        "$(run -t dtest -r "$ROOT" getxa "$XAH" 2>&1)"
+    check_contains "xattr reaches the rootfs file, so it is translated not blocked" \
+        "getxa: errno $xa_real" \
+        "$(run -t dtest -r "$ROOT" getxa /etc/greeting 2>&1)"
+fi
+rm -f "$XAH"
 
 # A ":ro" bind must answer EROFS for every mutating path syscall while still
 # serving reads. The rw run is the negative control: the same calls must NOT

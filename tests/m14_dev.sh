@@ -10,10 +10,10 @@
 # which are pure resolution overlays with no dirent either.
 echo "== M14: /dev zone + dirent injection =="
 
-M14_ALPINE="${M14_ALPINE:-/home/sol/arm64chroot/tests/.cache/rootfs/alpine}"
+M14_ALPINE="${M14_ALPINE:-$CNG_ALPINE}"
 
-if [ ! -x "$M14_ALPINE/bin/busybox" ]; then
-    echo "  skip: alpine rootfs missing"
+if [ -z "$M14_ALPINE" ] || [ ! -x "$M14_ALPINE/bin/busybox" ]; then
+    skip "/dev zone scenarios: no alpine rootfs"
 else
     # ls /dev must show the whitelist. The Alpine rootfs physically contains
     # only "null", so anything beyond it came from the injection.
@@ -43,11 +43,26 @@ else
     check_contains "m14 /dev/zero reads" "4" "$got"
 
     # Containment: a device that is NOT on the whitelist must not be reachable,
-    # even though it exists on the host.
-    got=$(run -R "$M14_ALPINE" /bin/busybox sh -c \
-        '[ -e /dev/mem ] && echo reachable || echo contained' 2>/dev/null)
-    check_contains "m14 a non-whitelisted host device is unreachable" \
-        "contained" "$got"
+    # even though it exists on the host. Which node that is has to be picked at
+    # runtime — /dev/mem is there on a devbox but not on every Android device,
+    # and a name the host does not have would make this pass for free.
+    m14_dev=
+    for d in mem kmsg loop-control hwrng snd input binder ashmem; do
+        [ -e "/dev/$d" ] || continue
+        [ -e "$M14_ALPINE/dev/$d" ] && continue
+        m14_dev=$d
+        break
+    done
+    if [ -n "$m14_dev" ]; then
+        got=$(run -R "$M14_ALPINE" /bin/busybox sh -c \
+            "[ -e /dev/$m14_dev ] && echo reachable || echo contained" \
+            2>/dev/null)
+        check_contains \
+            "m14 a non-whitelisted host device (/dev/$m14_dev) is unreachable" \
+            "contained" "$got"
+    else
+        skip "device-containment leg: this host has no non-whitelisted /dev node to try"
+    fi
 
     # --no-dev turns the whole zone off: /dev is the rootfs directory only.
     got=$(run -R --no-dev "$M14_ALPINE" /bin/busybox sh -c \

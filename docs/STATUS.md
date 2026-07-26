@@ -1076,8 +1076,16 @@ vfork/`posix_spawn` child-stack handling.
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes
-- `make` cross-compiles; `make run ARGS="..."` runs under qemu-aarch64.
-- `make test` runs `tests/run.sh`.
+- `make` builds (cross on x86_64, native on AArch64/Termux); `make run
+  ARGS="..."` runs the result, under qemu-aarch64 only where the host needs it.
+- `make test` runs `tests/run.sh`. It runs on x86_64 (cross + qemu), on native
+  AArch64 Linux, and under Termux; `tests/lib.sh` resolves every host
+  difference (emulator, guest toolchain and link mode, which translation tier is
+  live, rootfs images) and the milestone scripts assert against what it found.
+  See `tests/README.md`.
 - qemu-user does NOT emulate guest seccomp filters faithfully → M5's mechanism
   needs simulated-SIGSYS unit tests + real-hardware validation. Loader (M3/M4)
-  and path logic are fully qemu-testable.
+  and path logic are fully qemu-testable. On an AArch64 host the harness detects
+  the live filter (`CNG_SECCOMP_LIVE`) and flips the legs that depend on it —
+  M8's no-`-R` control, for instance, expects an untranslated open under qemu and
+  a seccomp-translated one on a real kernel.

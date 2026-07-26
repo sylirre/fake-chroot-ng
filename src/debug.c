@@ -697,22 +697,58 @@ int cng_cmd_loadtwice(int argc, char **argv, char **envp, unsigned long *auxv) {
     return (rc1 == 0 && rc2 == 0) ? 0 : 1;
 }
 
-/* _exectest -r ROOT PROG [args] — drive cng_emulate_execve (incl. shebang) and,
- * on success, enter the loaded program. Exercises execve emulation under qemu
- * where neither the SIGSYS nor trampoline route reaches it. */
+/* _exectest -r ROOT [-b SRC:DST[:ro]]... PROG [args] — drive cng_emulate_execve
+ * (incl. shebang) and, on success, enter the loaded program. Exercises execve
+ * emulation under qemu where neither the SIGSYS nor trampoline route reaches it.
+ *
+ * The binds matter for a dynamically linked guest: its ELF interpreter is named
+ * by an absolute guest path, and a synthetic rootfs holding only the test binary
+ * has no interpreter of its own. On a host whose toolchain cannot link static
+ * (Termux/bionic), the harness exposes the platform linker's directories here. */
 int cng_cmd_exectest(int argc, char **argv, char **envp, unsigned long *auxv) {
     const char *rootfs = "/";
+    const char *bind_g[CNG_MAX_BINDS];
+    const char *bind_h[CNG_MAX_BINDS];
+    int bind_ro[CNG_MAX_BINDS];
+    int nb = 0;
     int i = 1;
-    while (i < argc && !strcmp(argv[i], "-r") && i + 1 < argc) {
-        rootfs = argv[i + 1];
-        i += 2;
+    while (i < argc) {
+        if (!strcmp(argv[i], "-r") && i + 1 < argc) {
+            rootfs = argv[i + 1];
+            i += 2;
+        } else if (!strcmp(argv[i], "-b") && i + 1 < argc) {
+            /* SRC:DST[:ro] — host first, same order as the -b CLI option. Split
+             * in place: argv is writable and outlives the fs view. */
+            char *spec = argv[i + 1];
+            char *c = strchr(spec, ':');
+            if (c && nb < CNG_MAX_BINDS) {
+                *c = '\0';
+                char *dst = c + 1;
+                int ro = 0;
+                unsigned long dl = strlen(dst);
+                if (dl >= 3 && !strcmp(dst + dl - 3, ":ro")) {
+                    ro = 1;
+                    dst[dl - 3] = '\0';
+                }
+                bind_g[nb] = dst;
+                bind_h[nb] = spec;
+                bind_ro[nb] = ro;
+                nb++;
+            }
+            i += 2;
+        } else {
+            break;
+        }
     }
     if (i >= argc) {
-        cng_dprintf(2, "usage: _exectest -r ROOT PROG [args]\n");
+        cng_dprintf(2, "usage: _exectest -r ROOT [-b SRC:DST[:ro]]... "
+                       "PROG [args]\n");
         return 2;
     }
     static struct cng_fs fs;
     cng_fs_init(&fs, rootfs);
+    for (int b = 0; b < nb; b++)
+        cng_fs_add_bind(&fs, bind_g[b], bind_h[b], bind_ro[b]);
     cng_g_fs = &fs;
     cng_host_auxv = auxv;
 

@@ -5,35 +5,33 @@
 # loopback_setup(), glibc's source-address selection. Without a shim they all
 # fail inside the guest.
 #
-# Tested differentially. The same guest binary runs twice — once straight under
-# qemu, where it talks to the real kernel, and once under chroot-ng with
+# Tested differentially. The same guest binary runs twice — once with no
+# emulation, where it talks to the real kernel, and once under chroot-ng with
 # CNG_NETLINK_FORCE_BLOCK=1, which makes the emulation engage on a host where
 # rtnetlink actually works. The two must agree byte for byte. That is the only
-# way to check this here: the emulated path is the one that matters on a device
-# and never engages on a devbox unless it is forced.
+# way to check this on a host that is not the target: the emulated path is the
+# one that matters on a device and never engages elsewhere unless it is forced.
 echo "== M16: NETLINK_ROUTE emulation =="
 
-M16_GCC="${GCC:-aarch64-linux-gnu-gcc-13}"
-M16_QEMU="${QEMU:-qemu-aarch64-static}"
 # Guest runs are wrapped in a timeout: a netlink dump that never terminates would
 # otherwise wedge the whole suite instead of failing one check.
-m16run() { timeout 60 "$M16_QEMU" "$@"; }
+# shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+m16run() { run_t 60 $GUEST_BINDS "$@"; }
 M16D=$(mktemp -d)
 
-if ! $M16_GCC -static-pie -O2 -o "$M16D/netif" tests/guests/netif.c \
-        2>"$M16D/build.log"; then
-    echo "  skip: could not build tests/guests/netif.c"
-    sed 's/^/    /' "$M16D/build.log" | head -5
+if ! guest_xlate_ready "rtnetlink emulation scenarios"; then
+    :
+elif ! guest_cc_report "$M16D/netif" tests/guests/netif.c; then
+    :
 else
     R=$(mktemp -d); mkdir -p "$R/bin"; cp "$M16D/netif" "$R/bin/netif"
 
     # The real kernel's answers, via the same binary with no emulation at all.
-    base=$(m16run "$M16D/netif" 2>/dev/null)
+    base=$(emu_t 60 "$M16D/netif" 2>/dev/null)
     case "$base" in
     *"getifaddrs: ok"*)
         # 1. The emulation must reproduce the real kernel exactly.
-        em=$(CNG_NETLINK_FORCE_BLOCK=1 m16run build/chroot-ng -R "$R" \
-            /bin/netif 2>/dev/null)
+        em=$(CNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/netif 2>/dev/null)
         if [ "$em" = "$base" ]; then
             pass=$((pass + 1))
             echo "  ok   m16 emulated rtnetlink matches the real kernel"
@@ -61,14 +59,14 @@ else
 
         # 3. Without forcing, rtnetlink works on this host, so the emulation must
         #    stay out of the way entirely rather than shadowing a working kernel.
-        pt=$(m16run build/chroot-ng -R "$R" /bin/netif 2>/dev/null)
+        pt=$(m16run -R "$R" /bin/netif 2>/dev/null)
         if [ "$pt" = "$base" ]; then
             pass=$((pass + 1)); echo "  ok   m16 passthrough is unchanged"
         else
             fail=$((fail + 1)); echo "  FAIL m16 passthrough is unchanged"
             echo "    got: $pt"
         fi
-        dbg=$(CNG_DEBUG=1 m16run build/chroot-ng -R "$R" /bin/netif 2>&1 \
+        dbg=$(CNG_DEBUG=1 m16run -R "$R" /bin/netif 2>&1 \
             >/dev/null | grep -c 'netlink: emulating')
         check "m16 the emulation does not engage where rtnetlink works" 0 "$dbg"
 
@@ -79,12 +77,11 @@ else
         #    survive iproute2's pid/seq filter or the whole dump is dropped
         #    silently. `ip addr` buffers the link dump before printing, so any of
         #    these failing yields no output at all rather than a partial listing.
-        if $M16_GCC -static-pie -O2 -o "$M16D/nldone" tests/guests/nldone.c \
-                2>>"$M16D/build.log"; then
+        if guest_cc "$M16D/nldone" tests/guests/nldone.c; then
             cp "$M16D/nldone" "$R/bin/nldone"
-            kbase=$(m16run "$M16D/nldone" 2>/dev/null)
-            kem=$(CNG_NETLINK_FORCE_BLOCK=1 m16run build/chroot-ng -R "$R" \
-                /bin/nldone 2>/dev/null)
+            kbase=$(emu_t 60 "$M16D/nldone" 2>/dev/null)
+            kem=$(CNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nldone \
+                2>/dev/null)
             check_contains "m16 the dump satisfies iproute2's contract" \
                 "nldone: done=1 done_len_ok=1 links>0=1 named>0=1 skipped=0" \
                 "$kem"
@@ -102,13 +99,13 @@ else
             # RTM_GETLINK must be synthesized from the address dump plus
             # ioctls, not degraded to an empty dump that `ip addr` renders as
             # total silence. CNG_NETLINK_DENY_GETLINK simulates that split.
-            kdg=$(CNG_NETLINK_DENY_GETLINK=1 m16run build/chroot-ng -R "$R" \
-                /bin/nldone 2>/dev/null)
+            kdg=$(CNG_NETLINK_DENY_GETLINK=1 m16run -R "$R" /bin/nldone \
+                2>/dev/null)
             check_contains "m16 a refused RTM_GETLINK is synthesized" \
                 "nldone: done=1 done_len_ok=1 links>0=1 named>0=1 skipped=0" \
                 "$kdg"
-            edg=$(CNG_NETLINK_DENY_GETLINK=1 m16run build/chroot-ng -R "$R" \
-                /bin/netif 2>/dev/null)
+            edg=$(CNG_NETLINK_DENY_GETLINK=1 m16run -R "$R" /bin/netif \
+                2>/dev/null)
             check_contains "m16 getifaddrs works over a synthesized link dump" \
                 "getifaddrs: ok" "$edg"
             check_contains "m16 loopback survives the synthesized link dump" \
@@ -116,8 +113,8 @@ else
             # With no relay at all the guest still gets a well-formed dump
             # presenting loopback — the oracle's exact degradation when even
             # getifaddrs fails, and what bubblewrap/glibc want to see.
-            knr=$(CNG_NETLINK_NO_RELAY=1 m16run build/chroot-ng -R "$R" \
-                /bin/nldone 2>/dev/null)
+            knr=$(CNG_NETLINK_NO_RELAY=1 m16run -R "$R" /bin/nldone \
+                2>/dev/null)
             check_contains "m16 a relay-less dump presents loopback only" \
                 "nldone: done=1 done_len_ok=1 links>0=1 named>0=1 skipped=0" \
                 "$knr"
@@ -127,22 +124,22 @@ else
             # socketpair stand-in queues the write; the trapped recv drains and
             # serves it. Real `ip addr` output is the acceptance bar: at least
             # one interface line and one inet line, under the Android split.
-            M16_ALPINE="${M16_ALPINE:-/home/sol/arm64chroot/tests/.cache/rootfs/alpine}"
-            if [ -x "$M16_ALPINE/bin/busybox" ]; then
-                bb=$(CNG_NETLINK_DENY_GETLINK=1 m16run build/chroot-ng -R \
+            M16_ALPINE="${M16_ALPINE:-$CNG_ALPINE}"
+            if [ -n "$M16_ALPINE" ] && [ -x "$M16_ALPINE/bin/busybox" ]; then
+                bb=$(CNG_NETLINK_DENY_GETLINK=1 run_t 60 -R \
                     "$M16_ALPINE" /bin/busybox ip addr 2>/dev/null)
                 check_contains "m16 busybox ip addr lists loopback" \
                     ": lo: <LOOPBACK,UP" "$bb"
                 check_contains "m16 busybox ip addr lists an address" \
                     "inet 127.0.0.1/8" "$bb"
             else
-                echo "  skip: alpine rootfs missing, busybox ip leg untested"
+                skip "busybox ip leg: no alpine rootfs"
             fi
         else
-            echo "  skip: could not build tests/guests/nldone.c"
+            skip "iproute2 dump-contract legs: could not build tests/guests/nldone.c"
         fi
         ;;
-    *)  echo "  skip: host rtnetlink unavailable, nothing to diff against" ;;
+    *)  skip "rtnetlink differential: this host denies rtnetlink, nothing to diff against" ;;
     esac
 
     rm -rf "$R"

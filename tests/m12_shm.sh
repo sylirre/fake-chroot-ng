@@ -3,10 +3,10 @@
 # Three layers. First the dispatcher-level self-test (-t shmtest), which needs
 # no seccomp and so runs anywhere, over both backing tiers (memfd, and the
 # file-backed fallback forced with CNG_SHM_FORCE_FILE=1). Then a differential
-# leg: the same guest binaries run once under chroot-ng's emulation and once
-# straight under qemu-aarch64, where they get the host kernel's REAL SysV shm —
-# stdout must match byte for byte, which is the strongest statement available
-# that the emulation is indistinguishable. Finally the namespace scope, which
+# leg: the same guest binaries run once under chroot-ng's emulation and once with
+# no emulation at all, where they get the host kernel's REAL SysV shm — stdout
+# must match byte for byte, which is the strongest statement available that the
+# emulation is indistinguishable. Finally the namespace scope, which
 # has no kernel counterpart to diff against (that is the point) and is asserted
 # directly.
 #
@@ -47,20 +47,41 @@ check_contains "file-backed segments still share across a fork" \
     "shmtest fork share=1 nattch-after-exit=1 -> OK" "$out"
 
 # --- differential against the host kernel's real SysV shm -------------------
-GCC="${GUESTCC:-aarch64-linux-gnu-gcc-13}"
+# The reference side is the same binary run with no emulation at all, so it needs
+# the host to actually provide SysV shm: Android does not (bionic drops the API
+# and the app domain gets no IPC), so there the differential legs sit out and the
+# dispatcher self-test above is what covers the emulation.
 SG=$(mktemp -d)
-m12_ready=1
-for p in shm_sysv shm_stat shm_exec shm_edge shm_key; do
-    $GCC -static-pie -O2 -o "$SG/$p" "tests/guests/$p.c" 2>/dev/null ||
-        m12_ready=0
-done
-if [ "$m12_ready" = 0 ]; then
-    echo "  skip: guest cross-compiler unavailable"
-else
+# shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+m12run() { run $GUEST_BINDS "$@"; }
+m12_kbase=
+m12_ready=0
+if guest_xlate_ready "SysV shm differential"; then
+    m12_ready=1
+    for p in shm_sysv shm_stat shm_exec shm_edge shm_key; do
+        guest_cc "$SG/$p" "tests/guests/$p.c" || m12_ready=0
+    done
+    if [ "$m12_ready" = 0 ]; then
+        skip "SysV shm differential: the guest programs do not build here ($(head -1 "$GUEST_CC_LOG" 2>/dev/null))"
+    else
+        # Android drops SysV IPC from bionic and denies it to app domains, so
+        # there is no kernel reference to diff against there.
+        m12_kbase=$(emu_t 60 "$SG/shm_sysv" 2>/dev/null)
+        case "$m12_kbase" in
+        *done*) ;;
+        *)
+            m12_ready=0
+            skip "SysV shm differential: this host has no working SysV shm to diff against"
+            ;;
+        esac
+    fi
+fi
+if [ "$m12_ready" = 1 ]; then
     # shm_diff <desc> <prog>: emulated vs the real kernel, stdout + rc.
     shm_diff() {
-        out_k=$("$QEMU" "$SG/$2" 2>/dev/null); rc_k=$?
-        out_e=$(run -R "$SG" "/$2" 2>/dev/null); rc_e=$?
+        out_k=$(emu_t 60 "$SG/$2" 2>/dev/null); rc_k=$?
+        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
+        out_e=$(run_t 60 $GUEST_BINDS -R "$SG" "/$2" 2>/dev/null); rc_e=$?
         if [ "$out_k" = "$out_e" ] && [ "$rc_k" = "$rc_e" ]; then
             pass=$((pass + 1)); printf '  ok   %s\n' "$1"
         else
@@ -80,13 +101,13 @@ else
 
     # ...and again over the file-backed tier, which must be indistinguishable
     # from the memfd one (only the broker's backing differs).
-    out_k=$("$QEMU" "$SG/shm_sysv" 2>/dev/null)
-    out_e=$(CNG_SHM_FORCE_FILE=1 run -R "$SG" /shm_sysv 2>/dev/null)
+    out_k=$m12_kbase
+    out_e=$(CNG_SHM_FORCE_FILE=1 m12run -R "$SG" /shm_sysv 2>/dev/null)
     check_contains "m12 file-backed shm_sysv still matches" "$out_k" "$out_e"
 
     # The guest's calls really are being emulated, not passed to the host: the
     # dispatcher traces every one under CNG_DEBUG.
-    n=$(CNG_DEBUG=1 run -R "$SG" /shm_sysv 2>&1 | grep -c 'sysv-shm')
+    n=$(CNG_DEBUG=1 m12run -R "$SG" /shm_sysv 2>&1 | grep -c 'sysv-shm')
     if [ "$n" -ge 8 ]; then
         pass=$((pass + 1)); printf '  ok   %s\n' "m12 the guest's shm syscalls reach the emulation ($n)"
     else
@@ -97,19 +118,19 @@ else
     # Default: one namespace per invocation, so a keyed segment does not leak
     # from one launch to the next (two containers do not share IPC).
     K=51ab0001
-    run -R "$SG" /shm_key $K create first-invocation >/dev/null 2>&1
-    out=$(run -R "$SG" /shm_key $K find 2>/dev/null)
+    m12run -R "$SG" /shm_key $K create first-invocation >/dev/null 2>&1
+    out=$(m12run -R "$SG" /shm_key $K find 2>/dev/null)
     check_contains "m12 a keyed segment does not leak between invocations" \
         "found=0" "$out"
 
     # --shared-proc widens the namespace to the rootfs, the same way it widens
     # the guest process view.
     K=51ab0002
-    run --shared-proc -R "$SG" /shm_key $K create shared-invocation >/dev/null 2>&1
-    out=$(run --shared-proc -R "$SG" /shm_key $K find 2>/dev/null)
+    m12run --shared-proc -R "$SG" /shm_key $K create shared-invocation >/dev/null 2>&1
+    out=$(m12run --shared-proc -R "$SG" /shm_key $K find 2>/dev/null)
     check_contains "m12 --shared-proc shares segments between invocations" \
         "found=1 text=shared-invocation" "$out"
-    run --shared-proc -R "$SG" /shm_key $K rmid >/dev/null 2>&1
+    m12run --shared-proc -R "$SG" /shm_key $K rmid >/dev/null 2>&1
 fi
 rm -rf "$SG"
 
@@ -117,12 +138,12 @@ rm -rf "$SG"
 # ipcs(1) is what a user reaches for; busybox's applet drives SHM_INFO/SHM_STAT
 # exactly as shm_stat.c does, so this only has to show the tool runs and reports
 # an empty namespace the way it would against a kernel with no segments.
-M12_ALPINE="${M12_ALPINE:-/home/sol/arm64chroot/tests/.cache/rootfs/alpine}"
-if [ -x "$M12_ALPINE/bin/busybox" ]; then
+M12_ALPINE="${M12_ALPINE:-$CNG_ALPINE}"
+if [ -n "$M12_ALPINE" ] && [ -x "$M12_ALPINE/bin/busybox" ]; then
     SR=$(mktemp -d); cp -a "$M12_ALPINE/." "$SR"
     out=$(run -R "$SR" /bin/sh -c 'ipcs -m; echo rc=$?' 2>/dev/null)
     check_contains "m12 ipcs -m runs in a guest shell" "rc=0" "$out"
     rm -rf "$SR"
 else
-    echo "  skip: alpine rootfs missing (ipcs scenario)"
+    skip "ipcs guest-shell scenario: no alpine rootfs"
 fi

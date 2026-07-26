@@ -9,10 +9,13 @@
 # rows and mount IDs), so the assertions are structural instead.
 echo "== M11: /proc emulation =="
 
-M11_ALPINE="${M11_ALPINE:-/home/sol/arm64chroot/tests/.cache/rootfs/alpine}"
+M11_ALPINE="${M11_ALPINE:-$CNG_ALPINE}"
 
-PT=$(mktemp -d)
-out=$(run -t proctest -r "$PT" -b /usr:/usr 2>&1); rc=$?
+# The bind source is a directory we make, not a host path like /usr: Android has
+# no /usr at all, and all proctest wants is a bind whose guest mount point must
+# then show up in the synthesized mount table.
+PT=$(mktemp -d); PTB=$(mktemp -d)
+out=$(run -t proctest -r "$PT" -b "$PTB":/usr 2>&1); rc=$?
 check "proctest overall" 0 "$rc"
 check_contains "the registry runs broker-backed (--shared-proc plumbing)" \
     "proctest shared-proc backing: 3 -> OK" "$out"
@@ -49,18 +52,23 @@ check_contains "status Uid/Gid remapped under --fake-id" \
     "proctest status remap:" "$out"
 check_contains "--no-proc disables passthrough and synthesis" \
     "proctest no-proc -> OK" "$out"
-rm -rf "$PT"
+rm -rf "$PT" "$PTB"
 
 # --- guest-shell scenarios -------------------------------------------------
 m11_ready=0
-if [ -x "$M11_ALPINE/bin/busybox" ]; then m11_ready=1; else
-    echo "  skip: alpine rootfs missing"
+if [ -n "$M11_ALPINE" ] && [ -x "$M11_ALPINE/bin/busybox" ]; then
+    m11_ready=1
+else
+    skip "guest-shell /proc scenarios: no alpine rootfs"
 fi
+# Bound at the guest's /tmp so the mount table has a third row to find. The host
+# side is a directory of ours: /tmp is not a path Android has.
+M11TMP=$(mktemp -d)
 
 # m11_sh <desc> <expected> <script>: run the script in an Alpine guest under -R
 # and compare its (whitespace-trimmed) stdout.
 m11_sh() {
-    got=$(run -R -b /tmp:/tmp "$M11_ALPINE" /bin/busybox sh -c "$3" 2>/dev/null)
+    got=$(run -R -b "$M11TMP":/tmp "$M11_ALPINE" /bin/busybox sh -c "$3" 2>/dev/null)
     if [ "$got" = "$2" ]; then
         pass=$((pass + 1)); echo "  ok   m11 $1"
     else
@@ -165,3 +173,4 @@ if [ "$m11_ready" -eq 1 ]; then
     kill "$m11_bg" 2>/dev/null
     wait "$m11_bg" 2>/dev/null
 fi
+rm -rf "$M11TMP"

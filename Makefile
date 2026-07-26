@@ -17,8 +17,19 @@ CC      := $(CROSS)gcc
 endif
 endif
 OBJCOPY ?= $(CROSS)objcopy
-QEMU    ?= qemu-aarch64-static
 BUILD   ?= build
+
+# How to run an AArch64 binary here. On an AArch64 host (native Linux or Termux)
+# that is "directly", so QEMU stays EMPTY and `$(QEMU) $(BIN)` is just $(BIN);
+# elsewhere pick whichever qemu-user build is installed. tests/lib.sh does the
+# same detection for the suite, so `make test` needs nothing passed down.
+HOST_ARCH := $(shell uname -m)
+ifeq ($(filter aarch64 arm64,$(HOST_ARCH)),)
+QEMU    ?= $(shell command -v qemu-aarch64-static 2>/dev/null \
+             || command -v qemu-aarch64 2>/dev/null || echo qemu-aarch64-static)
+else
+QEMU    ?=
+endif
 
 # Is the compiler clang (Termux/NDK) rather than gcc? Some flags are gcc-only.
 CC_IS_CLANG := $(shell $(CC) --version 2>/dev/null | grep -ci clang)
@@ -75,11 +86,12 @@ $(BUILD)/%.S.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
-# Run the tool itself under the emulator: `make run ARGS="--version"`
+# Run the tool itself, natively or under the emulator: `make run ARGS="--version"`
 run: $(BIN)
 	$(QEMU) $(BIN) $(ARGS)
 
-# Capability probe under the emulator (real kernel needed for the seccomp line).
+# Capability probe (a real AArch64 kernel is needed for the seccomp line, so on
+# a cross host under qemu that line always reads "inert").
 probe: $(BIN)
 	$(QEMU) $(BIN) --probe
 

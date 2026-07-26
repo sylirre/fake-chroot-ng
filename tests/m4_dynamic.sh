@@ -1,28 +1,49 @@
-# M4 dynamic-loader tests (sourced by tests/run.sh). Requires an aarch64 sysroot
-# for ld.so/libc; skips cleanly if absent. Uses LD_LIBRARY_PATH so ld.so finds
-# libc at a real host path (M5 will instead redirect ld.so's opens into the
-# guest rootfs via the SIGSYS translator).
+# M4 dynamic-loader tests (sourced by tests/run.sh). Needs an AArch64 ELF
+# interpreter on this host; skips cleanly if there is none.
+#
+# On an AArch64 host the interpreter is simply on the system paths, and with the
+# rootfs at "/" the loader resolves it directly. On a cross host it lives under
+# the toolchain sysroot instead, so chroot-ng is pointed at it with -L and ld.so
+# with LD_LIBRARY_PATH (M5 is what redirects ld.so's opens into a real guest
+# rootfs through the SIGSYS translator).
 echo "== M4: ul_exec loader (dynamic) =="
 
-GCC="${GUESTCC:-aarch64-linux-gnu-gcc-13}"
 GDIR=build/tests
 mkdir -p "$GDIR"
-SYSROOT="${CNG_SYSROOT:-/usr/aarch64-linux-gnu}"
-LDSO="$SYSROOT/lib/ld-linux-aarch64.so.1"
 
-if [ ! -e "$LDSO" ]; then
-    printf '  skip dynamic tests (no aarch64 sysroot at %s)\n' "$SYSROOT"
-elif ! $GCC -O2 -o "$GDIR/hello_dyn" tests/guests/hello.c 2>"$GDIR/hello_dyn.log"; then
-    fail=$((fail + 1)); printf '  FAIL could not build dynamic guest\n'
-    sed 's/^/    /' "$GDIR/hello_dyn.log"
+if [ "$CNG_NATIVE" = 1 ]; then
+    M4_SYSROOT=${CNG_SYSROOT-}
 else
-    if file "$GDIR/hello_dyn" | grep -q "dynamically linked"; then
+    M4_SYSROOT=${CNG_SYSROOT-/usr/aarch64-linux-gnu}
+fi
+M4_LDSO=
+for c in "$M4_SYSROOT/lib/ld-linux-aarch64.so.1" \
+    "$M4_SYSROOT/lib/ld-musl-aarch64.so.1" \
+    "$M4_SYSROOT/lib64/ld-linux-aarch64.so.1" \
+    "$M4_SYSROOT/system/bin/linker64"; do
+    if [ -e "$c" ]; then M4_LDSO=$c; break; fi
+done
+
+if [ -z "$GUESTCC" ]; then
+    skip "dynamic tests: no AArch64 guest toolchain"
+elif [ -z "$M4_LDSO" ]; then
+    skip "dynamic tests: no AArch64 ELF interpreter under '${M4_SYSROOT:-/}'"
+elif ! $GUESTCC -O2 -o "$GDIR/hello_dyn" tests/guests/hello.c \
+    2>"$GUEST_CC_LOG"; then
+    fail=$((fail + 1)); printf '  FAIL could not build dynamic guest\n'
+    sed 's/^/    /' "$GUEST_CC_LOG"
+else
+    if elf_has_interp "$GDIR/hello_dyn"; then
         pass=$((pass + 1)); printf '  ok   guest is dynamically linked\n'
     else
         fail=$((fail + 1)); printf '  FAIL guest not dynamic\n'
     fi
-    out=$(CNG_TEST=dyn LD_LIBRARY_PATH="$SYSROOT/lib" \
-          run -L "$SYSROOT" / "$GDIR/hello_dyn" XX YY 2>&1); rc=$?
+    if [ -n "$M4_SYSROOT" ]; then
+        out=$(CNG_TEST=dyn LD_LIBRARY_PATH="$M4_SYSROOT/lib" \
+            run -L "$M4_SYSROOT" / "$GDIR/hello_dyn" XX YY 2>&1); rc=$?
+    else
+        out=$(CNG_TEST=dyn run / "$GDIR/hello_dyn" XX YY 2>&1); rc=$?
+    fi
     check "dynamic exit code (42)" 42 $rc
     check_contains "ld.so bootstrapped main (argc)" "guest: argc=3" "$out"
     check_contains "dynamic argv forwarded" "guest: argv1=XX" "$out"

@@ -10,17 +10,23 @@
 # Rules: scenarios are self-contained; raw inode numbers are never printed
 # (compare with `[ a = b ] && echo same-ino`); busybox `find` has no
 # -samefile (GNU-only — exercised in the Debian leg).
+#
+# The oracle is a host-native program, not an AArch64 one, so this whole
+# milestone only runs where a matching build of it exists (tests/lib.sh checks
+# its machine against the host's and drops it otherwise). Locations come from
+# tests/lib.sh; M10_ORACLE/M10_ALPINE/M10_DEBIAN still override per-milestone.
 echo "== M10: l2s shell (differential vs arm64chroot real hardlinks) =="
 
-M10_ORACLE="${M10_ORACLE:-/home/sol/arm64chroot/arm64chroot}"
-M10_ALPINE="${M10_ALPINE:-/home/sol/arm64chroot/tests/.cache/rootfs/alpine}"
-M10_DEBIAN="${M10_DEBIAN:-/home/sol/arm64-rootfs/debian-fresh}"
+M10_ORACLE="${M10_ORACLE:-$CNG_ORACLE}"
+M10_ALPINE="${M10_ALPINE:-$CNG_ALPINE}"
+M10_DEBIAN="${M10_DEBIAN:-$CNG_DEBIAN}"
 
 CNG_L2S_FORCE=1
 export CNG_L2S_FORCE   # chroot-ng only; the oracle ignores it
 
 m10_ready=0
-if [ -x "$M10_ORACLE" ] && [ -x "$M10_ALPINE/bin/busybox" ]; then
+if [ -n "$M10_ORACLE" ] && [ -x "$M10_ORACLE" ] &&
+    [ -n "$M10_ALPINE" ] && [ -x "$M10_ALPINE/bin/busybox" ]; then
     # Sanity: the oracle must produce real hardlinks (l2s compiled out).
     SAN=$(mktemp -d)
     cp -a "$M10_ALPINE/." "$SAN"
@@ -30,10 +36,10 @@ if [ -x "$M10_ORACLE" ] && [ -x "$M10_ALPINE/bin/busybox" ]; then
     if [ "$san" = "2" ]; then
         m10_ready=1
     else
-        echo "  skip: oracle does not produce real hardlinks (got '$san')"
+        skip "oracle does not produce real hardlinks (got '$san')"
     fi
 else
-    echo "  skip: oracle or alpine rootfs missing"
+    skip "differential l2s legs: no host-native oracle or no alpine rootfs"
 fi
 
 # l2s_diff <desc> <script>: run <script> under both, compare stdout + rc.
@@ -126,7 +132,7 @@ fi
 # Gated on a smoke test proving translation is live — a dynamic-glibc guest
 # under -R + qemu can silently run untranslated (ld.so-loaded libc.so has no
 # rewritten svc sites), which would read the HOST's /etc, not the guest's.
-if [ "$m10_ready" -eq 1 ] && [ -x "$M10_DEBIAN/bin/ls" ]; then
+if [ "$m10_ready" -eq 1 ] && [ -n "$M10_DEBIAN" ] && [ -x "$M10_DEBIAN/bin/ls" ]; then
     RD=$(mktemp -d)
     cp -a "$M10_DEBIAN/." "$RD"
     smoke=$(run -R -l "$RD" /bin/sh -c 'head -1 /etc/os-release' 2>/dev/null)
@@ -149,12 +155,12 @@ if [ "$m10_ready" -eq 1 ] && [ -x "$M10_DEBIAN/bin/ls" ]; then
         rm -rf "$RDO"
         ;;
     *)
-        echo "  skip: debian glibc guest not translating under -R (got '$smoke')"
+        skip "debian glibc guest not translating under -R (got '$smoke')"
         ;;
     esac
     rm -rf "$RD"
 elif [ "$m10_ready" -eq 1 ]; then
-    echo "  skip: debian rootfs missing"
+    skip "debian leg: no debian rootfs"
 fi
 
 unset CNG_L2S_FORCE
