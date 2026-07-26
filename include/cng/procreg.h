@@ -106,4 +106,20 @@ int cng_procreg_has(int pid);
  * recorded /proc/<pid>/stat starttime). */
 int cng_procreg_get(int pid, struct cng_procsnap *out);
 
+/* `pid`'s incarnation: its /proc/<pid>/stat starttime, or 0 if it is gone or
+ * /proc is unreadable. `zombie_out`, when non-NULL, reports whether the process
+ * has exited without being reaped — it still owns its pid, so this is not a
+ * reuse, but it holds no mappings (broker.c's shm attach reclaim keys on that).
+ * Shared with broker.c, which has no other way to tell a live guest from a dead
+ * one. */
+u64 cng_proc_starttime(int pid, int *zombie_out);
+
+/* The shared region's byte size, for whoever creates the backing — including
+ * the broker daemon, which sizes its table memfd from this. */
+unsigned long cng_procreg_table_size(void);
+
+/* Is any process in `tab` (a mapping of that size) still alive? The broker
+ * daemon's liveness signal for the --shared-proc table it serves. */
+int cng_procreg_table_live(const void *tab);
+
 #endif /* CNG_PROCREG_H */

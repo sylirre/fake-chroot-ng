@@ -17,6 +17,7 @@
  * Under qemu-user the seccomp filter is inert, so translation is only exercised
  * on a real AArch64 kernel (and via the `-t dtest` self-test).
  */
+#include "cng/broker.h"
 #include "cng/l2s.h"
 #include "cng/loader.h"
 #include "cng/monitor.h"
@@ -63,6 +64,12 @@ int cng_run(const char *rootfs, const char *libprefix,
     cng_host_auxv = auxv;
     cng_g_exe_guest = prog_guest;
     cng_g_envp = envp;
+
+    /* Key the System V shm namespace to this invocation (unless --shared-proc
+     * widens it to the rootfs). Seeded here, in the root process while we are
+     * still single-threaded, and fork-inherited — so one launch's whole process
+     * tree shares one namespace and separate launches stay isolated. */
+    cng_broker_seed_session();
 
     /* CNG_DEBUG=1 in the environment enables verbose syscall-error logging;
      * CNG_L2S_FORCE=1 routes every linkat through the -l emulation (test aid

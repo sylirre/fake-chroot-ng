@@ -529,6 +529,67 @@ vfork/`posix_spawn` child-stack handling.
   explicit path (only the listing is filtered); here the hidden view is keyed on
   the resolved host path, so both routes are closed.
 
+- [x] **M12 — System V shared memory (ported from `/home/sol/arm64chroot`)**
+  Android denies `shmget`/`shmat`/`shmdt`/`shmctl` outright — they are off the
+  app seccomp allow-list and SELinux forbids the class — so any guest that uses
+  them (PostgreSQL, X clients, dpkg's plumbing, anything linked against a stock
+  libc's shm functions) died on the first call. All four are now trapped and
+  served in-process from `src/monitor/shm.c`, with **no host SysV IPC syscall
+  and no `/dev/shm` anywhere in the path**. Trapped unconditionally, as in
+  arm64chroot: the guest gets one shm namespace whatever the host's own IPC
+  would have allowed.
+  - **The broker owns the segments** (`src/monitor/broker.c`). Somebody has to
+    hold each segment's backing fd for its lifetime, and it cannot be a guest
+    process — host fd == guest fd here, so a held fd would be visible to and
+    closable by the guest. The daemon holds it (an anonymous memfd, or a 0600
+    file in a writable dir where `memfd_create` is unavailable) and hands out
+    duplicates over `SCM_RIGHTS`; `shmat` maps the fd it is given `MAP_SHARED`
+    and closes it at once, so a process holds a segment only as a mapping. This
+    is the same daemon M11's `--shared-proc` registry already used: its
+    one-byte handshake became a tagged request protocol so one rendezvous
+    serves the PID table and the segment registry, exactly as arm64chroot's
+    `proctab.c` multiplexes them. It is spawned lazily on the first shm call —
+    safe from inside the SIGSYS handler because everything it runs is our own
+    gate-issued syscalls, which our filter allows by instruction pointer.
+  - **Namespace scope** follows the process view: per invocation by default
+    (keyed by a pid+clock nonce seeded in the root process and fork-inherited,
+    so one launch's process tree shares a namespace and separate launches do
+    not), widened to per-rootfs by **`--shared-proc`**.
+  - **Attach addresses become mmap flags.** arm64chroot mapped into a synthetic
+    guest address space; here the guest's address space is ours, so `shmaddr` is
+    an `mmap` hint: `SHM_RND` rounds down to the page size (SHMLBA on arm64),
+    `SHM_REMAP` is `MAP_FIXED`, and an occupied range is `MAP_FIXED_NOREPLACE`
+    → `EINVAL`. Pre-4.17 kernels ignore that flag and treat the address as a
+    hint, so a returned address that is not the requested one is unmapped and
+    answered `EINVAL` — what `shmat` would have said.
+  - **`nattch` without an exit hook.** arm64chroot detaches from its
+    `exit`/`exit_group` handlers; chroot-ng traps neither (same reason the PID
+    registry has no exit hook — a `SIGKILL` could never be trapped either), so
+    process death is the *normal* way an attach goes away here. The broker
+    tracks each attacher's pid and starttime and reclaims on any `STAT`, keyed
+    on the incarnation **and** on the zombie state: a process that has exited
+    but not been reaped still owns its pid, yet the kernel has already dropped
+    its mappings. Without that, a guest reading `nattch` right after `waitpid`
+    would see a count a real kernel never reports — the differential test
+    catches exactly this. `fork` re-counts inherited attaches from the child;
+    the emulated `execve` detaches them all at its commit point, since a real
+    one tears down the address space.
+  - **Two fidelity gaps the oracle also has**, found by diffing corner cases
+    (`tests/guests/shm_edge.c`): `SHM_EXEC` is a *permission* request, so
+    attaching a `0600` segment with it must fail `EACCES` the way the kernel
+    checks `S_IXUGO` — the broker's permission triad grew an execute leg for
+    it; and `SHM_LOCK`/`SHM_UNLOCK` succeed for the owner rather than answering
+    `EINVAL` (there is nothing to pin here, but refusing is the wrong answer).
+  - **Tested differentially.** `tests/guests/shm_sysv.c` and `shm_stat.c`
+    (arm64chroot's own, written for exactly this comparison) plus `shm_exec.c`
+    and `shm_edge.c` run once under the emulation and once straight under
+    qemu-aarch64, where the same code gets the genuine article — the host
+    kernel's `shmget`/`shmctl` and qemu's own `shmat`; stdout must match byte
+    for byte, over both backing tiers. `-t shmtest` covers the dispatcher level
+    in ten groups including a real fork and a real broker, and
+    `tests/guests/shm_key.c` pins the namespace scope, which is the one part
+    with no counterpart to diff against.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

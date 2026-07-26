@@ -50,7 +50,8 @@ Common options: `-u/--fake-id[=ID]` (fake user identity — `ID` is a `uid` or
 H), `-l/--link2symlink` (emulate hardlinks where the host refuses `link(2)`),
 `-R/--rewrite` (ahead-of-time `svc` rewriting), `--no-proc` (turn off the `/proc`
 emulation described below), `--shared-proc` (share the process view between
-independent invocations of the same rootfs).
+independent invocations of the same rootfs, for both the process view and the
+System V shm namespace).
 
 `/proc` is visible to the guest without a bind, and describes the guest rather
 than chroot-ng: host processes are hidden from it (by path and from listings,
@@ -64,6 +65,14 @@ hide each other's processes; `--shared-proc` keys the process registry by the
 rootfs instead — served diskless by a per-rootfs broker daemon that exits by
 itself once the last guest is gone — so `ps`/`top` in one session see the
 guest processes of another.
+
+**System V shared memory** works too. Android denies `shmget`/`shmat`/`shmdt`/
+`shmctl` outright, so chroot-ng serves them itself: the same broker daemon owns
+each segment as an anonymous `memfd` (or a private file where `memfd_create` is
+unavailable) and hands it to attachers over `SCM_RIGHTS`, which needs no host
+SysV IPC and no `/dev/shm`. Segments are shared by every process of one
+invocation and isolated between invocations, unless `--shared-proc` widens the
+namespace to the rootfs.
 
 ```sh
 chroot-ng -u ./rootfs /bin/sh              # fake root (uid/gid 0)

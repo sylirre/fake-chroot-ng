@@ -55,6 +55,25 @@ static const int id_syscalls[] = {
 };
 #define NID ((int)(sizeof(id_syscalls) / sizeof(id_syscalls[0])))
 
+/* System V shared memory: always trapped, always emulated (shm.c). Android
+ * denies all four, and trapping them everywhere keeps one guest namespace
+ * whatever the host would have allowed — the same choice arm64chroot makes. */
+static const int ipc_syscalls[] = {
+#ifdef __NR_shmget
+    __NR_shmget,
+#endif
+#ifdef __NR_shmat
+    __NR_shmat,
+#endif
+#ifdef __NR_shmdt
+    __NR_shmdt,
+#endif
+#ifdef __NR_shmctl
+    __NR_shmctl,
+#endif
+};
+#define NIPC ((int)(sizeof(ipc_syscalls) / sizeof(ipc_syscalls[0])))
+
 /* File syscalls trapped only when -l/--link2symlink is active: fstat must
  * report the emulated st_nlink, getdents64 must hide the backing files. Must
  * match the l2s hooks in dispatch.c. (getdents64 is also trapped for the /proc
@@ -71,12 +90,14 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
     uint32_t gate_lo = (uint32_t)gs;
     uint32_t gate_end_lo = (uint32_t)ge;
 
-    /* Build the trapped syscall list (path set, plus id set when faking, plus
-     * the l2s set when hardlink emulation is on). */
-    int nr[NPATH + NID + NL2S + 1]; /* +1: the conditional getdents64 */
+    /* Build the trapped syscall list (path set + SysV IPC set, plus the id set
+     * when faking, plus the l2s set when hardlink emulation is on). */
+    int nr[NPATH + NIPC + NID + NL2S + 1]; /* +1: the conditional getdents64 */
     int nsys = 0;
     for (int i = 0; i < NPATH; i++)
         nr[nsys++] = path_syscalls[i];
+    for (int i = 0; i < NIPC; i++)
+        nr[nsys++] = ipc_syscalls[i];
     if (cng_g_fake_id)
         for (int i = 0; i < NID; i++)
             nr[nsys++] = id_syscalls[i];

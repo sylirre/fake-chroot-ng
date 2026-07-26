@@ -4,6 +4,7 @@
  * Used by the M5 unit tests (the path core is pure logic, fully exercisable
  * under qemu).
  */
+#include "cng/broker.h"
 #include "cng/l2s.h"
 #include "cng/loader.h"
 #include "cng/monitor.h"
@@ -12,6 +13,7 @@
 #include "cng/procreg.h"
 #include "cng/rewrite.h"
 #include "cng/seccomp.h"
+#include "cng/shm.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
 #include "cng/uapi.h"
@@ -2162,6 +2164,12 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
 #endif
         {"write is never trapped", __NR_write, 0x1000, 1008,
          CNG_SECCOMP_RET_ALLOW},
+        /* System V shm: always trapped, so the guest gets the emulated
+         * namespace whatever the host's own IPC would have allowed. */
+        {"shmget traps", __NR_shmget, 0x1000, 0, CNG_SECCOMP_RET_TRAP},
+        {"shmat traps", __NR_shmat, 0x1000, 0, CNG_SECCOMP_RET_TRAP},
+        {"shmdt traps", __NR_shmdt, 0x1000, 0, CNG_SECCOMP_RET_TRAP},
+        {"shmctl traps", __NR_shmctl, 0x1000, 0, CNG_SECCOMP_RET_TRAP},
     };
     for (unsigned k = 0; k < sizeof cases / sizeof cases[0]; k++) {
         u32 d[16];
@@ -2191,5 +2199,252 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
     }
 
     cng_dprintf(1, "bpftest: %d failure(s)\n", fails);
+    return fails ? 1 : 0;
+}
+
+/* ---- M12: System V shared memory (-t shmtest) ---------------------------
+ *
+ * Drives the four syscalls through cng_dispatch, which is exactly what the
+ * SIGSYS handler does — so this needs no seccomp and runs under qemu. It spans
+ * a real fork (through the dispatcher's own clone path, so the fork hook is the
+ * one that ships) and a real broker daemon, which is the only way to see that
+ * two processes share the memory and that nattch tracks them.
+ *
+ * The test script re-runs this with CNG_SHM_FORCE_FILE=1 to cover the
+ * file-backed tier the broker falls back to where memfd_create is unavailable.
+ */
+#define SHMT_SZ 8192
+
+static long shm_call(long nr, long a0, long a1, long a2) {
+    return cng_dispatch(nr, a0, a1, a2, 0, 0, 0, /*trapped=*/0);
+}
+
+static long shmt_stat(long id, struct cng_shmid64_ds *ds) {
+    return shm_call(__NR_shmctl, id, CNG_IPC_STAT | 0x100 /*IPC_64*/,
+                    (long)ds);
+}
+
+/* A page-aligned address that is currently free: map it, then drop it. Single
+ * threaded here, and nothing else in this process allocates behind our back. */
+static unsigned long shmt_hole(unsigned long len) {
+    void *p = sys_mmap(0, len, CNG_PROT_NONE,
+                       CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (p == CNG_MAP_FAILED || cng_is_err((long)p))
+        return 0;
+    sys_munmap(p, len);
+    return (unsigned long)p;
+}
+
+int cng_cmd_shmtest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)auxv;
+    cng_g_envp = envp; /* the broker's env lookups (CNG_SHM_FORCE_FILE, TMPDIR) */
+    int fails = 0;
+    int self = (int)sys_getpid();
+    unsigned long pg = cng_page_size;
+
+    /* 1) create, attach, and see the memory. */
+    long id = shm_call(__NR_shmget, 0 /*IPC_PRIVATE*/, SHMT_SZ,
+                       CNG_IPC_CREAT | 0600);
+    long p = shm_call(__NR_shmat, id, 0, 0);
+    {
+        int ok = id > 0 && !cng_is_err(p);
+        if (ok)
+            cng_strlcpy((char *)p, "parent-wrote-this", 32);
+        struct cng_shmid64_ds ds;
+        ok = ok && shmt_stat(id, &ds) == 0 && ds.shm_segsz == SHMT_SZ &&
+             ds.shm_nattch == 1 && ds.shm_cpid == self &&
+             (ds.shm_perm.mode & 0777) == 0600;
+        cng_dprintf(1, "shmtest create+attach+stat -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+        if (!ok) { /* nothing below can mean anything without a segment */
+            cng_dprintf(1, "shmtest: %d failure(s)\n", fails + 1);
+            return 1;
+        }
+    }
+
+    /* 2) a fork child inherits the attachment: it must see our store, its own
+     *    store must come back to us, and nattch must count it — then drop it
+     *    again once the child is gone (chroot-ng traps no exit path, so that
+     *    last part is the broker's death reclaim doing its job). */
+    {
+        struct cng_shmid64_ds ds;
+        long kid = shm_call(__NR_clone, 17 /*SIGCHLD*/, 0, 0);
+        if (kid == 0) {
+            int saw = !strcmp((char *)p, "parent-wrote-this");
+            cng_strlcpy((char *)p, saw ? "child-wrote-this" : "child-saw-junk",
+                        32);
+            /* Prove the child's attach is counted while it is alive. */
+            if (shmt_stat(id, &ds) == 0 && ds.shm_nattch != 2)
+                cng_strlcpy((char *)p, "child-nattch-wrong", 32);
+            sys_exit_group(0);
+        }
+        int st = 0;
+        sys_wait4((int)kid, &st, 0, 0);
+        int ok = kid > 0 && !strcmp((char *)p, "child-wrote-this");
+        int reclaimed = shmt_stat(id, &ds) == 0 && ds.shm_nattch == 1;
+        cng_dprintf(1, "shmtest fork share=%d nattch-after-exit=%lu -> %s\n", ok,
+                    (unsigned long)ds.shm_nattch,
+                    ok && reclaimed ? "OK" : "FAIL");
+        fails += !(ok && reclaimed);
+    }
+
+    /* 3) attach-address rules, expressed as mmap flags here: an unaligned
+     *    address is EINVAL, SHM_RND rounds down to SHMLBA (the page size on
+     *    arm64), an occupied range is EINVAL, and SHM_REMAP takes it over. */
+    {
+        long bad = shm_call(__NR_shmat, id, 0x1234, 0);
+        unsigned long hole = shmt_hole(SHMT_SZ);
+        long rnd = shm_call(__NR_shmat, id, (long)(hole + 0x40), CNG_SHM_RND);
+        void *occ = sys_mmap(0, SHMT_SZ, CNG_PROT_READ | CNG_PROT_WRITE,
+                             CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+        long taken = shm_call(__NR_shmat, id, (long)occ, 0);
+        long remap = shm_call(__NR_shmat, id, (long)occ, CNG_SHM_REMAP);
+        int ok = bad == -EINVAL && hole && (unsigned long)rnd == hole &&
+                 taken == -EINVAL && remap == (long)occ &&
+                 !strcmp((char *)remap, "child-wrote-this");
+        cng_dprintf(1, "shmtest attach-addr unaligned/rnd/occupied/remap -> %s\n",
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+        if (!cng_is_err(rnd))
+            shm_call(__NR_shmdt, rnd, 0, 0);
+        if (!cng_is_err(remap))
+            shm_call(__NR_shmdt, remap, 0, 0);
+    }
+
+    /* 4) a read-only attach sees the same memory. */
+    {
+        long ro = shm_call(__NR_shmat, id, 0, CNG_SHM_RDONLY);
+        int ok = !cng_is_err(ro) && !strcmp((char *)ro, "child-wrote-this");
+        cng_dprintf(1, "shmtest rdonly attach -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+        if (!cng_is_err(ro))
+            shm_call(__NR_shmdt, ro, 0, 0);
+    }
+
+    /* 5) detach, remove, and confirm the id is dead. A second shmdt of the same
+     *    address is EINVAL, as it is on a real kernel. */
+    {
+        long d1 = shm_call(__NR_shmdt, p, 0, 0);
+        long d2 = shm_call(__NR_shmdt, p, 0, 0);
+        long rm = shm_call(__NR_shmctl, id, CNG_IPC_RMID, 0);
+        long again = shm_call(__NR_shmat, id, 0, 0);
+        int ok = d1 == 0 && d2 == -EINVAL && rm == 0 && again == -EINVAL;
+        cng_dprintf(1, "shmtest detach+rmid -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 6) keyed lookup: the same key finds the same segment, IPC_EXCL refuses an
+     *    existing one, and a missing key without IPC_CREAT is ENOENT. */
+    {
+        s32 key = (s32)(0x51000000 + (self & 0xffffff));
+        long a = shm_call(__NR_shmget, key, SHMT_SZ, CNG_IPC_CREAT | 0600);
+        long b = shm_call(__NR_shmget, key, SHMT_SZ, 0);
+        long e = shm_call(__NR_shmget, key, SHMT_SZ,
+                          CNG_IPC_CREAT | CNG_IPC_EXCL | 0600);
+        long n = shm_call(__NR_shmget, key + 1, SHMT_SZ, 0);
+        long big = shm_call(__NR_shmget, key, SHMT_SZ * 4, 0);
+        int ok = a > 0 && b == a && e == -EEXIST && n == -ENOENT &&
+                 big == -EINVAL;
+        cng_dprintf(1, "shmtest keyed lookup -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+        if (a > 0)
+            shm_call(__NR_shmctl, a, CNG_IPC_RMID, 0);
+    }
+
+    /* 7) the enumeration path ipcs(1) walks: SHM_INFO for the highest index,
+     *    then SHM_STAT by index until our own segment turns up. */
+    {
+        long id2 = shm_call(__NR_shmget, 0, 12288, CNG_IPC_CREAT | 0600);
+        struct cng_shm_info info;
+        long maxid = shm_call(__NR_shmctl, 0, CNG_SHM_INFO, (long)&info);
+        int found = 0, size_ok = 0, cpid_ok = 0;
+        for (long i = 0; i <= maxid; i++) {
+            struct cng_shmid64_ds ds;
+            long sid = shm_call(__NR_shmctl, i, CNG_SHM_STAT, (long)&ds);
+            if (sid != id2)
+                continue;
+            found = 1;
+            size_ok = ds.shm_segsz == 12288;
+            cpid_ok = ds.shm_cpid == self;
+        }
+        /* IPC_INFO reports the limits, not the segments; ipcs -m -l reads it. */
+        struct cng_shminfo64 li;
+        memset(&li, 0, sizeof li);
+        shm_call(__NR_shmctl, 0, CNG_IPC_INFO, (long)&li);
+        int limits_ok = li.shmmni >= 1 && li.shmseg >= 1 && li.shmmax >= 12288;
+        int ok = id2 > 0 && maxid >= 0 && info.used_ids >= 1 &&
+                 info.shm_tot >= 12288 / pg && found && size_ok && cpid_ok &&
+                 limits_ok;
+        cng_dprintf(1, "shmtest shm_info+shm_stat+ipc_info -> %s\n",
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+        if (id2 > 0)
+            shm_call(__NR_shmctl, id2, CNG_IPC_RMID, 0);
+    }
+
+    /* 8) IPC_SET writes the permission triad back. */
+    {
+        long id3 = shm_call(__NR_shmget, 0, SHMT_SZ, CNG_IPC_CREAT | 0600);
+        struct cng_shmid64_ds ds;
+        memset(&ds, 0, sizeof ds);
+        ds.shm_perm.mode = 0640;
+        ds.shm_perm.uid = (u32)sys_geteuid();
+        ds.shm_perm.gid = (u32)sys_getegid();
+        long set = shm_call(__NR_shmctl, id3, CNG_IPC_SET, (long)&ds);
+        struct cng_shmid64_ds back;
+        int ok = id3 > 0 && set == 0 && shmt_stat(id3, &back) == 0 &&
+                 (back.shm_perm.mode & 0777) == 0640;
+        cng_dprintf(1, "shmtest ipc_set -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+        if (id3 > 0)
+            shm_call(__NR_shmctl, id3, CNG_IPC_RMID, 0);
+    }
+
+    /* 9) execve semantics: attaches do not survive it. cng_shm_detach_all is
+     *    what the emulated execve calls at its commit point. */
+    {
+        long id4 = shm_call(__NR_shmget, 0, SHMT_SZ, CNG_IPC_CREAT | 0600);
+        long a1 = shm_call(__NR_shmat, id4, 0, 0);
+        long a2 = shm_call(__NR_shmat, id4, 0, 0);
+        struct cng_shmid64_ds ds;
+        int before = shmt_stat(id4, &ds) == 0 && ds.shm_nattch == 2;
+        cng_shm_detach_all();
+        int after = shmt_stat(id4, &ds) == 0 && ds.shm_nattch == 0;
+        /* The mappings are gone too, not just the accounting: both ranges must
+         * now be free, which MAP_FIXED_NOREPLACE reports by handing back the
+         * very address we asked for. */
+        int unmapped = 1;
+        for (int k = 0; k < 2; k++) {
+            long a = k ? a2 : a1;
+            void *m = sys_mmap((void *)a, SHMT_SZ, CNG_PROT_READ,
+                               CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS |
+                                   CNG_MAP_FIXED_NOREPLACE,
+                               -1, 0);
+            if (cng_is_err((long)m) || (long)m != a)
+                unmapped = 0;
+            if (!cng_is_err((long)m))
+                sys_munmap(m, SHMT_SZ);
+        }
+        int ok = id4 > 0 && !cng_is_err(a1) && !cng_is_err(a2) && before &&
+                 after && unmapped;
+        cng_dprintf(1, "shmtest execve detach-all -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+        if (id4 > 0)
+            shm_call(__NR_shmctl, id4, CNG_IPC_RMID, 0);
+    }
+
+    /* 10) a bad shmid, a zero size and an unknown command are refused. */
+    {
+        int ok = shm_call(__NR_shmat, 999999, 0, 0) == -EINVAL &&
+                 shm_call(__NR_shmctl, 999999, CNG_IPC_STAT, 0) == -EINVAL &&
+                 shm_call(__NR_shmget, 0, 0, CNG_IPC_CREAT | 0600) == -EINVAL &&
+                 shm_call(__NR_shmdt, 0, 0, 0) == -EINVAL;
+        cng_dprintf(1, "shmtest error cases -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    cng_dprintf(1, "shmtest: %d failure(s)\n", fails);
     return fails ? 1 : 0;
 }

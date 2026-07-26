@@ -12,6 +12,7 @@
 #include "cng/procfs.h"
 #include "cng/procreg.h"
 #include "cng/rt.h"
+#include "cng/shm.h"
 #include "cng/syscall.h"
 #include "cng/uapi.h"
 
@@ -1064,6 +1065,31 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         long r = cng_syscall6(flags, a1, a2, a3, a4, a5, __NR_clone);
         if (r > 0)
             cng_procreg_fork((int)r);
+        else if (r == 0)
+            cng_shm_fork_child(); /* the child inherited our shm attaches */
+        return r;
+    }
+
+    /* System V shared memory. Android's seccomp filter denies all four
+     * outright, so they are served from the broker instead of the host kernel
+     * — see shm.c. Trapped unconditionally (seccomp.c), so the guest gets one
+     * shm namespace whatever the host's own SysV IPC would have allowed. */
+#ifdef __NR_shmget
+    case __NR_shmget:
+#endif
+#ifdef __NR_shmat
+    case __NR_shmat:
+#endif
+#ifdef __NR_shmdt
+    case __NR_shmdt:
+#endif
+#ifdef __NR_shmctl
+    case __NR_shmctl:
+#endif
+    {
+        long r = cng_shm_handle(nr, a0, a1, a2);
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] sysv-shm nr=%ld -> %ld\n", nr, r);
         return r;
     }
 

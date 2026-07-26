@@ -47,6 +47,7 @@ int cng_cmd_clonetest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_clonestktest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv);
+int cng_cmd_shmtest(int argc, char **argv, char **envp, unsigned long *auxv);
 
 /* Internal self-tests, exposed via `-t/--test NAME`. Hidden from --help; the
  * argument that would be a <rootfs> can never begin with '-', so there is no
@@ -66,6 +67,7 @@ static const struct test_entry g_tests[] = {
     {"stackswtest", cng_cmd_stackswtest}, {"clonetest", cng_cmd_clonetest},
     {"clonestktest", cng_cmd_clonestktest},
     {"proctest", cng_cmd_proctest},   {"bpftest", cng_cmd_bpftest},
+    {"shmtest", cng_cmd_shmtest},
 };
 
 static int dispatch_test(const char *name, int argc, char **argv, char **envp,
@@ -349,7 +351,9 @@ static void help(char **envp) {
                       "daemon (an anonymous memfd over an abstract socket) "
                       "that exits by itself once the last guest is gone; "
                       "without this flag each invocation has its own view and "
-                      "hides the others' processes."},
+                      "hides the others' processes. The same daemon serves the "
+                      "System V shared-memory namespace, so this widens that "
+                      "from per-invocation to per-rootfs as well."},
         {"-L, --lib-prefix DIR", "Resolve the ELF interpreter under DIR instead "
                       "of through the rootfs/bind map (test aid). On real "
                       "hardware the interpreter and libraries resolve through "

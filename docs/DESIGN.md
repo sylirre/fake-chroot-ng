@@ -75,6 +75,21 @@ record of *our* invocation, so this is a correctness requirement, not polish.
 See `src/monitor/procfs.c` (synthesis) and `src/monitor/procreg.c` (the
 fork-inherited registry that tells a guest pid from a host one).
 
+### Shared component 3 — the IPC broker
+
+A detached per-namespace daemon (`src/monitor/broker.c`) that owns shared state
+no guest process can hold itself, because **host fd == guest fd** here: anything
+we keep open is visible to — and closable by — the guest. It serves two things
+over one abstract-socket rendezvous: the `--shared-proc` PID table (as a memfd),
+and the **System V shared-memory** registry, whose segments Android leaves us no
+choice but to emulate (`shmget`/`shmat`/`shmdt`/`shmctl` are all denied, and
+there is no writable tmpfs for `/dev/shm`). Each segment is an anonymous memfd
+the daemon holds and hands to attachers over `SCM_RIGHTS`; `shmat` maps it
+`MAP_SHARED` — into our own address space, which is also the guest's — and
+closes the fd immediately, so a process holds a segment only as a mapping. The
+daemon uses those registries as its own liveness signal and exits once nothing
+is left, leaving no file and no socket name. See `src/monitor/shm.c`.
+
 ### Interception mechanism — tiered, auto-selected
 
 | Tier | Mechanism | Min kernel | Notes |

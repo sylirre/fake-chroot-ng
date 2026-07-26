@@ -17,6 +17,7 @@
 #include "cng/path.h"
 #include "cng/procfs.h"
 #include "cng/rt.h"
+#include "cng/shm.h"
 #include "cng/syscall.h"
 #include "cng/uapi.h"
 #include "cng/ucontext.h"
@@ -267,6 +268,10 @@ static long execve_core(int dirfd, const char *path, char **argv, char **envp,
      * before entering the new program. */
     cng_close_cloexec();
     cng_reset_signals();
+    /* System V shm attaches do not survive execve. A real one tears down the
+     * address space; ours keeps it, so the mappings have to go explicitly (and
+     * the broker's nattch with them). */
+    cng_shm_detach_all();
 
     /* setuid/setgid-on-exec against the fake credential set (--setuid-root /
      * --setgid-root): `host` is the ELF the kernel would honor the set-id bit on

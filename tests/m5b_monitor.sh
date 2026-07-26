@@ -109,3 +109,5 @@ check_contains "an fd arg with a dirty upper half is judged on its low word" \
     "$out"
 check_contains "a foreign architecture is killed" \
     "bpftest foreign arch killed -> OK" "$out"
+check_contains "the System V shm syscalls trap (M12 emulation)" \
+    "bpftest shmat traps: TRAP -> OK" "$out"

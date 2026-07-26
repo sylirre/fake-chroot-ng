@@ -8,6 +8,7 @@
 #include "cng/loader.h"
 #include "cng/monitor.h"
 #include "cng/rt.h"
+#include "cng/shm.h"
 #include "cng/syscall.h"
 #include "cng/uapi.h"
 #include "cng/ucontext.h"
@@ -146,8 +147,13 @@ void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si) {
                                                          CNG_CLONE_VFORK));
         long ret = cng_syscall6(flags, 0, (long)r[2], (long)r[3], (long)r[4],
                                 (long)r[5], __NR_clone);
-        if (ret == 0 && child_stack)
-            uc->uc_mcontext.sp = child_stack;
+        if (ret == 0) {
+            /* The child inherited both the mappings and the attach list, so
+             * the broker must count those attaches again (shm.c). */
+            cng_shm_fork_child();
+            if (child_stack)
+                uc->uc_mcontext.sp = child_stack;
+        }
         r[0] = (unsigned long long)ret;
         return;
     }
