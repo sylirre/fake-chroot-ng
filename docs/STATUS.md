@@ -776,6 +776,59 @@ vfork/`posix_spawn` child-stack handling.
     trade already made for `/proc`, and for the same reason — apk chroots before
     every package script, and those scripts need `/dev/null`.
 
+- [x] **M15 — AF_UNIX address containment**
+  A pathname socket carries a filesystem path in `sun_path`, and **no socket
+  syscall was trapped**, so it got no containment at all. A guest
+  `bind("/run/foo.sock")` created the inode on the **host**;
+  `connect("/run/dbus/system_bus_socket")` reached the **host** daemon with the
+  guest's real credentials; and every readback handed back a raw host path, which
+  both leaks where the rootfs lives and breaks any program that compares the
+  readback against what it bound. Of the gaps this audit turned up, this was the
+  only outright containment escape among the ones the user named.
+  - **In** (`bind`/`connect`/`sendto`/`sendmsg`): `cng_sun_in` resolves `sun_path`
+    through the rootfs/bind map into its own buffer, so the guest's address is
+    never written. `bind` keeps the final component literal — it is the name being
+    created — while `connect`/`sendto` follow it. `sendmsg` copies the 56-byte
+    `msghdr` to swap `msg_name`, leaving the guest's struct alone.
+  - **The 108-byte problem.** `sun_path` is fixed at 108 bytes and the rootfs
+    prefix frequently overflows it. The socket is then bound relative to an
+    `O_DIRECTORY` handle on its parent — `/proc/self/fd/<n>/<basename>` — so only
+    the basename has to fit. The fd is closed by `cng_sun_done` *after* the
+    syscall, since the kernel resolves through it.
+  - **Out** (`getsockname`/`getpeername`/`accept`/`accept4`/`recvfrom`/`recvmsg`):
+    `cng_sun_out` maps the host path back to guest spelling in place and rewrites
+    the in/out `addrlen`.
+  - **Abstract names** have no filesystem node, so the rootfs prefix cannot scope
+    them and an unprivileged process cannot be handed its own netns. A short
+    per-rootfs tag (`\x01cng<hash8>`, keyed by `cng_broker_key_hash` — the same
+    primitive broker.c already used for its own rendezvous) is spliced in after
+    the leading NUL and stripped on readback. Without it, two invocations over
+    different rootfs collide on one name (two guest X or D-Bus daemons fighting
+    over `@/tmp/.X11-unix/X0`) and a guest can reach host abstract services.
+    `--share-abstract-sockets` opts out. A name too long to carry the tag, and an
+    unnamed/autobind address, pass through untagged.
+  - **`SO_PEERCRED`** is remapped under `--fake-id` (`getsockopt` joins the
+    credential set): the kernel reports the real invoking uid for the peer, while
+    the guest's own `getuid()` reports the fake id, so a daemon doing a peer-uid
+    ACL check — tmux, polkit, gpg-agent, ssh-agent — rejected its own client. The
+    pid is deliberately left alone; guest pid == host pid here.
+  - `CNG_SECCOMP_MAX_INSNS` 128 → 256 for the ten new entries (filter is 89
+    instructions; the kernel's own limit is 4096).
+  - Tests (`tests/m15_unixsock.sh`, guest `tests/guests/uxsock.c`) lean on facts
+    that make them self-proving rather than tautological: the host `/run` is
+    root-owned and unwritable, so `bind: ok` there is only reachable *through* the
+    rootfs (the pre-fix binary answers `Permission denied` — verified), and the
+    readback is asserted to contain no host path. For abstract names the tag is
+    read back out of the **host's** `/proc/net/unix` (proving it is on the wire
+    while the guest still sees a bare `@name`), two different rootfs are shown
+    taking the same name, and `--share-abstract-sockets` is the control that makes
+    them collide — so the isolation cannot pass by luck. An over-long rootfs path
+    exercises the `/proc/self/fd` fallback.
+  - Not covered, deliberately: `sendmmsg`/`recvmmsg` are left native. They are
+    array forms whose per-message addresses would need the same treatment; no
+    guest we run uses them with pathname addresses, and trapping them costs two
+    more filter entries plus a loop over guest memory. Noted rather than hidden.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

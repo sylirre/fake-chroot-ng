@@ -39,6 +39,9 @@ static const int probe_set[] = {
 #endif
     __NR_setxattr,   __NR_lsetxattr,  __NR_getxattr,   __NR_lgetxattr,
     __NR_listxattr,  __NR_llistxattr, __NR_removexattr, __NR_lremovexattr,
+    __NR_bind,       __NR_connect,    __NR_sendto,     __NR_sendmsg,
+    __NR_getsockname, __NR_getpeername, __NR_accept,   __NR_accept4,
+    __NR_recvfrom,   __NR_recvmsg,
 };
 #define NPROBE ((int)(sizeof probe_set / sizeof probe_set[0]))
 

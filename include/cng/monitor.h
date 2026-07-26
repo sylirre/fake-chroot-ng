@@ -199,7 +199,10 @@ int cng_install_seccomp(void);
 
 /* Upper bound on the filter's instruction count: prologue + clone block +
  * synthesized-fd block + one check per trapped syscall + the two tail RETs. */
-#define CNG_SECCOMP_MAX_INSNS 128
+/* Raised from 128 for the AF_UNIX and credential additions. The kernel's own
+ * limit is 4096 instructions, so there is ample headroom; the tail's per-syscall
+ * jump offset is a u8, which stays valid while the trapped set is under 255. */
+#define CNG_SECCOMP_MAX_INSNS 256
 
 /* Emit the filter into `f` (which must hold CNG_SECCOMP_MAX_INSNS entries) and
  * return its length, or -1 if the buffer is too small. Split out of the install

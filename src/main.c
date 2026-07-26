@@ -23,6 +23,7 @@
 #include "cng/rt.h"
 #include "cng/syscall.h"
 #include "cng/uapi.h"
+#include "cng/unixsock.h"
 
 
 /* --- the run + probe + self-test entry points (own translation units) ----- */
@@ -340,6 +341,14 @@ static void help(char **envp) {
         {"-F, --file-backed", "Force file-backed segment mapping. Auto-selected "
                       "when anonymous executable memory is denied (Android "
                       "no-new-privs / execmem); this forces it unconditionally."},
+        {"    --share-abstract-sockets", "Do not isolate abstract-namespace "
+                      "AF_UNIX sockets per rootfs; share the host's global "
+                      "abstract namespace. By default a short per-rootfs tag is "
+                      "spliced into abstract names (and stripped on readback), "
+                      "so same-rootfs guests still rendezvous while the host and "
+                      "other rootfs instances stay separate — abstract names have "
+                      "no filesystem node, so the rootfs prefix cannot scope them "
+                      "and we cannot give the guest its own network namespace."},
         {"    --no-dev", "Disable the /dev device-node passthrough. By default "
                       "a fixed whitelist of harmless host devices (null, zero, "
                       "full, random, urandom, tty, ptmx, console, pts/*, shm/*, "
@@ -633,6 +642,9 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
             } else if (!strcmp(n, "no-dev")) {
                 if (val) return err_noval(arg);
                 cng_g_no_dev = 1;
+            } else if (!strcmp(n, "share-abstract-sockets")) {
+                if (val) return err_noval(arg);
+                cng_g_share_abstract = 1;
             } else if (!strcmp(n, "shared-proc")) {
                 if (val) return err_noval(arg);
                 cng_g_shared_proc = 1;

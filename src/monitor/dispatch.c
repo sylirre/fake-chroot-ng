@@ -11,6 +11,7 @@
 #include "cng/path.h"
 #include "cng/procfs.h"
 #include "cng/procreg.h"
+#include "cng/unixsock.h"
 #include "cng/rt.h"
 #include "cng/shm.h"
 #include "cng/syscall.h"
@@ -1569,6 +1570,102 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     }
 
     /* path = a0 */
+    /* AF_UNIX addresses. A pathname socket's sun_path is a filesystem path and
+     * gets the same containment as any other: translated on the way out, mapped
+     * back to guest spelling on the way in. bind() keeps the final component
+     * literal (it is the name being created); connect/sendto follow it. The
+     * translated address lives in our own buffer, so the guest's is untouched. */
+    case __NR_bind:
+    case __NR_connect:
+    case __NR_sendto: {
+        int is_send = (nr == __NR_sendto);
+        long aa = is_send ? a4 : a1;   /* sockaddr */
+        long al = is_send ? a5 : a2;   /* addrlen */
+        struct cng_sun_xlate x;
+        long r;
+        if (cng_sun_in(&x, (const void *)aa, al, nr != __NR_bind)) {
+            if (is_send)
+                r = reissue(a0, a1, a2, a3, (long)x.buf, x.len, nr);
+            else
+                r = reissue(a0, (long)x.buf, x.len, a3, a4, a5, nr);
+        } else {
+            r = reissue(a0, a1, a2, a3, a4, a5, nr);
+        }
+        cng_sun_done(&x); /* after the syscall: the kernel walked the dirfd */
+        return r;
+    }
+
+    /* sendmsg: the address hangs off msg_name in the msghdr, so the header is
+     * copied to swap that pointer — the guest's own struct is never written. */
+    case __NR_sendmsg: {
+        struct cng_sun_xlate x;
+        char mh[56];
+        long r;
+        if (a1 && cng_sun_in(&x, *(void **)(char *)a1,
+                             (long)*(unsigned *)((char *)a1 + 8), 1)) {
+            memcpy(mh, (const void *)a1, sizeof mh);
+            *(void **)mh = x.buf;
+            *(unsigned *)(mh + 8) = (unsigned)x.len;
+            r = reissue(a0, (long)mh, a2, a3, a4, a5, nr);
+        } else {
+            r = reissue(a0, a1, a2, a3, a4, a5, nr);
+        }
+        cng_sun_done(&x);
+        return r;
+    }
+
+    /* The readback side. The kernel writes a HOST sun_path here; handing that to
+     * the guest leaks where the rootfs lives and breaks any program comparing it
+     * against what it bound. addrlen is an in/out pointer, so it is rewritten
+     * with the shortened length. */
+    case __NR_getsockname:
+    case __NR_getpeername:
+    case __NR_accept:
+    case __NR_accept4:
+    case __NR_recvfrom: {
+        long aa = (nr == __NR_recvfrom) ? a4 : a1;
+        long alp = (nr == __NR_recvfrom) ? a5 : a2;
+        long r = reissue(a0, a1, a2, a3, a4, a5, nr);
+        if (r >= 0 && aa && alp) {
+            long got = (long)*(unsigned *)alp;
+            cng_sun_out((void *)aa, &got);
+            *(unsigned *)alp = (unsigned)got;
+        }
+        return r;
+    }
+
+    case __NR_recvmsg: {
+        long r = reissue(a0, a1, a2, a3, a4, a5, nr);
+        if (r >= 0 && a1) {
+            void *name = *(void **)(char *)a1;
+            unsigned *nlp = (unsigned *)((char *)a1 + 8);
+            if (name && *nlp) {
+                long got = (long)*nlp;
+                cng_sun_out(name, &got);
+                *nlp = (unsigned)got;
+            }
+        }
+        return r;
+    }
+
+    /* getsockopt(SOL_SOCKET, SO_PEERCRED): the kernel reports the real invoking
+     * uid/gid for the peer, but a guest daemon compares it against its own
+     * getuid(), which under --fake-id is the fake identity. Remap the pair
+     * through the same rule stat uses. The pid is deliberately left alone: guest
+     * pid == host pid here, so it is already correct. Trapped only under
+     * --fake-id. */
+    case __NR_getsockopt: {
+        long r = reissue(a0, a1, a2, a3, a4, a5, nr);
+        if (r == 0 && cng_g_fake_id && a1 == CNG_SOL_SOCKET &&
+            a2 == CNG_SO_PEERCRED && a3 && a4 &&
+            *(unsigned *)a4 >= 12) { /* struct ucred: pid,uid,gid */
+            unsigned *uc = (unsigned *)a3;
+            uc[1] = cng_remap_uid(uc[1]);
+            uc[2] = cng_remap_gid(uc[2]);
+        }
+        return r;
+    }
+
     /* Extended attributes: the path is a0 and there is no dirfd, so this is a
      * plain translate + reissue. The "l" forms do not follow a final symlink;
      * the setters and removers mutate, so a :ro bind refuses them. */

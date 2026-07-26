@@ -49,7 +49,8 @@ Common options: `-u/--fake-id[=ID]` (fake user identity — `ID` is a `uid` or
 `uid:gid`, defaulting to `0:0` root), `-b/--bind SRC:DST[:ro]` (expose host
 directory SRC at guest path DST, read-only with `:ro`), `-l/--link2symlink` (emulate hardlinks where the host refuses `link(2)`),
 `-R/--rewrite` (ahead-of-time `svc` rewriting), `--no-proc` (turn off the `/proc`
-emulation described below), `--no-dev` (turn off the `/dev` passthrough), `--shared-proc` (share the process view between
+emulation described below), `--no-dev` (turn off the `/dev` passthrough),
+`--share-abstract-sockets` (don't isolate abstract AF_UNIX names per rootfs), `--shared-proc` (share the process view between
 independent invocations of the same rootfs, for both the process view and the
 System V shm namespace).
 
@@ -78,6 +79,17 @@ entry behind them, `getdents64` splices them into listings — otherwise `ls /de
 shows nothing while `/dev/null` opens fine, and a bind destination stays
 invisible to anything that enumerates before opening. `--no-dev` turns the zone
 off.
+
+**AF_UNIX sockets** are contained like any other path. A pathname socket carries
+a filesystem path in `sun_path`, so `bind`/`connect`/`sendto`/`sendmsg` translate
+it into the rootfs and `getsockname`/`getpeername`/`accept`/`recvfrom`/`recvmsg`
+strip the prefix back off, so the guest never sees where its rootfs lives and a
+program comparing the readback against what it bound still agrees. Where the
+rootfs prefix pushes the name past `sun_path`'s 108 bytes, the socket is bound
+relative to a `/proc/self/fd` directory handle instead, so only the basename has
+to fit. Abstract names have no filesystem node to contain, so they are isolated
+per rootfs by a short spliced tag (invisible to the guest, stripped on readback);
+`--share-abstract-sockets` opts out into the host's global namespace.
 
 **System V shared memory** works too. Android denies `shmget`/`shmat`/`shmdt`/
 `shmctl` outright, so chroot-ng serves them itself: the same broker daemon owns

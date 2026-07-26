@@ -65,6 +65,7 @@ if [ -f tests/m10_l2s_shell.sh ]; then . tests/m10_l2s_shell.sh; fi
 if [ -f tests/m11_proc.sh ]; then . tests/m11_proc.sh; fi
 if [ -f tests/m12_shm.sh ]; then . tests/m12_shm.sh; fi
 if [ -f tests/m14_dev.sh ]; then . tests/m14_dev.sh; fi
+if [ -f tests/m15_unixsock.sh ]; then . tests/m15_unixsock.sh; fi
 
 echo
 echo "== summary: $pass passed, $fail failed =="

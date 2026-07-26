@@ -45,6 +45,14 @@ static const int path_syscalls[] = {
      * setters and removers *write* the host filesystem. */
     __NR_setxattr,    __NR_lsetxattr,    __NR_getxattr,    __NR_lgetxattr,
     __NR_listxattr,   __NR_llistxattr,   __NR_removexattr, __NR_lremovexattr,
+    /* AF_UNIX addresses. A pathname socket carries a filesystem path in
+     * sun_path, so it needs the same containment as any other path: without
+     * these a guest bind("/run/foo.sock") created the inode on the HOST and
+     * connect() reached host daemons. The readback calls are here to strip the
+     * rootfs prefix back off, so the guest never sees where its rootfs lives. */
+    __NR_bind,        __NR_connect,      __NR_sendto,      __NR_sendmsg,
+    __NR_getsockname, __NR_getpeername,  __NR_accept,      __NR_accept4,
+    __NR_recvfrom,    __NR_recvmsg,
 };
 
 #define NPATH ((int)(sizeof(path_syscalls) / sizeof(path_syscalls[0])))
@@ -58,6 +66,10 @@ static const int id_syscalls[] = {
     __NR_setgid,    __NR_setresuid, __NR_setresgid, __NR_setreuid,
     __NR_setregid,  __NR_setgroups, __NR_setfsuid,  __NR_setfsgid,
     __NR_fchown,    __NR_capget,    __NR_capset,
+    /* SO_PEERCRED reports the real invoking uid, and ps/tmux/polkit-style peer
+     * checks compare it against getuid() — which under --fake-id is the fake id.
+     * A guest daemon would reject its own client on the mismatch. */
+    __NR_getsockopt,
 };
 #define NID ((int)(sizeof(id_syscalls) / sizeof(id_syscalls[0])))
 
