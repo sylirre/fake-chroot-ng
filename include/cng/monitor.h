@@ -209,6 +209,12 @@ int cng_install_seccomp(void);
 struct sock_filter;
 int cng_build_seccomp(struct sock_filter *f, int cap);
 
+/* 1 if `nr` is in the designed-ENOSYS set: a syscall we must refuse because it
+ * reaches the filesystem by a route the path traps cannot see (io_uring's SQE
+ * ring, above all). The seccomp filter answers these with RET_ERRNO on its own;
+ * this is for the -R trampoline tier, which runs with no filter at all. */
+int cng_denied_syscall(long nr);
+
 /* Point the dispatcher at fs, install the SIGSYS handler, then the filter.
  * Returns 0 on success or a negative errno (e.g. under qemu, where guest
  * seccomp filters are inert). */

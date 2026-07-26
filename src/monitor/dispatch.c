@@ -767,6 +767,15 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         }
     }
 
+    /* The designed-ENOSYS set. The filter answers these with RET_ERRNO, so a
+     * seccomp-tier guest never gets here; a rewritten svc site (-R) has no
+     * filter and calls straight in, so the refusal has to live here too. */
+    if (cng_denied_syscall(nr)) {
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] nr=%ld denied (designed ENOSYS)\n", nr);
+        return -ENOSYS;
+    }
+
     switch (nr) {
     /* Simple translate + reissue: dirfd = a0, path = a1. */
     case __NR_openat:

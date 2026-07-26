@@ -149,3 +149,11 @@ check_contains "a foreign architecture is killed" \
     "bpftest foreign arch killed -> OK" "$out"
 check_contains "the System V shm syscalls trap (M12 emulation)" \
     "bpftest shmat traps: TRAP -> OK" "$out"
+# io_uring submits path operations through a ring, never an svc, so a created
+# ring reaches the host filesystem with no trap and no translation. The filter
+# must refuse it outright -- including from inside the gate, which exempts our
+# own re-issues but must not become a hole for a call we never make.
+check_contains "io_uring is refused ENOSYS by the filter" \
+    "bpftest io_uring_setup is refused ENOSYS: ERRNO -> OK" "$out"
+check_contains "io_uring is refused even from inside the gate" \
+    "bpftest in-gate io_uring is refused too: ERRNO -> OK" "$out"

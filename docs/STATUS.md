@@ -659,6 +659,28 @@ vfork/`posix_spawn` child-stack handling.
     binary reads it, verified), a `..` run inside still reaches the real file,
     and an absolute symlink re-roots. 230/230.
 
+- [x] **io_uring refused (the one bypass no path trap can see)**
+  `io_uring` submits its operations by writing SQEs into a shared ring, not by a
+  syscall per operation, so `IORING_OP_OPENAT`/`STATX`/`RENAMEAT`/`UNLINKAT`/
+  `LINKAT`/`MKDIRAT` never execute an `svc`. Nothing traps, nothing translates,
+  and a guest linked against liburing (recent Node, Tokio, fio) addresses the
+  **host** filesystem directly. Unlike every other gap this is not a missing
+  translation — there is no interception point to add — so the ring must not be
+  created at all. arm64chroot reaches the same conclusion by `-ENOSYS`.
+  - New **designed-ENOSYS set** (`enosys_syscalls[]`, arm64chroot's
+    `quiet_enosys`): the one piece of policy chroot-ng needs that is not
+    translation. Answered with `SECCOMP_RET_ERRNO`, so the kernel refuses them
+    itself — no signal, no handler, and it holds where nested SIGSYS delivery
+    does not. liburing has a documented non-ring fallback for exactly this.
+  - The block sits **ahead of the gate allowlist**. The gate exists so our own
+    re-issued syscalls are not re-trapped, but we never issue `io_uring`, so
+    exempting it by instruction pointer would only leave a hole. `-t bpftest`
+    asserts both: an in-gate `io_uring_setup` is still ERRNO while an in-gate
+    `openat` re-issue is still ALLOW.
+  - `cng_denied_syscall()` gives the **`-R` trampoline tier** the same refusal;
+    a rewritten `svc` site has no filter and calls the dispatcher directly.
+  - Filter is 70 of 128 instructions. 232/232.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

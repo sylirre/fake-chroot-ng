@@ -83,6 +83,44 @@ static const int l2s_syscalls[] = {
 };
 #define NL2S ((int)(sizeof(l2s_syscalls) / sizeof(l2s_syscalls[0])))
 
+/* The designed-ENOSYS set — arm64chroot's `quiet_enosys`, and the one piece of
+ * policy chroot-ng needs that is not translation. These are syscalls a guest
+ * probes and falls back from, which we must refuse rather than let through:
+ * every one of them reaches the filesystem by a route the path traps cannot see,
+ * so allowing it would silently bypass the rootfs.
+ *
+ * io_uring is the whole reason this list exists. Its operations are submitted by
+ * writing SQEs into a shared ring, not by a syscall per operation, so
+ * IORING_OP_OPENAT / STATX / RENAMEAT / UNLINKAT / LINKAT / MKDIRAT never
+ * execute an `svc` and can never be trapped or translated. A guest linked
+ * against liburing would address the host filesystem directly. There is nothing
+ * to intercept, so the ring must not be created at all; liburing and every
+ * runtime that uses it (recent Node, Tokio, fio) has a documented non-ring
+ * fallback for exactly this answer.
+ *
+ * Answered with SECCOMP_RET_ERRNO, so the kernel refuses them itself — no
+ * signal, no handler, and it holds even where nested SIGSYS delivery does not.
+ * cng_denied_syscall() covers the -R trampoline tier, which has no filter. */
+static const int enosys_syscalls[] = {
+#ifdef __NR_io_uring_setup
+    __NR_io_uring_setup,
+#endif
+#ifdef __NR_io_uring_enter
+    __NR_io_uring_enter,
+#endif
+#ifdef __NR_io_uring_register
+    __NR_io_uring_register,
+#endif
+};
+#define NENOSYS ((int)(sizeof(enosys_syscalls) / sizeof(enosys_syscalls[0])))
+
+int cng_denied_syscall(long nr) {
+    for (int i = 0; i < NENOSYS; i++)
+        if (nr == enosys_syscalls[i])
+            return 1;
+    return 0;
+}
+
 int cng_build_seccomp(struct sock_filter *f, int cap) {
     unsigned long gs = (unsigned long)__cng_gate_start;
     unsigned long ge = (unsigned long)__cng_gate_end;
@@ -120,24 +158,45 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
         CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, CNG_AUDIT_ARCH_AARCH64, 1,
         0); /* 1: match->3, else->2 */
     f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
-                                              CNG_SECCOMP_RET_KILL_THREAD); /*2*/
+                                              CNG_SECCOMP_RET_KILL_THREAD);
+
+    /* Designed-ENOSYS set (see enosys_syscalls), refused by the kernel itself.
+     * Deliberately ahead of the gate allowlist: the gate exists so our own
+     * re-issued syscalls are not re-trapped, but we never issue any of these, so
+     * exempting them by instruction pointer would only leave a hole. The last
+     * check's jf skips the RET; earlier ones fall through to the next check. */
+    if (NENOSYS > 0) {
+        f[n++] = (struct sock_filter)CNG_BPF_STMT(
+            CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* A = nr */
+        for (int i = 0; i < NENOSYS; i++)
+            f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+                CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K,
+                (uint32_t)enosys_syscalls[i], (uint8_t)(NENOSYS - 1 - i),
+                (uint8_t)(i == NENOSYS - 1 ? 1 : 0));
+        f[n++] = (struct sock_filter)CNG_BPF_STMT(
+            CNG_BPF_RET | CNG_BPF_K,
+            CNG_SECCOMP_RET_ERRNO | (ENOSYS & CNG_SECCOMP_RET_DATA));
+    }
+
+    /* Gate allowlist: a syscall issued from inside our own gate is a re-issue
+     * from the handler and must not trap again. Offsets below are relative, so
+     * "-> nr" means the A = nr load that follows this block. */
     f[n++] = (struct sock_filter)CNG_BPF_STMT(
-        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_IP + 4); /* 3: ip high */
+        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_IP + 4); /* ip high */
     f[n++] = (struct sock_filter)CNG_BPF_JUMP(
-        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, gate_hi, 0,
-        4); /* 4: match->5, else->nr(9) */
+        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, gate_hi, 0, 4); /* else -> nr */
     f[n++] = (struct sock_filter)CNG_BPF_STMT(
-        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_IP); /* 5: ip low */
+        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_IP); /* ip low */
     f[n++] = (struct sock_filter)CNG_BPF_JUMP(
         CNG_BPF_JMP | CNG_BPF_JGE | CNG_BPF_K, gate_lo, 0,
-        2); /* 6: >=lo ->7, else->nr(9) */
+        2); /* >=lo ? -> next : nr */
     f[n++] = (struct sock_filter)CNG_BPF_JUMP(
         CNG_BPF_JMP | CNG_BPF_JGE | CNG_BPF_K, gate_end_lo, 1,
-        0); /* 7: >=end ->nr(9), else->8 */
+        0); /* >=end ? -> nr : in-gate */
     f[n++] = (struct sock_filter)CNG_BPF_STMT(
-        CNG_BPF_RET | CNG_BPF_K, CNG_SECCOMP_RET_ALLOW); /* 8: in-gate allow */
+        CNG_BPF_RET | CNG_BPF_K, CNG_SECCOMP_RET_ALLOW); /* in-gate allow */
     f[n++] = (struct sock_filter)CNG_BPF_STMT(
-        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* 9: A = nr */
+        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* A = nr */
 
     /* clone: trap process creation, let thread creation run natively.
      *  - without CLONE_VM the clone makes a new process, and the parent must

@@ -2292,6 +2292,27 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
         {"shmat traps", __NR_shmat, 0x1000, 0, CNG_SECCOMP_RET_TRAP},
         {"shmdt traps", __NR_shmdt, 0x1000, 0, CNG_SECCOMP_RET_TRAP},
         {"shmctl traps", __NR_shmctl, 0x1000, 0, CNG_SECCOMP_RET_TRAP},
+        /* Designed-ENOSYS: io_uring must be refused by the filter itself. Its
+         * ring operations never execute an svc, so a created ring would reach
+         * the host filesystem with no trap and no translation. */
+#ifdef __NR_io_uring_setup
+        {"io_uring_setup is refused ENOSYS", __NR_io_uring_setup, 0x1000, 0,
+         CNG_SECCOMP_RET_ERRNO | 38 /*ENOSYS*/},
+#endif
+#ifdef __NR_io_uring_enter
+        {"io_uring_enter is refused ENOSYS", __NR_io_uring_enter, 0x1000, 0,
+         CNG_SECCOMP_RET_ERRNO | 38},
+#endif
+#ifdef __NR_io_uring_register
+        {"io_uring_register is refused ENOSYS", __NR_io_uring_register, 0x1000,
+         0, CNG_SECCOMP_RET_ERRNO | 38},
+#endif
+        /* ...including from inside the gate. The gate exempts our own
+         * re-issues, but we never issue io_uring, so it must not be a hole. */
+#ifdef __NR_io_uring_setup
+        {"in-gate io_uring is refused too", __NR_io_uring_setup, gate, 0,
+         CNG_SECCOMP_RET_ERRNO | 38},
+#endif
     };
     for (unsigned k = 0; k < sizeof cases / sizeof cases[0]; k++) {
         u32 d[16];
@@ -2303,6 +2324,7 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
                     bad             ? "malformed"
                     : got == CNG_SECCOMP_RET_TRAP ? "TRAP"
                     : got == CNG_SECCOMP_RET_ALLOW ? "ALLOW"
+                    : (got & 0xffff0000U) == CNG_SECCOMP_RET_ERRNO ? "ERRNO"
                                                    : "other",
                     ok ? "OK" : "FAIL");
         fails += !ok;
