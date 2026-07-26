@@ -121,12 +121,12 @@ if [ "$m11_ready" -eq 1 ]; then
     check_contains "a host pid stays unreachable under a /proc bind" \
         "hidden" "$got"
 
-    # An explicit -b /proc:DIR pointing somewhere else is the user overriding
+    # An explicit -b DIR:/proc pointing somewhere else is the user overriding
     # the host view, and must outrank both the passthrough and the synthesis.
     BP=$(mktemp -d); printf 'bound\n' > "$BP/loadavg"
-    got=$(run -R -b /proc:"$BP" "$M11_ALPINE" /bin/busybox cat /proc/loadavg \
+    got=$(run -R -b "$BP":/proc "$M11_ALPINE" /bin/busybox cat /proc/loadavg \
         2>/dev/null)
-    check_contains "an explicit -b /proc:DIR outranks the synthesis" \
+    check_contains "an explicit -b DIR:/proc outranks the synthesis" \
         "bound" "$got"
     rm -rf "$BP"
 

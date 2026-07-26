@@ -6,7 +6,9 @@
  *   libprefix  resolve the ELF interpreter under this dir (test aid; NULL on
  *              real hardware, where the interpreter and libraries resolve
  *              through the rootfs/bind map + the monitor)
- *   bind_g/h   nb guest->host bind pairs (guest path G backed by host path H)
+ *   bind_g/h/ro  nb bind mounts: guest path bind_g[i] is backed by host path
+ *              bind_h[i], read-only when bind_ro[i] (the CLI spells this
+ *              SRC:DST[:ro], host first)
  *   gargv/gargc  the guest program (gargv[0]) and its arguments
  *
  * The credential/rewrite/loader flags (cng_g_fake_id, cng_g_rewrite,
@@ -54,7 +56,8 @@ static char *join2(char *dst, size_t size, const char *a, const char *b) {
 }
 
 int cng_run(const char *rootfs, const char *libprefix,
-            const char *const *bind_g, const char *const *bind_h, int nb,
+            const char *const *bind_g, const char *const *bind_h,
+            const int *bind_ro, int nb,
             int gargc, char **gargv, char **envp, unsigned long *auxv) {
     const char *prog_guest = gargv[0];
 
@@ -101,7 +104,7 @@ int cng_run(const char *rootfs, const char *libprefix,
     /* Filesystem view. */
     cng_fs_init(&g_fs, rootfs);
     for (int j = 0; j < nb; j++)
-        cng_fs_add_bind(&g_fs, bind_g[j], bind_h[j]);
+        cng_fs_add_bind(&g_fs, bind_g[j], bind_h[j], bind_ro[j]);
     /* Initial guest cwd. With a real rootfs, default to "/" (never leak the host
      * launch dir) and chdir the real process into the rootfs so untranslated
      * relative access stays contained; a -w option can override later. With an

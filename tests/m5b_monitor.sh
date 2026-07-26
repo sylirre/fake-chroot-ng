@@ -43,6 +43,23 @@ check "debug logging survives a scalar syscall arg" 0 "$rc"
 check_contains "debug logging still reports the real error" \
     "dbgpath: survived rc=-21 -> OK" "$out"
 
+# A ":ro" bind must answer EROFS for every mutating path syscall while still
+# serving reads. The rw run is the negative control: the same calls must NOT
+# report EROFS there, so a blanket refusal cannot pass both legs.
+RB=$(mktemp -d); printf 'RO-DATA' > "$RB/f"
+out=$(run -t dtest -r "$ROOT" -b "$RB":/ro:ro robind /ro/f 2>&1); rc=$?
+check ":ro bind refuses every mutating syscall" 0 "$rc"
+check_contains ":ro bind still serves reads" "robind ro read: rc=" "$out"
+check_contains ":ro bind refuses a write open" \
+    "robind ro open-w: rc=-30 -> OK" "$out"
+check_contains ":ro bind refuses unlinkat" \
+    "robind ro unlinkat: rc=-30 -> OK" "$out"
+check_contains ":ro bind refuses rename" \
+    "robind ro renameat: rc=-30 -> OK" "$out"
+out=$(run -t dtest -r "$ROOT" -b "$RB":/rw robind /rw/f 2>&1); rc=$?
+check "a plain (rw) bind reports no EROFS" 0 "$rc"
+rm -rf "$RB"
+
 run -t sigtest >/dev/null 2>&1
 check "signal round-trip + ucontext readable" 0 $?
 check_contains "sigtest handler ran" "handler ran" "$(run -t sigtest 2>&1)"

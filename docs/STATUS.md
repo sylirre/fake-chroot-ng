@@ -418,7 +418,7 @@ vfork/`posix_spawn` child-stack handling.
   The host `/proc` now passes through to the guest automatically (a rootfs
   directory tree has none, and mounting one needs privileges we do not have),
   with two layers on top: a **hidden-process view** and **synthesized files**.
-  Off with `--no-proc`; an explicit `-b /proc:DIR` still wins over the
+  Off with `--no-proc`; an explicit `-b DIR:/proc` still wins over the
   passthrough.
   - **Hidden-process view**, on both sides. A numeric `/proc/<pid>` that is not
     a guest process is redirected to `/proc/0`, which never exists (pid 0 is the
@@ -519,7 +519,7 @@ vfork/`posix_spawn` child-stack handling.
   which on Android is the one being denied; `readlink` of a synthesized fd shows
   `memfd:cng-proc`; `/proc/version` passes through (arm64chroot must keep it in
   step with the kernel identity its `uname` fakes; chroot-ng fakes neither);
-  an explicit `-b /proc:DIR` outranks the synthesis (the user overriding the
+  an explicit `-b DIR:/proc` outranks the synthesis (the user overriding the
   view — arm64chroot keys its synthesis on the guest path, so there it outlives
   a bind); and without `--shared-proc` two separate chroot-ng invocations over
   one rootfs do not share a registry, so each hides the other's processes
@@ -589,6 +589,39 @@ vfork/`posix_spawn` child-stack handling.
     in ten groups including a real fork and a real broker, and
     `tests/guests/shm_key.c` pins the namespace scope, which is the one part
     with no counterpart to diff against.
+
+- [x] **M13 — `-b SRC:DST[:ro]`: oracle-compatible bind syntax + read-only binds**
+  `-b` took `GUEST:HOST`; arm64chroot takes `SRC:DST` — host first. Same flag,
+  same syntax, opposite meaning, and nothing diagnosed a swap. The order is now
+  the oracle's, and `:ro` (which used to be parsed as part of the host path, so
+  `-b /etc:/etc:ro` produced the host path `/etc:ro`) is a real read-only mount.
+  - **Parse** (`add_bind`): first `:` splits SRC from DST, a trailing `:ro`/`:rw`
+    is stripped, DST must be absolute and not `/`, SRC must exist and not be the
+    host root. A missing SRC whose DST *does* exist on the host reports the
+    likely swap (`-b now takes SRC:DST (host path first); did you mean …?`) —
+    the failure is otherwise a bare ENOENT, and the inverted-but-valid case
+    would have been silent. `CNG_VERSION` is 0.1.0 so a hand-copied device build
+    identifies which convention it carries.
+  - **Enforcement.** `struct cng_bind` grew an `ro` bit; `cng_fs_host_ro` matches
+    the bound **host** prefix at a `/` boundary, mirroring the oracle's
+    `host_ro`, so a guest symlink leading into a `:ro` bind is covered however
+    the path got there. `ro_denied()` gates the nine mutating dispatch sites:
+    `openat`/`openat2` (write intent only — non-`O_RDONLY`, or
+    `O_CREAT`/`O_TRUNC`), `mkdirat`, `mknodat`, `unlinkat`, `fchmodat`,
+    `fchownat`, `utimensat`, `symlinkat`, `truncate`, both ends of
+    `renameat`/`renameat2`, and the **destination** end of `linkat` (linking
+    *from* a read-only mount is allowed, as on Linux). The check runs before
+    `chattr_result`, so fake-root does not paper over a read-only mount.
+    `name_to_handle_at` shares the openat case block and never writes, so its
+    a2 (a handle pointer) is never read as open flags.
+  - `/proc/mounts` and `/proc/mountinfo` render a `:ro` bind as `ro,relatime`
+    instead of hardcoding `rw`.
+  - Tests: `-t dtest -b SRC:DST[:ro] robind` drives eleven calls through the
+    real dispatcher and asserts EROFS for the ten mutators while the read
+    succeeds — with the **rw bind as a negative control** in the same harness,
+    so a blanket refusal cannot pass both legs. `m5_xlate` pins that `:ro` is
+    stripped from the mount point rather than folded into the host path. Every
+    `-b` invocation in the suite and the docs moved to the new order. 227/227.
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 

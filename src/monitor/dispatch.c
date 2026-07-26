@@ -66,6 +66,15 @@ static long chattr_result(long r) {
     return r;
 }
 
+/* A mutating syscall whose target lands under a `:ro` bind must answer -EROFS,
+ * the way it would on a real read-only mount. Keyed on the already-resolved
+ * HOST path, so a guest symlink that leads into the bind is covered however the
+ * path got there. Checked before the reissue, and before chattr_result — a
+ * read-only mount is a genuine error that fake-root does not paper over. */
+static int ro_denied(const char *host) {
+    return host && cng_g_fs && cng_fs_host_ro(cng_g_fs, host);
+}
+
 /* One-shot-per-number diagnostic that a syscall was emulated away (blocked by
  * Android's seccomp filter, or a credential change we can't perform). Shared
  * with the SIGSYS gate-net. Async-signal-safe. */
@@ -730,6 +739,24 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 return pr;
         }
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
+        /* :ro bind — mkdirat/mknodat always create; an open only offends with
+         * write intent (non-RDONLY, or O_CREAT/O_TRUNC). name_to_handle_at also
+         * lands here and never writes, so its a2 (a handle pointer) is never
+         * read as flags. */
+        if (ro_denied(p)) {
+            if (nr == __NR_mkdirat || nr == __NR_mknodat)
+                return -EROFS;
+            if (is_open) {
+                long of = a2;
+#ifdef __NR_openat2
+                if (nr == __NR_openat2)
+                    of = a2 ? (long)*(unsigned long *)a2 : 0;
+#endif
+                if ((of & 3) != CNG_O_RDONLY ||
+                    (of & (CNG_O_CREAT | CNG_O_TRUNC)))
+                    return -EROFS;
+            }
+        }
         long r = reissue(a0, (long)p, a2, a3, a4, a5, nr);
         /* O_NOFOLLOW through a real dirfd lands on the l2s symlink and draws
          * ELOOP where a real hardlink would open. Retry on the backing file —
@@ -795,6 +822,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * denies the mode change (a chmod on a file you own still applies for real). */
     case __NR_fchmodat: {
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, 1);
+        if (ro_denied(p))
+            return -EROFS;
         return chattr_result(reissue(a0, (long)p, a2, a3, a4, a5, nr));
     }
 
@@ -811,6 +840,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 dec = 1;
         }
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, 0);
+        if (ro_denied(p))
+            return -EROFS;
         long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_unlinkat);
         if (r == 0 && dec)
             cng_l2s_decref(data, cnt);
@@ -838,6 +869,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         }
         int deref = !((int)a3 & CNG_AT_SYMLINK_NOFOLLOW);
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
+        if (ro_denied(p))
+            return -EROFS;
         long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_utimensat);
         if (cng_fake_root() && (r == -EPERM || r == -EACCES))
             return 0;
@@ -909,6 +942,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         }
         int deref = !((int)a4 & CNG_AT_SYMLINK_NOFOLLOW);
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
+        if (ro_denied(p))
+            return -EROFS;
         return chattr_result(reissue(a0, (long)p, a2, a3, a4, a5, __NR_fchownat));
     }
 
@@ -971,6 +1006,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     /* symlinkat(target, newdirfd, linkpath): translate only the linkpath. */
     case __NR_symlinkat: {
         const char *lp = xlate(a1, (const char *)a2, b2, sizeof b2, 0);
+        if (ro_denied(lp))
+            return -EROFS;
         return reissue(a0, a1, (long)lp, a3, a4, a5, __NR_symlinkat);
     }
 
@@ -1137,6 +1174,10 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_renameat2: {
         const char *op = xlate(a0, (const char *)a1, b1, sizeof b1, 0);
         const char *np = xlate(a2, (const char *)a3, b2, sizeof b2, 0);
+        /* A rename unlinks the old name and creates the new one, so either end
+         * under a :ro bind is EROFS. */
+        if (ro_denied(op) || ro_denied(np))
+            return -EROFS;
         int exch = (nr == __NR_renameat2 && ((int)a4 & CNG_RENAME_EXCHANGE));
         char data[CNG_PATH_MAX], absdata[CNG_PATH_MAX], dsth[CNG_PATH_MAX];
         unsigned long cnt;
@@ -1186,6 +1227,11 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                             a3 ? (const char *)a3 : "(null)");
             return -ENOENT;
         }
+        /* Only the new name is created, so only the destination end matters —
+         * linking *from* a read-only mount is allowed, as on Linux. Checked
+         * after both ends resolve so a bad source still reports ENOENT. */
+        if (ro_denied(dsth))
+            return -EROFS;
         long r;
         if (cng_g_l2s && cng_g_l2s_force)
             r = -EPERM; /* CNG_L2S_FORCE: exercise the fallback directly */
@@ -1237,6 +1283,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_statfs: {
         const char *p =
             xlate(CNG_AT_FDCWD, (const char *)a0, b1, sizeof b1, 1);
+        if (nr == __NR_truncate && ro_denied(p)) /* statfs only reads */
+            return -EROFS;
         return reissue((long)p, a1, a2, a3, a4, a5, nr);
     }
 

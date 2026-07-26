@@ -40,6 +40,7 @@ int cng_cmd_xlate(int argc, char **argv, char **envp, unsigned long *auxv) {
     const char *chroot_to = 0;
     const char *bind_g[CNG_MAX_BINDS];
     const char *bind_h[CNG_MAX_BINDS];
+    int bind_ro[CNG_MAX_BINDS];
     int nb = 0;
     const char *paths[256];
     int np = 0;
@@ -48,12 +49,21 @@ int cng_cmd_xlate(int argc, char **argv, char **envp, unsigned long *auxv) {
         if (!strcmp(argv[i], "-r") && i + 1 < argc) {
             rootfs = argv[++i];
         } else if (!strcmp(argv[i], "-b") && i + 1 < argc) {
+            /* SRC:DST[:ro] — host first, same order as the -b CLI option. */
             char *spec = argv[++i];
             char *c = strchr(spec, ':');
             if (c && nb < CNG_MAX_BINDS) {
                 *c = '\0';
-                bind_g[nb] = spec;
-                bind_h[nb] = c + 1;
+                char *dst = c + 1;
+                int ro = 0;
+                unsigned long dl = strlen(dst);
+                if (dl >= 3 && !strcmp(dst + dl - 3, ":ro")) {
+                    ro = 1;
+                    dst[dl - 3] = '\0';
+                }
+                bind_g[nb] = dst;
+                bind_h[nb] = spec;
+                bind_ro[nb] = ro;
                 nb++;
             }
         } else if (!strcmp(argv[i], "-C") && i + 1 < argc) {
@@ -68,7 +78,7 @@ int cng_cmd_xlate(int argc, char **argv, char **envp, unsigned long *auxv) {
     struct cng_fs fs;
     cng_fs_init(&fs, rootfs);
     for (int i = 0; i < nb; i++)
-        cng_fs_add_bind(&fs, bind_g[i], bind_h[i]);
+        cng_fs_add_bind(&fs, bind_g[i], bind_h[i], bind_ro[i]);
     if (cwd)
         cng_fs_set_cwd(&fs, cwd);
     if (chroot_to) { /* what cng_dispatch does for chroot(2), minus the stat */
@@ -95,23 +105,41 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     (void)envp;
     (void)auxv;
     const char *rootfs = "/";
-    const char *op = 0, *gpath = 0;
+    const char *op = 0, *gpath = 0, *bind_spec = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-r") && i + 1 < argc)
             rootfs = argv[++i];
+        else if (!strcmp(argv[i], "-b") && i + 1 < argc)
+            bind_spec = argv[++i];
         else if (!op)
             op = argv[i];
         else if (!gpath)
             gpath = argv[i];
     }
     if (!op || !gpath) {
-        cng_dprintf(2,
-                    "usage: _dtest -r ROOT (open|access|dbgpath) GUESTPATH\n");
+        cng_dprintf(2, "usage: _dtest -r ROOT [-b SRC:DST[:ro]] "
+                       "(open|access|dbgpath|robind) GUESTPATH\n");
         return 2;
     }
 
     static struct cng_fs fs; /* referenced by dispatcher via cng_g_fs */
     cng_fs_init(&fs, rootfs);
+    if (bind_spec) { /* SRC:DST[:ro] — host first, as the CLI spells it */
+        static char spec[512];
+        cng_strlcpy(spec, bind_spec, sizeof spec);
+        char *c = strchr(spec, ':');
+        if (c) {
+            *c = '\0';
+            char *dst = c + 1;
+            int ro = 0;
+            unsigned long dl = strlen(dst);
+            if (dl >= 3 && !strcmp(dst + dl - 3, ":ro")) {
+                ro = 1;
+                dst[dl - 3] = '\0';
+            }
+            cng_fs_add_bind(&fs, dst, spec, ro);
+        }
+    }
     cng_g_fs = &fs;
 
     if (!strcmp(op, "open")) {
@@ -151,6 +179,59 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
                               0, /*trapped=*/0);
         cng_dprintf(1, "access: %s\n", r == 0 ? "ok" : "no");
         return r == 0 ? 0 : 1;
+    }
+    /* A ":ro" bind must answer -EROFS for every mutating path syscall while
+     * still serving reads, the way a real read-only mount does. GUESTPATH names
+     * an existing file inside the bind. Without ":ro" on the -b spec the same
+     * calls must NOT report EROFS — that is the negative control the test
+     * drives, so a blanket refusal cannot pass. */
+    if (!strcmp(op, "robind")) {
+        int ro = fs.nbinds > 0 && fs.binds[0].ro;
+        char sib[CNG_PATH_MAX];
+        size_t gl = cng_strlcpy(sib, gpath, sizeof sib);
+        cng_strlcpy(sib + gl, ".x", sizeof sib - gl);
+        struct {
+            const char *name;
+            long r;
+        } t[] = {
+            {"read", cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
+                                  CNG_O_RDONLY, 0, 0, 0, 0)},
+            {"open-w", cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
+                                    CNG_O_WRONLY, 0, 0, 0, 0)},
+            {"open-creat", cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)sib,
+                                        CNG_O_RDONLY | CNG_O_CREAT, 0644, 0, 0,
+                                        0)},
+            {"mkdirat", cng_dispatch(__NR_mkdirat, CNG_AT_FDCWD, (long)sib, 0755,
+                                     0, 0, 0, 0)},
+            {"unlinkat", cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)gpath, 0,
+                                      0, 0, 0, 0)},
+            {"fchmodat", cng_dispatch(__NR_fchmodat, CNG_AT_FDCWD, (long)gpath,
+                                      0600, 0, 0, 0, 0)},
+            {"truncate",
+             cng_dispatch(__NR_truncate, (long)gpath, 0, 0, 0, 0, 0, 0)},
+            {"symlinkat", cng_dispatch(__NR_symlinkat, (long)"/t", CNG_AT_FDCWD,
+                                       (long)sib, 0, 0, 0, 0)},
+            {"renameat", cng_dispatch(__NR_renameat, CNG_AT_FDCWD, (long)gpath,
+                                      CNG_AT_FDCWD, (long)sib, 0, 0, 0)},
+            {"utimensat", cng_dispatch(__NR_utimensat, CNG_AT_FDCWD, (long)gpath,
+                                       0, 0, 0, 0, 0)},
+            {"fchownat", cng_dispatch(__NR_fchownat, CNG_AT_FDCWD, (long)gpath, 0,
+                                      0, 0, 0, 0)},
+        };
+        int fails = 0;
+        for (unsigned i = 0; i < sizeof t / sizeof *t; i++) {
+            int is_read = !strcmp(t[i].name, "read");
+            /* reads always succeed; mutators are EROFS exactly when ro */
+            int ok = is_read ? t[i].r >= 0
+                             : (ro ? t[i].r == -EROFS : t[i].r != -EROFS);
+            if (is_read && t[i].r >= 0)
+                sys_close((int)t[i].r);
+            cng_dprintf(1, "robind %s %s: rc=%d -> %s\n", ro ? "ro" : "rw",
+                        t[i].name, (int)t[i].r, ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+        cng_dprintf(1, "robind: %d failures\n", fails);
+        return fails ? 1 : 0;
     }
     cng_dprintf(2, "_dtest: unknown op %s\n", op);
     return 2;
@@ -1577,9 +1658,16 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
         char spec[512];
         cng_strlcpy(spec, bind_spec, sizeof spec);
         char *c = strchr(spec, ':');
-        if (c) {
+        if (c) { /* SRC:DST[:ro] — host first, as the -b CLI option spells it */
             *c = '\0';
-            cng_fs_add_bind(&fs, spec, c + 1);
+            char *dst = c + 1;
+            int ro = 0;
+            unsigned long dl = strlen(dst);
+            if (dl >= 3 && !strcmp(dst + dl - 3, ":ro")) {
+                ro = 1;
+                dst[dl - 3] = '\0';
+            }
+            cng_fs_add_bind(&fs, dst, spec, ro);
         }
     }
     cng_g_fs = &fs;
@@ -1638,7 +1726,7 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
     {
         static struct cng_fs pb;
         cng_fs_init(&pb, rootfs);
-        cng_fs_add_bind(&pb, "/proc", "/proc");
+        cng_fs_add_bind(&pb, "/proc", "/proc", 0);
         char out[CNG_PATH_MAX];
         int ok = 1;
         ok &= cng_fs_translate(&pb, "/proc/1/stat", out, sizeof out) == 0 &&

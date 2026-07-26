@@ -158,9 +158,10 @@ static void put_mounts(int fd, int fmt) {
                 bmaj = dev_major(d);
                 bmin = dev_minor(d);
             }
-            cng_dprintf(fd, "%d 1 %lu:%lu / %s rw,relatime - %s %s rw\n",
-                        i + 3, bmaj, bmin, cng_g_fs->binds[i].guest, fstype,
-                        cng_g_fs->binds[i].host);
+            const char *rw = cng_g_fs->binds[i].ro ? "ro" : "rw";
+            cng_dprintf(fd, "%d 1 %lu:%lu / %s %s,relatime - %s %s %s\n",
+                        i + 3, bmaj, bmin, cng_g_fs->binds[i].guest, rw, fstype,
+                        cng_g_fs->binds[i].host, rw);
         }
     } else if (fmt == MNT_MOUNTSTATS) {
         /* No NFS per-op stats: every mount here is a local filesystem. */
@@ -178,9 +179,9 @@ static void put_mounts(int fd, int fmt) {
             cng_dprintf(fd,
                         "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n");
         for (int i = 0; i < nb; i++)
-            cng_dprintf(fd, "%s %s %s rw,relatime 0 0\n",
+            cng_dprintf(fd, "%s %s %s %s,relatime 0 0\n",
                         cng_g_fs->binds[i].host, cng_g_fs->binds[i].guest,
-                        fstype);
+                        fstype, cng_g_fs->binds[i].ro ? "ro" : "rw");
     }
 }
 

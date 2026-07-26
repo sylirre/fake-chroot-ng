@@ -12,7 +12,10 @@
 /* Shared by --version and the CNG_DEBUG startup banner (which also stamps the
  * build time: this repo is copied to devices by hand, so "am I running the
  * build I just made?" is a question every device-side trace has to answer). */
-#define CNG_VERSION "0.0.1"
+/* 0.1.0 reversed -b to SRC:DST (host first), matching arm64chroot. This tree
+ * reaches devices by hand-copy, so the version must distinguish a build that
+ * carries the old GUEST:HOST order from one that does not. */
+#define CNG_VERSION "0.1.0"
 
 /* Active filesystem view used by the dispatcher (set before install). */
 extern struct cng_fs *cng_g_fs;

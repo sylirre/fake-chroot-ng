@@ -15,6 +15,7 @@ struct cng_bind {
     char guest[256];  /* canonical guest prefix */
     char host[512];   /* host path, no trailing slash */
     unsigned glen;    /* strlen(guest) */
+    unsigned ro;      /* ":ro" mount: mutating syscalls under it get -EROFS */
 };
 
 struct cng_fs {
@@ -29,8 +30,15 @@ struct cng_fs {
 extern int cng_g_no_proc;
 
 void cng_fs_init(struct cng_fs *fs, const char *rootfs);
-int cng_fs_add_bind(struct cng_fs *fs, const char *guest, const char *host);
+int cng_fs_add_bind(struct cng_fs *fs, const char *guest, const char *host,
+                    int ro);
 void cng_fs_set_cwd(struct cng_fs *fs, const char *guest_cwd);
+
+/* 1 if `host` (an already-resolved host path) lies under a read-only bind, so a
+ * mutating syscall on it must answer -EROFS. Keyed on the host side — as the
+ * oracle's host_ro is — so a guest symlink that lands inside a :ro bind is
+ * covered too, however the path got there. */
+int cng_fs_host_ro(const struct cng_fs *fs, const char *host);
 
 /* Emulate chroot(2): make the guest directory `guest_root` (canonical, with
  * `host_root` its already-translated host path) the new guest root. Bind

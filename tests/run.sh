@@ -40,8 +40,8 @@ fi
 
 echo "== M1: CLI =="
 out=$(run --version 2>&1); check "version rc" 0 $?
-check_contains "version string" "chroot-ng 0.0.1" "$out"
-out=$(run -v 2>&1); check_contains "short -v version" "chroot-ng 0.0.1" "$out"
+check_contains "version string" "chroot-ng 0.1.0" "$out"
+out=$(run -v 2>&1); check_contains "short -v version" "chroot-ng 0.1.0" "$out"
 out=$(run --help 2>&1); check "help rc" 0 $?
 check_contains "help usage line" "chroot-ng [options] <rootfs> <program>" "$out"
 check_contains "help OPTIONS section" "OPTIONS" "$out"

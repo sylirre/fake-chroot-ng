@@ -46,8 +46,8 @@ chroot-ng --help                                   # full option reference
 `<rootfs>` is a host directory holding an AArch64 userland (`/` runs
 host-native binaries directly); `<program>` is an absolute path inside it.
 Common options: `-u/--fake-id[=ID]` (fake user identity — `ID` is a `uid` or
-`uid:gid`, defaulting to `0:0` root), `-b/--bind G:H` (bind guest path G to host
-H), `-l/--link2symlink` (emulate hardlinks where the host refuses `link(2)`),
+`uid:gid`, defaulting to `0:0` root), `-b/--bind SRC:DST[:ro]` (expose host
+directory SRC at guest path DST, read-only with `:ro`), `-l/--link2symlink` (emulate hardlinks where the host refuses `link(2)`),
 `-R/--rewrite` (ahead-of-time `svc` rewriting), `--no-proc` (turn off the `/proc`
 emulation described below), `--shared-proc` (share the process view between
 independent invocations of the same rootfs, for both the process view and the

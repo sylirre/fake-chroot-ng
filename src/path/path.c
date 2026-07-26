@@ -69,7 +69,8 @@ void cng_fs_init(struct cng_fs *fs, const char *rootfs) {
     fs->cwd[1] = '\0';
 }
 
-int cng_fs_add_bind(struct cng_fs *fs, const char *guest, const char *host) {
+int cng_fs_add_bind(struct cng_fs *fs, const char *guest, const char *host,
+                    int ro) {
     if (fs->nbinds >= CNG_MAX_BINDS)
         return -1;
     struct cng_bind *b = &fs->binds[fs->nbinds];
@@ -83,8 +84,24 @@ int cng_fs_add_bind(struct cng_fs *fs, const char *guest, const char *host) {
     cng_strlcpy(b->guest, canon, sizeof b->guest);
     normalize_root(b->host, sizeof b->host, host);
     b->glen = (unsigned)strlen(b->guest);
+    b->ro = ro ? 1u : 0u;
     fs->nbinds++;
     return 0;
+}
+
+int cng_fs_host_ro(const struct cng_fs *fs, const char *host) {
+    int best = -1;
+    size_t blen = 0;
+    for (int i = 0; i < fs->nbinds; i++) {
+        const char *bh = fs->binds[i].host;
+        size_t hl = strlen(bh);
+        if (hl && strncmp(host, bh, hl) == 0 &&
+            (host[hl] == '/' || host[hl] == '\0') && hl > blen) {
+            best = i;
+            blen = hl;
+        }
+    }
+    return best >= 0 && fs->binds[best].ro;
 }
 
 /* Rebase a canonical guest path onto a new root: under root "/a", "/a/b"

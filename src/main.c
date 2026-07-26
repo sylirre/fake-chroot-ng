@@ -22,11 +22,13 @@
 #include "cng/rewrite.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
+#include "cng/uapi.h"
 
 
 /* --- the run + probe + self-test entry points (own translation units) ----- */
 int cng_run(const char *rootfs, const char *libprefix,
-            const char *const *bind_g, const char *const *bind_h, int nb,
+            const char *const *bind_g, const char *const *bind_h,
+            const int *bind_ro, int nb,
             int gargc, char **gargv, char **envp, unsigned long *auxv);
 int cng_cmd_probe(int argc, char **argv, char **envp, unsigned long *auxv);
 
@@ -302,9 +304,13 @@ static void help(char **envp) {
         {"args...",   "Arguments passed on to the guest program."},
     };
     static const struct help_def opts[] = {
-        {"-b, --bind G:H", "Bind guest path G to host path H (repeatable, up to "
-                      "64). Guest accesses under G resolve to H on the host. "
-                      "Neither side may contain ':'."},
+        {"-b, --bind SRC:DST[:ro]", "Expose host directory SRC at guest path "
+                      "DST (repeatable, up to 64). Guest accesses under DST "
+                      "resolve to SRC on the host; append ':ro' to make the "
+                      "mount read-only (mutating syscalls under it answer "
+                      "EROFS). DST must be absolute; host paths may not contain "
+                      "':'. Note the order is host-first, matching arm64chroot "
+                      "— it was GUEST:HOST before 0.1.0."},
         {"-u, --fake-id[=ID]", "Present a fake user identity. ID is a uid or "
                       "uid:gid (a bare -u/--fake-id defaults to 0:0, root; a "
                       "single number sets both uid and gid). Credential syscalls "
@@ -379,7 +385,7 @@ static void help(char **envp) {
         "chroot-ng -u ./rootfs /bin/sh",
         "chroot-ng --fake-id 1000:1000 --setuid-root --setgid-root ./rootfs /bin/su -",
         "chroot-ng -u -l ./rootfs /sbin/apk add busybox",
-        "chroot-ng -R -b /tmp:/data/local/tmp ./rootfs /bin/busybox sh",
+        "chroot-ng -R -b /data/local/tmp:/tmp ./rootfs /bin/busybox sh",
         "chroot-ng / /usr/bin/uname -a",
     };
 
@@ -480,23 +486,73 @@ static int parse_id_spec(const char *s) {
     return 0;
 }
 
-/* Register a "-b GUEST:HOST" spec into the (guest, host) bind arrays. Returns 0,
- * or -1 (with a diagnostic) on a full table or a malformed spec. */
+/* 1 if `path` names something that exists on the host. */
+static int host_exists(const char *path) {
+    char st[128]; /* struct stat, aarch64 */
+    return CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, (long)path, (long)st, 0, 0,
+                   0) == 0;
+}
+
+/* Register a "-b SRC:DST[:ro]" spec: host directory SRC is exposed at absolute
+ * guest path DST, read-only with a trailing ":ro". This is the arm64chroot
+ * order — host first — and it is the reverse of what chroot-ng accepted before
+ * 0.1.0, so a swapped spec is diagnosed explicitly below rather than silently
+ * mounting the wrong way round. Host paths may not contain ':'.
+ * Returns 0, or -1 with a diagnostic. */
 static int add_bind(char *spec, const char **bind_g, const char **bind_h,
-                    int *nb) {
+                    int *bind_ro, int *nb) {
     if (*nb >= CNG_MAX_BINDS) {
         cng_dprintf(2, "chroot-ng: too many --bind mounts (max %d)\n",
                     CNG_MAX_BINDS);
         return -1;
     }
-    char *c = strchr(spec, ':');
+    char *c = strchr(spec, ':'); /* first ':' splits SRC | DST[:ro] */
     if (!c || c == spec || c[1] == '\0') {
-        cng_dprintf(2, "chroot-ng: --bind '%s': expected GUEST:HOST\n", spec);
+        cng_dprintf(2, "chroot-ng: --bind '%s': expected SRC:DST[:ro]\n", spec);
         return -1;
     }
     *c = '\0';
-    bind_g[*nb] = spec;
-    bind_h[*nb] = c + 1;
+    char *src = spec, *dst = c + 1;
+    int ro = 0;
+    size_t dl = strlen(dst);
+    if (dl >= 3 && strcmp(dst + dl - 3, ":ro") == 0) {
+        ro = 1;
+        dst[dl - 3] = '\0';
+    } else if (dl >= 3 && strcmp(dst + dl - 3, ":rw") == 0) {
+        dst[dl - 3] = '\0';
+    }
+    if (dst[0] != '/') {
+        cng_dprintf(2,
+                    "chroot-ng: --bind '%s': destination must be an absolute "
+                    "guest path\n",
+                    src);
+        return -1;
+    }
+    if (strcmp(dst, "/") == 0) {
+        cng_dprintf(2, "chroot-ng: --bind '%s': cannot bind over the guest "
+                       "root\n", src);
+        return -1;
+    }
+    if (!host_exists(src)) {
+        cng_dprintf(2, "chroot-ng: --bind source '%s': not found\n", src);
+        /* The pre-0.1.0 spelling was GUEST:HOST. If the operands read as a
+         * swap, say so — the failure is otherwise a bare ENOENT and the
+         * successful-but-inverted case would be silent. */
+        if (dst[0] == '/' && host_exists(dst))
+            cng_dprintf(2,
+                        "chroot-ng: -b now takes SRC:DST (host path first); "
+                        "did you mean '%s:%s'?\n",
+                        dst, src);
+        return -1;
+    }
+    if (strcmp(src, "/") == 0) {
+        cng_dprintf(2, "chroot-ng: --bind '%s': cannot bind the host root\n",
+                    src);
+        return -1;
+    }
+    bind_g[*nb] = dst;
+    bind_h[*nb] = src;
+    bind_ro[*nb] = ro;
     (*nb)++;
     return 0;
 }
@@ -508,6 +564,7 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
     const char *libprefix = 0;
     const char *bind_g[CNG_MAX_BINDS];
     const char *bind_h[CNG_MAX_BINDS];
+    int bind_ro[CNG_MAX_BINDS];
     int nb = 0;
 
     /* GNU-style options: single-letter short (-R), --word long. Value-taking
@@ -574,7 +631,7 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
                     if (i + 1 >= argc) return err_needarg("--bind");
                     spec = argv[++i];
                 }
-                if (add_bind(spec, bind_g, bind_h, &nb) < 0) return 2;
+                if (add_bind(spec, bind_g, bind_h, bind_ro, &nb) < 0) return 2;
             } else if (!strcmp(n, "lib-prefix")) {
                 if (val) libprefix = val;
                 else {
@@ -613,7 +670,7 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
                 else if (c == 'b') {
                     char *spec = *p ? p : (i + 1 < argc ? argv[++i] : 0);
                     if (!spec) return err_needarg("-b");
-                    if (add_bind(spec, bind_g, bind_h, &nb) < 0) return 2;
+                    if (add_bind(spec, bind_g, bind_h, bind_ro, &nb) < 0) return 2;
                     break;
                 } else if (c == 'L') {
                     char *v = *p ? p : (i + 1 < argc ? argv[++i] : 0);
@@ -642,6 +699,6 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
     char **gargv = argv + i + 1;
     int gargc = argc - i - 1;
 
-    return cng_run(rootfs, libprefix, bind_g, bind_h, nb, gargc, gargv, envp,
+    return cng_run(rootfs, libprefix, bind_g, bind_h, bind_ro, nb, gargc, gargv, envp,
                    auxv);
 }
