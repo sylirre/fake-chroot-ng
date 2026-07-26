@@ -906,6 +906,9 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         case __NR_faccessat2:
 #endif
         case __NR_fchmodat:
+#ifdef __NR_fchmodat2
+        case __NR_fchmodat2:
+#endif
         case __NR_unlinkat:
         case __NR_utimensat:
         case __NR_newfstatat:
@@ -1099,6 +1102,18 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             return -EROFS;
         return chattr_result(reissue(a0, (long)p, a2, a3, a4, a5, nr));
     }
+
+    /* fchmodat2(dirfd, path, mode, flags): same as fchmodat but with a real
+     * flags word, so unlike its predecessor it can chmod a symlink itself. */
+#ifdef __NR_fchmodat2
+    case __NR_fchmodat2: {
+        int deref = !((int)a3 & CNG_AT_SYMLINK_NOFOLLOW);
+        const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
+        if (ro_denied(p))
+            return -EROFS;
+        return chattr_result(reissue(a0, (long)p, a2, a3, a4, a5, nr));
+    }
+#endif
 
     /* unlinkat: on removing one of our link2symlink names, drop the group's
      * refcount (and reclaim the backing file on the last reference). */

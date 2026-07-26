@@ -176,6 +176,17 @@ check_contains "io_uring is refused even from inside the gate" \
 # reach the emulated execve and load the new program over its parent.
 check_contains "clone3 is refused so spawns use the converted clone path" \
     "bpftest clone3 is refused ENOSYS: ERRNO -> OK" "$out"
+# M12 gave the guest its own shm namespace but left sem/msg native, so it shared
+# the HOST's -- it could attach to host semaphores and host `ipcs -s` listed the
+# guest's. shm stays emulated; these are refused.
+check_contains "SysV semaphores no longer reach the host namespace" \
+    "bpftest semget is refused ENOSYS: ERRNO -> OK" "$out"
+check_contains "SysV message queues no longer reach the host namespace" \
+    "bpftest msgget is refused ENOSYS: ERRNO -> OK" "$out"
+check_contains "shm is still emulated rather than refused" \
+    "bpftest shmget still traps for emulation: TRAP -> OK" "$out"
+check_contains "fchmodat2 is translated, not refused" \
+    "bpftest fchmodat2 traps for translation: TRAP -> OK" "$out"
 check_contains "plain clone still traps for the vfork conversion" \
     "bpftest plain clone still traps for the conversion: TRAP -> OK" "$out"
 
@@ -192,4 +203,8 @@ check_contains "clone3 is refused on the -R tier" \
     "denied clone3: rc=-38 -> OK" "$out"
 check_contains "an ordinary syscall still runs on the -R tier" \
     "denied control getpid: rc=" "$out"
+check_contains "SysV semaphores are refused on the -R tier" \
+    "denied semget: rc=-38 -> OK" "$out"
+check_contains "SysV message queues are refused on the -R tier" \
+    "denied msgget: rc=-38 -> OK" "$out"
 rm -rf "$DR"

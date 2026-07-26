@@ -53,6 +53,12 @@ static const int path_syscalls[] = {
     __NR_bind,        __NR_connect,      __NR_sendto,      __NR_sendmsg,
     __NR_getsockname, __NR_getpeername,  __NR_accept,      __NR_accept4,
     __NR_recvfrom,    __NR_recvmsg,
+    /* fchmodat2 (6.6+) is what glibc >= 2.39 reaches for first, and the only
+     * way to chmod a symlink itself. Translated rather than refused, so the
+     * guest keeps the capability. */
+#ifdef __NR_fchmodat2
+    __NR_fchmodat2,
+#endif
     /* socket(): substitutes an emulated NETLINK_ROUTE socket where the host
      * denies app domains rtnetlink (netlink.c). Everything else runs native. */
     __NR_socket,
@@ -147,6 +153,50 @@ static const int enosys_syscalls[] = {
 #ifdef __NR_clone3
     __NR_clone3,
 #endif
+    /* Path-bearing syscalls we do not model. Each takes a path or names a mount
+     * and would otherwise reach the host filesystem untranslated; all are
+     * privileged in practice, so an unprivileged guest saw EPERM rather than an
+     * escape — but ENOSYS is the honest answer and the oracle's. */
+#ifdef __NR_open_tree
+    __NR_open_tree, /* unprivileged without OPEN_TREE_CLONE: a path->fd lookup */
+#endif
+#ifdef __NR_move_mount
+    __NR_move_mount,
+#endif
+#ifdef __NR_fsopen
+    __NR_fsopen,
+#endif
+#ifdef __NR_fsconfig
+    __NR_fsconfig,
+#endif
+#ifdef __NR_fsmount
+    __NR_fsmount,
+#endif
+#ifdef __NR_fspick
+    __NR_fspick,
+#endif
+#ifdef __NR_open_by_handle_at
+    __NR_open_by_handle_at, /* name_to_handle_at is trapped; keep the pair even */
+#endif
+#ifdef __NR_fanotify_mark
+    __NR_fanotify_mark,
+#endif
+    /* statmount/listmount would hand the guest the HOST mount tree, defeating
+     * the synthesized /proc/self/mounts entirely. */
+#ifdef __NR_statmount
+    __NR_statmount,
+#endif
+#ifdef __NR_listmount
+    __NR_listmount,
+#endif
+    /* System V semaphores and message queues. M12 gave the guest its own shm
+     * namespace; these were left running natively, so on a desktop host the
+     * guest shared the HOST's sem/msg namespace — it could attach to host
+     * semaphores, and host `ipcs -s`/`-q` listed the guest's objects. That is
+     * exactly the isolation the shm broker exists to provide. Refusing them is
+     * the oracle's answer; a broker-backed emulation would be the richer one. */
+    __NR_semget,      __NR_semop,       __NR_semctl,      __NR_semtimedop,
+    __NR_msgget,      __NR_msgsnd,      __NR_msgrcv,      __NR_msgctl,
 };
 #define NENOSYS ((int)(sizeof(enosys_syscalls) / sizeof(enosys_syscalls[0])))
 

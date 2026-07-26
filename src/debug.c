@@ -241,6 +241,14 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
 #ifdef __NR_clone3
             {"clone3", __NR_clone3},
 #endif
+#ifdef __NR_statmount
+            {"statmount", __NR_statmount},
+#endif
+#ifdef __NR_open_tree
+            {"open_tree", __NR_open_tree},
+#endif
+            {"semget", __NR_semget},
+            {"msgget", __NR_msgget},
         };
         int fails = 0;
         for (unsigned i = 0; i < sizeof d / sizeof *d; i++) {
@@ -2373,6 +2381,22 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
 #ifdef __NR_clone3
         {"clone3 is refused ENOSYS", __NR_clone3, 0x1000, 0,
          CNG_SECCOMP_RET_ERRNO | 38},
+#endif
+        /* SysV sem/msg: M12 gave the guest its own shm namespace but left these
+         * native, so it shared the HOST's sem/msg namespace. */
+        {"semget is refused ENOSYS", __NR_semget, 0x1000, 0,
+         CNG_SECCOMP_RET_ERRNO | 38},
+        {"msgget is refused ENOSYS", __NR_msgget, 0x1000, 0,
+         CNG_SECCOMP_RET_ERRNO | 38},
+        /* ...while shm stays emulated, not refused. */
+        {"shmget still traps for emulation", __NR_shmget, 0x1000, 0,
+         CNG_SECCOMP_RET_TRAP},
+#ifdef __NR_fchmodat2
+        /* fchmodat2 is translated, not refused: it is glibc's modern chmod. */
+        {"fchmodat2 traps for translation", __NR_fchmodat2, 0x1000, 0,
+         CNG_SECCOMP_RET_TRAP},
+#endif
+#ifdef __NR_clone3
         {"plain clone still traps for the conversion", __NR_clone, 0x1000,
          CNG_CLONE_VM | CNG_CLONE_VFORK, CNG_SECCOMP_RET_TRAP},
 #endif

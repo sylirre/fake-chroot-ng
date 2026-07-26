@@ -39,6 +39,9 @@ static const int probe_set[] = {
 #endif
     __NR_setxattr,   __NR_lsetxattr,  __NR_getxattr,   __NR_lgetxattr,
     __NR_listxattr,  __NR_llistxattr, __NR_removexattr, __NR_lremovexattr,
+#ifdef __NR_fchmodat2
+    __NR_fchmodat2,
+#endif
     __NR_bind,       __NR_connect,    __NR_sendto,     __NR_sendmsg,
     __NR_getsockname, __NR_getpeername, __NR_accept,   __NR_accept4,
     __NR_recvfrom,   __NR_recvmsg,

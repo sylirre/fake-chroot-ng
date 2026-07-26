@@ -887,6 +887,36 @@ vfork/`posix_spawn` child-stack handling.
     through the handler. The clean approach is a BPF range test on `args[1]`
     (`0x8910`–`0x8970`), which is its own change.
 
+- [x] **The remaining path-bearing enumeration gaps**
+  With the filter's tail being `RET_ALLOW`, any path-bearing syscall not on the
+  trapped list reaches the host with the guest's string verbatim. The audit's
+  remaining entries are closed here.
+  - **`fchmodat2`** (6.6+) is **translated**, not refused: glibc >= 2.39 reaches
+    for it first, and it is the only way to chmod a symlink itself. It honors
+    `AT_SYMLINK_NOFOLLOW`, respects a `:ro` bind, and joins the l2s deny and
+    block-list probe sets like its predecessor. This was a live escape on any
+    modern glibc guest — the ordinary `chmod` path.
+  - **Refused** (designed-ENOSYS, the oracle's answer): `open_tree` — which needs
+    no privilege at all without `OPEN_TREE_CLONE` and is otherwise just a
+    path→fd lookup on the host — plus `move_mount`, `fsopen`, `fsconfig`,
+    `fsmount`, `fspick`, `fanotify_mark`, and `open_by_handle_at` (the pair to the
+    already-trapped `name_to_handle_at`). `statmount`/`listmount` are refused for
+    a different reason: they would hand the guest the **host** mount tree,
+    defeating the synthesized `/proc/self/mounts` outright.
+  - **System V semaphores and message queues.** M12 gave the guest its own shm
+    namespace, but `semget`/`semop`/`semctl`/`semtimedop` and
+    `msgget`/`msgsnd`/`msgrcv`/`msgctl` were left running natively — so on a
+    desktop host the guest operated in the **host's** sem/msg namespace: it could
+    attach to host semaphores, and host `ipcs -s`/`ipcs -q` listed the guest's
+    objects. That is precisely the isolation the shm broker exists to provide, and
+    the largest thing the M11/M12 divergence lists had missed. Refused, which is
+    the oracle's behaviour; a broker-backed emulation mirroring shm would be the
+    richer answer and is the obvious follow-up.
+  - `-t bpftest` pins the distinction that matters: `semget`/`msgget` answer
+    ERRNO while `shmget` still TRAPs for emulation, and `fchmodat2` TRAPs for
+    translation rather than being refused. `-t dtest denied` covers the same on
+    the `-R` trampoline tier. Filter is 109 of 256 instructions.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes
