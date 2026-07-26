@@ -73,7 +73,14 @@ void cng_probe_blocked(void) {
     if (child == 0) {
         cng_sig_install(CNG_SIGSYS, probe_sigsys);
         for (int i = 0; i < NPROBE; i++)
-            cng_syscall6(0, 0, 0, 0, 0, 0, probe_set[i]); /* NULL args: harmless */
+            /* arg0 = -1: a seccomp filter matches on the syscall number before
+             * the kernel reads any argument, so a blocked call still traps —
+             * while an allowed one dies on EBADF/EFAULT instantly. Zeros here
+             * made arg0 name fd 0, and the probes really ran against stdin:
+             * utimensat(0, NULL, ...) is futimens and STAMPED it, fchown hit
+             * it, and recvfrom(0, NULL, 0, 0) blocked startup forever when
+             * stdin was a silent datagram socket (ssh/CI harnesses). */
+            cng_syscall6(-1, 0, 0, 0, 0, 0, probe_set[i]);
         sys_exit_group(0);
     }
     if (child > 0) {

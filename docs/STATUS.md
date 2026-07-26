@@ -1017,6 +1017,18 @@ vfork/`posix_spawn` child-stack handling.
     `close_range()` sweep would; that hazard is general to this design and
     tracked with the rest.
 
+- [x] **Fix: the startup probe ran its candidates against live fd 0.** The
+  blocked-syscall probe (blocklist.c) invoked every candidate with all-zero
+  arguments, believing them harmless. But a zero arg0 names stdin:
+  `utimensat(0, NULL, ...)` is futimens and really stamped its timestamps,
+  `fchown(0, 0, 0)` really ran against it — and once the probe set grew the
+  socket syscalls (M15), `recvfrom(0, NULL, 0, 0)` **blocked startup forever**
+  whenever stdin was a datagram socket with nothing queued, which is what ssh
+  and CI harnesses hand a process. Probes now pass arg0 = -1: a seccomp filter
+  matches on the syscall number before the kernel reads any argument, so a
+  blocked call still traps, while an allowed one returns EBADF/EFAULT
+  instantly, with no side effects on inherited fds.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes
