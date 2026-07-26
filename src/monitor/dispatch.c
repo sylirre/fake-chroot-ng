@@ -335,12 +335,75 @@ static void proc_fd_path(long fd, char *out) {
     out[p] = '\0';
 }
 
+/* Read the host directory a real dirfd names, from /proc/self/fd/<dirfd>.
+ * Returns 0/-1. */
+static int dirfd_host(int dfd, char *hdir, size_t sz) {
+    if (dfd < 0)
+        return -1;
+    char proc[40];
+    proc_fd_path(dfd, proc);
+    long n = sys_readlinkat(CNG_AT_FDCWD, proc, hdir, sz - 1);
+    if (n <= 0)
+        return -1;
+    hdir[n] = '\0';
+    return 0;
+}
+
+/* Put a dirfd-relative name through the same containment an absolute path gets:
+ * map the dirfd's host directory back to its GUEST path, join the name onto it,
+ * and resolve the whole thing through the rootfs/bind map. Concatenating the
+ * host directory instead — which is what this used to do — leaves the kernel to
+ * resolve the name itself, and the kernel has no rootfs: a ".." component
+ * climbs straight past it and an absolute symlink target is taken from the HOST
+ * root.
+ *
+ * `out` comes back an absolute host path. Callers reissue with the original
+ * dirfd, which the kernel ignores for an absolute path, so no caller changes.
+ * Returns -1 when the dirfd names a directory outside the guest view (a /proc
+ * dirfd, say) — there is no guest path to express it as, and the /proc zone
+ * wants the host namespace anyway, so the caller passes the name through. */
+static int xlate_at(int dfd, const char *path, char *out, size_t sz, int deref) {
+    char hdir[CNG_PATH_MAX], gdir[CNG_PATH_MAX], gp[CNG_PATH_MAX];
+    if (dirfd_host(dfd, hdir, sizeof hdir) != 0)
+        return -1;
+    if (cng_fs_untranslate(cng_g_fs, hdir, gdir, sizeof gdir) != 0)
+        return -1;
+    size_t k = cng_strlcpy(gp, gdir, sizeof gp);
+    if (k && gp[k - 1] != '/' && k + 1 < sizeof gp) {
+        gp[k++] = '/';
+        gp[k] = '\0';
+    }
+    cng_strlcpy(gp + k, path, sizeof gp > k ? sizeof gp - k : 0);
+    return cng_resolve(gp, deref, out, sz) == 0 ? 0 : -1;
+}
+
+/* Does a dirfd-relative name need the guest-side walk above, or can the kernel
+ * be trusted with it? The dirfd itself already points inside the guest view, so
+ * only two things can redirect out of it: a ".." component, and a symlink. This
+ * is the hot path (every relative openat), so the cheap cases stay cheap.
+ *
+ *  - any '/' => some intermediate component is followed as a symlink => walk;
+ *  - a ".." component => walk;
+ *  - otherwise a single component, and only its own symlink can escape: one
+ *    readlinkat settles it. EINVAL (not a symlink) and ENOENT (nothing there)
+ *    are safe for the kernel to finish; a real link needs the walk. */
+static int at_needs_xlate(int dfd, const char *path, int deref) {
+    for (const char *p = path; *p; p++)
+        if (*p == '/')
+            return 1;
+    if (path[0] == '.' && path[1] == '.' && !path[2])
+        return 1;
+    if (!deref)
+        return 0;
+    char lb[8];
+    return sys_readlinkat(dfd, path, lb, sizeof lb) >= 0;
+}
+
 /* Resolve (dirfd, path) to a HOST path. Handles absolute paths and AT_FDCWD
  * (through the rootfs, re-rooting guest symlinks — except the /proc magic
- * links, which cng_resolve keeps in the host namespace), and real dirfds
- * (whose /proc/self/fd link is already a host path inside the rootfs, so the
- * relative name needs no translation). `deref` follows the final component's
- * symlink for the absolute/AT_FDCWD case. Returns 0/-1. */
+ * links, which cng_resolve keeps in the host namespace), and real dirfds (via
+ * xlate_at, so a relative name is contained the same way an absolute one is).
+ * `deref` follows the final component's symlink. Returns 0/-1. */
 static int resolve_at_host(long dirfd, const char *path, int deref, char *out,
                            size_t sz) {
     int dfd = (int)dirfd; /* int arg: the x-register's top half may be dirty */
@@ -351,16 +414,15 @@ static int resolve_at_host(long dirfd, const char *path, int deref, char *out,
             return 0;
         return cng_fs_translate(cng_g_fs, path, out, sz) == 0 ? 0 : -1;
     }
-    /* real dirfd: read its host directory path from /proc/self/fd/<dirfd>. */
     if (dfd < 0)
         return -1;
-    char proc[40];
-    proc_fd_path(dfd, proc);
+    if (xlate_at(dfd, path, out, sz, deref) == 0)
+        return 0;
+    /* Outside the guest view (a /proc dirfd): the host directory joined with
+     * the name is the only answer available, and the right one there. */
     char hdir[CNG_PATH_MAX];
-    long n = sys_readlinkat(CNG_AT_FDCWD, proc, hdir, sizeof hdir - 1);
-    if (n <= 0)
+    if (dirfd_host(dfd, hdir, sizeof hdir) != 0)
         return -1;
-    hdir[n] = '\0';
     size_t k = cng_strlcpy(out, hdir, sz);
     if (k && out[k - 1] != '/' && k + 1 < sz) {
         out[k++] = '/';
@@ -445,12 +507,22 @@ static const char *xlate(long dirfd, const char *gp, char *buf, size_t bufsz,
                          int deref_final) {
     if (!gp)
         return gp;
-    if (gp[0] == '/' || (int)dirfd == CNG_AT_FDCWD) {
+    int dfd = (int)dirfd; /* int arg: the x-register's top half may be dirty */
+    if (gp[0] == '/' || dfd == CNG_AT_FDCWD) {
         if (cng_resolve(gp, deref_final, buf, bufsz) == 0)
             return buf;
         if (cng_fs_translate(cng_g_fs, gp, buf, bufsz) == 0)
             return buf;
+        return gp;
     }
+    /* Relative to a real dirfd. Handing this to the kernel unchanged — which is
+     * what we used to do — lets a ".." run climb out of the rootfs and an
+     * absolute symlink target resolve from the HOST root, since the kernel does
+     * not know about the rootfs. Contain it like any other path, but only when
+     * something in it could actually redirect (see at_needs_xlate). */
+    if (dfd >= 0 && at_needs_xlate(dfd, gp, deref_final) &&
+        xlate_at(dfd, gp, buf, bufsz, deref_final) == 0)
+        return buf;
     return gp;
 }
 
@@ -707,22 +779,31 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_name_to_handle_at:
 #endif
     {
-        int deref = !(nr == __NR_mkdirat || nr == __NR_mknodat);
-        /* A read-only open of a /proc file that would describe chroot-ng
-         * instead of the guest is served from an in-memory copy of the guest
-         * view (see procfs.c). openat2 carries its flags in the open_how it
-         * points at. */
+        /* openat2 carries its flags in the open_how it points at. */
 #ifdef __NR_openat2
         int is_open = (nr == __NR_openat || nr == __NR_openat2);
 #else
         int is_open = (nr == __NR_openat);
 #endif
+        long oflags = 0;
         if (is_open) {
-            long oflags = a2;
+            oflags = a2;
 #ifdef __NR_openat2
             if (nr == __NR_openat2)
                 oflags = a2 ? (long)*(unsigned long *)a2 : 0;
 #endif
+        }
+        /* O_NOFOLLOW must reach the kernel as a symlink, or it has nothing to
+         * refuse: resolving the final component here would hand over the
+         * target and the open would succeed where it must ELOOP. (An l2s link
+         * name is the deliberate exception, restored by the ELOOP retry below —
+         * the guest believes that name IS the file.) */
+        int deref = !(nr == __NR_mkdirat || nr == __NR_mknodat) &&
+                    !(is_open && (oflags & CNG_O_NOFOLLOW));
+        /* A read-only open of a /proc file that would describe chroot-ng
+         * instead of the guest is served from an in-memory copy of the guest
+         * view (see procfs.c). */
+        if (is_open) {
             const char *gp = (const char *)a1;
             char canon[CNG_PATH_MAX];
             long pr;

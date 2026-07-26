@@ -623,6 +623,42 @@ vfork/`posix_spawn` child-stack handling.
     stripped from the mount point rather than folded into the host path. Every
     `-b` invocation in the suite and the docs moved to the new order. 227/227.
 
+- [x] **dirfd-relative paths are contained (rootfs escape) + `O_NOFOLLOW` honored**
+  `xlate` translated a path only when it was absolute or `AT_FDCWD`-relative;
+  a name relative to a **real dirfd** was handed to the kernel untouched, on the
+  reasoning that the dirfd already points inside the rootfs. The kernel, though,
+  has no rootfs: a `..` run climbs straight past it, and an absolute symlink
+  target is resolved from the **host** root. `openat(fd, "../../etc/shadow")`
+  read the host file, and `openat(fd_of_/bin, "sh")` with
+  `<rootfs>/bin/sh -> /bin/busybox` opened the *host* busybox. Ordinary software
+  issues exactly these — `find`, `rm -rf`, `tar -C`, anything on `fts(3)`.
+  - `xlate_at` maps the dirfd's host directory back to its **guest** path
+    (`cng_fs_untranslate`), joins the name, and resolves the result through the
+    rootfs/bind map — the same containment an absolute path gets. It returns an
+    absolute host path, which the kernel ignores the dirfd for, so no caller
+    changed. A dirfd outside the guest view (a `/proc` dirfd) has no guest
+    spelling and keeps the host namespace, which is what the `/proc` zone wants.
+  - `resolve_at_host`'s dirfd branch had the identical hole and fed `linkat`'s
+    reissue directly; it now goes through `xlate_at` too, keeping the old
+    host-concat only for the outside-the-view case.
+  - **Hot-path cost.** `at_needs_xlate` keeps the common cases free: only a `/`
+    (an intermediate component the kernel would follow), a `..` component, or —
+    for a single dereferenced component — a `readlinkat` that says it really is
+    a symlink, triggers the walk. `EINVAL`/`ENOENT` there are safe to finish in
+    the kernel.
+  - **`O_NOFOLLOW`** had to be fixed with it, and was a bug in its own right:
+    the resolver always dereferenced the final component, so the kernel received
+    a path that was no longer a symlink and had nothing to refuse — the open
+    succeeded where it must `ELOOP`. `deref` now honors it (for `openat2` too,
+    read from its `open_how`). The l2s link-name exception still works, restored
+    by the existing `ELOOP` retry, and the l2s suite's "real symlinks still
+    ELOOP through a dirfd" assertion is what caught this.
+  - Tests: `-t dtest atrel GUESTDIR RELPATH` opens a directory through the
+    dispatcher and reads a name relative to that fd. Asserted three ways — a
+    `..` run at a file planted outside the rootfs reports ENOENT (the pre-fix
+    binary reads it, verified), a `..` run inside still reaches the real file,
+    and an absolute symlink re-roots. 230/230.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

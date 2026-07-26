@@ -105,7 +105,7 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     (void)envp;
     (void)auxv;
     const char *rootfs = "/";
-    const char *op = 0, *gpath = 0, *bind_spec = 0;
+    const char *op = 0, *gpath = 0, *bind_spec = 0, *relpath = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-r") && i + 1 < argc)
             rootfs = argv[++i];
@@ -115,10 +115,13 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
             op = argv[i];
         else if (!gpath)
             gpath = argv[i];
+        else if (!relpath)
+            relpath = argv[i];
     }
     if (!op || !gpath) {
         cng_dprintf(2, "usage: _dtest -r ROOT [-b SRC:DST[:ro]] "
-                       "(open|access|dbgpath|robind) GUESTPATH\n");
+                       "(open|access|dbgpath|robind) GUESTPATH\n"
+                       "       _dtest -r ROOT atrel GUESTDIR RELPATH\n");
         return 2;
     }
 
@@ -173,6 +176,37 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
         cng_dprintf(1, "dbgpath: survived rc=%d -> %s\n", (int)r,
                     r == -EISDIR ? "OK" : "FAIL");
         return r == -EISDIR ? 0 : 1;
+    }
+    /* A name resolved relative to a real dirfd must be contained exactly like an
+     * absolute one. It used to be handed to the kernel untouched, and the kernel
+     * has no rootfs: a ".." run climbed out of it and an absolute symlink target
+     * came from the HOST root. Opens GUESTDIR through the dispatcher, then reads
+     * RELPATH relative to that fd. */
+    if (!strcmp(op, "atrel") && relpath) {
+        long dfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
+                                CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+        if (dfd < 0) {
+            cng_dprintf(1, "atrel: dir errno %d\n", (int)-dfd);
+            return 1;
+        }
+        long fd = cng_dispatch(__NR_openat, dfd, (long)relpath, CNG_O_RDONLY, 0,
+                               0, 0, 0);
+        if (fd < 0) {
+            cng_dprintf(1, "atrel: errno %d\n", (int)-fd);
+            sys_close((int)dfd);
+            return 1;
+        }
+        char buf[128];
+        long n = sys_read((int)fd, buf, sizeof buf - 1);
+        sys_close((int)fd);
+        sys_close((int)dfd);
+        if (n < 0) {
+            cng_dprintf(1, "atrel: read errno %d\n", (int)-n);
+            return 1;
+        }
+        buf[n] = '\0';
+        cng_dprintf(1, "atrel: %s\n", buf);
+        return 0;
     }
     if (!strcmp(op, "access")) {
         long r = cng_dispatch(__NR_faccessat, CNG_AT_FDCWD, (long)gpath, 0, 0, 0,

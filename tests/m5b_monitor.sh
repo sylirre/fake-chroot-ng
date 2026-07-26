@@ -43,6 +43,27 @@ check "debug logging survives a scalar syscall arg" 0 "$rc"
 check_contains "debug logging still reports the real error" \
     "dbgpath: survived rc=-21 -> OK" "$out"
 
+# A name resolved relative to a real dirfd must be contained exactly like an
+# absolute one. It used to be passed to the kernel untouched, and the kernel has
+# no rootfs: a ".." run climbed out (find/rm -rf/tar -C all issue these) and an
+# absolute symlink target was taken from the host root.
+mkdir -p "$ROOT/sub"
+printf SECRET > "$ROOT/../atesc_$$"
+check_contains "dirfd-relative .. cannot escape the rootfs" \
+    "atrel: errno 2" \
+    "$(run -t dtest -r "$ROOT" atrel /sub "../../atesc_$$" 2>&1)"
+rm -f "$ROOT/../atesc_$$"
+# ..-clamped, the same walk still reaches the real file inside the rootfs.
+check_contains "dirfd-relative .. still resolves inside the rootfs" \
+    "atrel: HELLO-FROM-ROOTFS" \
+    "$(run -t dtest -r "$ROOT" atrel /sub "../etc/greeting" 2>&1)"
+# An absolute symlink target is a guest path, so it re-roots rather than
+# reaching the host file of the same name.
+ln -sf /etc/greeting "$ROOT/sub/lnk"
+check_contains "dirfd-relative absolute symlink re-roots into the rootfs" \
+    "atrel: HELLO-FROM-ROOTFS" \
+    "$(run -t dtest -r "$ROOT" atrel /sub lnk 2>&1)"
+
 # A ":ro" bind must answer EROFS for every mutating path syscall while still
 # serving reads. The rw run is the negative control: the same calls must NOT
 # report EROFS there, so a blanket refusal cannot pass both legs.
