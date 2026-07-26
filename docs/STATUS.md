@@ -829,6 +829,64 @@ vfork/`posix_spawn` child-stack handling.
     guest we run uses them with pathname addresses, and trapping them costs two
     more filter entries plus a loop over guest memory. Noted rather than hidden.
 
+- [x] **M16 — NETLINK_ROUTE emulation**
+  Android denies app domains rtnetlink, and everything that asks the kernel about
+  interfaces goes through it — `getifaddrs(3)` (so `apt`, `dnf`, Java and Go
+  runtimes), iproute2 (`ip link/addr/route`), bubblewrap's `loopback_setup()`, and
+  glibc's netlink-based source-address selection. Without a shim every one of
+  them fails inside the guest. This was the largest pure functionality gap
+  against the oracle, and it is on chroot-ng's own target platform.
+  - **The insight that made it small: an unbound socket can still dump.** The
+    SELinux denial is on `bind(2)`, not on the query, so `RTM_GETLINK`,
+    `RTM_GETADDR` *and* `RTM_GETROUTE` can all be relayed through a host netlink
+    socket we open, send on and read from without ever binding it — verified
+    directly before committing to the design. arm64chroot relays only GETROUTE
+    that way and rebuilds the other two from `getifaddrs`; relaying all three is
+    both far less code (about 300 lines against its 1246) and **more faithful**,
+    since every reply is the kernel's own rather than an approximation. It is
+    also the only option here: chroot-ng is `-nostdlib` and has no `getifaddrs`.
+  - The guest's fd is a real `AF_UNIX` datagram socket, so `close`/`dup`/`poll`
+    behave, that we never transmit on. A send builds the reply; the matching recv
+    drains it. Slot identity is pinned by the socket's **inode**, not the fd
+    number — we cannot trap `close`, so without that a guest which closed this fd
+    and opened something else on the same number would have its I/O diverted here
+    (the staleness discipline `procfs.c` already uses).
+  - Four things had to be right for a real libc to accept the replies, and each
+    was found by driving glibc at it rather than by reading the spec:
+    `MSG_PEEK`/`MSG_TRUNC` (glibc sizes the message before reading it, so PEEK
+    must not consume and TRUNC must report the whole pending length); the reply's
+    `nlmsg_pid` is the **destination** port id — the requesting socket's, matching
+    what `getsockname` reports — not whatever the request carried; the *source*
+    address of a reply must be `nl_pid == 0`, which is how a client knows a
+    message came from the kernel (filling it with our own id made glibc discard
+    the entire dump and then report the next empty read as an error); and each
+    recv must return **whole messages only**, since a reader walks with
+    `NLMSG_OK` and a record split across two reads desynchronizes it.
+  - A dump truncated by our buffer ends in a partial record, and a client walking
+    with `NLMSG_OK` stops dead there — so `nl_finish` rewinds to the last complete
+    message and puts `NLMSG_DONE` at that offset, discarding the partial tail. The
+    guest loses whatever the truncation dropped but always sees a finite,
+    well-formed dump instead of hanging.
+  - `getsockname`/`getpeername` report a 12-byte `sockaddr_nl`: the underlying
+    AF_UNIX answer is 2 bytes and iproute2 rejects that outright. `bind` on an
+    emulated socket is a silent success. A non-dump request gets a zero-error ack,
+    which is what lets bubblewrap's `loopback_setup()` proceed.
+  - Where even `socket(AF_NETLINK)` is refused, a dump degrades to an empty
+    result: `getifaddrs` then succeeds with no interfaces instead of failing, and
+    `ip addr` prints nothing instead of "Cannot open netlink socket".
+  - Tested **differentially**: the same guest (`tests/guests/netif.c`, exercising
+    `getifaddrs` plus a raw iproute2-style `RTM_GETLINK` dump) runs once straight
+    under qemu against the real kernel and once under chroot-ng with
+    `CNG_NETLINK_FORCE_BLOCK=1`, and the two must agree byte for byte. That is the
+    only way to check this on a devbox, where the emulated path never engages on
+    its own. The suite also asserts the reverse — that with rtnetlink working the
+    emulation stays entirely out of the way (no emulated fd is created).
+  - Not done, and separable: the `SIOCGIF*` interface ioctls. They arrive on an
+    `AF_INET` socket rather than a netlink one, so the fd-based hook does not
+    reach them, and trapping `ioctl` wholesale would put every terminal `TCGETS`
+    through the handler. The clean approach is a BPF range test on `args[1]`
+    (`0x8910`–`0x8970`), which is its own change.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

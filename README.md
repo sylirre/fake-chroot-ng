@@ -91,6 +91,17 @@ to fit. Abstract names have no filesystem node to contain, so they are isolated
 per rootfs by a short spliced tag (invisible to the guest, stripped on readback);
 `--share-abstract-sockets` opts out into the host's global namespace.
 
+**rtnetlink** is emulated where the host denies it, which Android does to app
+domains — and everything that asks the kernel about interfaces goes through it:
+`getifaddrs(3)`, iproute2, bubblewrap's `loopback_setup()`, glibc's
+source-address selection. The guest's `socket(AF_NETLINK, …, NETLINK_ROUTE)` is
+served by a stand-in fd whose dumps are relayed through an **unbound** host
+netlink socket, which works because the denial is on `bind(2)`, not on the query.
+Where even the socket is refused, dumps degrade to an empty result so
+`getifaddrs` succeeds with no interfaces rather than failing outright. Nothing
+engages where rtnetlink already works; `CNG_NETLINK_FORCE_BLOCK=1` forces the
+emulated path for testing.
+
 **System V shared memory** works too. Android denies `shmget`/`shmat`/`shmdt`/
 `shmctl` outright, so chroot-ng serves them itself: the same broker daemon owns
 each segment as an anonymous `memfd` (or a private file where `memfd_create` is

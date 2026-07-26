@@ -11,6 +11,7 @@
 #include "cng/path.h"
 #include "cng/procfs.h"
 #include "cng/procreg.h"
+#include "cng/netlink.h"
 #include "cng/unixsock.h"
 #include "cng/rt.h"
 #include "cng/shm.h"
@@ -1570,6 +1571,17 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     }
 
     /* path = a0 */
+    /* socket(): where the host denies app domains rtnetlink — Android does —
+     * hand back an emulated NETLINK_ROUTE socket instead of the kernel's
+     * refusal, so getifaddrs/iproute2/bubblewrap keep working. Every other
+     * socket runs native. */
+    case __NR_socket: {
+        long fd = cng_nl_socket(a0, a1, a2);
+        if (fd >= 0)
+            return fd;
+        return reissue(a0, a1, a2, a3, a4, a5, nr);
+    }
+
     /* AF_UNIX addresses. A pathname socket's sun_path is a filesystem path and
      * gets the same containment as any other: translated on the way out, mapped
      * back to guest spelling on the way in. bind() keeps the final component
@@ -1578,6 +1590,17 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_bind:
     case __NR_connect:
     case __NR_sendto: {
+        /* An emulated netlink socket: bind is a silent success (the guest is
+         * binding a netlink address we do not really have), and a send is the
+         * request whose reply the matching recv will drain. */
+        if (cng_nl_is_fake((int)a0)) {
+            if (nr == __NR_bind || nr == __NR_connect)
+                return 0;
+            long out = 0;
+            if (cng_nl_send((int)a0, (const void *)a1, a2, &out))
+                return out;
+            return 0;
+        }
         int is_send = (nr == __NR_sendto);
         long aa = is_send ? a4 : a1;   /* sockaddr */
         long al = is_send ? a5 : a2;   /* addrlen */
@@ -1598,6 +1621,19 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     /* sendmsg: the address hangs off msg_name in the msghdr, so the header is
      * copied to swap that pointer — the guest's own struct is never written. */
     case __NR_sendmsg: {
+        if (cng_nl_is_fake((int)a0)) {
+            /* The payload is the first iovec; netlink requests are single-iov
+             * in every library that builds them. */
+            long out = 0;
+            const char *m = (const char *)a1;
+            if (m) {
+                struct cng_iovec *iov = *(struct cng_iovec **)(m + 16);
+                unsigned long nio = *(unsigned long *)(m + 24);
+                if (iov && nio > 0)
+                    cng_nl_send((int)a0, iov[0].base, (long)iov[0].len, &out);
+            }
+            return out;
+        }
         struct cng_sun_xlate x;
         char mh[56];
         long r;
@@ -1625,6 +1661,19 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_recvfrom: {
         long aa = (nr == __NR_recvfrom) ? a4 : a1;
         long alp = (nr == __NR_recvfrom) ? a5 : a2;
+        if (cng_nl_is_fake((int)a0)) {
+            if (nr == __NR_recvfrom) {
+                long out = 0;
+                cng_nl_recv((int)a0, (void *)a1, a2, a3, &out);
+                if (aa && alp)
+                    cng_nl_srcaddr((int)a0, (void *)aa, (unsigned *)alp);
+                return out;
+            }
+            /* getsockname/getpeername must report a sockaddr_nl: the real
+             * AF_UNIX answer is 2 bytes and iproute2 refuses it. */
+            if (cng_nl_getname((int)a0, (void *)aa, (unsigned *)alp))
+                return 0;
+        }
         long r = reissue(a0, a1, a2, a3, a4, a5, nr);
         if (r >= 0 && aa && alp) {
             long got = (long)*(unsigned *)alp;
@@ -1635,6 +1684,22 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     }
 
     case __NR_recvmsg: {
+        if (cng_nl_is_fake((int)a0)) {
+            long out = 0;
+            char *m = (char *)a1;
+            if (m) {
+                struct cng_iovec *iov = *(struct cng_iovec **)(m + 16);
+                unsigned long nio = *(unsigned long *)(m + 24);
+                if (iov && nio > 0)
+                    cng_nl_recv((int)a0, iov[0].base, (long)iov[0].len, a2,
+                                &out);
+                void *name = *(void **)m;
+                unsigned *nlp = (unsigned *)(m + 8);
+                if (name && nlp)
+                    cng_nl_srcaddr((int)a0, name, nlp);
+            }
+            return out;
+        }
         long r = reissue(a0, a1, a2, a3, a4, a5, nr);
         if (r >= 0 && a1) {
             void *name = *(void **)(char *)a1;

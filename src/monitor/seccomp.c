@@ -53,6 +53,9 @@ static const int path_syscalls[] = {
     __NR_bind,        __NR_connect,      __NR_sendto,      __NR_sendmsg,
     __NR_getsockname, __NR_getpeername,  __NR_accept,      __NR_accept4,
     __NR_recvfrom,    __NR_recvmsg,
+    /* socket(): substitutes an emulated NETLINK_ROUTE socket where the host
+     * denies app domains rtnetlink (netlink.c). Everything else runs native. */
+    __NR_socket,
 };
 
 #define NPATH ((int)(sizeof(path_syscalls) / sizeof(path_syscalls[0])))

@@ -23,6 +23,7 @@
 #include "cng/l2s.h"
 #include "cng/loader.h"
 #include "cng/monitor.h"
+#include "cng/netlink.h"
 #include "cng/path.h"
 #include "cng/procfs.h"
 #include "cng/rewrite.h"
@@ -123,6 +124,9 @@ int cng_run(const char *rootfs, const char *libprefix,
     /* The dispatcher (used by both the SIGSYS handler and M8 trampolines) needs
      * the fs view even if the seccomp monitor never installs (e.g. -R only). */
     cng_g_fs = &g_fs;
+    cng_nl_init();
+    if (cng_broker_env("CNG_NETLINK_FORCE_BLOCK"))
+        cng_nl_force_block = 1;
 
     /* Resolve the program itself through the map (following symlinks) to find
      * the host file. */
