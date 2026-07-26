@@ -220,6 +220,46 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
         cng_dprintf(1, "getxa: errno %d\n", r < 0 ? (int)-r : 0);
         return 0;
     }
+    /* The -R trampoline tier runs with no seccomp filter at all, so the
+     * designed-ENOSYS refusals cannot come from the kernel there: the dispatcher
+     * has to answer them itself. bpftest covers the filter; this covers the
+     * other tier, and it is the only one testable under qemu-user. */
+    if (!strcmp(op, "denied")) {
+        struct {
+            const char *name;
+            long nr;
+        } d[] = {
+#ifdef __NR_io_uring_setup
+            {"io_uring_setup", __NR_io_uring_setup},
+#endif
+#ifdef __NR_io_uring_enter
+            {"io_uring_enter", __NR_io_uring_enter},
+#endif
+#ifdef __NR_io_uring_register
+            {"io_uring_register", __NR_io_uring_register},
+#endif
+#ifdef __NR_clone3
+            {"clone3", __NR_clone3},
+#endif
+        };
+        int fails = 0;
+        for (unsigned i = 0; i < sizeof d / sizeof *d; i++) {
+            /* trapped=0: exactly how an -R trampoline calls in. */
+            long r = cng_dispatch(d[i].nr, 0, 0, 0, 0, 0, 0, 0);
+            int ok = (r == -ENOSYS);
+            cng_dprintf(1, "denied %s: rc=%d -> %s\n", d[i].name, (int)r,
+                        ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+        /* Control: an ordinary untranslated syscall still runs on this tier. */
+        long g = cng_dispatch(__NR_getpid, 0, 0, 0, 0, 0, 0, 0);
+        int ok = g > 0;
+        cng_dprintf(1, "denied control getpid: rc=%d -> %s\n", (int)g,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+        cng_dprintf(1, "denied: %d failures\n", fails);
+        return fails ? 1 : 0;
+    }
     if (!strcmp(op, "access")) {
         long r = cng_dispatch(__NR_faccessat, CNG_AT_FDCWD, (long)gpath, 0, 0, 0,
                               0, /*trapped=*/0);
@@ -2324,6 +2364,17 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
 #ifdef __NR_io_uring_setup
         {"in-gate io_uring is refused too", __NR_io_uring_setup, gate, 0,
          CNG_SECCOMP_RET_ERRNO | 38},
+#endif
+        /* clone3 carries its flags behind a pointer, so BPF cannot tell a
+         * thread from a vfork. Refusing it puts glibc's posix_spawn and
+         * pthread_create back on __NR_clone, which the conversion below
+         * handles. A CLONE_VM|CLONE_VFORK clone3 would otherwise reach the
+         * emulated execve with the parent's address space still shared. */
+#ifdef __NR_clone3
+        {"clone3 is refused ENOSYS", __NR_clone3, 0x1000, 0,
+         CNG_SECCOMP_RET_ERRNO | 38},
+        {"plain clone still traps for the conversion", __NR_clone, 0x1000,
+         CNG_CLONE_VM | CNG_CLONE_VFORK, CNG_SECCOMP_RET_TRAP},
 #endif
     };
     for (unsigned k = 0; k < sizeof cases / sizeof cases[0]; k++) {

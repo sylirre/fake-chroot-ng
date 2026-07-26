@@ -170,3 +170,26 @@ check_contains "io_uring is refused ENOSYS by the filter" \
     "bpftest io_uring_setup is refused ENOSYS: ERRNO -> OK" "$out"
 check_contains "io_uring is refused even from inside the gate" \
     "bpftest in-gate io_uring is refused too: ERRNO -> OK" "$out"
+# clone3's flags sit behind a pointer, so BPF cannot tell a thread from a vfork.
+# Refusing it puts glibc's posix_spawn/pthread_create back on __NR_clone, where
+# the CLONE_VFORK->fork conversion lives; otherwise a shared-VM child would
+# reach the emulated execve and load the new program over its parent.
+check_contains "clone3 is refused so spawns use the converted clone path" \
+    "bpftest clone3 is refused ENOSYS: ERRNO -> OK" "$out"
+check_contains "plain clone still traps for the vfork conversion" \
+    "bpftest plain clone still traps for the conversion: TRAP -> OK" "$out"
+
+# The -R trampoline tier runs with no filter, so the designed-ENOSYS refusals
+# cannot come from the kernel there -- the dispatcher must answer them itself.
+# bpftest covers the filter; this covers the other tier, and is the only one of
+# the two that qemu-user can actually run.
+DR=$(mktemp -d)
+out=$(run -t dtest -r "$DR" denied /x 2>&1); rc=$?
+check "the trampoline tier refuses the designed-ENOSYS set itself" 0 "$rc"
+check_contains "io_uring is refused on the -R tier" \
+    "denied io_uring_setup: rc=-38 -> OK" "$out"
+check_contains "clone3 is refused on the -R tier" \
+    "denied clone3: rc=-38 -> OK" "$out"
+check_contains "an ordinary syscall still runs on the -R tier" \
+    "denied control getpid: rc=" "$out"
+rm -rf "$DR"

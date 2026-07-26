@@ -117,6 +117,21 @@ static const int enosys_syscalls[] = {
 #ifdef __NR_io_uring_register
     __NR_io_uring_register,
 #endif
+    /* clone3. Its flags live in a `struct clone_args` behind args[0], so BPF —
+     * which can only read scalars out of seccomp_data — cannot tell a thread
+     * from a vfork here, and the CLONE_VFORK conversion below is exactly what
+     * keeps an emulated execve from loading the new program over its parent.
+     * glibc >= 2.34 reaches clone3 first from posix_spawn and pthread_create and
+     * falls back to clone on ENOSYS, which we do handle, so refusing it puts
+     * every spawn back on the path that has the conversion. Cheaper and far more
+     * predictable than reimplementing that delicate child-stack handling for a
+     * second entry point; it is also what the oracle does.
+     *
+     * We never issue clone3 ourselves (sys_fork uses __NR_clone), so refusing it
+     * ahead of the gate allowlist costs nothing. */
+#ifdef __NR_clone3
+    __NR_clone3,
+#endif
 };
 #define NENOSYS ((int)(sizeof(enosys_syscalls) / sizeof(enosys_syscalls[0])))
 

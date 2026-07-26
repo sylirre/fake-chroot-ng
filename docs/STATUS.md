@@ -700,6 +700,32 @@ vfork/`posix_spawn` child-stack handling.
     (verified); the fixed one answers ENOENT, while the rootfs's own file still
     answers ENODATA — so the syscall is translated, not merely blocked. 234/234.
 
+- [x] **`clone3` refused (the vfork corruption, reopened by a second entry point)**
+  The M8-era `CLONE_VFORK` → fork conversion is what stops an emulated `execve`
+  from loading the new program over the address space its parent is still using.
+  It hangs off `__NR_clone`, and `clone3` was never trapped — but glibc >= 2.34
+  reaches `clone3` **first** from `posix_spawn` and `pthread_create`, falling back
+  to `clone` only on ENOSYS. On any kernel with `clone3` (5.3+, so every Android
+  target) a glibc guest's spawn therefore produced a genuine shared-VM vfork
+  child that the monitor never saw, and whose `execve` then overwrote the parent —
+  exactly the corruption STATUS records as fixed for `clone`. It also bypassed
+  `cng_procreg_fork` (invisible in the guest `/proc` view) and
+  `cng_shm_fork_child` (under-counted `nattch`).
+  - BPF cannot help here: `clone3`'s flags live in a `struct clone_args` behind
+    `args[0]`, and seccomp can only read scalars out of `seccomp_data`, so the
+    filter cannot tell a thread from a vfork. `clone3` joins the designed-ENOSYS
+    set instead, which puts every glibc spawn and thread creation back on the
+    `clone` path that *has* the conversion. Cheaper and far more predictable than
+    reimplementing the delicate child-stack handling for a second entry point,
+    and it is what the oracle does. We never issue `clone3` ourselves
+    (`sys_fork` uses `__NR_clone`), so refusing it ahead of the gate costs
+    nothing.
+  - `-t bpftest` asserts `clone3` → ERRNO while a `CLONE_VM|CLONE_VFORK` `clone`
+    still TRAPs for the conversion. `-t dtest denied` covers the **`-R`
+    trampoline tier**, which has no filter and must answer from the dispatcher —
+    the only one of the two tiers qemu-user can run — with an ordinary syscall as
+    the control. 236/236.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes
