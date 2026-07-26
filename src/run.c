@@ -127,6 +127,10 @@ int cng_run(const char *rootfs, const char *libprefix,
     cng_nl_init();
     if (cng_broker_env("CNG_NETLINK_FORCE_BLOCK"))
         cng_nl_force_block = 1;
+    if (cng_broker_env("CNG_NETLINK_NO_RELAY")) {
+        cng_nl_force_block = 1;
+        cng_nl_no_relay = 1;
+    }
 
     /* Resolve the program itself through the map (following symlinks) to find
      * the host file. */

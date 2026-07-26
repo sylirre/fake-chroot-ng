@@ -15,6 +15,10 @@ echo "== M15: AF_UNIX containment =="
 
 M15_GCC="${GCC:-aarch64-linux-gnu-gcc-13}"
 M15_QEMU="${QEMU:-qemu-aarch64-static}"
+# Wrapped in a timeout for the same reason as m16: a socket test that blocks
+# should fail one check, not wedge the suite. The held-socket runs below sleep on
+# purpose, so allow for that.
+m15run() { timeout 60 "$M15_QEMU" "$@"; }
 M15D=$(mktemp -d)
 
 if ! $M15_GCC -static-pie -O2 -o "$M15D/uxsock" tests/guests/uxsock.c \
@@ -29,7 +33,7 @@ else
     # --- pathname sockets -------------------------------------------------
     # /run is not writable on the host, so "bind: ok" is only reachable by way
     # of the rootfs, and the readback must be the guest path, not the host one.
-    out=$($M15_QEMU build/chroot-ng -R "$R1" /bin/uxsock /run/s.sock 2>&1)
+    out=$(m15run build/chroot-ng -R "$R1" /bin/uxsock /run/s.sock 2>&1)
     check_contains "m15 a pathname bind lands inside the rootfs" "bind: ok" "$out"
     check_contains "m15 getsockname reports the guest path" \
         "getsockname: /run/s.sock" "$out"
@@ -54,18 +58,18 @@ else
     # fallback binds relative to a /proc/self/fd directory handle instead.
     DEEP="$M15D/$(printf 'd/%.0s' $(seq 1 30))"
     mkdir -p "$DEEP/run" "$DEEP/bin" && cp "$M15D/uxsock" "$DEEP/bin/uxsock"
-    out=$($M15_QEMU build/chroot-ng -R "$DEEP" /bin/uxsock /run/s.sock 2>&1)
+    out=$(m15run build/chroot-ng -R "$DEEP" /bin/uxsock /run/s.sock 2>&1)
     check_contains "m15 an over-long translated path still binds" "bind: ok" \
         "$out"
 
     # --- abstract namespace ----------------------------------------------
-    out=$($M15_QEMU build/chroot-ng -R "$R1" /bin/uxsock myabs abstract 2>&1)
+    out=$(m15run build/chroot-ng -R "$R1" /bin/uxsock myabs abstract 2>&1)
     check_contains "m15 an abstract bind works" "bind: ok" "$out"
     check_contains "m15 the per-rootfs tag is invisible to the guest" \
         "getsockname: @myabs" "$out"
 
     # ...but it IS on the wire: the host sees the tag, so the name is scoped.
-    $M15_QEMU build/chroot-ng -R "$R1" /bin/uxsock tagprobe abstract 4 \
+    m15run build/chroot-ng -R "$R1" /bin/uxsock tagprobe abstract 4 \
         >/dev/null 2>&1 &
     m15bg=$!
     sleep 2
@@ -82,22 +86,22 @@ else
     esac
 
     # Two DIFFERENT rootfs must both be able to take the same abstract name.
-    $M15_QEMU build/chroot-ng -R "$R1" /bin/uxsock shared abstract 4 \
+    m15run build/chroot-ng -R "$R1" /bin/uxsock shared abstract 4 \
         >/dev/null 2>&1 &
     m15bg=$!
     sleep 2
-    out=$($M15_QEMU build/chroot-ng -R "$R2" /bin/uxsock shared abstract 2>&1)
+    out=$(m15run build/chroot-ng -R "$R2" /bin/uxsock shared abstract 2>&1)
     wait $m15bg 2>/dev/null
     check_contains "m15 abstract names are isolated between rootfs" "bind: ok" \
         "$out"
 
     # --share-abstract-sockets opts out, and then they DO collide — the control
     # that proves the isolation above comes from the tag and not from luck.
-    $M15_QEMU build/chroot-ng -R --share-abstract-sockets "$R1" \
+    m15run build/chroot-ng -R --share-abstract-sockets "$R1" \
         /bin/uxsock shared2 abstract 4 >/dev/null 2>&1 &
     m15bg=$!
     sleep 2
-    out=$($M15_QEMU build/chroot-ng -R --share-abstract-sockets "$R2" \
+    out=$(m15run build/chroot-ng -R --share-abstract-sockets "$R2" \
         /bin/uxsock shared2 abstract 2>&1)
     wait $m15bg 2>/dev/null
     check_contains "m15 --share-abstract-sockets shares the host namespace" \

@@ -12,6 +12,11 @@
  * CNG_SHM_FORCE_FILE). */
 extern int cng_nl_force_block;
 
+/* CNG_NETLINK_NO_RELAY=1: additionally pretend the host refuses us a netlink
+ * socket for relaying, so the degradation path (a well-formed *empty* dump) can
+ * be exercised on a host where the relay actually works. */
+extern int cng_nl_no_relay;
+
 void cng_nl_init(void);
 
 /* 1 if `fd` is one of our emulated netlink sockets. */

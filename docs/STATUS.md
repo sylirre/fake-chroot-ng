@@ -943,6 +943,41 @@ vfork/`posix_spawn` child-stack handling.
     credential syscalls under `--fake-id`, and that `AT_RANDOM` differs between
     two execs.
 
+- [x] **`ip addr` on-device fix: iproute2's dump contract, and no more relay buffer**
+  Reported from a device: `ip addr` printed `DONE truncated / Dump terminated` and
+  nothing else, where arm64chroot listed every interface. Two defects, and the
+  first explains the message exactly.
+  - **`NLMSG_DONE` must carry a 4-byte error int.** iproute2's
+    `rtnl_dump_done()` rejects a terminator shorter than
+    `NLMSG_LENGTH(sizeof(int))` — 20 bytes — and prints precisely
+    `DONE truncated`. We emitted 16 (`NLMSG_LENGTH(0)`). glibc's `getifaddrs`
+    never looks at the length, which is why this passed every local test: the
+    M16 differential guest only counted messages. And because `ip addr`
+    collects the `RTM_GETLINK` dump into a list *before* printing anything, the
+    rejection lost the entire listing rather than truncating it — matching the
+    report of no output at all.
+  - **Our own terminator only appeared when the dump was truncated** by the
+    16 KB reply buffer, which is why a devbox with two interfaces never saw it
+    and a phone with seven did. Rather than widen the buffer, the buffer is
+    **gone**: each slot now keeps its unbound host netlink socket open and the
+    guest's `recvfrom`/`recvmsg` reads the kernel's reply *straight into the
+    guest's own buffer*, with the guest's `MSG_*` flags forwarded. That removes
+    the cap, the message-boundary splitting, and the hand-rolled
+    `MSG_PEEK`/`MSG_TRUNC` emulation in one move — the kernel does all of it —
+    and it means a dump can no longer silently lose entries. Only `nlmsg_pid`
+    still needs rewriting (our host socket is unbound, so the kernel addresses
+    replies to port 0 while the client matches them against the port id
+    `getsockname` reported).
+  - `tests/guests/nldone.c` now applies **iproute2's** filter rather than
+    glibc's: it asserts the terminator's length, that the source address is
+    `nl_pid == 0`, that `nlmsg_pid` equals the port id from `getsockname`, that
+    the sequence number matches, and that nothing was silently skipped — the
+    checks whose absence let this ship. `CNG_NETLINK_NO_RELAY=1` exercises the
+    relay-less degradation path on a working host, asserting an empty dump is
+    still well-formed rather than a terminator a client rejects.
+  - The M15/M16 guest invocations are wrapped in `timeout` now: a dump that
+    never terminates should fail one check rather than wedge the suite.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

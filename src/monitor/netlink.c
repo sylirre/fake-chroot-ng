@@ -34,6 +34,7 @@
 #include <asm/unistd.h>
 
 int cng_nl_force_block = 0;
+int cng_nl_no_relay = 0;
 
 #define AF_NETLINK_    16
 #define NETLINK_ROUTE_ 0
@@ -52,10 +53,7 @@ int cng_nl_force_block = 0;
 #define RTM_GETADDR_  22
 #define RTM_GETROUTE_ 26
 
-/* Big enough for a real interface list in one dump; the oracle's 8192 truncates
- * on a host with many interfaces, and a truncated dump costs the guest entries. */
-#define NL_REPLY_MAX 16384
-#define NL_SLOTS     4
+#define NL_SLOTS 4
 
 struct nlmsghdr_ {
     unsigned len;
@@ -68,16 +66,24 @@ struct sockaddr_nl_ {
     unsigned pid, groups;
 };
 
-/* One emulated netlink socket. `ino` pins the identity of the fd: we cannot trap
- * close(), so a slot is only ours while the fd still names the same socket
- * inode — the same staleness discipline procfs.c uses for its synthesized fds.
- * Without it, a guest that closed this fd and opened something else on the same
- * number would have its I/O quietly diverted here. */
+/* One emulated netlink socket.
+ *
+ * `fd` is the AF_UNIX stand-in the guest holds; `hostfd` is a real, deliberately
+ * UNBOUND netlink socket we keep for its lifetime and stream replies from. `ino`
+ * pins the identity of the guest fd: we cannot trap close(), so a slot is only
+ * ours while the fd still names the same socket inode — the same staleness
+ * discipline procfs.c uses for its synthesized fds. Without it, a guest that
+ * closed this fd and opened something else on the same number would have its I/O
+ * quietly diverted here.
+ *
+ * `ack` holds a locally-built reply for the requests we answer ourselves rather
+ * than forward (see nl_send); dumps never land in it, so it stays small. */
 struct nl_slot {
-    int fd;
+    int fd, hostfd;
     unsigned long long ino;
-    unsigned char reply[NL_REPLY_MAX];
-    long rlen, rpos;
+    unsigned char ack[64];
+    long alen, apos;
+    int streaming; /* the pending reply comes from hostfd, not from ack */
 };
 
 static struct nl_slot g_slots[NL_SLOTS];
@@ -134,145 +140,48 @@ static int host_blocks(void) {
     return cached;
 }
 
-/* Relay a dump through an UNBOUND host netlink socket. This is the whole reason
- * the emulation can be this small: the denial is on bind, not on the query.
- * Returns the bytes placed in `out`, or 0 if the host would not answer. */
-static long relay(const unsigned char *req, long rlen, unsigned char *out,
-                  long cap, unsigned seq, unsigned pid) {
-    long fd = CNG_SYS(__NR_socket, AF_NETLINK_, SOCK_RAW_ | CNG_O_CLOEXEC,
-                      NETLINK_ROUTE_, 0, 0, 0);
-    if (fd < 0)
-        return 0;
-    /* Don't block forever if the kernel says nothing. */
-    struct cng_timeval tv = {1, 0};
-    CNG_SYS(__NR_setsockopt, fd, CNG_SOL_SOCKET, CNG_SO_RCVTIMEO, (long)&tv,
-            sizeof tv, 0);
-    struct sockaddr_nl_ sa;
-    memset(&sa, 0, sizeof sa);
-    sa.family = AF_NETLINK_;
-    if (CNG_SYS(__NR_sendto, fd, (long)req, rlen, 0, (long)&sa, sizeof sa) < 0) {
-        sys_close((int)fd);
-        return 0;
-    }
-    long off = 0;
-    for (int round = 0; round < 64; round++) {
-        long n = CNG_SYS(__NR_recvfrom, fd, (long)(out + off), cap - off, 0, 0, 0);
-        if (n <= 0)
-            break;
-        /* Rewrite the sequence and port id of every message so the guest's
-         * netlink library accepts them as answers to *its* request (iproute2
-         * checks both and silently drops a mismatch). Also spot the terminating
-         * NLMSG_DONE while walking. */
-        int done = 0;
-        long p = off;
-        while (p + (long)sizeof(struct nlmsghdr_) <= off + n) {
-            struct nlmsghdr_ *h = (struct nlmsghdr_ *)(out + p);
-            if (h->len < sizeof *h || p + (long)h->len > off + n)
-                break;
-            h->seq = seq;
-            h->pid = pid;
-            if (h->type == NLMSG_DONE_ || h->type == NLMSG_ERROR_)
-                done = 1;
-            if (!(h->flags & NLM_F_MULTI_))
-                done = 1;
-            p += (long)((h->len + 3) & ~3u);
-        }
-        off += n;
-        if (done || off >= cap)
-            break;
-    }
-    sys_close((int)fd);
-    return off;
+/* Build a well-formed NLMSG_DONE at `buf`. The kernel's own DONE carries a
+ * 4-byte error int and NLM_F_MULTI, and iproute2 *enforces* it: rtnl_dump_done()
+ * prints "DONE truncated" and abandons the dump when nlmsg_len is below
+ * NLMSG_LENGTH(sizeof(int)) == 20. glibc's getifaddrs never looks, which is why
+ * a 16-byte DONE passed every local test and still broke `ip addr` on a device.
+ * Returns the bytes written. */
+static long put_done(unsigned char *buf, unsigned seq, unsigned pid) {
+    struct nlmsghdr_ *d = (struct nlmsghdr_ *)buf;
+    d->len = (unsigned)(sizeof *d + 4);
+    d->type = NLMSG_DONE_;
+    d->flags = NLM_F_MULTI_;
+    d->seq = seq;
+    d->pid = pid;
+    *(int *)(buf + sizeof *d) = 0; /* dump error: success */
+    return (long)d->len;
 }
 
-/* Make a relayed dump self-terminating, and return its final length.
+/* Rewrite the port id of every complete message in a received buffer.
  *
- * A reply cut off by our buffer (or the round cap) ends in a PARTIAL message.
- * A netlink client walks with NLMSG_OK and stops dead at that partial record, so
- * appending the terminator after it is useless — the client never gets there,
- * reads again, sees an empty datagram and reports it as an error (glibc:
- * "Unexpected netlink response of size 0"). The terminator has to *replace* the
- * partial tail: rewind to the end of the last complete message and put
- * NLMSG_DONE there. The guest then loses whatever the truncation dropped, but it
- * sees a well-formed, finite dump instead of hanging. */
-static long nl_finish(unsigned char *buf, long len, unsigned seq, unsigned pid) {
-    long end = 0;
-    int done = 0;
+ * Our host socket is unbound, so the kernel addresses its replies to port 0,
+ * while the guest's client matches them against the port id getsockname reported
+ * (cng_nl_getname: our pid). iproute2 and glibc both silently skip a mismatch,
+ * which loses the whole dump including its terminator. The sequence number needs
+ * no fixing: the guest's own request carried it and we forward that verbatim. */
+static void fix_pid(unsigned char *buf, long len, unsigned pid) {
     for (long p = 0; p + (long)sizeof(struct nlmsghdr_) <= len;) {
         struct nlmsghdr_ *h = (struct nlmsghdr_ *)(buf + p);
         if (h->len < sizeof *h || p + (long)h->len > len)
-            break; /* partial: everything from here is discarded */
-        done = (h->type == NLMSG_DONE_);
+            break;
+        h->pid = pid;
         p += (long)((h->len + 3) & ~3u);
-        end = p;
     }
-    if (done)
-        return end;
-    struct nlmsghdr_ *d = (struct nlmsghdr_ *)(buf + end);
-    d->len = sizeof *d;
-    d->type = NLMSG_DONE_;
-    d->flags = 0;
-    d->seq = seq;
-    d->pid = pid;
-    return end + (long)sizeof *d;
 }
 
-/* Build the answer to one guest request into the slot's reply buffer. */
-static void answer(struct nl_slot *s, const unsigned char *req, long rlen) {
-    s->rlen = 0;
-    s->rpos = 0;
-    if (rlen < (long)sizeof(struct nlmsghdr_))
-        return;
-    const struct nlmsghdr_ *rh = (const struct nlmsghdr_ *)req;
-    unsigned seq = rh->seq;
-    /* The reply's nlmsg_pid is the *destination* port id — the requesting
-     * socket's — not whatever the request happened to carry (usually 0, since
-     * the kernel fills it in). glibc's __netlink_request drops any message whose
-     * nlmsg_pid does not equal the port id it read from getsockname, so echoing
-     * the request's value made it discard the entire dump, terminator included,
-     * and then report the next empty read as an error. Must stay in step with
-     * cng_nl_getname. */
-    unsigned pid = (unsigned)sys_getpid();
-    unsigned short type = rh->type;
-    int is_dump = (rh->flags & NLM_F_DUMP_) == NLM_F_DUMP_;
-
-    if (type == RTM_GETLINK_ || type == RTM_GETADDR_ || type == RTM_GETROUTE_) {
-        /* Reserve room for a terminator: a dump the guest cannot see the end of
-         * is worse than a short one. glibc and iproute2 both read until
-         * NLMSG_DONE, so a reply truncated by our buffer (or by the round cap)
-         * without one makes them wait forever. */
-        long n = relay(req, rlen, s->reply, NL_REPLY_MAX - (long)sizeof *rh, seq,
-                       pid);
-        if (n > 0) {
-            s->rlen = nl_finish(s->reply, n, seq, pid);
-            return;
-        }
-        /* The host would not answer at all. An empty dump is the graceful
-         * degradation: getifaddrs() then succeeds with no interfaces rather
-         * than failing outright, and `ip addr` prints nothing instead of
-         * "Cannot open netlink socket". */
-    }
-
-    struct nlmsghdr_ *o = (struct nlmsghdr_ *)s->reply;
-    if (is_dump) {
-        o->len = sizeof *o;
-        o->type = NLMSG_DONE_;
-        o->flags = 0;
-        o->seq = seq;
-        o->pid = pid;
-        s->rlen = (long)sizeof *o;
-        return;
-    }
-    /* Everything else gets a success ack. This is what makes bubblewrap's
-     * loopback_setup() (RTM_NEWADDR/RTM_NEWLINK) proceed instead of aborting. */
-    o->len = sizeof *o + 4 + (unsigned)sizeof *o;
-    o->type = NLMSG_ERROR_;
-    o->flags = 0;
-    o->seq = seq;
-    o->pid = pid;
-    *(int *)(s->reply + sizeof *o) = 0; /* error == 0 => ack */
-    memcpy(s->reply + sizeof *o + 4, req, sizeof *o);
-    s->rlen = (long)o->len;
+/* An unbound netlink socket for relaying. Unbound is the whole point: the
+ * SELinux denial on Android is on bind(2), not on the query. */
+static long open_hostfd(void) {
+    if (cng_nl_no_relay)
+        return -1; /* test aid: exercise the degradation path on a working host */
+    long fd = CNG_SYS(__NR_socket, AF_NETLINK_, SOCK_RAW_ | CNG_O_CLOEXEC,
+                      NETLINK_ROUTE_, 0, 0, 0);
+    return fd < 0 ? -1 : fd;
 }
 
 long cng_nl_socket(long domain, long type, long protocol) {
@@ -299,11 +208,15 @@ long cng_nl_socket(long domain, long type, long protocol) {
         return -1;
     g_slots[free_slot].fd = (int)fd;
     g_slots[free_slot].ino = fd_ino((int)fd);
-    g_slots[free_slot].rlen = 0;
-    g_slots[free_slot].rpos = 0;
+    g_slots[free_slot].hostfd = (int)open_hostfd();
+    g_slots[free_slot].alen = 0;
+    g_slots[free_slot].apos = 0;
+    g_slots[free_slot].streaming = 0;
     if (cng_g_debug)
-        cng_dprintf(2, "[cng] netlink: emulating fd %ld (host denies rtnetlink)\n",
-                    fd);
+        cng_dprintf(2,
+                    "[cng] netlink: emulating fd %ld (host denies rtnetlink), "
+                    "relay fd %d\n",
+                    fd, g_slots[free_slot].hostfd);
     return fd;
 }
 
@@ -311,14 +224,59 @@ int cng_nl_send(int fd, const void *buf, long len, long *out) {
     struct nl_slot *s = slot_of(fd);
     if (!s)
         return 0;
-    if (buf && len > 0)
-        answer(s, (const unsigned char *)buf, len);
-    if (cng_g_debug) {
-        unsigned t = (len >= 16) ? ((const struct nlmsghdr_ *)buf)->type : 0;
-        cng_dprintf(2, "[cng] nl send fd=%d len=%ld type=%u -> reply %ld\n", fd,
-                    len, t, s->rlen);
+    *out = len; /* the guest's request is always "sent" in full */
+    s->alen = s->apos = 0;
+    s->streaming = 0;
+    if (!buf || len < (long)sizeof(struct nlmsghdr_))
+        return 1;
+    const struct nlmsghdr_ *rh = (const struct nlmsghdr_ *)buf;
+    unsigned short type = rh->type;
+    unsigned seq = rh->seq;
+    int is_dump = (rh->flags & NLM_F_DUMP_) == NLM_F_DUMP_;
+
+    if (type == RTM_GETLINK_ || type == RTM_GETADDR_ || type == RTM_GETROUTE_) {
+        /* Forward verbatim to the unbound host socket and let the guest read the
+         * kernel's own answer straight out of it (see cng_nl_recv). Buffering the
+         * dump here instead — which is what this used to do — capped it at our
+         * own buffer size, and a host with more than a few interfaces overran
+         * that: the guest silently lost entries and got our synthesized
+         * terminator rather than the kernel's. */
+        struct sockaddr_nl_ sa;
+        memset(&sa, 0, sizeof sa);
+        sa.family = AF_NETLINK_;
+        if (s->hostfd >= 0 &&
+            CNG_SYS(__NR_sendto, s->hostfd, (long)buf, len, 0, (long)&sa,
+                    sizeof sa) >= 0) {
+            s->streaming = 1;
+            if (cng_g_debug)
+                cng_dprintf(2, "[cng] nl send fd=%d type=%u -> relayed\n", fd,
+                            type);
+            return 1;
+        }
+        /* The host will not answer at all. Give a well-formed empty dump: the
+         * guest then sees no interfaces rather than an error or a hang. */
+        s->alen = put_done(s->ack, seq, (unsigned)sys_getpid());
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] nl send fd=%d type=%u -> empty (no relay)\n",
+                        fd, type);
+        return 1;
     }
-    *out = len; /* the guest's request was "sent" in full */
+
+    if (is_dump) {
+        s->alen = put_done(s->ack, seq, (unsigned)sys_getpid());
+        return 1;
+    }
+    /* Anything else gets a success ack, which is what lets bubblewrap's
+     * loopback_setup() (RTM_NEWADDR/RTM_NEWLINK) proceed instead of aborting. */
+    struct nlmsghdr_ *o = (struct nlmsghdr_ *)s->ack;
+    o->len = (unsigned)(sizeof *o + 4 + sizeof *o);
+    o->type = NLMSG_ERROR_;
+    o->flags = 0;
+    o->seq = seq;
+    o->pid = (unsigned)sys_getpid();
+    *(int *)(s->ack + sizeof *o) = 0; /* error == 0 => ack */
+    memcpy(s->ack + sizeof *o + 4, buf, sizeof *o);
+    s->alen = (long)o->len;
     return 1;
 }
 
@@ -326,54 +284,51 @@ int cng_nl_recv(int fd, void *buf, long len, long flags, long *out) {
     struct nl_slot *s = slot_of(fd);
     if (!s)
         return 0;
-    long avail = s->rlen - s->rpos;
-    if (avail <= 0) {
-        *out = 0; /* drained: an empty datagram, which reads as end-of-dump */
+
+    if (s->streaming) {
+        /* Read the kernel's reply straight into the guest's buffer, forwarding
+         * the guest's own MSG_* flags so MSG_PEEK and MSG_TRUNC are handled by
+         * the kernel exactly as they would be on a real netlink socket — which
+         * is how glibc sizes a dump before reading it. No message ever has to be
+         * split by us, so there is no boundary bookkeeping and no cap. */
+        long n = CNG_SYS(__NR_recvfrom, s->hostfd, (long)buf, len, flags, 0, 0);
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] nl recv fd=%d len=%ld flags=%lx -> %ld\n", fd,
+                        len, flags, n);
+        if (n < 0) {
+            *out = 0; /* nothing more: reads as end-of-dump */
+            return 1;
+        }
+        /* Applies to a peek too: the client inspects what it peeked, and the
+         * real read that follows rewrites it again harmlessly. */
+        if (buf && n > 0)
+            fix_pid((unsigned char *)buf, n < len ? n : len,
+                    (unsigned)sys_getpid());
+        *out = n;
         return 1;
     }
-    /* Netlink is message-oriented: a reader walks the buffer with NLMSG_OK, so a
-     * read must never end mid-record. A dump legitimately spans several reads
-     * (the client loops until NLMSG_DONE), but handing back a truncated record
-     * makes the next read start mid-header and the walk falls apart — which
-     * presented as glibc reporting "Unexpected netlink response of size 0" two
-     * reads later. So hand back as many WHOLE messages as fit. */
-    long end = s->rpos;
-    while (end < s->rlen) {
-        const struct nlmsghdr_ *h = (const struct nlmsghdr_ *)(s->reply + end);
-        if (end + (long)sizeof *h > s->rlen || h->len < sizeof *h)
-            break;
-        long adv = (long)((h->len + 3) & ~3u);
-        if (end + adv > s->rlen || (end - s->rpos) + adv > len)
-            break;
-        end += adv;
+
+    long avail = s->alen - s->apos;
+    if (avail <= 0) {
+        *out = 0;
+        return 1;
     }
-    long n = end - s->rpos;
-    if (n == 0) /* a single message larger than the buffer: truncate, as the
-                 * kernel does (and flag it via MSG_TRUNC below) */
-        n = avail < len ? avail : len;
-    if (cng_g_debug)
-        cng_dprintf(2, "[cng] nl recv fd=%d len=%ld flags=%lx avail=%ld -> %ld\n",
-                    fd, len, flags, avail, n);
+    long n = avail < len ? avail : len;
     if (buf && n > 0)
-        memcpy(buf, s->reply + s->rpos, (size_t)n);
-    /* glibc's __netlink_request sizes the message first with
-     * MSG_PEEK|MSG_TRUNC, grows its buffer to fit, and only then reads for
-     * real. Honoring both flags is what makes getifaddrs(3) work: PEEK must not
-     * consume, and TRUNC must report the *whole* pending length rather than the
-     * bytes that fit, or the caller concludes the reply was empty. */
+        memcpy(buf, s->ack + s->apos, (size_t)n);
     if (!(flags & MSG_PEEK_))
-        s->rpos += n;
+        s->apos += n;
     *out = (flags & MSG_TRUNC_) ? avail : n;
     return 1;
 }
 
 /* Write a sockaddr_nl into a guest buffer. `pid` distinguishes the two callers,
- * and getting it wrong is not cosmetic: glibc's __netlink_request discards any
- * reply whose *source* address is not nl_pid == 0, because that is what "came
- * from the kernel" means. Filling the source with our own port id made glibc
- * skip every message and wait for an NLMSG_DONE it would never accept —
- * getifaddrs(3) hung rather than failed. getsockname, by contrast, must report
- * our own port id, which is what the caller then matches replies against. */
+ * and getting it wrong is not cosmetic: a netlink client discards any reply whose
+ * *source* address is not nl_pid == 0, because that is what "came from the
+ * kernel" means. Filling the source with our own port id made glibc skip every
+ * message and wait for an NLMSG_DONE it would never accept. getsockname, by
+ * contrast, must report our own port id, which is what the client then matches
+ * each reply's nlmsg_pid against (see fix_pid). */
 static int write_nladdr(void *addr, unsigned *alen, unsigned pid) {
     if (!addr || !alen || *alen < sizeof(struct sockaddr_nl_))
         return 1;
