@@ -90,5 +90,6 @@ typedef struct {
 #define AT_HWCAP2        26
 #define AT_EXECFN        31
 #define AT_SYSINFO_EHDR  33
+#define AT_MINSIGSTKSZ   51
 
 #endif /* CNG_ELF_H */

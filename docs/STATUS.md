@@ -917,6 +917,32 @@ vfork/`posix_spawn` child-stack handling.
     translation rather than being refused. `-t dtest denied` covers the same on
     the `-R` trampoline tier. Filter is 109 of 256 instructions.
 
+- [x] **auxv fidelity: `AT_SECURE`, `AT_RANDOM`, the identity entries, `AT_MINSIGSTKSZ`**
+  Four entries the loader was getting wrong, two of them security-relevant.
+  - **`AT_SECURE` was hardcoded 0.** It is what makes glibc's
+    `__libc_enable_secure` and musl's `libc.secure` sanitize `LD_PRELOAD`,
+    `LD_LIBRARY_PATH` and `LD_AUDIT` — so a `--setuid-root` exec that really did
+    elevate the fake identity ran **unguarded**, which is the one case where it
+    matters most. Now computed from the transition the way the kernel does
+    (`uid != euid || gid != egid`).
+  - **The identity entries carried chroot-ng's own host ids** even under
+    `--fake-id`, so `getauxval(AT_UID)` contradicted `getuid()`. musl derives
+    `libc.secure` from exactly that comparison. They now come from the live
+    credential set when a fake identity is active.
+  - **`AT_RANDOM` was a copy of our own host value**, reused for every program.
+    glibc and musl take the stack canary and pointer guard from it, and a real
+    execve re-randomizes per exec — so the whole exec chain shared one canary,
+    and it was predictable from any single leak. Drawn fresh from `getrandom(2)`
+    now, falling back to the host value only if that is unavailable.
+  - **`AT_MINSIGSTKSZ` was dropped** while `AT_HWCAP` was forwarded verbatim —
+    so guests do enable SVE, then size `SA_ONSTACK` alt-stacks from glibc's small
+    compile-time fallback rather than the kernel's real answer. That is in direct
+    tension with the ~4.5 KiB frame our own SIGSYS handler is delivered on. Now
+    passed through.
+  - `tests/guests/auxprobe.c` asserts the identity entries agree with the
+    credential syscalls under `--fake-id`, and that `AT_RANDOM` differs between
+    two execs.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

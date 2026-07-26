@@ -85,3 +85,30 @@ check_contains "dirfd args tolerate dirty upper halves (glibc w-registers)" \
     "l2s-dirtyfd: rc=0 nlink2=1 -> OK" "$out"
 check_contains "fchdir updates virtual cwd" "fchdir: cwd=/w -> OK" "$out"
 rm -rf "$L2"
+
+# --- auxv fidelity ---------------------------------------------------------
+# AT_UID/AT_EUID must agree with the credential syscalls (they used to carry
+# chroot-ng's own host ids under --fake-id, so getauxval contradicted getuid);
+# AT_SECURE must be computed from a real set-id transition rather than hardcoded
+# 0, since it is what makes glibc/musl sanitize LD_PRELOAD; and AT_RANDOM must be
+# fresh per exec, since the stack canary comes from it and a copy of our own gave
+# every program in an exec chain the same one.
+AXD=$(mktemp -d)
+if ${GCC:-aarch64-linux-gnu-gcc-13} -static-pie -O2 -o "$AXD/auxprobe" \
+        tests/guests/auxprobe.c 2>"$AXD/log"; then
+    mkdir -p "$AXD/rootfs/bin"; cp "$AXD/auxprobe" "$AXD/rootfs/bin/"
+    out=$(run -R -u 0:0 "$AXD/rootfs" /bin/auxprobe 2>/dev/null)
+    check_contains "auxv identity agrees with the fake id" \
+        "AT_UID=0 AT_EUID=0 getuid=0 geteuid=0" "$out"
+    check_contains "AT_SECURE is 0 with no set-id transition" "AT_SECURE=0" "$out"
+    r1=$(run -R "$AXD/rootfs" /bin/auxprobe 2>/dev/null | grep AT_RANDOM)
+    r2=$(run -R "$AXD/rootfs" /bin/auxprobe 2>/dev/null | grep AT_RANDOM)
+    if [ -n "$r1" ] && [ "$r1" != "$r2" ]; then
+        pass=$((pass + 1)); echo "  ok   AT_RANDOM is fresh per exec"
+    else
+        fail=$((fail + 1)); echo "  FAIL AT_RANDOM is fresh per exec ($r1 vs $r2)"
+    fi
+else
+    echo "  skip: could not build tests/guests/auxprobe.c"
+fi
+rm -rf "$AXD"

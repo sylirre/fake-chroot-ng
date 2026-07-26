@@ -137,6 +137,9 @@ static inline long sys_prlimit64(int pid, int res, const struct cng_rlimit *new_
                                  struct cng_rlimit *old) {
     return CNG_SYS(__NR_prlimit64, pid, res, new_, old, 0, 0);
 }
+static inline long sys_getrandom(void *buf, unsigned long n, unsigned flags) {
+    return CNG_SYS(__NR_getrandom, buf, n, flags, 0, 0, 0);
+}
 static inline long sys_getuid(void) {
     return CNG_SYS(__NR_getuid, 0, 0, 0, 0, 0, 0);
 }

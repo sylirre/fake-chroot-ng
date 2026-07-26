@@ -6,6 +6,7 @@
  */
 #include "cng/elf.h"
 #include "cng/loader.h"
+#include "cng/monitor.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
 #include "cng/uapi.h"
@@ -62,14 +63,21 @@ unsigned long cng_build_stack(int argc, char **argv, char **envp,
         PUSH_STR(execfn ? execfn : (argc > 0 ? argv[0] : ""));
     unsigned long platform_addr = PUSH_STR("aarch64");
 
-    /* AT_RANDOM: 16 bytes, 16-aligned; reuse host randomness if available. */
+    /* AT_RANDOM: 16 bytes, 16-aligned. glibc and musl take the stack canary and
+     * pointer guard from here, and a real execve re-randomizes it per exec —
+     * so copying our own host value (which is what this used to do) gave every
+     * program in an exec chain the same canary, and made it predictable from any
+     * single leak. Draw fresh bytes instead, falling back to the host's own
+     * value and then to a constant only if getrandom is unavailable. */
     sp_str = (sp_str - 16) & ~15UL;
     unsigned long random_addr = sp_str;
-    unsigned long hr = auxval(host_auxv, AT_RANDOM);
-    if (hr)
-        memcpy((void *)random_addr, (void *)hr, 16);
-    else
-        memset((void *)random_addr, 0x5a, 16);
+    if (sys_getrandom((void *)random_addr, 16, 0) != 16) {
+        unsigned long hr = auxval(host_auxv, AT_RANDOM);
+        if (hr)
+            memcpy((void *)random_addr, (void *)hr, 16);
+        else
+            memset((void *)random_addr, 0x5a, 16);
+    }
 
     /* Assemble auxv (type,val pairs). */
     unsigned long aux[64 * 2];
@@ -90,11 +98,31 @@ unsigned long cng_build_stack(int argc, char **argv, char **envp,
     AUX(AT_EXECFN, execfn_addr);
     AUX(AT_PLATFORM, platform_addr);
     AUX(AT_RANDOM, random_addr);
-    AUX(AT_UID, auxval(host_auxv, AT_UID));
-    AUX(AT_EUID, auxval(host_auxv, AT_EUID));
-    AUX(AT_GID, auxval(host_auxv, AT_GID));
-    AUX(AT_EGID, auxval(host_auxv, AT_EGID));
-    AUX(AT_SECURE, 0);
+    /* Identity: under --fake-id these must agree with what the credential
+     * syscalls report, or getauxval(AT_UID) contradicts getuid() — and musl
+     * derives libc.secure from exactly this comparison. */
+    unsigned long a_uid, a_euid, a_gid, a_egid;
+    if (cng_g_fake_id) {
+        a_uid = cng_g_cred.ruid;
+        a_euid = cng_g_cred.euid;
+        a_gid = cng_g_cred.rgid;
+        a_egid = cng_g_cred.egid;
+    } else {
+        a_uid = auxval(host_auxv, AT_UID);
+        a_euid = auxval(host_auxv, AT_EUID);
+        a_gid = auxval(host_auxv, AT_GID);
+        a_egid = auxval(host_auxv, AT_EGID);
+    }
+    AUX(AT_UID, a_uid);
+    AUX(AT_EUID, a_euid);
+    AUX(AT_GID, a_gid);
+    AUX(AT_EGID, a_egid);
+    /* AT_SECURE is what makes glibc's __libc_enable_secure (and musl's
+     * libc.secure) sanitize LD_PRELOAD / LD_LIBRARY_PATH / LD_AUDIT. It was
+     * hardcoded 0, so a --setuid-root exec that really did elevate the fake
+     * identity ran *unguarded* — the one case where it matters most. Compute it
+     * from the transition the way the kernel does. */
+    AUX(AT_SECURE, (a_uid != a_euid || a_gid != a_egid) ? 1 : 0);
     unsigned long clk = auxval(host_auxv, AT_CLKTCK);
     AUX(AT_CLKTCK, clk ? clk : 100);
     unsigned long hw = auxval(host_auxv, AT_HWCAP);
@@ -106,6 +134,14 @@ unsigned long cng_build_stack(int argc, char **argv, char **envp,
     unsigned long vdso = auxval(host_auxv, AT_SYSINFO_EHDR);
     if (vdso)
         AUX(AT_SYSINFO_EHDR, vdso);
+    /* AT_MINSIGSTKSZ is the kernel's own answer for how much signal-frame space
+     * this CPU needs, and on an SVE machine it is far above the compile-time
+     * constant glibc falls back to. Dropping it while forwarding AT_HWCAP
+     * verbatim (so guests do enable SVE) left them sizing SA_ONSTACK alt-stacks
+     * too small for the frame our own SIGSYS handler is delivered on. */
+    unsigned long mss = auxval(host_auxv, AT_MINSIGSTKSZ);
+    if (mss)
+        AUX(AT_MINSIGSTKSZ, mss);
     AUX(AT_NULL, 0);
 
     /* Fixed region below the strings: argc + argv[] + NULL + envp[] + NULL
