@@ -681,6 +681,25 @@ vfork/`posix_spawn` child-stack handling.
     a rewritten `svc` site has no filter and calls the dispatcher directly.
   - Filter is 70 of 128 instructions. 232/232.
 
+- [x] **xattr family translated (host read *and* write)**
+  None of the twelve xattr syscalls was trapped, so the eight path-bearing forms
+  took the guest's absolute path straight to the host filesystem. The getters
+  leaked host state and answered existence questions about it; `setxattr` and
+  `removexattr` **wrote** it. The `f*` forms act on an fd and correctly need no
+  translation.
+  - `setxattr`/`lsetxattr`/`getxattr`/`lgetxattr`/`listxattr`/`llistxattr`/
+    `removexattr`/`lremovexattr` join `path_syscalls[]` and get one dispatch case:
+    the path is a0 with no dirfd, so it is a plain translate + reissue. The `l`
+    forms pass `deref_final = 0`; the four mutators honor a `:ro` bind (matching
+    the four sites the oracle guards). They also join the l2s deny set, so a path
+    naming the `.l2s` machinery reports ENOENT here as everywhere else, and the
+    block-list probe set, since Android may refuse to re-issue them.
+  - Tested by errno separation: `/etc/passwd` exists on the host and not in the
+    test rootfs, so `getxattr` on it answering ENODATA means a real file was
+    reached and ENOENT means containment. The pre-fix binary answers ENODATA
+    (verified); the fixed one answers ENOENT, while the rootfs's own file still
+    answers ENODATA — so the syscall is translated, not merely blocked. 234/234.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

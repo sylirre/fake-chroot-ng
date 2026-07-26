@@ -208,6 +208,18 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
         cng_dprintf(1, "atrel: %s\n", buf);
         return 0;
     }
+    /* The xattr family was never trapped, so a guest's absolute path went to the
+     * HOST filesystem: getxattr answered existence questions about it and
+     * setxattr wrote it. Translation shows up as the errno: a name that exists
+     * inside the rootfs answers ENODATA/EOPNOTSUPP ("no such attribute"), while
+     * an untranslated path lands on a host name that is not there -> ENOENT. */
+    if (!strcmp(op, "getxa")) {
+        char val[64];
+        long r = cng_dispatch(__NR_getxattr, (long)gpath, (long)"user.cng.probe",
+                              (long)val, sizeof val, 0, 0, 0);
+        cng_dprintf(1, "getxa: errno %d\n", r < 0 ? (int)-r : 0);
+        return 0;
+    }
     if (!strcmp(op, "access")) {
         long r = cng_dispatch(__NR_faccessat, CNG_AT_FDCWD, (long)gpath, 0, 0, 0,
                               0, /*trapped=*/0);

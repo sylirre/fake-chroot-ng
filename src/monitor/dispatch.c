@@ -756,6 +756,14 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         case __NR_statfs:
         case __NR_chdir:
         case __NR_chroot:
+        case __NR_setxattr:
+        case __NR_lsetxattr:
+        case __NR_getxattr:
+        case __NR_lgetxattr:
+        case __NR_listxattr:
+        case __NR_llistxattr:
+        case __NR_removexattr:
+        case __NR_lremovexattr:
             p1 = (const char *)a0;
             break;
         }
@@ -1369,6 +1377,28 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     }
 
     /* path = a0 */
+    /* Extended attributes: the path is a0 and there is no dirfd, so this is a
+     * plain translate + reissue. The "l" forms do not follow a final symlink;
+     * the setters and removers mutate, so a :ro bind refuses them. */
+    case __NR_setxattr:
+    case __NR_lsetxattr:
+    case __NR_getxattr:
+    case __NR_lgetxattr:
+    case __NR_listxattr:
+    case __NR_llistxattr:
+    case __NR_removexattr:
+    case __NR_lremovexattr: {
+        int deref = !(nr == __NR_lsetxattr || nr == __NR_lgetxattr ||
+                      nr == __NR_llistxattr || nr == __NR_lremovexattr);
+        int writes = (nr == __NR_setxattr || nr == __NR_lsetxattr ||
+                      nr == __NR_removexattr || nr == __NR_lremovexattr);
+        const char *p =
+            xlate(CNG_AT_FDCWD, (const char *)a0, b1, sizeof b1, deref);
+        if (writes && ro_denied(p))
+            return -EROFS;
+        return reissue((long)p, a1, a2, a3, a4, a5, nr);
+    }
+
     case __NR_truncate:
     case __NR_statfs: {
         const char *p =

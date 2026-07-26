@@ -64,6 +64,19 @@ check_contains "dirfd-relative absolute symlink re-roots into the rootfs" \
     "atrel: HELLO-FROM-ROOTFS" \
     "$(run -t dtest -r "$ROOT" atrel /sub lnk 2>&1)"
 
+# The xattr family was never trapped, so a guest's absolute path reached the HOST
+# filesystem: getxattr answered existence questions about it and setxattr wrote
+# it. Translation shows up in the errno -- ENODATA (61) means a real file was
+# reached, ENOENT (2) means the name was resolved inside the rootfs and is not
+# there. /etc/passwd exists on the host and not in this rootfs, so it separates
+# the two: errno 61 here is the pre-fix escape.
+check_contains "xattr on a host-only path is contained" \
+    "getxa: errno 2" \
+    "$(run -t dtest -r "$ROOT" getxa /etc/passwd 2>&1)"
+check_contains "xattr reaches the rootfs file, so it is translated not blocked" \
+    "getxa: errno 61" \
+    "$(run -t dtest -r "$ROOT" getxa /etc/greeting 2>&1)"
+
 # A ":ro" bind must answer EROFS for every mutating path syscall while still
 # serving reads. The rw run is the negative control: the same calls must NOT
 # report EROFS there, so a blanket refusal cannot pass both legs.

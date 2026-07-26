@@ -39,6 +39,12 @@ static const int path_syscalls[] = {
 #ifdef __NR_name_to_handle_at
     __NR_name_to_handle_at,
 #endif
+    /* Extended attributes. Eight path-bearing forms, all with the path in a0
+     * and no dirfd; the f* variants act on an fd and need no translation. The
+     * getters leak host state and answer existence questions about it; the
+     * setters and removers *write* the host filesystem. */
+    __NR_setxattr,    __NR_lsetxattr,    __NR_getxattr,    __NR_lgetxattr,
+    __NR_listxattr,   __NR_llistxattr,   __NR_removexattr, __NR_lremovexattr,
 };
 
 #define NPATH ((int)(sizeof(path_syscalls) / sizeof(path_syscalls[0])))

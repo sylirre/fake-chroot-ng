@@ -37,6 +37,8 @@ static const int probe_set[] = {
 #ifdef __NR_name_to_handle_at
     __NR_name_to_handle_at,
 #endif
+    __NR_setxattr,   __NR_lsetxattr,  __NR_getxattr,   __NR_lgetxattr,
+    __NR_listxattr,  __NR_llistxattr, __NR_removexattr, __NR_lremovexattr,
 };
 #define NPROBE ((int)(sizeof probe_set / sizeof probe_set[0]))
 
