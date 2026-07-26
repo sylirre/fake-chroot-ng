@@ -978,6 +978,45 @@ vfork/`posix_spawn` child-stack handling.
   - The M15/M16 guest invocations are wrapped in `timeout` now: a dump that
     never terminates should fail one check rather than wedge the suite.
 
+- [x] **`ip addr` on-device, part 2: relay the minimal dump request form**
+  After the terminator fix, `ip addr` still printed nothing on-device. The debug
+  trace localized it exactly:
+
+        nl send fd=3 type=18 -> empty (no relay)   <- RTM_GETLINK refused
+        nl send fd=3 type=22 -> relayed            <- RTM_GETADDR accepted
+
+  The relay socket existed (`relay fd 4`), so it was the `sendto` on it that
+  failed, and only for `RTM_GETLINK`. That alone explains an empty listing:
+  `ip addr` builds its output from the **link** dump and annotates it with
+  addresses, so zero links prints nothing however well `RTM_GETADDR` went.
+  - **Cause: the request *form*.** iproute2 asks for `RTM_GETLINK` with a
+    `struct ifinfomsg` **plus an `IFLA_EXT_MASK` attribute**; Android refuses
+    that, while accepting the bare `rtgenmsg` (family byte only) form that
+    Bionic's `getifaddrs(3)` sends. Two pieces of evidence agree: the split
+    between the two request types above, and the blank `link/ether` fields in
+    arm64chroot's own output on the same device — the signature of Android's MAC
+    scrubbing, which proves `RTM_GETLINK` data *is* obtainable there via
+    getifaddrs. That is also why the oracle works: it never issues the rich form,
+    because it builds link replies out of getifaddrs.
+  - **Fix:** `relay_dump` rewrites the request to the minimal 20-byte form —
+    nlmsghdr + one family byte — keeping the guest's type, flags and sequence.
+    The family byte is at offset 16 in all three payloads we relay
+    (`ifinfomsg.ifi_family`, `ifaddrmsg.ifa_family`, `rtmsg.rtm_family`), so it
+    carries across without knowing which. Dropping the filter attributes means
+    the kernel may return more than was asked, which is safe: netlink filtering
+    is advisory and every client filters replies itself.
+  - Forwarding the request verbatim looked obviously right and was the bug.
+  - `SO_RCVTIMEO` is set on the relay socket, so a kernel that answers nothing
+    cannot hang the guest.
+  - **Test gap closed:** `tests/guests/nldone.c` now sends iproute2's request
+    byte for byte, `IFLA_EXT_MASK` and all. It previously sent the bare form —
+    the one form that already worked — which is precisely why the suite passed
+    while the device failed.
+  - Known, unchanged: the relay socket occupies a guest-visible fd (host fd ==
+    guest fd here). Nothing a guest does normally disturbs it, but a
+    `close_range()` sweep would; that hazard is general to this design and
+    tracked with the rest.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

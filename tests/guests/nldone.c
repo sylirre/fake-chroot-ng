@@ -20,6 +20,7 @@
  * so any of these failing yields no output at all — not a partial listing.
  */
 #include <errno.h>
+#include <linux/if_link.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <stdio.h>
@@ -49,9 +50,17 @@ int main(void) {
         return 1;
     }
 
+    /* iproute2's link-dump request, byte for byte: a struct ifinfomsg *plus* an
+     * IFLA_EXT_MASK attribute. The shape matters — Android refuses this rich form
+     * while accepting the bare rtgenmsg one that getifaddrs sends, which is how
+     * `ip addr` came back with an empty link list on-device while getifaddrs
+     * worked. An earlier version of this test sent the bare form and so could
+     * not see it. */
     struct {
         struct nlmsghdr nlh;
         struct ifinfomsg ifi;
+        struct rtattr ext_req __attribute__((aligned(NLMSG_ALIGNTO)));
+        __u32 ext_filter_mask;
     } req;
     memset(&req, 0, sizeof req);
     req.nlh.nlmsg_len = sizeof req;
@@ -59,6 +68,9 @@ int main(void) {
     req.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
     req.nlh.nlmsg_seq = 1234;
     req.ifi.ifi_family = AF_UNSPEC;
+    req.ext_req.rta_type = IFLA_EXT_MASK;
+    req.ext_req.rta_len = RTA_LENGTH(sizeof(__u32));
+    req.ext_filter_mask = RTEXT_FILTER_VF;
     if (sendto(fd, &req, sizeof req, 0, (struct sockaddr *)&sa, sizeof sa) < 0) {
         printf("sendto: FAILED\n");
         return 1;

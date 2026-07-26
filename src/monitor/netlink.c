@@ -181,7 +181,50 @@ static long open_hostfd(void) {
         return -1; /* test aid: exercise the degradation path on a working host */
     long fd = CNG_SYS(__NR_socket, AF_NETLINK_, SOCK_RAW_ | CNG_O_CLOEXEC,
                       NETLINK_ROUTE_, 0, 0, 0);
-    return fd < 0 ? -1 : fd;
+    if (fd < 0)
+        return -1;
+    /* Never block the guest forever on a kernel that says nothing. */
+    struct cng_timeval tv = {2, 0};
+    CNG_SYS(__NR_setsockopt, fd, CNG_SOL_SOCKET, CNG_SO_RCVTIMEO, (long)&tv,
+            sizeof tv, 0);
+    return fd;
+}
+
+/* Relay a dump as the MINIMAL request form: an nlmsghdr plus a one-byte
+ * rtgenmsg family, which is what Bionic's getifaddrs(3) sends.
+ *
+ * Forwarding the guest's request verbatim looked obviously right and is not:
+ * iproute2 asks for RTM_GETLINK with a struct ifinfomsg *and* an IFLA_EXT_MASK
+ * attribute, and Android refuses that form — while the bare rtgenmsg form it
+ * refuses nothing. That is exactly the split observed on-device, where
+ * RTM_GETLINK came back refused and RTM_GETADDR (which iproute2 sends without
+ * the extra attribute) went through, leaving `ip addr` with an empty link list
+ * and so nothing at all to print. It is also why arm64chroot works there: it
+ * builds its link replies from getifaddrs, i.e. from this same minimal form.
+ *
+ * Dropping the request's filter attributes means the kernel may return more than
+ * the guest asked for, which is safe: netlink filtering is advisory and every
+ * client filters the replies itself (iproute2 always has).
+ *
+ * The family byte sits at offset 16 in all three dump payloads we relay —
+ * ifinfomsg.ifi_family, ifaddrmsg.ifa_family, rtmsg.rtm_family — so it is
+ * carried across without knowing which one this is. */
+static long relay_dump(int hostfd, const unsigned char *req, long rlen) {
+    unsigned char out[20];
+    memset(out, 0, sizeof out);
+    struct nlmsghdr_ *h = (struct nlmsghdr_ *)out;
+    const struct nlmsghdr_ *rh = (const struct nlmsghdr_ *)req;
+    h->len = (unsigned)sizeof out;
+    h->type = rh->type;
+    h->flags = rh->flags;
+    h->seq = rh->seq;
+    h->pid = 0; /* the kernel fills in the source port id */
+    out[16] = (rlen > 16) ? req[16] : 0;
+    struct sockaddr_nl_ sa;
+    memset(&sa, 0, sizeof sa);
+    sa.family = AF_NETLINK_;
+    return CNG_SYS(__NR_sendto, hostfd, (long)out, sizeof out, 0, (long)&sa,
+                   sizeof sa);
 }
 
 long cng_nl_socket(long domain, long type, long protocol) {
@@ -241,12 +284,10 @@ int cng_nl_send(int fd, const void *buf, long len, long *out) {
          * own buffer size, and a host with more than a few interfaces overran
          * that: the guest silently lost entries and got our synthesized
          * terminator rather than the kernel's. */
-        struct sockaddr_nl_ sa;
-        memset(&sa, 0, sizeof sa);
-        sa.family = AF_NETLINK_;
-        if (s->hostfd >= 0 &&
-            CNG_SYS(__NR_sendto, s->hostfd, (long)buf, len, 0, (long)&sa,
-                    sizeof sa) >= 0) {
+        long sr = (s->hostfd >= 0)
+                      ? relay_dump(s->hostfd, (const unsigned char *)buf, len)
+                      : -1;
+        if (sr >= 0) {
             s->streaming = 1;
             if (cng_g_debug)
                 cng_dprintf(2, "[cng] nl send fd=%d type=%u -> relayed\n", fd,
@@ -257,8 +298,10 @@ int cng_nl_send(int fd, const void *buf, long len, long *out) {
          * guest then sees no interfaces rather than an error or a hang. */
         s->alen = put_done(s->ack, seq, (unsigned)sys_getpid());
         if (cng_g_debug)
-            cng_dprintf(2, "[cng] nl send fd=%d type=%u -> empty (no relay)\n",
-                        fd, type);
+            cng_dprintf(2,
+                        "[cng] nl send fd=%d type=%u -> empty (relay fd=%d "
+                        "sendto=%ld)\n",
+                        fd, type, s->hostfd, sr);
         return 1;
     }
 
