@@ -1,8 +1,11 @@
 /* NETLINK_ROUTE emulation for hosts that deny app domains rtnetlink (Android).
- * A guest netlink socket is stood in for by an AF_UNIX datagram fd we never
- * transmit on; dumps are relayed through an UNBOUND host netlink socket, which
- * works because the SELinux denial is on bind(2), not on the query.
- * See src/monitor/netlink.c.
+ * A guest netlink socket is stood in for by one end of an AF_UNIX datagram
+ * socketpair whose peer the monitor holds: replies are pushed into the pair,
+ * so untrapped read()/write()/poll() behave like the real fd they are. Dumps
+ * are relayed through an UNBOUND host netlink socket, which works because the
+ * SELinux denial is on bind(2), not on the query — except RTM_GETLINK, which
+ * Android refuses outright (nlmsg_readpriv) and which is synthesized from the
+ * address dump plus SIOCGIF* ioctls instead. See src/monitor/netlink.c.
  */
 #ifndef CNG_NETLINK_H
 #define CNG_NETLINK_H
@@ -13,9 +16,17 @@
 extern int cng_nl_force_block;
 
 /* CNG_NETLINK_NO_RELAY=1: additionally pretend the host refuses us a netlink
- * socket for relaying, so the degradation path (a well-formed *empty* dump) can
- * be exercised on a host where the relay actually works. */
+ * socket for relaying, so the degradation path (a loopback-only dump, as the
+ * oracle presents when getifaddrs fails) can be exercised on a host where the
+ * relay actually works. */
 extern int cng_nl_no_relay;
+
+/* CNG_NETLINK_DENY_GETLINK=1: pretend the host refuses RTM_GETLINK sends on
+ * the relay socket — Android's nlmsg_readpriv restriction, which denies app
+ * domains the link dump in every request form while the address dump relays
+ * fine — so the synthesized link dump can be exercised on a host whose relay
+ * works. Implies CNG_NETLINK_FORCE_BLOCK. */
+extern int cng_nl_deny_getlink;
 
 void cng_nl_init(void);
 
@@ -48,5 +59,10 @@ int cng_nl_srcaddr(int fd, void *addr, unsigned *alen);
 
 /* bind(2) on an emulated socket is a silent success. Returns 1 if handled. */
 int cng_nl_bind(int fd);
+
+/* Serve any requests the guest submitted with untrapped write(2)/send(2), so
+ * their replies are in the pair before a passthrough read runs. No-op unless
+ * `fd` is an emulated netlink socket. */
+void cng_nl_poke(int fd);
 
 #endif /* CNG_NETLINK_H */

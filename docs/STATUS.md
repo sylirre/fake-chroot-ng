@@ -1029,6 +1029,50 @@ vfork/`posix_spawn` child-stack handling.
   blocked call still traps, while an allowed one returns EBADF/EFAULT
   instantly, with no side effects on inherited fds.
 
+- [x] **Fix: `ip addr` on-device, round three — synthesize the link dump and
+  serve write()-submitted requests.** The previous fix (minimal request form)
+  was not enough: the on-device trace showed `sendto=-13` on the relay socket
+  for `RTM_GETLINK` *in the minimal form too*, while `RTM_GETADDR` relayed
+  fine. That is Android's real policy: link dumps expose MAC addresses, so app
+  domains are refused them under `nlmsg_readpriv` in **every** request form,
+  while address and route dumps are plain `nlmsg_read`. Relaying GETLINK can
+  never work there — and the oracle never tries: arm64chroot synthesizes its
+  link replies out of getifaddrs (whose Bionic implementation has its own
+  fallback for exactly this restriction).
+  - **Synthesis (netlink.c):** a refused GETLINK is rebuilt the oracle's way,
+    from raw syscalls since chroot-ng has no libc: interfaces enumerated from
+    our own RTM_GETADDR relay (the same enumeration Bionic's fallback uses —
+    so, like the oracle on-device, only interfaces carrying an address appear),
+    fleshed out with SIOCGIFNAME/FLAGS/MTU/HWADDR ioctls, and rendered with
+    the oracle's exact recipe: hardcoded txqlen 1000, operstate from IFF_UP,
+    IFF_LOWER_UP from IFF_RUNNING, IFLA_ADDRESS absent when the host refuses
+    the MAC (the blank `link/ether ` arm64chroot shows). Zero interfaces —
+    including the no-relay degradation — presents loopback alone, as the
+    oracle does; a non-dump GETLINK filters by ifindex/IFLA_IFNAME and answers
+    ENODEV for a miss. A refused GETADDR falls back to loopback addresses.
+  - **Second defect, found by running Alpine's actual `ip`:** busybox submits
+    its netlink request with plain `write(2)` — a syscall deliberately left
+    untrapped — which hit the AF_UNIX stand-in and died with ENOTCONN. The
+    stand-in is now one end of a datagram **socketpair** whose peer the
+    monitor holds: replies are pushed in as per-message datagrams (the kernel
+    itself provides MSG_PEEK/MSG_TRUNC/blocking/poll semantics, and nothing is
+    ever split or truncated by us), an untrapped write() queues its request on
+    our end natively, and every trapped netlink call — plus dispatch's
+    read/readv case under -R — drains and serves the queue first. Relayed
+    dumps are pumped through datagram-for-datagram with the pid fixup, and a
+    dump whose host goes quiet still ends in a proper NLMSG_DONE.
+  - Known limitations, judged acceptable: a client that write()s a request and
+    then poll()s with no trapped call in between would sleep (no known client
+    does this — busybox recv's, everything else sendmsg's); a guest that never
+    reads ~200 KB of replies has the tail dropped rather than deadlocking the
+    monitor (logged under CNG_DEBUG).
+  - **Tests:** `CNG_NETLINK_DENY_GETLINK` simulates the Android split on a
+    working host (implies FORCE_BLOCK); nldone gained a `named>0` field
+    (IFLA_IFNAME is what `ip addr` prints names from); the no-relay leg now
+    expects the loopback-only dump (oracle parity, was: empty); and an
+    acceptance leg runs busybox `ip addr` from the Alpine rootfs under the
+    split, asserting real output. Suite: 310 passed, 0 failed.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

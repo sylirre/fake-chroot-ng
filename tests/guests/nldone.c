@@ -76,8 +76,11 @@ int main(void) {
         return 1;
     }
 
-    /* Drain the dump the way rtnl_dump_filter_l does. */
-    int links = 0, saw_done = 0, done_len_ok = 0, skipped = 0, rounds = 0;
+    /* Drain the dump the way rtnl_dump_filter_l does. `named` counts links
+     * carrying IFLA_IFNAME — the attribute `ip addr` prints names from, so a
+     * synthesized dump without it would render as nameless entries. */
+    int links = 0, named = 0, saw_done = 0, done_len_ok = 0, skipped = 0,
+        rounds = 0;
     char buf[16384];
     while (!saw_done && rounds++ < 256) {
         struct sockaddr_nl from;
@@ -106,12 +109,21 @@ int main(void) {
                 close(fd);
                 return 1;
             }
-            if (h->nlmsg_type == RTM_NEWLINK)
+            if (h->nlmsg_type == RTM_NEWLINK) {
+                struct ifinfomsg *ifi = NLMSG_DATA(h);
+                int rlen = (int)(h->nlmsg_len - NLMSG_LENGTH(sizeof *ifi));
                 links++;
+                for (struct rtattr *rta = IFLA_RTA(ifi); RTA_OK(rta, rlen);
+                     rta = RTA_NEXT(rta, rlen))
+                    if (rta->rta_type == IFLA_IFNAME) {
+                        named++;
+                        break;
+                    }
+            }
         }
     }
-    printf("nldone: done=%d done_len_ok=%d links>0=%d skipped=%d\n", saw_done,
-           done_len_ok, links > 0, skipped);
+    printf("nldone: done=%d done_len_ok=%d links>0=%d named>0=%d skipped=%d\n",
+           saw_done, done_len_ok, links > 0, named > 0, skipped);
     close(fd);
     return 0;
 }

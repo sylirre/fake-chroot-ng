@@ -1446,6 +1446,11 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * current position, which pre_read resolves with an lseek). */
     case __NR_read:
     case __NR_readv:
+        /* A netlink stand-in is a socketpair end, so the read itself works —
+         * but a request the guest submitted with untrapped write(2) must be
+         * served first or this read blocks on an empty queue (busybox ip under
+         * the -R tier; the seccomp tier never traps read on ordinary fds). */
+        cng_nl_poke((int)a0);
         cng_procfs_pre_read((int)a0, -1);
         return cng_syscall6(a0, a1, a2, a3, a4, a5, nr);
     case __NR_pread64:

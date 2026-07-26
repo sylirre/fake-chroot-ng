@@ -86,7 +86,8 @@ else
             kem=$(CNG_NETLINK_FORCE_BLOCK=1 m16run build/chroot-ng -R "$R" \
                 /bin/nldone 2>/dev/null)
             check_contains "m16 the dump satisfies iproute2's contract" \
-                "nldone: done=1 done_len_ok=1 links>0=1 skipped=0" "$kem"
+                "nldone: done=1 done_len_ok=1 links>0=1 named>0=1 skipped=0" \
+                "$kem"
             if [ "$kem" = "$kbase" ]; then
                 pass=$((pass + 1))
                 echo "  ok   m16 the dump contract matches the real kernel"
@@ -96,12 +97,47 @@ else
                 echo "    want: $kbase"
                 echo "    got:  $kem"
             fi
-            # With no relay available the dump must still be well-formed: an
-            # empty interface list, not a terminator iproute2 rejects.
+            # Android refuses the link dump itself (nlmsg_readpriv), in every
+            # request form, while the address dump relays fine — so a refused
+            # RTM_GETLINK must be synthesized from the address dump plus
+            # ioctls, not degraded to an empty dump that `ip addr` renders as
+            # total silence. CNG_NETLINK_DENY_GETLINK simulates that split.
+            kdg=$(CNG_NETLINK_DENY_GETLINK=1 m16run build/chroot-ng -R "$R" \
+                /bin/nldone 2>/dev/null)
+            check_contains "m16 a refused RTM_GETLINK is synthesized" \
+                "nldone: done=1 done_len_ok=1 links>0=1 named>0=1 skipped=0" \
+                "$kdg"
+            edg=$(CNG_NETLINK_DENY_GETLINK=1 m16run build/chroot-ng -R "$R" \
+                /bin/netif 2>/dev/null)
+            check_contains "m16 getifaddrs works over a synthesized link dump" \
+                "getifaddrs: ok" "$edg"
+            check_contains "m16 loopback survives the synthesized link dump" \
+                "lo=1" "$edg"
+            # With no relay at all the guest still gets a well-formed dump
+            # presenting loopback — the oracle's exact degradation when even
+            # getifaddrs fails, and what bubblewrap/glibc want to see.
             knr=$(CNG_NETLINK_NO_RELAY=1 m16run build/chroot-ng -R "$R" \
                 /bin/nldone 2>/dev/null)
-            check_contains "m16 a relay-less dump is still well-formed" \
-                "nldone: done=1 done_len_ok=1 links>0=0 skipped=0" "$knr"
+            check_contains "m16 a relay-less dump presents loopback only" \
+                "nldone: done=1 done_len_ok=1 links>0=1 named>0=1 skipped=0" \
+                "$knr"
+
+            # busybox ip submits its request with plain write(2) — a syscall
+            # deliberately left untrapped — and that is what Alpine runs. The
+            # socketpair stand-in queues the write; the trapped recv drains and
+            # serves it. Real `ip addr` output is the acceptance bar: at least
+            # one interface line and one inet line, under the Android split.
+            M16_ALPINE="${M16_ALPINE:-/home/sol/arm64chroot/tests/.cache/rootfs/alpine}"
+            if [ -x "$M16_ALPINE/bin/busybox" ]; then
+                bb=$(CNG_NETLINK_DENY_GETLINK=1 m16run build/chroot-ng -R \
+                    "$M16_ALPINE" /bin/busybox ip addr 2>/dev/null)
+                check_contains "m16 busybox ip addr lists loopback" \
+                    ": lo: <LOOPBACK,UP" "$bb"
+                check_contains "m16 busybox ip addr lists an address" \
+                    "inet 127.0.0.1/8" "$bb"
+            else
+                echo "  skip: alpine rootfs missing, busybox ip leg untested"
+            fi
         else
             echo "  skip: could not build tests/guests/nldone.c"
         fi
