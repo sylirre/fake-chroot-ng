@@ -243,6 +243,171 @@ int cng_proc_self_fd(const char *host) {
     return *d == '\0' ? fd : -1;
 }
 
+/* Rewrite the /dev aliases of the /proc fd links in place — /dev/fd[/...] to
+ * /proc/self/fd[/...], /dev/std{in,out,err} to /proc/self/fd/{0,1,2} — so the
+ * resolver's existing magic-link handling covers them. Returns 1 if `cur` was
+ * rewritten (the caller re-runs the round), 0 otherwise. */
+static int dev_magic(char *cur, size_t sz) {
+    if (cng_g_no_dev || strncmp(cur, "/dev/", 5) != 0)
+        return 0;
+    const char *leaf = cur + 5;
+    const char *rest = 0;
+    const char *base = 0;
+    if (!strncmp(leaf, "fd", 2) && (leaf[2] == '\0' || leaf[2] == '/')) {
+        base = "/proc/self/fd";
+        rest = leaf + 2;
+    } else if (!strcmp(leaf, "stdin")) {
+        base = "/proc/self/fd/0";
+        rest = "";
+    } else if (!strcmp(leaf, "stdout")) {
+        base = "/proc/self/fd/1";
+        rest = "";
+    } else if (!strcmp(leaf, "stderr")) {
+        base = "/proc/self/fd/2";
+        rest = "";
+    } else {
+        return 0;
+    }
+    char tmp[CNG_PATH_MAX];
+    size_t n = cng_strlcpy(tmp, base, sizeof tmp);
+    cng_strlcpy(tmp + n, rest, sizeof tmp > n ? sizeof tmp - n : 0);
+    cng_strlcpy(cur, tmp, sz);
+    return 1;
+}
+
+static int dirfd_host(int dfd, char *hdir, size_t sz);
+
+/* The canonical GUEST directory an open fd names, for the getdents64 overlay
+ * splicing below. Returns 0/-1. */
+static int dirfd_guest_dir(long dirfd, char *out, size_t sz) {
+    char hdir[CNG_PATH_MAX];
+    if (dirfd_host((int)dirfd, hdir, sizeof hdir) != 0)
+        return -1;
+    return cng_fs_untranslate(cng_g_fs, hdir, out, sz);
+}
+
+/* Append one synthesized linux_dirent64. Layout is a fixed kernel ABI:
+ * d_ino @0, d_off @8, d_reclen @16 (u16), d_type @18, d_name @19, records
+ * 8-byte aligned. `d_off` is an opaque stream cookie, so a high constant keeps
+ * these clear of the kernel's own. Returns the bytes written, or 0 if the record
+ * would not fit — a short batch is legal and the guest simply reads again. */
+static long put_dent(char *buf, long at, long cap, const char *name,
+                     unsigned long long ino, unsigned char dtype,
+                     long long cookie) {
+    size_t nl = strlen(name);
+    long reclen = (long)((19 + nl + 1 + 7) & ~(size_t)7);
+    if (at < 0 || cap < 0 || at + reclen > cap)
+        return 0;
+    char *rec = buf + at;
+    memset(rec, 0, (size_t)reclen);
+    memcpy(rec, &ino, 8);
+    memcpy(rec + 8, &cookie, 8);
+    unsigned short rl = (unsigned short)reclen;
+    memcpy(rec + 16, &rl, 2);
+    rec[18] = (char)dtype;
+    memcpy(rec + 19, name, nl + 1);
+    return reclen;
+}
+
+/* Is `name` already present in the batch, or a real dirent of the directory? */
+static int dent_present(long dirfd, const char *name, const char *buf,
+                        long used) {
+    for (long o = 0; o + 19 <= used;) {
+        unsigned short rl;
+        memcpy(&rl, buf + o + 16, 2);
+        if (rl == 0)
+            break;
+        if (!strcmp(buf + o + 19, name))
+            return 1;
+        o += rl;
+    }
+    char st[144];
+    return CNG_SYS(__NR_newfstatat, dirfd, (long)name, (long)st,
+                   CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0;
+}
+
+/* Splice the entries that exist only as path-resolution overlays and therefore
+ * have no physical dirent for getdents64 to return:
+ *
+ *  - **bind mount points**: a -b destination is pure resolution (cng_fs_translate
+ *    matches the prefix), so `ls /` never showed a `-b SRC:/host`. Anything that
+ *    enumerates before opening — shell globbing, find, a package manager's tree
+ *    walk — could not see it.
+ *  - the **device nodes**: the /dev whitelist grants access by name only, so a
+ *    rootfs /dev (usually empty) listed as empty even though /dev/null opens.
+ *
+ * Both are skipped when the name is already there, so a rootfs that ships a real
+ * `null`, or a bind over an existing directory, is not duplicated. d_ino/d_type
+ * come from an lstat of the real host target, so `ls -l` and `find -type` agree
+ * with what an open of the same name gets. Returns the bytes appended. */
+static long inject_dents(long dirfd, const char *gdir, char *buf, long used,
+                         long cap) {
+    long added = 0;
+    /* Bind mount points whose parent is exactly this directory. */
+    for (int i = 0; i < cng_g_fs->nbinds; i++) {
+        const char *g = cng_g_fs->binds[i].guest;
+        const char *slash = 0;
+        for (const char *p = g; *p; p++)
+            if (*p == '/')
+                slash = p;
+        if (!slash || !slash[1])
+            continue;
+        char parent[CNG_PATH_MAX];
+        size_t plen = (size_t)(slash - g);
+        if (plen == 0)
+            cng_strlcpy(parent, "/", sizeof parent);
+        else {
+            if (plen >= sizeof parent)
+                continue;
+            memcpy(parent, g, plen);
+            parent[plen] = '\0';
+        }
+        if (strcmp(parent, gdir) != 0)
+            continue;
+        const char *base = slash + 1;
+        if (dent_present(dirfd, base, buf, used + added))
+            continue;
+        unsigned long long ino = 0xffffffffULL - (unsigned)i;
+        unsigned char type = 4; /* DT_DIR */
+        char st[144];
+        if (CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD,
+                    (long)cng_g_fs->binds[i].host, (long)st, 0, 0, 0) == 0) {
+            ino = *(unsigned long long *)(st + 8);
+            type = (unsigned char)((*(unsigned *)(st + STAT_MODE_OFF) >> 12) &
+                                   0xf);
+        }
+        long k = put_dent(buf, used + added, cap, base, ino, type,
+                          0x7fffffff00000000LL + i);
+        if (!k)
+            return added;
+        added += k;
+    }
+    /* /dev whitelist, when this is the guest's own /dev (a -b for /dev makes
+     * that directory's real contents authoritative, and cng_fs_translate would
+     * have matched the bind first, so gdir would not be "/dev" here). */
+    if (!cng_g_no_dev && strcmp(gdir, "/dev") == 0) {
+        for (int i = 0; i < cng_dev_nnodes; i++) {
+            const char *name = cng_dev_nodes[i].name;
+            char st[144];
+            if (CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD,
+                        (long)cng_dev_nodes[i].host, (long)st,
+                        CNG_AT_SYMLINK_NOFOLLOW, 0, 0) != 0)
+                continue; /* not present on this host */
+            if (dent_present(dirfd, name, buf, used + added))
+                continue;
+            unsigned long long ino = *(unsigned long long *)(st + 8);
+            unsigned char type =
+                (unsigned char)((*(unsigned *)(st + STAT_MODE_OFF) >> 12) & 0xf);
+            long k = put_dent(buf, used + added, cap, name, ino, type,
+                              0x7ffffffe00000000LL + i);
+            if (!k)
+                return added;
+            added += k;
+        }
+    }
+    return added;
+}
+
 /* Resolve a guest path to a host path, following symlinks *within the guest*:
  * an absolute symlink target is re-rooted into the rootfs rather than resolved
  * against the host root (which is what breaks Alpine's busybox symlinks). Walks
@@ -254,6 +419,14 @@ int cng_resolve(const char *path, int deref_final, char *out, size_t outsz) {
         return -ENAMETOOLONG;
 
     for (int iter = 0; iter < 40; iter++) {
+        /* /dev/fd/N and /dev/std{in,out,err} are the same magic links as their
+         * /proc spelling, so rewrite them to it and let the round below treat
+         * them as such. Doing it here rather than in the /dev zone matters: the
+         * component walk would otherwise readlink the fd link like an ordinary
+         * symlink and try to re-root whatever it names — which for a pipe or a
+         * memfd is not a path at all ("pipe:[12345]"). */
+        if (dev_magic(cur, sizeof cur))
+            continue;
         /* Checked every round, not just up front: the guest can reach these
          * through a symlink of its own (Alpine's /dev/fd -> /proc/self/fd). */
         int magic = proc_magic(cur, sizeof cur);
@@ -1133,11 +1306,24 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     /* getdents64: hide the l2s machinery from directory listings — backing
      * data/marker names anywhere, and the ".l2s" store dir in the rootfs
      * root. Filtered in place in the guest buffer; when a whole batch is
-     * ours, re-read so a filtered 0 isn't mistaken for end-of-directory. */
+     * ours, re-read so a filtered 0 isn't mistaken for end-of-directory.
+     * Then splice in the entries that exist only as resolution overlays (bind
+     * mount points, /dev nodes) and so have no physical dirent to return. */
     case __NR_getdents64: {
+        /* Injection belongs at the start of the stream and only there, so the
+         * decision is taken before the read: lseek(SEEK_CUR) == 0 means nothing
+         * has been read from this fd yet. Deciding it up front also means an
+         * empty directory (n == 0 below) still gets its overlay entries. */
+        char injdir[CNG_PATH_MAX];
+        int inject = a1 && sys_lseek((int)a0, 0, CNG_SEEK_CUR) == 0 &&
+                     dirfd_guest_dir(a0, injdir, sizeof injdir) == 0;
+
         long n = reissue(a0, a1, a2, a3, a4, a5, __NR_getdents64);
-        if (n <= 0 || !a1)
+        if (n < 0 || !a1)
             return n;
+        if (n == 0)
+            return inject ? inject_dents(a0, injdir, (char *)a1, 0, (long)a2)
+                          : 0;
         /* Hidden-process view, listing side: the path layer makes a host
          * process's /proc entry unreachable, but `ls /proc` and `ps` read the
          * directory, so the numeric entries have to go as well. Deciding that
@@ -1146,7 +1332,9 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         int at_proc = !cng_g_no_proc && dents_have_pid((const char *)a1, n) &&
                       fd_is_host_proc(a0);
         if (!cng_g_l2s && !at_proc)
-            return n;
+            return inject ? n + inject_dents(a0, injdir, (char *)a1, n,
+                                             (long)a2)
+                          : n;
         int at_root = cng_g_l2s && fd_is_rootfs_root(a0);
         char *buf = (char *)a1;
         for (;;) {
@@ -1170,10 +1358,14 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 o += reclen;
             }
             if (w > 0)
-                return w;
+                return inject ? w + inject_dents(a0, injdir, buf, w, (long)a2)
+                              : w;
             n = reissue(a0, a1, a2, a3, a4, a5, __NR_getdents64);
+            /* A real end-of-directory (0) still owes the overlay entries. */
             if (n <= 0)
-                return n;
+                return (n == 0 && inject)
+                           ? inject_dents(a0, injdir, buf, 0, (long)a2)
+                           : n;
         }
     }
 

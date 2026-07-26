@@ -49,7 +49,7 @@ Common options: `-u/--fake-id[=ID]` (fake user identity — `ID` is a `uid` or
 `uid:gid`, defaulting to `0:0` root), `-b/--bind SRC:DST[:ro]` (expose host
 directory SRC at guest path DST, read-only with `:ro`), `-l/--link2symlink` (emulate hardlinks where the host refuses `link(2)`),
 `-R/--rewrite` (ahead-of-time `svc` rewriting), `--no-proc` (turn off the `/proc`
-emulation described below), `--shared-proc` (share the process view between
+emulation described below), `--no-dev` (turn off the `/dev` passthrough), `--shared-proc` (share the process view between
 independent invocations of the same rootfs, for both the process view and the
 System V shm namespace).
 
@@ -65,6 +65,19 @@ hide each other's processes; `--shared-proc` keys the process registry by the
 rootfs instead — served diskless by a per-rootfs broker daemon that exits by
 itself once the last guest is gone — so `ps`/`top` in one session see the
 guest processes of another.
+
+`/dev` works the same way, and for the same reason: a rootfs directory tree
+ships no device nodes and `mknod` needs privileges we lack. A fixed whitelist —
+`null`, `zero`, `full`, `random`, `urandom`, `tty`, `ptmx`, `console`, `pts/*`,
+`shm/*`, `fd/*`, `std{in,out,err}` — resolves to the host's nodes, and everything
+else under `/dev` comes from the rootfs, so the guest cannot reach the host's
+block devices. This is deliberately narrower than the `-b /dev:/dev` people
+otherwise reach for, which exposes the host's whole `/dev`. Because these nodes
+and the `-b` mount points are pure path-resolution overlays with no directory
+entry behind them, `getdents64` splices them into listings — otherwise `ls /dev`
+shows nothing while `/dev/null` opens fine, and a bind destination stays
+invisible to anything that enumerates before opening. `--no-dev` turns the zone
+off.
 
 **System V shared memory** works too. Android denies `shmget`/`shmat`/`shmdt`/
 `shmctl` outright, so chroot-ng serves them itself: the same broker daemon owns

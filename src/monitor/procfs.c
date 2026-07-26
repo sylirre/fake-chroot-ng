@@ -127,9 +127,11 @@ static const char *rootfs_fstype(const char *root) {
     return "ext4";
 }
 
-/* The guest mount table: the rootfs, the /proc passthrough, and one row per
- * -b bind. Fixed mount IDs; the root's major:minor is real, so tools
- * cross-referencing stat().st_dev find it. */
+/* The guest mount table: the rootfs, the /proc and /dev passthrough zones, and
+ * one row per -b bind. Mount IDs are handed out by a running counter because the
+ * zone rows are conditional (--no-proc / --no-dev), so a bind's id depends on
+ * what precedes it. The root's major:minor is real, so tools cross-referencing
+ * stat().st_dev find it. */
 static void put_mounts(int fd, int fmt) {
     const char *root = cng_g_fs->rootfs[0] ? cng_g_fs->rootfs : "/";
     const char *fstype = rootfs_fstype(root);
@@ -142,13 +144,23 @@ static void put_mounts(int fd, int fmt) {
     }
     int nb = cng_g_fs->nbinds;
     int proc_row = !cng_g_no_proc;
+    int dev_row = !cng_g_no_dev;
+    int id = 2; /* 1 is the root */
 
     if (fmt == MNT_MOUNTINFO) {
         cng_dprintf(fd, "1 1 %lu:%lu / / rw,relatime - %s /dev/root rw\n", maj,
                     min, fstype);
         if (proc_row)
-            cng_dprintf(fd, "2 1 0:5 / /proc rw,nosuid,nodev,noexec,relatime - "
-                            "proc proc rw\n");
+            cng_dprintf(fd, "%d 1 0:5 / /proc rw,nosuid,nodev,noexec,relatime - "
+                            "proc proc rw\n", id++);
+        if (dev_row) {
+            cng_dprintf(fd, "%d 1 0:6 / /dev rw,nosuid,relatime - devtmpfs "
+                            "devtmpfs rw\n", id++);
+            cng_dprintf(fd, "%d 1 0:7 / /dev/pts rw,nosuid,noexec,relatime - "
+                            "devpts devpts rw\n", id++);
+            cng_dprintf(fd, "%d 1 0:8 / /dev/shm rw,nosuid,nodev,relatime - "
+                            "tmpfs tmpfs rw\n", id++);
+        }
         for (int i = 0; i < nb; i++) {
             unsigned long bmaj = maj, bmin = min;
             char bst[128];
@@ -159,8 +171,8 @@ static void put_mounts(int fd, int fmt) {
                 bmin = dev_minor(d);
             }
             const char *rw = cng_g_fs->binds[i].ro ? "ro" : "rw";
-            cng_dprintf(fd, "%d 1 %lu:%lu / %s %s,relatime - %s %s %s\n",
-                        i + 3, bmaj, bmin, cng_g_fs->binds[i].guest, rw, fstype,
+            cng_dprintf(fd, "%d 1 %lu:%lu / %s %s,relatime - %s %s %s\n", id++,
+                        bmaj, bmin, cng_g_fs->binds[i].guest, rw, fstype,
                         cng_g_fs->binds[i].host, rw);
         }
     } else if (fmt == MNT_MOUNTSTATS) {
@@ -169,6 +181,14 @@ static void put_mounts(int fd, int fmt) {
                     fstype);
         if (proc_row)
             cng_dprintf(fd, "device proc mounted on /proc with fstype proc\n");
+        if (dev_row) {
+            cng_dprintf(fd,
+                        "device devtmpfs mounted on /dev with fstype devtmpfs\n");
+            cng_dprintf(
+                fd, "device devpts mounted on /dev/pts with fstype devpts\n");
+            cng_dprintf(fd,
+                        "device tmpfs mounted on /dev/shm with fstype tmpfs\n");
+        }
         for (int i = 0; i < nb; i++)
             cng_dprintf(fd, "device %s mounted on %s with fstype %s\n",
                         cng_g_fs->binds[i].host, cng_g_fs->binds[i].guest,
@@ -178,6 +198,12 @@ static void put_mounts(int fd, int fmt) {
         if (proc_row)
             cng_dprintf(fd,
                         "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n");
+        if (dev_row) {
+            cng_dprintf(fd, "devtmpfs /dev devtmpfs rw,nosuid,relatime 0 0\n");
+            cng_dprintf(
+                fd, "devpts /dev/pts devpts rw,nosuid,noexec,relatime 0 0\n");
+            cng_dprintf(fd, "tmpfs /dev/shm tmpfs rw,nosuid,nodev,relatime 0 0\n");
+        }
         for (int i = 0; i < nb; i++)
             cng_dprintf(fd, "%s %s %s %s,relatime 0 0\n",
                         cng_g_fs->binds[i].host, cng_g_fs->binds[i].guest,

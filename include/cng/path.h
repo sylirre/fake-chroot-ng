@@ -29,6 +29,22 @@ struct cng_fs {
  * the guest sees only whatever /proc its rootfs (or an explicit -b) provides. */
 extern int cng_g_no_proc;
 
+/* --no-dev: disable the /dev device-node passthrough, so /dev is served from the
+ * rootfs (or an explicit -b) only. */
+extern int cng_g_no_dev;
+
+/* The /dev passthrough whitelist, shared by the path zone and the getdents64
+ * synthesis so the two can never disagree about what /dev contains. `host` is
+ * what the name resolves to (usually itself; the std* aliases and fd point into
+ * /proc/self/fd), and is what gets lstat'ed for a real d_type when the entry is
+ * spliced into a listing. */
+struct cng_dev_node {
+    const char *name; /* basename under /dev */
+    const char *host; /* host path it resolves to */
+};
+extern const struct cng_dev_node cng_dev_nodes[];
+extern const int cng_dev_nnodes;
+
 void cng_fs_init(struct cng_fs *fs, const char *rootfs);
 int cng_fs_add_bind(struct cng_fs *fs, const char *guest, const char *host,
                     int ro);

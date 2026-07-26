@@ -340,6 +340,14 @@ static void help(char **envp) {
         {"-F, --file-backed", "Force file-backed segment mapping. Auto-selected "
                       "when anonymous executable memory is denied (Android "
                       "no-new-privs / execmem); this forces it unconditionally."},
+        {"    --no-dev", "Disable the /dev device-node passthrough. By default "
+                      "a fixed whitelist of harmless host devices (null, zero, "
+                      "full, random, urandom, tty, ptmx, console, pts/*, shm/*, "
+                      "fd/*, std{in,out,err}) is visible to the guest, because a "
+                      "rootfs directory tree ships no device nodes and mknod "
+                      "needs privileges we lack; everything else under /dev "
+                      "comes from the rootfs. With this flag /dev is served from "
+                      "the rootfs (or a -b bind) only."},
         {"    --no-proc", "Disable /proc emulation. By default the host /proc "
                       "is visible to the guest (a rootfs directory tree has "
                       "none, and mounting one needs privileges we lack), host "
@@ -622,6 +630,9 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
             } else if (!strcmp(n, "no-proc")) {
                 if (val) return err_noval(arg);
                 cng_g_no_proc = 1;
+            } else if (!strcmp(n, "no-dev")) {
+                if (val) return err_noval(arg);
+                cng_g_no_dev = 1;
             } else if (!strcmp(n, "shared-proc")) {
                 if (val) return err_noval(arg);
                 cng_g_shared_proc = 1;

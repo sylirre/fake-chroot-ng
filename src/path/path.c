@@ -12,6 +12,71 @@ static int proc_zone(const char *canon) {
            (canon[5] == '\0' || canon[5] == '/');
 }
 
+int cng_g_no_dev = 0;
+
+/* The /dev zone. A rootfs directory tree ships no device nodes and mknod(2)
+ * needs privileges we do not have, so a fixed whitelist of harmless host
+ * devices passes through and everything else under /dev resolves into the
+ * rootfs — usually ENOENT. The alternative users reach for, `-b /dev:/dev`, is
+ * far coarser: it hands the guest the host's whole /dev, block devices and all.
+ *
+ * Order matters against the binds: cng_fs_translate matches binds first, so an
+ * explicit -b for /dev or a subpath still overrides this.
+ *
+ * `fd` and the std* aliases point into /proc/self/fd. Guest fd == host fd here,
+ * so that link is already the right answer, and it reaches the anonymous files
+ * (pipes, memfd, O_TMPFILE) that no re-rooted name could describe at all. The
+ * resolver rewrites those to their /proc spelling a step earlier (dev_magic in
+ * dispatch.c) so the walk treats them as the magic links they are rather than
+ * readlink'ing them as ordinary symlinks; this table is what a direct
+ * cng_fs_translate call falls back on, and the two agree. */
+const struct cng_dev_node cng_dev_nodes[] = {
+    {"null", "/dev/null"},         {"zero", "/dev/zero"},
+    {"full", "/dev/full"},         {"random", "/dev/random"},
+    {"urandom", "/dev/urandom"},   {"tty", "/dev/tty"},
+    {"ptmx", "/dev/ptmx"},         {"console", "/dev/tty"},
+    {"pts", "/dev/pts"},           {"shm", "/dev/shm"},
+    {"fd", "/proc/self/fd"},       {"stdin", "/proc/self/fd/0"},
+    {"stdout", "/proc/self/fd/1"}, {"stderr", "/proc/self/fd/2"},
+};
+const int cng_dev_nnodes =
+    (int)(sizeof cng_dev_nodes / sizeof cng_dev_nodes[0]);
+
+/* Fill `out` for a guest path inside the /dev zone. Returns 1 when it did, 0 to
+ * fall through to ordinary rootfs prefixing. */
+static int dev_zone(const char *canon, char *out, size_t outsz) {
+    if (cng_g_no_dev)
+        return 0;
+    if (strncmp(canon, "/dev", 4) != 0 || (canon[4] && canon[4] != '/'))
+        return 0;
+    if (!canon[4])
+        return 0; /* "/dev" itself is the rootfs directory we list into */
+    const char *leaf = canon + 5;
+    for (int i = 0; i < cng_dev_nnodes; i++) {
+        size_t nl = strlen(cng_dev_nodes[i].name);
+        if (strncmp(leaf, cng_dev_nodes[i].name, nl) != 0)
+            continue;
+        char c = leaf[nl];
+        if (c == '\0') {
+            cng_strlcpy(out, cng_dev_nodes[i].host, outsz);
+            return 1;
+        }
+        /* A subpath is only meaningful for the directory-valued entries
+         * (pts/<n>, shm/<name>, fd/<n>); a device node has no children. */
+        if (c == '/') {
+            const char *h = cng_dev_nodes[i].host;
+            if (strcmp(h, "/dev/pts") == 0 || strcmp(h, "/dev/shm") == 0 ||
+                strcmp(h, "/proc/self/fd") == 0) {
+                size_t n = cng_strlcpy(out, h, outsz);
+                cng_strlcpy(out + n, leaf + nl, outsz > n ? outsz - n : 0);
+                return 1;
+            }
+            return 0;
+        }
+    }
+    return 0;
+}
+
 /* The hidden-process view: a numeric entry of the host's real /proc that is not
  * a guest process must appear not to exist, so the guest sees only its own
  * session. The test is on the RESOLVED HOST path, not on the guest one, so it
@@ -237,8 +302,10 @@ int cng_fs_translate(const struct cng_fs *fs, const char *path, char *out,
         cng_strlcpy(out + n, suffix, outsz > n ? outsz - n : 0);
     } else if (proc_zone(canon)) {
         /* A bind wins over the passthrough (checked first, above): an explicit
-         * -b /proc:DIR is the user overriding the host view. */
+         * -b DIR:/proc is the user overriding the host view. */
         cng_strlcpy(out, canon, outsz);
+    } else if (dev_zone(canon, out, outsz)) {
+        /* filled by the zone */
     } else {
         size_t n = cng_strlcpy(out, fs->rootfs, outsz); /* "" or "/root" */
         cng_strlcpy(out + n, canon, outsz > n ? outsz - n : 0);

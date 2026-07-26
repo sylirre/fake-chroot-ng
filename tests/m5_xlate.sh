@@ -52,9 +52,35 @@ check_contains "chroot rebases a bind under the new root" \
     "/dev/null -> /hostdev/null" \
     "$(run -t xlate -r /root -b /hostdev:/a/dev -c /a /dev/null)"
 
+# Uses /etc, not /dev: after a chroot the rebased view spells the guest's own
+# /dev as "/dev" again, so the device zone below picks it up and the bind-drop
+# would not be what the result showed.
 check_contains "chroot drops a bind outside the new root" \
-    "/dev/null -> /root/a/dev/null" \
-    "$(run -t xlate -r /root -b /hostdev:/dev -c /a /dev/null)"
+    "/etc/hosts -> /root/a/etc/hosts" \
+    "$(run -t xlate -r /root -b /hostetc:/etc -c /a /etc/hosts)"
+
+# The /dev zone: a whitelist of harmless host devices passes through, everything
+# else under /dev comes from the rootfs, and the fd aliases are the /proc magic
+# links (which reach pipes and memfds no re-rooted name could describe).
+check_contains "/dev whitelist passes through to the host node" \
+    "/dev/null -> /dev/null" "$(run -t xlate -r /root /dev/null)"
+check_contains "/dev/console maps to the host tty" \
+    "/dev/console -> /dev/tty" "$(run -t xlate -r /root /dev/console)"
+check_contains "/dev/pts subpaths pass through" \
+    "/dev/pts/3 -> /dev/pts/3" "$(run -t xlate -r /root /dev/pts/3)"
+check_contains "/dev/fd is the /proc fd link" \
+    "/dev/fd/7 -> /proc/self/fd/7" "$(run -t xlate -r /root /dev/fd/7)"
+check_contains "/dev/stdin is fd 0" \
+    "/dev/stdin -> /proc/self/fd/0" "$(run -t xlate -r /root /dev/stdin)"
+# The containment half: a device NOT on the whitelist must not be reachable.
+check_contains "a non-whitelisted device resolves into the rootfs" \
+    "/dev/sda1 -> /root/dev/sda1" "$(run -t xlate -r /root /dev/sda1)"
+check_contains "/dev itself is the rootfs directory (so it can be listed)" \
+    "/dev -> /root/dev" "$(run -t xlate -r /root /dev)"
+# A bind still outranks the zone: cng_fs_translate matches binds first.
+check_contains "a -b bind outranks the /dev zone" \
+    "/dev/null -> /hostdev/null" \
+    "$(run -t xlate -r /root -b /hostdev:/dev /dev/null)"
 
 check_contains "chroot rebases the cwd" \
     "x -> /root/a/b/x" \

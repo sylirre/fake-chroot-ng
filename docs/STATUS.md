@@ -726,6 +726,56 @@ vfork/`posix_spawn` child-stack handling.
     the only one of the two tiers qemu-user can run — with an ordinary syscall as
     the control. 236/236.
 
+- [x] **M14 — the `/dev` zone, and directory-entry injection**
+  There was no `/dev` handling at all: guest `/dev/null` resolved to
+  `<rootfs>/dev/null` and ENOENT'd on a plain directory tree, because a rootfs
+  ships no device nodes and `mknod(2)` needs privileges we lack. The workaround
+  people reach for, `-b /dev:/dev`, is far coarser than the gap deserves — it
+  hands the guest the host's entire `/dev`, block devices included.
+  - **The zone** (`dev_zone` in `path.c`, mirroring the oracle's
+    `special_host_path`): `null`, `zero`, `full`, `random`, `urandom`, `tty`,
+    `ptmx` pass through; `console` → `/dev/tty`; `pts/*` and `shm/*` pass
+    through; everything else under `/dev` falls into the rootfs, so
+    `/dev/mem` and the host's disks stay unreachable (asserted). Binds are
+    matched first, so an explicit `-b` still overrides the zone. `--no-dev`
+    disables it.
+  - **`fd` and the std\* aliases** are the `/proc` fd links, and are rewritten to
+    that spelling by `dev_magic` **in the resolver**, one step before the
+    component walk. Putting them in the zone alone would not do: the walk
+    readlinks each prefix, so it would treat the fd link as an ordinary symlink
+    and try to re-root whatever it names — and for a pipe or a memfd that is not
+    a path at all (`pipe:[12345]`). Routed through the magic-link machinery they
+    reach exactly the anonymous files no re-rooted name could describe.
+  - **Directory-entry injection** (`inject_dents`). Both the device nodes and the
+    `-b` mount points are pure resolution overlays with no dirent behind them, so
+    `getdents64` returned neither: `ls /dev` showed an empty directory that
+    nonetheless opened `/dev/null` fine, and a bind destination was reachable by
+    name but invisible to everything that enumerates before opening — shell
+    globbing, `find`, a package manager's tree walk. Entries are spliced on the
+    first read of the stream (`lseek(SEEK_CUR) == 0`), deduped against both the
+    batch and a real dirent (a rootfs shipping its own `null` is not doubled),
+    and carry `d_ino`/`d_type` from an lstat of the real host target so `ls -l`
+    and `find -type` agree with what opening the name gets. The decision is taken
+    *before* the read so an empty directory still gets its entries, and a genuine
+    end-of-directory still owes them.
+  - The synthesized mount table gains `devtmpfs /dev`, `devpts /dev/pts` and
+    `tmpfs /dev/shm` rows; mount IDs now come from a running counter, since the
+    zone rows are conditional and a bind's id depends on what precedes it.
+  - Tests: `m5_xlate` covers the access half (whitelist, `console`, subpaths, the
+    fd aliases, the non-whitelisted device staying in the rootfs, a bind
+    outranking the zone); new `tests/m14_dev.sh` covers the listing half in a
+    real Alpine guest — all fourteen names in `ls /dev` where the rootfs
+    physically has only `null`, no duplicate for that one, the nodes actually
+    readable/writable, `/dev/mem` unreachable, a spliced bind point listed with a
+    real `d_type` and usable, and `--no-dev` injecting nothing and dropping the
+    mount rows. 273/273.
+  - Accepted divergence: after `chroot(2)` chroot-ng rebases the whole view, so
+    the guest's own `/dev` is spelled `/dev` again and the zone applies inside the
+    chroot. The oracle matches its zones on the *namespace* path, so there `/dev`
+    is not auto-provided and the guest must bind-mount it. This is the same
+    trade already made for `/proc`, and for the same reason — apk chroots before
+    every package script, and those scripts need `/dev/null`.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes
