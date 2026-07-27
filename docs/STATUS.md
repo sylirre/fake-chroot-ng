@@ -1388,6 +1388,35 @@ vfork/`posix_spawn` child-stack handling.
     occurrence of the *host's* actual release, which is the leak the change is
     about. Suite: 457 passed, 0 failed.
 
+- [x] **M17-15 — the registry holds 4096 processes, and our own identity needs
+      no registry at all**
+  - **Capacity 256 → 4096**, the oracle's number. 256 concurrent guest processes
+    is a lot for a phone, but it is a *shared* table under `--shared-proc` and
+    slots are only reclaimed lazily (there is no exit hook), so a busy session
+    could reach it — and past the cap a process is simply invisible.
+  - Raising it would have made every lookup 16× more expensive, because a miss
+    walks the whole table and "is this pid a guest?" is asked once per numeric
+    name in a `/proc` listing — several hundred times for one `ps`. So the claim
+    array is now kept apart from the payload: interleaved, each of those loads
+    landed on its own cache line ~6.5 KiB from the last; dense, the whole
+    4096-slot scan is 16 KiB, which is *less* work than the old 256-slot table
+    cost.
+  - **`/proc/self/cmdline` no longer falls back to our own argv.** The registry
+    can be missing (no memfd) or full, and the fallback was the host file —
+    which for a guest process describes the chroot-ng invocation that started
+    it, so `cat /proc/self/cmdline` read back `chroot-ng -u /rootfs /bin/sh`.
+    Anything that identifies itself by its own cmdline (busybox multi-call
+    applets, a daemon writing a pid file) was told the wrong program was
+    running. For our own pid the answer now comes from the live guest stack,
+    which is where the kernel reads it from too — no shared table needed to
+    describe the process doing the asking. Only *another* process's identity
+    still requires the registry.
+  - **Tests:** new `-t selfproc` and 7 legs in `m11_proc.sh`, run twice — once
+    normally and once with a new `CNG_PROCREG_NONE=1`, which makes the registry
+    unavailable so the degraded tier is reachable at all on a working host (the
+    same testing convention as `CNG_SHM_FORCE_FILE`). Suite: 464 passed, 0
+    failed.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

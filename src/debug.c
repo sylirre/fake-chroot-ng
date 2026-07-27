@@ -933,6 +933,68 @@ int cng_cmd_prctltest(int argc, char **argv, char **envp, unsigned long *auxv) {
     return fails ? 1 : 0;
 }
 
+/* _selfproc — our own /proc/self/{cmdline,environ} must describe the GUEST.
+ *
+ * The registry is where another process's identity comes from, but for our own
+ * it is a convenience: when it is unavailable (never mapped, or full) the old
+ * fallback was the host file, which for a guest process is the chroot-ng
+ * invocation that started it — `/proc/self/cmdline` read back "chroot-ng -u
+ * /rootfs /bin/sh". Run with CNG_PROCREG_NONE=1 the registry is gone and the
+ * answer must still be the guest's own argv, out of the live stack.
+ *
+ * The stack below is the layout cng_build_stack hands a guest: argc, argv,
+ * NULL, envp, NULL, then auxv pairs terminated by AT_NULL. */
+int cng_cmd_selfproc(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)auxv;
+    static struct cng_fs fs;
+    cng_fs_init(&fs, "/");
+    cng_g_fs = &fs;
+    cng_g_host_envp = envp;
+    cng_g_exe_guest = "/bin/guestprog";
+
+    static char *gargv[] = {"/bin/guestprog", "--flag", 0};
+    static char *genvp[] = {"GUESTVAR=yes", 0};
+    static unsigned long stk[16];
+    int i = 0;
+    stk[i++] = 2; /* argc */
+    stk[i++] = (unsigned long)gargv[0];
+    stk[i++] = (unsigned long)gargv[1];
+    stk[i++] = 0;
+    stk[i++] = (unsigned long)genvp[0];
+    stk[i++] = 0;
+    stk[i++] = 0; /* AT_NULL */
+    stk[i++] = 0;
+
+    cng_procfs_init();
+    cng_procfs_publish_stack((unsigned long)stk);
+
+    char buf[512];
+    struct {
+        const char *name, *want;
+        int len;
+    } t[] = {
+        {"/proc/self/cmdline", "/bin/guestprog\0--flag", 22},
+        {"/proc/self/environ", "GUESTVAR=yes", 13},
+    };
+    int fails = 0;
+    for (unsigned k = 0; k < sizeof t / sizeof t[0]; k++) {
+        long fd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)t[k].name,
+                               CNG_O_RDONLY, 0, 0, 0, /*trapped=*/0);
+        long n = fd < 0 ? -1 : sys_read((int)fd, buf, sizeof buf);
+        if (fd >= 0)
+            sys_close((int)fd);
+        int ok = (n == t[k].len && !memcmp(buf, t[k].want, (size_t)n));
+        cng_dprintf(1, "selfproc %s: %ld bytes [%s] -> %s\n", t[k].name, n,
+                    n > 0 ? buf : "", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+    cng_dprintf(1, "selfproc registry=%d: %d failure(s)\n",
+                cng_g_procreg_backing, fails);
+    return fails ? 1 : 0;
+}
+
 /* _loadtwice PATH — load the same ELF twice into this address space (as execve
  * emulation does, without tearing down the first) to surface re-load failures. */
 int cng_cmd_loadtwice(int argc, char **argv, char **envp, unsigned long *auxv) {

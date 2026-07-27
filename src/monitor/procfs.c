@@ -627,6 +627,66 @@ static int per_pid_kind(const char *leaf) {
     return 0;
 }
 
+/* The guest stack of the program running here, kept so our own cmdline/environ/
+ * auxv can be answered from live state when the registry cannot answer (see
+ * self_snapshot). Re-recorded at every emulated execve, which is where a real
+ * kernel moves its own arg_start/env_start too. */
+static unsigned long g_self_sp;
+
+/* Flatten a NUL-terminated vector into NUL-joined bytes, the way the kernel
+ * stores cmdline and environ. Every string is validated first: this reads the
+ * guest's own stack long after it was built, and a program that has since
+ * rewritten its argv (setproctitle) must not be able to fault us. */
+static unsigned flatten_vec(char *dst, unsigned cap, char **v) {
+    unsigned n = 0;
+    long cnt = cng_user_veclen(v, 4096);
+    for (long i = 0; i < cnt; i++) {
+        long len = cng_user_strlen(v[i], cap);
+        if (len < 0 || n + (unsigned)len + 1 > cap)
+            break;
+        memcpy(dst + n, v[i], (size_t)len);
+        n += (unsigned)len;
+        dst[n++] = '\0';
+    }
+    return n;
+}
+
+/* Our own identity from the live stack rather than the registry.
+ *
+ * The registry can miss — it was never mapped, or its table is full — and the
+ * fallback then was the *host* file, which for a guest process describes the
+ * chroot-ng invocation that started it: `/proc/self/cmdline` read back
+ * "chroot-ng -u /rootfs /bin/sh". Anything that identifies itself by its own
+ * cmdline (busybox multi-call applets, `ps` on itself, a daemon writing a pid
+ * file) was told the wrong program was running. We are the process being asked
+ * about, so no shared table is needed to answer. */
+static int self_snapshot(struct cng_procsnap *out) {
+    if (!g_self_sp)
+        return 0;
+    long argc = *(long *)g_self_sp;
+    if (argc < 0 || argc > 4096)
+        return 0;
+    char **argv = (char **)(g_self_sp + 8);
+    char **envp = argv + argc + 1;
+    char **p = envp;
+    while (*p)
+        p++;
+    unsigned long *auxv = (unsigned long *)(p + 1);
+    unsigned long *end = auxv;
+    while (end[0])
+        end += 2;
+    end += 2;
+    memset(out, 0, sizeof *out);
+    out->cmd_len = flatten_vec(out->cmd, CNG_PROCREG_CMDLINE, argv);
+    out->env_len = flatten_vec(out->env, CNG_PROCREG_ENVIRON, envp);
+    unsigned alen = (unsigned)((char *)end - (char *)auxv);
+    if (alen && alen <= CNG_PROCREG_AUXV) {
+        memcpy(out->auxv, auxv, alen);
+        out->auxv_len = alen;
+    }
+    return 1;
+}
+
 /* ---- the open hook ------------------------------------------------------- */
 
 int cng_procfs_open(const char *canon, long gflags, long *ret) {
@@ -673,7 +733,12 @@ int cng_procfs_open(const char *canon, long gflags, long *ret) {
      * unavailable, or the table was full) the host file is the better answer. */
     struct cng_procsnap snap;
     if (kind == PF_CMDLINE || kind == PF_ENVIRON || kind == PF_AUXV) {
-        if (!cng_procreg_get(pid, &snap))
+        /* For ourselves the registry is a convenience, not the source: we ARE
+         * the process being described, and the host file — chroot-ng's own
+         * argv and exec-time environment — is the one answer that is certainly
+         * wrong. Only another process's identity truly needs the table. */
+        if (!cng_procreg_get(pid, &snap) &&
+            !(pid == (int)sys_getpid() && self_snapshot(&snap)))
             return 0;
     }
 
@@ -795,6 +860,7 @@ static void set_comm(const char *exe_guest) {
 void cng_procfs_publish_stack(unsigned long guest_sp) {
     if (!guest_sp)
         return;
+    g_self_sp = guest_sp;
     long argc = *(long *)guest_sp;
     if (argc < 0 || argc > 4096)
         return;

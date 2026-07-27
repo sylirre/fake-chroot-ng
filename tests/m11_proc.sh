@@ -27,6 +27,27 @@ check_contains "a /proc listing drops host pids, keeps guest ones" \
     "proctest listing: self=1 own_pid=1 host_pids=0 -> OK" "$out"
 check_contains "cmdline is the guest argv, not the chroot-ng invocation" \
     "proctest cmdline: 24 bytes argv0=/bin/busybox -> OK" "$out"
+
+# ...and that has to hold when there is no registry at all. It is a shared table
+# and it can be missing (no memfd) or full; the fallback used to be the host
+# file, which for a guest process is the chroot-ng invocation that started it.
+# We are the process being described, so the live stack answers on its own.
+# CNG_PROCREG_NONE=1 is the only way to reach the degraded tier on a working
+# host (same convention as CNG_SHM_FORCE_FILE).
+sout=$(run -t selfproc 2>&1)
+check "selfproc with the registry" 0 $?
+check_contains "our own cmdline is the guest's argv" \
+    "selfproc /proc/self/cmdline: 22 bytes [/bin/guestprog] -> OK" "$sout"
+check_contains "our own environ is the guest's" \
+    "selfproc /proc/self/environ: 13 bytes [GUESTVAR=yes] -> OK" "$sout"
+sout=$(CNG_PROCREG_NONE=1 run -t selfproc 2>&1)
+check "selfproc with no registry at all" 0 $?
+check_contains "the registry really was unavailable" \
+    "selfproc registry=0: 0 failure(s)" "$sout"
+check_contains "cmdline still answers from the live stack" \
+    "selfproc /proc/self/cmdline: 22 bytes [/bin/guestprog] -> OK" "$sout"
+check_contains "environ still answers from the live stack" \
+    "selfproc /proc/self/environ: 13 bytes [GUESTVAR=yes] -> OK" "$sout"
 check_contains "environ is the guest environment" \
     "proctest environ: 30 bytes -> OK" "$out"
 check_contains "another guest process is described from the registry" \

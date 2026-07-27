@@ -42,7 +42,7 @@
 
 #include "cng/rt.h"
 
-#define CNG_PROCREG_MAX     256  /* concurrent guest processes in the view */
+#define CNG_PROCREG_MAX    4096  /* concurrent guest processes in the view */
 #define CNG_PROCREG_CMDLINE 1024 /* per-entry caps; longer values truncate */
 #define CNG_PROCREG_ENVIRON 4096
 #define CNG_PROCREG_AUXV     512
