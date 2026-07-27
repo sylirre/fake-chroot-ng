@@ -62,6 +62,11 @@ static const int path_syscalls[] = {
     /* socket(): substitutes an emulated NETLINK_ROUTE socket where the host
      * denies app domains rtnetlink (netlink.c). Everything else runs native. */
     __NR_socket,
+    /* POSIX timers: not a path syscall, but one whose result the emulated
+     * execve has to undo. A real exec deletes every timer with the address
+     * space; ours keeps the address space, and nothing enumerates a process's
+     * timers, so the id has to be caught as it is handed out (dispatch.c). */
+    __NR_timer_create, __NR_timer_delete,
 };
 
 #define NPATH ((int)(sizeof(path_syscalls) / sizeof(path_syscalls[0])))

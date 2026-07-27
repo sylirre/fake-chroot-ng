@@ -698,6 +698,7 @@ int cng_cmd_faulttest(int argc, char **argv, char **envp, unsigned long *auxv) {
     cng_g_fs = &fs;
 
     void *bad = (void *)0x10; /* non-NULL, and no mapping starts that low */
+    char *badv[2] = {(char *)0x10, 0}; /* a readable vector of unreadable strings */
     char good[128];
     int fails = 0;
 
@@ -738,6 +739,14 @@ int cng_cmd_faulttest(int argc, char **argv, char **envp, unsigned long *auxv) {
         {"shmctl",
          cng_dispatch(__NR_shmctl, 0, CNG_IPC_SET, (long)bad, 0, 0, 0, 1)},
         {"sendmsg", cng_dispatch(__NR_sendmsg, 0, (long)bad, 0, 0, 0, 0, 1)},
+        /* execve walks argv/envp itself — the kernel never sees them — so both
+         * the vector and the strings it points at have to be validated. */
+        {"execve path",
+         cng_dispatch(__NR_execve, (long)bad, 0, 0, 0, 0, 0, 1)},
+        {"execve argv",
+         cng_dispatch(__NR_execve, (long)"/bin/sh", (long)bad, 0, 0, 0, 0, 1)},
+        {"execve argv string",
+         cng_dispatch(__NR_execve, (long)"/bin/sh", (long)badv, 0, 0, 0, 0, 1)},
     };
     for (unsigned i = 0; i < sizeof t / sizeof t[0]; i++) {
         int ok = (t[i].r == -EFAULT);
@@ -853,9 +862,17 @@ int cng_cmd_loadtwice(int argc, char **argv, char **envp, unsigned long *auxv) {
     return (rc1 == 0 && rc2 == 0) ? 0 : 1;
 }
 
-/* _exectest -r ROOT [-b SRC:DST[:ro]]... PROG [args] — drive cng_emulate_execve
- * (incl. shebang) and, on success, enter the loaded program. Exercises execve
- * emulation under qemu where neither the SIGSYS nor trampoline route reaches it.
+/* _exectest -r ROOT [-b SRC:DST[:ro]]... [-D DIR] [-e] [-N] [-B] PROG [args]
+ * — drive cng_emulate_execve (incl. shebang) and, on success, enter the loaded
+ * program. Exercises execve emulation under qemu where neither the SIGSYS nor
+ * trampoline route reaches it.
+ *
+ * The execveat form is reachable through the option flags, which is the only way
+ * to test what its flags word means now that it is read at all:
+ *   -D DIR  resolve PROG against an open fd for DIR (a real dirfd)
+ *   -e      AT_EMPTY_PATH: open PROG and execute the fd, with an empty path
+ *   -N      AT_SYMLINK_NOFOLLOW
+ *   -B      set an undefined flag bit, which the kernel refuses with EINVAL
  *
  * The binds matter for a dynamically linked guest: its ELF interpreter is named
  * by an absolute guest path, and a synthetic rootfs holding only the test binary
@@ -866,12 +883,28 @@ int cng_cmd_exectest(int argc, char **argv, char **envp, unsigned long *auxv) {
     const char *bind_g[CNG_MAX_BINDS];
     const char *bind_h[CNG_MAX_BINDS];
     int bind_ro[CNG_MAX_BINDS];
-    int nb = 0;
+    const char *dirpath = 0;
+    int nb = 0, xflags = 0, empty = 0, probe_reset = 0;
     int i = 1;
     while (i < argc) {
         if (!strcmp(argv[i], "-r") && i + 1 < argc) {
             rootfs = argv[i + 1];
             i += 2;
+        } else if (!strcmp(argv[i], "-D") && i + 1 < argc) {
+            dirpath = argv[i + 1];
+            i += 2;
+        } else if (!strcmp(argv[i], "-e")) {
+            empty = 1;
+            i++;
+        } else if (!strcmp(argv[i], "-N")) {
+            xflags |= CNG_AT_SYMLINK_NOFOLLOW;
+            i++;
+        } else if (!strcmp(argv[i], "-B")) {
+            xflags |= CNG_AT_NO_AUTOMOUNT; /* not a valid execveat flag */
+            i++;
+        } else if (!strcmp(argv[i], "-R")) {
+            probe_reset = 1;
+            i++;
         } else if (!strcmp(argv[i], "-b") && i + 1 < argc) {
             /* SRC:DST[:ro] — host first, same order as the -b CLI option. Split
              * in place: argv is writable and outlives the fs view. */
@@ -898,7 +931,7 @@ int cng_cmd_exectest(int argc, char **argv, char **envp, unsigned long *auxv) {
     }
     if (i >= argc) {
         cng_dprintf(2, "usage: _exectest -r ROOT [-b SRC:DST[:ro]]... "
-                       "PROG [args]\n");
+                       "[-D DIR] [-e] [-N] [-B] PROG [args]\n");
         return 2;
     }
     static struct cng_fs fs;
@@ -909,9 +942,64 @@ int cng_cmd_exectest(int argc, char **argv, char **envp, unsigned long *auxv) {
     cng_host_auxv = auxv;
 
     char **gargv = argv + i;
+    const char *gpath = gargv[0];
+    int dirfd = CNG_AT_FDCWD;
+    /* Both fds are opened through the dispatcher, so they are the translated
+     * ones a guest would have. */
+    if (dirpath) {
+        long d = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)dirpath,
+                              CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 1);
+        if (d < 0) {
+            cng_dprintf(2, "exectest: open dir %s failed %ld\n", dirpath, d);
+            return 1;
+        }
+        dirfd = (int)d;
+    }
+    if (empty) {
+        long f = cng_dispatch(__NR_openat, dirfd, (long)gpath, CNG_O_RDONLY, 0,
+                              0, 0, 1);
+        if (f < 0) {
+            cng_dprintf(2, "exectest: open %s failed %ld\n", gpath, f);
+            return 1;
+        }
+        dirfd = (int)f;
+        gpath = "";
+        xflags |= CNG_AT_EMPTY_PATH;
+    }
+    /* -R: the state a real execve drops with the address space. Grow the heap
+     * and arm a POSIX timer the way a running program would, then report
+     * whether the emulation undid both — the reset happens at the commit point,
+     * so it is only observable from here, before we enter the new program. */
+    int tid = 0, have_timer = 0;
+    if (probe_reset) {
+        long b = CNG_SYS(__NR_brk, 0, 0, 0, 0, 0, 0);
+        if (b > 0) {
+            cng_g_brk0 = (unsigned long)b;
+            CNG_SYS(__NR_brk, b + (1 << 20), 0, 0, 0, 0, 0);
+        }
+        /* Through the dispatcher, which is where the id gets recorded — a raw
+         * syscall here would be a timer the emulation never saw. */
+        have_timer = cng_dispatch(__NR_timer_create, 0 /*CLOCK_REALTIME*/, 0,
+                                  (long)&tid, 0, 0, 0, 1) == 0;
+    }
+
     static struct cng_ucontext uc;
     memset(&uc, 0, sizeof uc);
-    cng_emulate_execve(&uc, CNG_AT_FDCWD, gargv[0], gargv, envp);
+    cng_emulate_execve(&uc, dirfd, gpath, gargv, envp, xflags);
+    if (probe_reset) {
+        long b = CNG_SYS(__NR_brk, 0, 0, 0, 0, 0, 0);
+        /* The timer is gone when deleting it again is refused. Counting
+         * /proc/self/timers would answer a different question under an emulator,
+         * which keeps its own timer table. */
+        int gone = have_timer &&
+                   CNG_SYS(__NR_timer_delete, tid, 0, 0, 0, 0, 0) < 0;
+        int brk_back = ((unsigned long)b == cng_g_brk0);
+        int ok = brk_back && (!have_timer || gone);
+        cng_dprintf(1, "execreset: brk_back=%d timer_created=%d timer_gone=%d "
+                       "-> %s\n",
+                    brk_back, have_timer, gone, ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
     unsigned long entry = (unsigned long)uc.uc_mcontext.pc;
     unsigned long sp = (unsigned long)uc.uc_mcontext.sp;
     if (entry == 0) {

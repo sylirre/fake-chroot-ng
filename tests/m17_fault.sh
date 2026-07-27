@@ -21,7 +21,8 @@ case "$out" in
     check "faulttest rc" 0 $rc
     check_absent "no case faulted" "FAIL" "$out"
     for _c in rt_sigaction rt_sigprocmask getcwd getresuid getresgid \
-        setgroups getgroups capget shmctl sendmsg; do
+        setgroups getgroups capget shmctl sendmsg "execve path" \
+        "execve argv" "execve argv string"; do
         check_contains "$_c answers EFAULT" "faulttest $_c=-14 want=-14 -> OK" \
             "$out"
     done

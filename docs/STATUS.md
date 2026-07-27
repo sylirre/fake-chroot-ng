@@ -1258,6 +1258,51 @@ vfork/`posix_spawn` child-stack handling.
     (`PR_SET_NAME`) still reaches the kernel. Seven filter legs in
     `m5b_monitor.sh` cover which ops trap. Suite: 412 passed, 0 failed.
 
+- [x] **M17-10 — execve fidelity: nesting, `execveat` flags, and the state a real
+      exec drops**
+  Four separate gaps in the emulation, all of them things the kernel does that we
+  did not.
+  - **Shebang nesting.** `#!` was a single `if`, so a script whose interpreter is
+    itself a script came out as "not an ELF" (`ENOEXEC`). It is a loop now,
+    bounded at four levels like `fs/exec.c` with `ELOOP` beyond — and each level
+    prepends its interpreter and pushes the previous script down, so the whole
+    chain reaches the final argv in order, exactly as the kernel assembles it.
+  - **`execveat`'s flags word was never read** (`sigsys.c` did not even pass it
+    on). `AT_EMPTY_PATH` — the fd-only form Go's `os/exec` and any
+    `open`-then-`exec` idiom use — was ignored, so an empty path was simply
+    ENOENT; `AT_SYMLINK_NOFOLLOW` silently followed the link it was told to
+    refuse; and undefined bits were accepted where the kernel answers `EINVAL`.
+    All three are honored now, with `AT_EMPTY_PATH` routed through
+    `/proc/self/fd/N` so it reuses the path that already loads from an open
+    description (and so reaches an anonymous or deleted image).
+  - **A real dirfd resolved against the cwd.** `execveat(dirfd, "prog", ...)`
+    copied the relative name through verbatim, leaving the *kernel* to resolve
+    it — against the host cwd, with no rootfs in sight. It goes through
+    `cng_resolve_at` now, the same containment every other `*at` syscall gets, so
+    a `..` is clamped at the guest root instead of climbing past it.
+  - **`EFAULT` on argv/envp.** The vectors were walked with a bare `strlen`,
+    so a wild pointer was a fatal SIGSEGV inside the handler rather than the
+    `-EFAULT` execve(2) promises. Both the vector and every string it points at
+    are measured with the M17-7 helpers, one probe per page rather than per
+    element, with `E2BIG` at the kernel's own `MAX_ARG_STRLEN`.
+  - **State that outlived the image.** A real execve drops POSIX timers, the
+    `clear_child_tid` futex, the robust futex list and the heap along with the
+    address space. We keep the address space, so all four survived: a timer went
+    on firing into a program that never armed it, and `clear_child_tid` still
+    pointed at the dead libc's TCB — an address the kernel writes a zero to and
+    futex-wakes on thread exit, landing in whatever the new program put there.
+    Timer ids are recorded as they are handed out (`timer_create`/`timer_delete`
+    join the trapped set; nothing enumerates a process's timers, and the id in
+    `/proc/self/timers` is the kernel's, not the one a guest under an emulator
+    holds). The break is wound back to what it was before the first guest
+    program ran, which also stops an exec chain accumulating every heap in it.
+  - **Tests:** 18 new legs in `m6_execve.sh` on an extended `-t exectest`, whose
+    new flags (`-D` dirfd, `-e` AT_EMPTY_PATH, `-N` nofollow, `-B` bad flag,
+    `-R` state probe) are the only way to reach the execveat forms under qemu. A
+    five-deep chain asserts `ELOOP` and a four-deep one asserts the full argv;
+    the `-R` leg arms a heap and a timer and checks both are gone at the commit
+    point. Three EFAULT legs in `m17_fault.sh`. Suite: 432 passed, 0 failed.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

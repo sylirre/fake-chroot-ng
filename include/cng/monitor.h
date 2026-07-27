@@ -133,12 +133,24 @@ static inline unsigned cng_exec_vis_gid(unsigned g, unsigned mode) {
  * filter and SIGSYS handler survive (a real execve would wipe them). On failure
  * it sets the return register to -errno and returns (normal execve semantics). */
 void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
-                        char **argv, char **envp);
+                        char **argv, char **envp, int flags);
 
 /* Trampoline-path (-R) counterpart: same emulation from an ordinary call
  * context — on success it enters the new program and never returns; on failure
  * it returns -errno for the trampoline to hand back to the guest. */
-long cng_execve_tramp(int dirfd, const char *path, char **argv, char **envp);
+long cng_execve_tramp(int dirfd, const char *path, char **argv, char **envp,
+                      int flags);
+
+/* The program break before the first guest program ran. A real execve drops the
+ * heap with the address space; ours keeps the address space, so the break is
+ * wound back to this at each exec. 0 = never recorded, and nothing is done. */
+extern unsigned long cng_g_brk0;
+
+/* Record / forget a POSIX timer the guest created. A real execve deletes them
+ * all, and nothing enumerates a process's timers, so the dispatcher hands over
+ * every id as it is created (see cng_exec_reset). */
+void cng_timer_note(int id);
+void cng_timer_forget(int id);
 
 /* Close every FD_CLOEXEC descriptor, as a real execve would (emulated execve
  * does not, so fork/exec launchers' O_CLOEXEC notify pipes must be closed here
@@ -172,6 +184,13 @@ extern char **cng_g_host_envp;
  * last component's own symlink. Returns 0/-errno. Uses cng_g_fs + readlink. */
 int cng_resolve(const char *path, int deref_final, char *out, size_t outsz);
 
+/* Resolve (dirfd, path) to a HOST path: absolute names and AT_FDCWD through the
+ * rootfs, a real dirfd through the guest path it names — so a relative name is
+ * contained exactly as an absolute one is. `deref` follows the final component's
+ * own symlink. Returns 0/-1. */
+int cng_resolve_at(long dirfd, const char *path, int deref, char *out,
+                   size_t sz);
+
 /* The fd behind a host path that names one of this process's own descriptors
  * ("/proc/self/fd/<n>" and its thread-self / own-pid spellings), else -1. */
 int cng_proc_self_fd(const char *host);
@@ -190,6 +209,13 @@ long cng_fd_reopen(const char *host, long flags, long mode, long err);
  * buffer. Both answer 1 when they cannot ask (see uaccess.c). */
 int cng_user_readable(const void *p, unsigned long n);
 int cng_user_writable(void *p, unsigned long n);
+
+/* Length of a guest string / entry count of a guest pointer vector, measured
+ * without ever reading past accessible memory. Returns the count, -EFAULT when
+ * it runs off readable memory, or -E2BIG when `max` passes with no terminator —
+ * the same two answers execve(2) gives for the same inputs. */
+long cng_user_strlen(const char *s, unsigned long max);
+long cng_user_veclen(char *const *v, unsigned long max);
 
 /* Ambient-seccomp block-list: cng_blocked[nr] != 0 means Android blocks that
  * syscall, so dispatch emulates ENOSYS instead of re-issuing it. Populated by

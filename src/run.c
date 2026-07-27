@@ -178,6 +178,11 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
     cng_host_auxv = auxv;
     cng_g_exe_guest = prog_guest;
     cng_g_host_envp = envp;
+    /* The break before any guest program has run: what an emulated execve winds
+     * the heap back to, since it cannot drop it with the address space. */
+    long brk0 = CNG_SYS(__NR_brk, 0, 0, 0, 0, 0, 0);
+    if (brk0 > 0)
+        cng_g_brk0 = (unsigned long)brk0;
 
     /* Key the System V shm namespace to this invocation (unless --shared-proc
      * widens it to the rootfs). Seeded here, in the root process while we are

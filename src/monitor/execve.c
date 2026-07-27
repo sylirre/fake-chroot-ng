@@ -113,6 +113,14 @@ struct exec_args {
     char **envp;
 };
 
+/* Per-string and per-vector bounds, as fs/exec.c has them: MAX_ARG_STRLEN is
+ * 32 pages, and the entry count is capped well above anything real (the kernel's
+ * MAX_ARG_STRINGS is 0x7FFFFFFF, but the byte budget below bites long before
+ * that, and a bounded walk is what keeps a bogus vector from costing a probe
+ * per entry forever). Both answer -E2BIG, as the kernel does. */
+#define EXEC_MAX_STRLEN  (32u * 4096u)
+#define EXEC_MAX_STRINGS 0x40000u
+
 /* What a real execve accepts: a quarter of RLIMIT_STACK, floored at 32 pages
  * (fs/exec.c). Read the limit rather than inventing a number, so a command line
  * the kernel would take is not refused here — but clamp to what the stack we
@@ -162,14 +170,39 @@ static void exec_args_free(struct exec_args *a) {
     a->mem = 0;
 }
 
+/* Measure one vector, validating as it goes. argv/envp are guest memory the
+ * kernel never gets to check for us — walking them with a bare strlen is how a
+ * wild pointer became a fatal SIGSEGV inside the handler instead of the -EFAULT
+ * execve(2) promises. Returns the total bytes of its strings, or -errno. */
+static long vec_bytes(char **v, int *count) {
+    long n = cng_user_veclen(v, EXEC_MAX_STRINGS);
+    if (n < 0)
+        return n;
+    unsigned long bytes = 0;
+    for (long i = 0; i < n; i++) {
+        long len = cng_user_strlen(v[i], EXEC_MAX_STRLEN);
+        if (len < 0)
+            return len;
+        bytes += (unsigned long)len + 1;
+    }
+    *count = (int)n;
+    return (long)bytes;
+}
+
 static long exec_args_take(struct exec_args *a, const char *path, char **argv,
                            char **envp) {
     int argc = 0, envc = 0;
-    unsigned long bytes = strlen(path) + 1;
-    while (argv && argv[argc])
-        bytes += strlen(argv[argc++]) + 1;
-    while (envp && envp[envc])
-        bytes += strlen(envp[envc++]) + 1;
+    long pn = cng_user_strlen(path, EXEC_MAX_STRLEN);
+    if (pn < 0)
+        return pn;
+    long ab = vec_bytes(argv, &argc);
+    if (ab < 0)
+        return ab;
+    long eb = vec_bytes(envp, &envc);
+    if (eb < 0)
+        return eb;
+    unsigned long bytes = (unsigned long)pn + 1 + (unsigned long)ab +
+                          (unsigned long)eb;
     /* Two NULL-terminated pointer arrays, 8-aligned, ahead of the strings. */
     unsigned long vecs = ((unsigned long)argc + 1 + (unsigned long)envc + 1) * 8;
     unsigned long max = exec_arg_max();
@@ -188,13 +221,12 @@ static long exec_args_take(struct exec_args *a, const char *path, char **argv,
     char *end = (char *)a->mem + a->len;
     a->argv = (char **)a->mem;
     a->envp = copy_vec(argv, a->argv, argc + 1, &pool, end);
-    size_t pn = strlen(path) + 1;
     if (!a->envp || !copy_vec(envp, a->envp, envc + 1, &pool, end) ||
-        pn > (size_t)(end - pool)) {
+        (size_t)pn + 1 > (size_t)(end - pool)) {
         exec_args_free(a);
         return -E2BIG; /* raced its own measurement: treat as too big */
     }
-    memcpy(pool, path, pn);
+    memcpy(pool, path, (size_t)pn + 1);
     a->path = pool;
     return 0;
 }
@@ -208,54 +240,140 @@ static long exec_args_take(struct exec_args *a, const char *path, char **argv,
  * path/argv/envp are the snapshot taken by execve_core, not the guest's own
  * pointers: everything from cng_load_elf onwards would otherwise be reading
  * memory the load just replaced. */
+unsigned long cng_g_brk0 = 0;
+
+/* POSIX timers the guest created. There is no syscall that enumerates a
+ * process's timers, and the id the guest was handed is the only handle there is,
+ * so they are recorded as they are created (dispatch traps timer_create and
+ * timer_delete for exactly this) and deleted at the next exec. /proc/self/timers
+ * lists them too, but the number in that file is the kernel's own id, which is
+ * not what a guest under an emulator holds — recording what we handed out is
+ * both simpler and true on every tier. Best-effort: a full table just means a
+ * timer outlives the exec, as it did before. */
+#define CNG_TIMERS_MAX 64
+static int g_timers[CNG_TIMERS_MAX];
+static int g_ntimers;
+
+void cng_timer_note(int id) {
+    if (g_ntimers < CNG_TIMERS_MAX)
+        g_timers[g_ntimers++] = id;
+}
+
+void cng_timer_forget(int id) {
+    for (int i = 0; i < g_ntimers; i++)
+        if (g_timers[i] == id) {
+            g_timers[i] = g_timers[--g_ntimers];
+            return;
+        }
+}
+
+/* State a real execve drops with the address space, and ours does not.
+ *
+ * We keep the address space — that is the whole point of the in-process model —
+ * so each of these outlives the program that set it and goes on pointing into
+ * memory the next program now owns:
+ *
+ *  - POSIX timers keep firing, into a signal handler that no longer exists.
+ *  - clear_child_tid is where the kernel writes a zero and issues a FUTEX_WAKE
+ *    when the thread exits. Left pointing at the old libc's TCB, that write
+ *    lands in whatever the new program put there.
+ *  - the robust futex list is walked by the kernel on exit, following pointers
+ *    the old program owned.
+ *  - the heap keeps every byte the old program allocated, and an exec chain
+ *    (a wrapper script running a wrapper script) accumulates all of them.
+ *
+ * All best-effort: a kernel without POSIX timers has no such file, and a failed
+ * brk simply leaves the heap where it was. */
+static void cng_exec_reset(void) {
+    for (int i = 0; i < g_ntimers; i++)
+        CNG_SYS(__NR_timer_delete, g_timers[i], 0, 0, 0, 0, 0);
+    g_ntimers = 0;
+    CNG_SYS(__NR_set_tid_address, 0, 0, 0, 0, 0, 0);
+    CNG_SYS(__NR_set_robust_list, 0, 24 /* sizeof(struct robust_list_head) */, 0,
+            0, 0, 0);
+    if (cng_g_brk0) {
+        long cur = CNG_SYS(__NR_brk, 0, 0, 0, 0, 0, 0);
+        if (cur > 0 && (unsigned long)cur > cng_g_brk0)
+            CNG_SYS(__NR_brk, cng_g_brk0, 0, 0, 0, 0, 0);
+    }
+}
+
+/* Shebang nesting, as fs/exec.c bounds it: a script whose interpreter is itself
+ * a script is followed up to four times, and the fifth is -ELOOP. Each level
+ * needs its interpreter (and optional argument) to stay alive until the stack is
+ * built, since both end up in the new argv. */
+#define SHEB_MAX   4
+#define SHEB_WORD  256
+#define SHEB_ARGV  128
+
 static long execve_load(int dirfd, const char *path, char **argv, char **envp,
-                        unsigned long *out_sp, unsigned long *out_entry) {
-    /* Resolve the target through the rootfs/bind map, following symlinks
-     * (absolute or AT_FDCWD); a real dirfd with a relative path is a rare case
-     * we pass through. */
+                        int flags, unsigned long *out_sp,
+                        unsigned long *out_entry) {
     char host[CNG_PATH_MAX];
-    if (path[0] == '/' || dirfd == CNG_AT_FDCWD) {
-        long rr = cng_resolve(path, 1, host, sizeof host);
-        if (rr != 0) {
+    char sheb_interp[SHEB_MAX][SHEB_WORD], sheb_arg[SHEB_MAX][SHEB_WORD];
+    char *sheb_argv[SHEB_ARGV];
+    const char *cur = path; /* the guest path of the image at this level */
+    char **eff_argv = argv;
+    int gfd = -1;           /* an open fd for the image, when we have one */
+    int nofollow = (flags & CNG_AT_SYMLINK_NOFOLLOW) != 0;
+
+    for (int depth = 0;; depth++) {
+        if (depth > SHEB_MAX) {
             if (cng_g_debug)
-                cng_dprintf(2, "[cng] execve %s -> unresolved errno=%ld\n", path,
-                            -rr);
+                cng_dprintf(2, "[cng] execve %s -> shebang nesting\n", path);
+            return -ELOOP;
+        }
+        /* Resolve through the rootfs/bind map. Level 0 honors the execveat
+         * dirfd — a relative name used to be handed to the kernel as-is, so it
+         * resolved against the HOST cwd and left the guest view entirely — and
+         * its AT_SYMLINK_NOFOLLOW; every level after it is an interpreter path
+         * from a #! line, which is absolute or cwd-relative by definition. */
+        if (depth == 0) {
+            if (cng_resolve_at(dirfd, cur, !nofollow, host, sizeof host) != 0) {
+                if (cng_g_debug)
+                    cng_dprintf(2, "[cng] execve %s -> unresolved\n", cur);
+                return -ENOENT;
+            }
+            /* AT_SYMLINK_NOFOLLOW does not open the link's target, it refuses:
+             * the kernel answers ELOOP for a final symlink. */
+            if (nofollow) {
+                char st[144];
+                if (CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, host, st,
+                            CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0 &&
+                    (*(unsigned *)(st + 16) & 0170000) == 0120000)
+                    return -ELOOP;
+            }
+        } else if (cng_resolve(cur, 1, host, sizeof host) != 0) {
+            if (cng_g_debug)
+                cng_dprintf(2, "[cng] execve interp %s -> unresolved\n", cur);
             return -ENOENT;
         }
-    } else {
-        cng_strlcpy(host, path, sizeof host);
-    }
-    /* Every failure below this point is silent otherwise, and the guest only
-     * sees an errno — trace the resolution so a device-side failure says which
-     * stage produced it (and which build is running). */
-    if (cng_g_debug)
-        cng_dprintf(2, "[cng] execve resolve %s -> %s\n", path, host);
+        /* Every failure below this point is silent otherwise, and the guest only
+         * sees an errno — trace the resolution so a device-side failure says
+         * which stage produced it (and which build is running). */
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] execve resolve %s -> %s\n", cur, host);
 
-    /* Shebang: the kernel interprets `#!interp [arg]` scripts, but we bypass the
-     * kernel, so do it ourselves — exec the interpreter with
-     * [interp, arg?, script, orig-args...]. One level (interp is expected to be
-     * a real ELF, e.g. /bin/sh -> busybox). */
-    /* When the target names one of our own fds ("/proc/self/fd/N", how apk runs
-     * package scripts) work from that open file description instead of
-     * reopening the magic link. execve(2) checks *execute* permission on the
-     * inode; a reopen checks *read* — so a script a real (root) chroot execs
-     * happily can come back EACCES here, since our fake root has no DAC bypass.
-     * The fd we already hold needs no permission check at all, and covers the
-     * anonymous files (memfd, O_TMPFILE, deleted) that have no readable name.
-     * Everything below reads it with pread/mmap, so the guest's file offset —
-     * shared with its parent through fork — is left alone. */
-    int gfd = cng_proc_self_fd(host); /* the guest's fd: never close it */
-    if (gfd >= 0 && cng_g_debug) {
-        char st[128]; /* AArch64 struct stat: mode@16, uid@24, gid@28 */
-        if (CNG_SYS(__NR_fstat, gfd, st, 0, 0, 0, 0) == 0)
-            cng_dprintf(2, "[cng] execve fd=%d mode=%o uid=%u gid=%u\n", gfd,
-                        *(unsigned *)(st + 16) & 07777, *(unsigned *)(st + 24),
-                        *(unsigned *)(st + 28));
-    }
+        /* When the target names one of our own fds ("/proc/self/fd/N", how apk
+         * runs package scripts, and what execveat(AT_EMPTY_PATH) becomes) work
+         * from that open file description instead of reopening the magic link.
+         * execve(2) checks *execute* permission on the inode; a reopen checks
+         * *read* — so a script a real (root) chroot execs happily can come back
+         * EACCES here, since our fake root has no DAC bypass. The fd we already
+         * hold needs no permission check at all, and covers the anonymous files
+         * (memfd, O_TMPFILE, deleted) that have no readable name. Everything
+         * below reads it with pread/mmap, so the guest's file offset — shared
+         * with its parent through fork — is left alone. */
+        gfd = cng_proc_self_fd(host); /* the guest's fd: never close it */
+        if (gfd >= 0 && cng_g_debug) {
+            char st[128]; /* AArch64 struct stat: mode@16, uid@24, gid@28 */
+            if (CNG_SYS(__NR_fstat, gfd, st, 0, 0, 0, 0) == 0)
+                cng_dprintf(2, "[cng] execve fd=%d mode=%o uid=%u gid=%u\n", gfd,
+                            *(unsigned *)(st + 16) & 07777,
+                            *(unsigned *)(st + 24), *(unsigned *)(st + 28));
+        }
 
-    char interp_buf[256], arg_buf[256], *sheb_argv[128];
-    char **eff_argv = argv;
-    {
+        char hdr[257];
         long fd = gfd;
         if (gfd < 0) {
             fd = sys_openat(CNG_AT_FDCWD, host, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
@@ -266,53 +384,58 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
                 return fd; /* the real errno (EACCES, ELOOP, ENOENT, ...) */
             }
         }
-        char hdr[257];
         long n = sys_pread64((int)fd, hdr, 256, 0);
         if (gfd < 0)
             sys_close((int)fd);
-        if (n >= 2 && hdr[0] == '#' && hdr[1] == '!') {
-            hdr[n < 256 ? n : 256] = '\0';
-            char *p = hdr + 2;
-            while (*p == ' ' || *p == '\t')
-                p++;
-            char *i0 = p;
-            while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
-                p++;
-            size_t ilen = (size_t)(p - i0);
-            while (*p == ' ' || *p == '\t')
-                p++;
-            char *a0 = p;
-            while (*p && *p != '\n' && *p != '\r')
-                p++;
-            size_t alen = (size_t)(p - a0);
-            if (ilen == 0 || ilen >= sizeof interp_buf) {
-                if (cng_g_debug)
-                    cng_dprintf(2, "[cng] execve %s -> bad shebang\n", path);
-                return -ENOEXEC;
-            }
-            memcpy(interp_buf, i0, ilen);
-            interp_buf[ilen] = '\0';
-            int k = 0;
-            sheb_argv[k++] = interp_buf;
-            if (alen > 0 && alen < sizeof arg_buf) {
-                memcpy(arg_buf, a0, alen);
-                arg_buf[alen] = '\0';
-                sheb_argv[k++] = arg_buf;
-            }
-            sheb_argv[k++] = (char *)path; /* the script path */
-            if (argv)
-                for (int j = 1; argv[j] && k < 126; j++)
-                    sheb_argv[k++] = argv[j];
-            sheb_argv[k] = 0;
-            eff_argv = sheb_argv;
-            gfd = -1; /* the image to load is now the interpreter, by path */
-            if (cng_resolve(interp_buf, 1, host, sizeof host) != 0) {
-                if (cng_g_debug)
-                    cng_dprintf(2, "[cng] execve interp %s -> unresolved\n",
-                                interp_buf);
-                return -ENOENT;
-            }
+        if (!(n >= 2 && hdr[0] == '#' && hdr[1] == '!'))
+            break; /* an ELF (or something the loader will reject) */
+
+        /* `#! interp [arg]`: the kernel replaces argv[0] with the interpreter,
+         * then the optional argument, then the path of the script being run —
+         * which at depth > 0 is the previous level's interpreter, so the chain
+         * accumulates rather than resetting. */
+        hdr[n < 256 ? n : 256] = '\0';
+        char *p = hdr + 2;
+        while (*p == ' ' || *p == '\t')
+            p++;
+        char *i0 = p;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
+            p++;
+        size_t ilen = (size_t)(p - i0);
+        while (*p == ' ' || *p == '\t')
+            p++;
+        char *a0 = p;
+        while (*p && *p != '\n' && *p != '\r')
+            p++;
+        size_t alen = (size_t)(p - a0);
+        if (ilen == 0 || ilen >= SHEB_WORD) {
+            if (cng_g_debug)
+                cng_dprintf(2, "[cng] execve %s -> bad shebang\n", cur);
+            return -ENOEXEC;
         }
+        if (depth == SHEB_MAX)
+            return -ELOOP; /* no room to record another level */
+        memcpy(sheb_interp[depth], i0, ilen);
+        sheb_interp[depth][ilen] = '\0';
+
+        char *nv[SHEB_ARGV];
+        int k = 0;
+        nv[k++] = sheb_interp[depth];
+        if (alen > 0 && alen < SHEB_WORD) {
+            memcpy(sheb_arg[depth], a0, alen);
+            sheb_arg[depth][alen] = '\0';
+            nv[k++] = sheb_arg[depth];
+        }
+        nv[k++] = (char *)cur; /* the script path, as the guest named it */
+        if (eff_argv)
+            for (int j = 1; eff_argv[j] && k < SHEB_ARGV - 2; j++)
+                nv[k++] = eff_argv[j];
+        nv[k] = 0;
+        memcpy(sheb_argv, nv, (size_t)(k + 1) * sizeof *nv);
+        eff_argv = sheb_argv;
+        cur = sheb_interp[depth];
+        gfd = -1; /* the image to load is now the interpreter, by path */
+        nofollow = 0;
     }
 
     if (cng_g_debug)
@@ -372,6 +495,11 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
      * address space; ours keeps it, so the mappings have to go explicitly (and
      * the broker's nattch with them). */
     cng_shm_detach_all();
+    /* ...and neither do POSIX timers, the clear_child_tid futex, the robust
+     * futex list, or the heap. A real execve drops all four with the address
+     * space; ours keeps the address space, so each is state of a program that no
+     * longer exists, pointing into memory the new one now owns. */
+    cng_exec_reset();
 
     /* setuid/setgid-on-exec against the fake credential set (--setuid-root /
      * --setgid-root): `host` is the ELF the kernel would honor the set-id bit on
@@ -414,12 +542,40 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
 /* Shared emulation core: the checks that need only the guest's own pointers,
  * then the snapshot (see exec_args_take) around the part that maps the image. */
 static long execve_core(int dirfd, const char *path, char **argv, char **envp,
-                        unsigned long *out_sp, unsigned long *out_entry) {
+                        int flags, unsigned long *out_sp,
+                        unsigned long *out_entry) {
     if (cng_g_debug)
-        cng_dprintf(2, "[cng] execve enter path=%s\n", path ? path : "(null)");
+        cng_dprintf(2, "[cng] execve enter path=%s flags=%x\n",
+                    path ? path : "(null)", (unsigned)flags);
 
-    if (!path)
-        return -EFAULT;
+    /* execveat's flags word was never read, so AT_EMPTY_PATH and
+     * AT_SYMLINK_NOFOLLOW were both silently ignored — and so was every
+     * undefined bit, which the kernel refuses. */
+    if (flags & ~(CNG_AT_EMPTY_PATH | CNG_AT_SYMLINK_NOFOLLOW))
+        return -EINVAL;
+    /* The path is guest memory and everything below reads it — the l2s check,
+     * the resolver, the snapshot — so it is validated once, here, before the
+     * first dereference (`path[0]` was one). */
+    long plen = cng_user_strlen(path, EXEC_MAX_STRLEN);
+    if (plen < 0)
+        return plen;
+
+    /* AT_EMPTY_PATH: the dirfd IS the file to execute. Naming it through
+     * /proc/self/fd puts it back on the ordinary path — the resolver keeps that
+     * spelling in the host namespace, and the loader then works from the open
+     * description itself, which is what reaches an anonymous or deleted image. */
+    char fdpath[40];
+    if (!plen) {
+        if (!(flags & CNG_AT_EMPTY_PATH))
+            return -ENOENT;
+        if (sys_fcntl(dirfd, CNG_F_GETFD, 0) < 0)
+            return -EBADF;
+        cng_snprintf(fdpath, sizeof fdpath, "/proc/self/fd/%d", dirfd);
+        path = fdpath;
+        dirfd = CNG_AT_FDCWD;
+        flags &= ~CNG_AT_SYMLINK_NOFOLLOW; /* nothing left to follow */
+    }
+
     /* l2s machinery is invisible to the guest — not executable either. Both
      * tiers (SIGSYS cng_emulate_execve, -R cng_execve_tramp) come through
      * here, so this covers every exec path. */
@@ -437,7 +593,7 @@ static long execve_core(int dirfd, const char *path, char **argv, char **envp,
                         -rc);
         return rc;
     }
-    rc = execve_load(dirfd, a.path, a.argv, a.envp, out_sp, out_entry);
+    rc = execve_load(dirfd, a.path, a.argv, a.envp, flags, out_sp, out_entry);
     /* The new stack owns its own copy of everything by now (on the failure paths
      * nothing was consumed at all), so the snapshot goes either way. */
     exec_args_free(&a);
@@ -445,10 +601,10 @@ static long execve_core(int dirfd, const char *path, char **argv, char **envp,
 }
 
 void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
-                        char **argv, char **envp) {
+                        char **argv, char **envp, int flags) {
     unsigned long long *r = uc->uc_mcontext.regs;
     unsigned long sp, entry;
-    long rc = execve_core(dirfd, path, argv, envp, &sp, &entry);
+    long rc = execve_core(dirfd, path, argv, envp, flags, &sp, &entry);
     if (rc < 0) {
         r[0] = (unsigned long long)rc;
         return;
@@ -463,9 +619,10 @@ void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
     uc->uc_mcontext.pc = entry;
 }
 
-long cng_execve_tramp(int dirfd, const char *path, char **argv, char **envp) {
+long cng_execve_tramp(int dirfd, const char *path, char **argv, char **envp,
+                      int flags) {
     unsigned long sp, entry;
-    long rc = execve_core(dirfd, path, argv, envp, &sp, &entry);
+    long rc = execve_core(dirfd, path, argv, envp, flags, &sp, &entry);
     if (rc < 0)
         return rc;
     /* Ordinary call context (no signal frame): abandon the old program's stack

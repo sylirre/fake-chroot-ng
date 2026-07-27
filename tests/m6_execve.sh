@@ -73,6 +73,59 @@ if guest_cc_report "$ER/hello" tests/guests/hello.c; then
             "emulate_execve failed x0=-13" \
             "$(exectest /noperm 2>&1)"
     fi
+
+    # --- M17-10: shebang nesting -------------------------------------------
+    # A script whose interpreter is itself a script is followed up to four
+    # times, as fs/exec.c bounds it; the fifth is ELOOP. Each level prepends its
+    # own interpreter and pushes the previous one down, so the whole chain shows
+    # up in the final argv — which is the only way to see that the levels ran in
+    # order rather than being collapsed.
+    printf '#!/hello\n'  >"$ER/s4"
+    printf '#!/s4\n'     >"$ER/s3"
+    printf '#!/s3\n'     >"$ER/s2"
+    printf '#!/s2\n'     >"$ER/s1"
+    printf '#!/s1\n'     >"$ER/s0"
+    out=$(exectest /s1 AA 2>&1); rc=$?
+    check "a four-deep shebang chain runs" 42 $rc
+    check_contains "the innermost interpreter is argv0" "argv0=/hello" "$out"
+    check_contains "each level pushed its script down (1)" "argv1=/s4" "$out"
+    check_contains "each level pushed its script down (2)" "argv2=/s3" "$out"
+    check_contains "each level pushed its script down (3)" "argv3=/s2" "$out"
+    check_contains "the original script is last" "argv4=/s1" "$out"
+    check_contains "the guest's own argument survives all of it" "argv5=AA" \
+        "$out"
+    check_contains "a fifth level is ELOOP" "emulate_execve failed x0=-40" \
+        "$(exectest /s0 AA 2>&1)"
+
+    # --- M17-10: execveat's flags word -------------------------------------
+    # It was never read: a real dirfd resolved against the cwd instead, and
+    # AT_EMPTY_PATH / AT_SYMLINK_NOFOLLOW did nothing at all.
+    mkdir -p "$ER/sub"
+    cp "$ER/hello" "$ER/sub/hello"
+    out=$(exectest -D /sub hello X 2>&1); rc=$?
+    check "a relative execveat resolves against its dirfd" 42 $rc
+    check_contains "and runs the program there" "argv0=hello" "$out"
+    # ..-climbing out of a dirfd is clamped at the guest root, not followed onto
+    # the host: /sub/../../hello is /hello inside the rootfs.
+    check_contains "a dirfd-relative '..' is clamped at the guest root" \
+        "exe=/hello" "$(exectest -D /sub ../../hello X 2>&1)"
+    out=$(exectest -e /hello X 2>&1); rc=$?
+    check "AT_EMPTY_PATH executes the fd itself" 42 $rc
+    check_contains "AT_SYMLINK_NOFOLLOW refuses a symlinked target" \
+        "emulate_execve failed x0=-40" "$(exectest -N /go X 2>&1)"
+    out=$(exectest -N /hello X 2>&1); rc=$?
+    check "AT_SYMLINK_NOFOLLOW on a real file still runs it" 42 $rc
+    check_contains "an undefined execveat flag is EINVAL" \
+        "emulate_execve failed x0=-22" "$(exectest -B /hello 2>&1)"
+
+    # --- M17-10: state a real execve drops with the address space ------------
+    # Ours keeps the address space, so the heap and any POSIX timer outlive the
+    # program that owned them — a timer would go on firing into a program that
+    # never armed it. -R arms both before the emulation and reports afterwards.
+    out=$(exectest -R /hello 2>&1); rc=$?
+    check "exec resets the state that would have died with the image" 0 $rc
+    check_contains "the heap is wound back and the timer deleted" \
+        "execreset: brk_back=1 timer_created=1 timer_gone=1 -> OK" "$out"
 fi
 rm -rf "$ER"
 

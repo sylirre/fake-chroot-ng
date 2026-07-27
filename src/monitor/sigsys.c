@@ -122,13 +122,13 @@ void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si) {
     /* execve/execveat are emulated in-process (they'd otherwise wipe us). */
     if (nr == __NR_execve) {
         cng_emulate_execve(uc, CNG_AT_FDCWD, (const char *)r[0], (char **)r[1],
-                           (char **)r[2]);
+                           (char **)r[2], 0);
         return;
     }
 #ifdef __NR_execveat
     if (nr == __NR_execveat) {
         cng_emulate_execve(uc, (int)r[0], (const char *)r[1], (char **)r[2],
-                           (char **)r[3]);
+                           (char **)r[3], (int)r[4]);
         return;
     }
 #endif

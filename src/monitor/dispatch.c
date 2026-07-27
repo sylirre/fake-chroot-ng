@@ -579,8 +579,8 @@ static int at_needs_xlate(int dfd, const char *path, int deref) {
  * links, which cng_resolve keeps in the host namespace), and real dirfds (via
  * xlate_at, so a relative name is contained the same way an absolute one is).
  * `deref` follows the final component's symlink. Returns 0/-1. */
-static int resolve_at_host(long dirfd, const char *path, int deref, char *out,
-                           size_t sz) {
+int cng_resolve_at(long dirfd, const char *path, int deref, char *out,
+                   size_t sz) {
     int dfd = (int)dirfd; /* int arg: the x-register's top half may be dirty */
     if (!path || !path[0])
         return -1;
@@ -810,7 +810,7 @@ static int at_canon(long dirfd, const char *path, char *out, size_t sz) {
     if (path[0] == '/' || (int)dirfd == CNG_AT_FDCWD)
         return cng_fs_abscanon(cng_g_fs, path, out, sz);
     char host[CNG_PATH_MAX];
-    if (resolve_at_host(dirfd, path, 0, host, sizeof host) != 0)
+    if (cng_resolve_at(dirfd, path, 0, host, sizeof host) != 0)
         return -1;
     if (!strncmp(host, "/proc/", 6) || !strcmp(host, "/proc"))
         return cng_path_canon(host, out, sz);
@@ -1039,7 +1039,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         if (r == -ELOOP && cng_g_l2s && nr == __NR_openat &&
             ((int)a2 & CNG_O_NOFOLLOW)) {
             char hnf[CNG_PATH_MAX], data[CNG_PATH_MAX];
-            if (resolve_at_host(a0, (const char *)a1, 0, hnf, sizeof hnf) ==
+            if (cng_resolve_at(a0, (const char *)a1, 0, hnf, sizeof hnf) ==
                     0 &&
                 cng_l2s_resolve(hnf, data, sizeof data, 0) == 1)
                 r = reissue(CNG_AT_FDCWD, (long)data, a2, a3, a4, a5,
@@ -1069,7 +1069,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         if (nr == __NR_faccessat2 && cng_g_l2s &&
             ((int)a3 & CNG_AT_SYMLINK_NOFOLLOW)) {
             char hnf[CNG_PATH_MAX];
-            if (resolve_at_host(a0, (const char *)a1, 0, hnf, sizeof hnf) ==
+            if (cng_resolve_at(a0, (const char *)a1, 0, hnf, sizeof hnf) ==
                     0 &&
                 cng_l2s_resolve(hnf, fdata, sizeof fdata, 0) == 1) {
                 p = fdata;
@@ -1121,7 +1121,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         int dec = 0;
         if (cng_g_l2s && !((int)a2 & CNG_AT_REMOVEDIR)) {
             char hnf[CNG_PATH_MAX];
-            if (resolve_at_host(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0 &&
+            if (cng_resolve_at(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0 &&
                 cng_l2s_resolve(hnf, data, sizeof data, &cnt) == 1)
                 dec = 1;
         }
@@ -1144,7 +1144,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         unsigned long cnt;
         if (cng_g_l2s) {
             char hnf[CNG_PATH_MAX];
-            if (resolve_at_host(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0 &&
+            if (cng_resolve_at(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0 &&
                 cng_l2s_resolve(hnf, data, sizeof data, &cnt) == 1) {
                 long r = cng_syscall6(CNG_AT_FDCWD, (long)data, a2, 0, 0, 0,
                                       __NR_utimensat);
@@ -1170,7 +1170,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_newfstatat: {
         if (cng_g_l2s && a2) {
             char hnf[CNG_PATH_MAX];
-            if (resolve_at_host(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0 &&
+            if (cng_resolve_at(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0 &&
                 cng_l2s_stat(hnf, (void *)a2) == 1) {
                 if (cng_g_fake_id)
                     stat_remap((void *)a2);
@@ -1192,7 +1192,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_statx: {
         if (cng_g_l2s && a4) {
             char hnf[CNG_PATH_MAX];
-            if (resolve_at_host(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0 &&
+            if (cng_resolve_at(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0 &&
                 cng_l2s_statx(hnf, (void *)a4, (unsigned)a3, (unsigned)a2) ==
                     1) {
                 if (cng_g_fake_id)
@@ -1220,7 +1220,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_fchownat: {
         if (cng_g_l2s) {
             char hnf[CNG_PATH_MAX], data[CNG_PATH_MAX];
-            if (resolve_at_host(a0, (const char *)a1, 0, hnf, sizeof hnf) ==
+            if (cng_resolve_at(a0, (const char *)a1, 0, hnf, sizeof hnf) ==
                     0 &&
                 cng_l2s_resolve(hnf, data, sizeof data, 0) == 1)
                 return chattr_result(reissue(CNG_AT_FDCWD, (long)data, a2, a3,
@@ -1251,7 +1251,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * real dirfd, which xlate passes through untranslated. */
         if (cng_g_l2s) {
             char hnf[CNG_PATH_MAX], data[CNG_PATH_MAX];
-            if (resolve_at_host(a0, gp, 0, hnf, sizeof hnf) == 0 &&
+            if (cng_resolve_at(a0, gp, 0, hnf, sizeof hnf) == 0 &&
                 cng_l2s_resolve(hnf, data, sizeof data, 0) == 1)
                 return -EINVAL;
         }
@@ -1467,11 +1467,11 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * returns; on failure return -errno like a real execve. */
     case __NR_execve:
         return cng_execve_tramp(CNG_AT_FDCWD, (const char *)a0, (char **)a1,
-                                (char **)a2);
+                                (char **)a2, 0);
 #ifdef __NR_execveat
     case __NR_execveat:
         return cng_execve_tramp((int)a0, (const char *)a1, (char **)a2,
-                                (char **)a3);
+                                (char **)a3, (int)a4);
 #endif
 
     /* rename: two translated paths. If the destination is one of our
@@ -1493,11 +1493,11 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         unsigned long cnt;
         int dec = 0, fix = 0;
         if (cng_g_l2s && !exch && strcmp(op, np) != 0 &&
-            resolve_at_host(a2, (const char *)a3, 0, dsth, sizeof dsth) == 0) {
+            cng_resolve_at(a2, (const char *)a3, 0, dsth, sizeof dsth) == 0) {
             if (cng_l2s_resolve(dsth, data, sizeof data, &cnt) == 1)
                 dec = 1;
             char hnf[CNG_PATH_MAX];
-            if (resolve_at_host(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0)
+            if (cng_resolve_at(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0)
                 fix = cng_l2s_rename_prep(hnf, absdata, sizeof absdata);
         }
         long r = reissue(a0, (long)op, a2, (long)np, a4, a5, nr);
@@ -1525,13 +1525,13 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * idiom) goes through /proc/self/fd, which the host must follow. */
         if (empty) {
             proc_fd_path(a0, srch);
-        } else if (resolve_at_host(a0, sp, follow, srch, sizeof srch) != 0) {
+        } else if (cng_resolve_at(a0, sp, follow, srch, sizeof srch) != 0) {
             if (cng_g_debug)
                 cng_dprintf(2, "[cng] linkat: src unresolved (%s)\n",
                             sp ? sp : "(null)");
             return -ENOENT;
         }
-        if (resolve_at_host(a2, (const char *)a3, 0, dsth, sizeof dsth) != 0) {
+        if (cng_resolve_at(a2, (const char *)a3, 0, dsth, sizeof dsth) != 0) {
             if (cng_g_debug)
                 cng_dprintf(2, "[cng] linkat: dst unresolved (%s)\n",
                             a3 ? (const char *)a3 : "(null)");
@@ -1897,6 +1897,23 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                                 __NR_rt_sigprocmask);
         }
         return cng_syscall6(a0, a1, a2, a3, a4, a5, __NR_rt_sigprocmask);
+    }
+
+    /* POSIX timers do not survive an execve, and ours is emulated — the address
+     * space stays, so a timer would go on firing into a program that never
+     * armed it, through a handler that no longer exists. Nothing enumerates a
+     * process's timers, so the ids are recorded as they are handed out. */
+    case __NR_timer_create: {
+        long r = reissue(a0, a1, a2, a3, a4, a5, nr);
+        if (r == 0 && a2)
+            cng_timer_note(*(int *)a2); /* the kernel just validated a2 */
+        return r;
+    }
+    case __NR_timer_delete: {
+        long r = reissue(a0, a1, a2, a3, a4, a5, nr);
+        if (r == 0)
+            cng_timer_forget((int)a0);
+        return r;
     }
 
     /* prctl: the four ops that describe OUR confinement rather than the guest's.

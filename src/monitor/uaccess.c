@@ -119,3 +119,52 @@ int cng_user_readable(const void *p, unsigned long n) {
 int cng_user_writable(void *p, unsigned long n) {
     return probe(p, n, __NR_pread64, UA_ZERO_OFF);
 }
+
+/* A string and a pointer vector are read a piece at a time, so they cannot be
+ * probed in one go — their length is what we are trying to find out. Both walk
+ * up to the next 4 KiB boundary and never across one, which makes each probe
+ * exact whatever the page size is: a range inside a single page is readable
+ * exactly when that page is. That is also what keeps the cost down — one probe
+ * per page, not per element. */
+#define UA_GRAIN 4096
+
+long cng_user_strlen(const char *s, unsigned long max) {
+    if (!s)
+        return -EFAULT;
+    unsigned long done = 0;
+    while (done < max) {
+        unsigned long k = UA_GRAIN - ((unsigned long)(s + done) & (UA_GRAIN - 1));
+        if (k > max - done)
+            k = max - done;
+        if (!cng_user_readable(s + done, k))
+            return -EFAULT;
+        for (unsigned long i = 0; i < k; i++)
+            if (!s[done + i])
+                return (long)(done + i);
+        done += k;
+    }
+    return -E2BIG;
+}
+
+long cng_user_veclen(char *const *v, unsigned long max) {
+    if (!v)
+        return 0; /* a NULL argv/envp is an empty one, as the kernel takes it */
+    unsigned long n = 0;
+    while (n < max) {
+        const char *base = (const char *)(v + n);
+        unsigned long k = (UA_GRAIN - ((unsigned long)base & (UA_GRAIN - 1))) /
+                          sizeof *v;
+        if (k == 0)
+            k = 1; /* a misaligned vector: this slot straddles the boundary, and
+                    * probing all 8 bytes covers both pages anyway */
+        if (k > max - n)
+            k = max - n;
+        if (!cng_user_readable(base, k * sizeof *v))
+            return -EFAULT;
+        for (unsigned long i = 0; i < k; i++)
+            if (!v[n + i])
+                return (long)(n + i);
+        n += k;
+    }
+    return -E2BIG;
+}
