@@ -410,88 +410,150 @@ static long inject_dents(long dirfd, const char *gdir, char *buf, long used,
     return added;
 }
 
+/* Append one component to the resolved prefix ("/a" + "b" -> "/a/b"). 0/-1. */
+static int canon_push(char *c, size_t sz, const char *comp, size_t clen) {
+    size_t n = strlen(c);
+    if (n == 1 && c[0] == '/')
+        n = 0; /* the root is spelled "/", not "" — do not double the slash */
+    if (n + 1 + clen + 1 > sz)
+        return -1;
+    c[n] = '/';
+    memcpy(c + n + 1, comp, clen);
+    c[n + 1 + clen] = '\0';
+    return 0;
+}
+
+/* Drop the last component ("/a/b" -> "/a", "/a" -> "/"). "/" stays "/", which
+ * is what clamps a `..` run at the guest root. */
+static void canon_pop(char *c) {
+    char *s = strrchr(c, '/');
+    if (!s || s == c) {
+        c[0] = '/';
+        c[1] = '\0';
+        return;
+    }
+    *s = '\0';
+}
+
+/* rest = tgt + remainder, where `remainder` points into `rest` itself. */
+static int splice_rest(char *rest, size_t sz, const char *tgt,
+                       const char *remainder) {
+    char tmp[CNG_PATH_MAX];
+    size_t n = cng_strlcpy(tmp, tgt, sizeof tmp);
+    if (n >= sizeof tmp || cng_strlcpy(tmp + n, remainder, sizeof tmp - n) >=
+                               sizeof tmp - n)
+        return -1;
+    return cng_strlcpy(rest, tmp, sz) < sz ? 0 : -1;
+}
+
 /* Resolve a guest path to a host path, following symlinks *within the guest*:
  * an absolute symlink target is re-rooted into the rootfs rather than resolved
- * against the host root (which is what breaks Alpine's busybox symlinks). Walks
- * component by component, readlink()-ing each prefix; deref_final controls
- * whether the last component's own symlink is followed. Returns 0/-errno. */
+ * against the host root (which is what breaks Alpine's busybox symlinks).
+ *
+ * The walk is *physical*, like the kernel's: components are consumed one at a
+ * time against a resolved prefix, and `..` pops that prefix — so it backs out of
+ * where a symlink actually led. Canonicalizing `..` up front instead (which is
+ * what this used to do) is logical resolution, the shell's convention, not the
+ * kernel's: with /bin a symlink to /usr/bin, "/bin/../lib" is "/usr/lib" to
+ * every syscall and was "/lib" to us. `..` at the guest root stays at the guest
+ * root, which is what keeps the rootfs closed.
+ *
+ * deref_final controls whether the last component's own symlink is followed;
+ * "last" is judged against the path as it stands, so a symlink expanded earlier
+ * moves it, exactly as O_NOFOLLOW behaves. Returns 0/-errno. */
 int cng_resolve(const char *path, int deref_final, char *out, size_t outsz) {
-    char cur[CNG_PATH_MAX];
-    if (cng_fs_abscanon(cng_g_fs, path, cur, sizeof cur) < 0)
+    char canon[CNG_PATH_MAX], rest[CNG_PATH_MAX];
+    if (!path || !path[0])
+        return -ENOENT;
+    const char *base = path[0] == '/'          ? "/"
+                       : cng_g_fs->cwd[0] != 0 ? cng_g_fs->cwd
+                                               : "/";
+    if (cng_strlcpy(canon, base, sizeof canon) >= sizeof canon ||
+        cng_strlcpy(rest, path, sizeof rest) >= sizeof rest)
         return -ENAMETOOLONG;
 
-    for (int iter = 0; iter < 40; iter++) {
-        /* /dev/fd/N and /dev/std{in,out,err} are the same magic links as their
-         * /proc spelling, so rewrite them to it and let the round below treat
-         * them as such. Doing it here rather than in the /dev zone matters: the
-         * component walk would otherwise readlink the fd link like an ordinary
-         * symlink and try to re-root whatever it names — which for a pipe or a
-         * memfd is not a path at all ("pipe:[12345]"). */
-        if (dev_magic(cur, sizeof cur))
-            continue;
-        /* Checked every round, not just up front: the guest can reach these
-         * through a symlink of its own (Alpine's /dev/fd -> /proc/self/fd). */
-        int magic = proc_magic(cur, sizeof cur);
-        if (magic == PROC_MAGIC_HOST)
-            return cng_strlcpy(out, cur, outsz) < outsz ? 0 : -ENAMETOOLONG;
-        if (magic == PROC_MAGIC_GUEST)
-            continue;
-
-        size_t len = strlen(cur);
-        int found = 0;
-        for (size_t e = 1; e <= len; e++) {
-            if (e < len && cur[e] != '/')
-                continue;
-            int is_final = (e == len);
-            if (is_final && !deref_final)
-                break;
-
-            char prefix[CNG_PATH_MAX], host[CNG_PATH_MAX], link[CNG_PATH_MAX];
-            if (e >= sizeof prefix)
-                break;
-            memcpy(prefix, cur, e);
-            prefix[e] = '\0';
-            if (cng_fs_translate(cng_g_fs, prefix, host, sizeof host) != 0)
-                continue;
-            long n = sys_readlinkat(CNG_AT_FDCWD, host, link, sizeof link - 1);
-            if (n <= 0)
-                continue; /* not a symlink, or missing */
-            link[n] = '\0';
-
-            /* Rewrite cur = <link, re-rooted if absolute> + <suffix cur[e..]>.
-             * Exception: an absolute target naming an l2s data file is a HOST
-             * path (central store / cross-directory group) — map it into the
-             * guest view instead of re-rooting it. */
-            char tmp[CNG_PATH_MAX];
-            size_t p;
-            if (link[0] == '/') {
-                if (!(cng_g_l2s &&
-                      cng_l2s_untranslate_target(link, tmp, sizeof tmp)))
-                    cng_strlcpy(tmp, link, sizeof tmp);
-                p = strlen(tmp);
-            } else {
-                size_t pe = e; /* parent dir of prefix */
-                while (pe > 0 && cur[pe - 1] != '/')
-                    pe--;
-                if (pe > 0)
-                    pe--;
-                memcpy(tmp, cur, pe);
-                p = pe;
-                if (p + 1 < sizeof tmp)
-                    tmp[p++] = '/';
-                cng_strlcpy(tmp + p, link, sizeof tmp - p);
-                p = strlen(tmp);
-            }
-            cng_strlcpy(tmp + p, cur + e, p < sizeof tmp ? sizeof tmp - p : 0);
-            if (cng_path_canon(tmp, cur, sizeof cur) < 0)
-                return -ENAMETOOLONG;
-            found = 1;
+    int nlinks = 0;
+    char *p = rest;
+    while (*p) {
+        while (*p == '/')
+            p++;
+        if (!*p)
             break;
+        char *end = p;
+        while (*end && *end != '/')
+            end++;
+        const char *comp = p;
+        size_t clen = (size_t)(end - p);
+        int last = 1; /* nothing but slashes left after this component */
+        for (const char *q = end; *q; q++)
+            if (*q != '/') {
+                last = 0;
+                break;
+            }
+        p = end;
+
+        if (clen == 1 && comp[0] == '.')
+            continue;
+        if (clen == 2 && comp[0] == '.' && comp[1] == '.') {
+            canon_pop(canon);
+            continue;
         }
-        if (!found)
-            return cng_fs_translate(cng_g_fs, cur, out, outsz);
+        if (canon_push(canon, sizeof canon, comp, clen) < 0)
+            return -ENAMETOOLONG;
+
+        /* /dev/fd/N and /dev/std{in,out,err} are the same magic links as their
+         * /proc spelling, so rewrite them to it and let the checks below treat
+         * them as such — readlink-ing an fd link like an ordinary symlink would
+         * try to re-root whatever it names, which for a pipe or a memfd is not a
+         * path at all ("pipe:[12345]"). */
+        dev_magic(canon, sizeof canon);
+        int magic = proc_magic(canon, sizeof canon);
+        if (magic == PROC_MAGIC_HOST) {
+            /* The magic path IS the host path. Any components left ride along,
+             * as they do for a real dirfd. */
+            size_t n = cng_strlcpy(out, canon, outsz);
+            if (n >= outsz || cng_strlcpy(out + n, p, outsz - n) >= outsz - n)
+                return -ENAMETOOLONG;
+            return 0;
+        }
+        if (magic == PROC_MAGIC_GUEST) {
+            /* exe/cwd/root: the guest-visible target replaces the link, which
+             * is a symlink expansion in everything but name. */
+            if (++nlinks > 40)
+                return -ELOOP;
+            if (splice_rest(rest, sizeof rest, canon, p) < 0)
+                return -ENAMETOOLONG;
+            p = rest;
+            cng_strlcpy(canon, "/", sizeof canon);
+            continue;
+        }
+
+        if (last && !deref_final)
+            continue;
+        char host[CNG_PATH_MAX], link[CNG_PATH_MAX];
+        if (cng_fs_translate(cng_g_fs, canon, host, sizeof host) != 0)
+            continue;
+        long n = sys_readlinkat(CNG_AT_FDCWD, host, link, sizeof link - 1);
+        if (n <= 0)
+            continue; /* not a symlink, or missing */
+        link[n] = '\0';
+        if (++nlinks > 40)
+            return -ELOOP;
+        canon_pop(canon); /* the link itself is replaced by its target */
+        if (link[0] == '/') {
+            /* An absolute target is re-rooted — except one naming an l2s data
+             * file, which is a HOST path (central store / cross-directory
+             * group) and must be mapped into the guest view instead. */
+            char tmp[CNG_PATH_MAX];
+            if (cng_g_l2s && cng_l2s_untranslate_target(link, tmp, sizeof tmp))
+                cng_strlcpy(link, tmp, sizeof link);
+            cng_strlcpy(canon, "/", sizeof canon);
+        }
+        if (splice_rest(rest, sizeof rest, link, p) < 0)
+            return -ENAMETOOLONG;
+        p = rest;
     }
-    return -ELOOP;
+    return cng_fs_translate(cng_g_fs, canon, out, outsz);
 }
 
 /* "/proc/self/fd/<fd>" into out[40]. fd args are 32-bit: glibc passes ints in
@@ -1059,7 +1121,15 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_faccessat2:
 #endif
     {
-        const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, 1);
+        /* faccessat2 has a real flags word, so unlike its predecessor it can ask
+         * about the symlink itself. Resolving the final component here would
+         * hand the kernel the target and answer for the wrong file. */
+        int deref = 1;
+#ifdef __NR_faccessat2
+        if (nr == __NR_faccessat2 && ((int)a3 & CNG_AT_SYMLINK_NOFOLLOW))
+            deref = 0;
+#endif
+        const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
         long fl = a3;
         long dfd = a0;
 #ifdef __NR_faccessat2
@@ -1797,7 +1867,12 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         long r = reissue((long)hp, 0, 0, 0, 0, 0, __NR_chdir);
         if (r == 0) {
             char gc[CNG_PATH_MAX];
-            if (cng_fs_abscanon(cng_g_fs, gp, gc, sizeof gc) == 0) {
+            /* Record where the chdir LANDED, not what was typed: the kernel's
+             * cwd is the directory itself, so getcwd reports the symlink-free
+             * name and a later ".." backs out of the real parent. Falls back to
+             * the lexical form only for a directory outside the guest view. */
+            if (cng_fs_untranslate(cng_g_fs, hp, gc, sizeof gc) == 0 ||
+                cng_fs_abscanon(cng_g_fs, gp, gc, sizeof gc) == 0) {
                 cng_fs_set_cwd(cng_g_fs, gc);
                 cng_procreg_set_cwd(cng_g_fs->cwd); /* /proc/<pid>/cwd */
             }

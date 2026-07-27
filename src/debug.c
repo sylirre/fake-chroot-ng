@@ -43,7 +43,7 @@ int cng_cmd_xlate(int argc, char **argv, char **envp, unsigned long *auxv) {
     int bind_ro[CNG_MAX_BINDS];
     int nb = 0;
     const char *paths[256];
-    int np = 0;
+    int np = 0, resolve = 0, deref_final = 1;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-r") && i + 1 < argc) {
@@ -70,6 +70,11 @@ int cng_cmd_xlate(int argc, char **argv, char **envp, unsigned long *auxv) {
             cwd = argv[++i];
         } else if (!strcmp(argv[i], "-c") && i + 1 < argc) {
             chroot_to = argv[++i];
+        } else if (!strcmp(argv[i], "-R")) {
+            resolve = 1; /* the real resolver: symlinks, physical ".." */
+        } else if (!strcmp(argv[i], "-n")) {
+            resolve = 1;
+            deref_final = 0;
         } else if (np < 256) {
             paths[np++] = argv[i];
         }
@@ -90,6 +95,17 @@ int cng_cmd_xlate(int argc, char **argv, char **envp, unsigned long *auxv) {
 
     char out[CNG_PATH_MAX];
     for (int i = 0; i < np; i++) {
+        if (resolve) {
+            /* cng_resolve reads the real filesystem (it readlinks each
+             * component), so this leg needs the tree to exist. */
+            cng_g_fs = &fs;
+            long r = cng_resolve(paths[i], deref_final, out, sizeof out);
+            if (r == 0)
+                cng_dprintf(1, "%s -> %s\n", paths[i], out);
+            else
+                cng_dprintf(1, "%s -> <errno %d>\n", paths[i], (int)-r);
+            continue;
+        }
         if (cng_fs_translate(&fs, paths[i], out, sizeof out) == 0)
             cng_dprintf(1, "%s -> %s\n", paths[i], out);
         else
@@ -274,6 +290,19 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
         cng_dprintf(1, "access: %s\n", r == 0 ? "ok" : "no");
         return r == 0 ? 0 : 1;
     }
+#ifdef __NR_faccessat2
+    /* faccessat2's AT_SYMLINK_NOFOLLOW asks about the link itself, so a
+     * dangling one exists (F_OK) where following it is ENOENT. Resolving the
+     * final component during translation answered for the target instead. */
+    if (!strcmp(op, "accessnf")) {
+        long f = cng_dispatch(__NR_faccessat2, CNG_AT_FDCWD, (long)gpath, 0,
+                              CNG_AT_SYMLINK_NOFOLLOW, 0, 0, /*trapped=*/0);
+        long d = cng_dispatch(__NR_faccessat2, CNG_AT_FDCWD, (long)gpath, 0, 0,
+                              0, 0, /*trapped=*/0);
+        cng_dprintf(1, "accessnf: nofollow=%d follow=%d\n", (int)f, (int)d);
+        return 0;
+    }
+#endif
     /* A ":ro" bind must answer -EROFS for every mutating path syscall while
      * still serving reads, the way a real read-only mount does. GUESTPATH names
      * an existing file inside the bind. Without ":ro" on the -b spec the same
@@ -1715,6 +1744,19 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
     cng_dprintf(1, "fchdir: cwd=%s -> %s\n", cng_g_fs->cwd,
                 ok_cwd ? "OK" : "FAIL");
     fails += !ok_cwd;
+
+    /* chdir through a symlink records where it LANDED, as the kernel's cwd is
+     * the directory itself — so getcwd reports the symlink-free name and a
+     * later ".." backs out of the real parent, not the link's. */
+    cng_dispatch(__NR_symlinkat, (long)"/w", CNG_AT_FDCWD, (long)"/wlink", 0, 0,
+                 0, 0);
+    long lch = cng_dispatch(__NR_chdir, (long)"/wlink", 0, 0, 0, 0, 0, 0);
+    int ok_link = (lch == 0 && strcmp(cng_g_fs->cwd, "/w") == 0);
+    cng_dprintf(1, "chdir-symlink: rc=%d cwd=%s -> %s\n", (int)lch,
+                cng_g_fs->cwd, ok_link ? "OK" : "FAIL");
+    fails += !ok_link;
+    cng_dispatch(__NR_chdir, (long)"/", 0, 0, 0, 0, 0, 0);
+    cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/wlink", 0, 0, 0, 0, 0);
     return fails ? 1 : 0;
 }
 

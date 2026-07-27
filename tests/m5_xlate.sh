@@ -93,3 +93,34 @@ check_contains "chroot rebases the cwd" \
 check_contains "a :ro suffix is not part of the guest mount point" \
     "/dev/null -> /hostdev/null" \
     "$(run -t xlate -r /root -b /hostdev:/dev:ro /dev/null)"
+
+# --- M17-11: physical resolution ------------------------------------------
+# Resolution is the kernel's, not the shell's: ".." backs out of where a symlink
+# actually led, so it has to be applied while walking, not collapsed lexically
+# up front. `-t xlate -R` runs the real resolver (it readlinks each component,
+# so these need a tree on disk); `-n` leaves the final component's own symlink
+# alone, which is what O_NOFOLLOW and AT_SYMLINK_NOFOLLOW need.
+XR=$(mktemp -d)
+mkdir -p "$XR/usr/bin" "$XR/usr/lib" "$XR/lib" "$XR/etc"
+ln -s /usr/bin "$XR/bin"        # absolute target, re-rooted into the rootfs
+ln -s usr/lib "$XR/l"           # relative target
+: >"$XR/etc/f"
+ln -s /etc/f "$XR/link"
+xres() { run -t xlate -R -r "$XR" "$@"; }
+check_contains "'..' backs out of where the symlink led, not out of its name" \
+    "/bin/../lib -> $XR/usr/lib" "$(xres /bin/../lib)"
+check_contains "a symlinked directory resolves to its target" \
+    "/bin -> $XR/usr/bin" "$(xres /bin)"
+check_contains "'..' on a symlinked directory lands in the target's parent" \
+    "/bin/.. -> $XR/usr" "$(xres /bin/..)"
+check_contains "a relative symlink target resolves against its own directory" \
+    "/l/target -> $XR/usr/lib/target" "$(xres /l/target)"
+check_contains "a final symlink is followed by default" \
+    "/link -> $XR/etc/f" "$(xres /link)"
+check_contains "'..' cannot climb out of the guest root" \
+    "/../../etc -> $XR/etc" "$(xres /../../etc)"
+check_contains "the final component's symlink is kept under -n" \
+    "/link -> $XR/link" "$(run -t xlate -n -r "$XR" /link)"
+check_contains "...while the components before it still resolve under -n" \
+    "/bin/../lib -> $XR/usr/lib" "$(run -t xlate -n -r "$XR" /bin/../lib)"
+rm -rf "$XR"

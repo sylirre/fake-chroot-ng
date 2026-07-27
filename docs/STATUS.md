@@ -1303,6 +1303,38 @@ vfork/`posix_spawn` child-stack handling.
     the `-R` leg arms a heap and a timer and checks both are gone at the commit
     point. Three EFAULT legs in `m17_fault.sh`. Suite: 432 passed, 0 failed.
 
+- [x] **M17-11 — resolution is physical, the way the kernel does it**
+  `..` was collapsed lexically by `cng_fs_abscanon` *before* any symlink was
+  expanded — logical resolution, the shell's convention, not the kernel's. With
+  `/bin` a symlink to `/usr/bin`, `"/bin/../lib"` is `/usr/lib` to every syscall
+  and was `/lib` to us; nothing that walks a tree with symlinked directories
+  (and every distro has them) could agree with the filesystem it was walking.
+  - `cng_resolve` is now a component walk against a resolved prefix, like
+    `fs/exec.c`'s and the oracle's: each component is appended, checked for
+    being a symlink, and expanded in place, while `..` pops the prefix — so it
+    backs out of where the link actually led. `..` at the guest root stays
+    there, which is what keeps the rootfs closed. It is also cheaper than what
+    it replaces: one `readlink` per component instead of one per prefix per
+    restart.
+  - The magic links keep their meaning inside the walk: `/dev/fd/N` and
+    `/dev/std*` are rewritten to their `/proc` spelling as the component is
+    reached, `/proc/<pid>/fd/N` ends resolution in the host namespace with the
+    remaining components riding along, and `exe`/`cwd`/`root` splice their
+    guest-visible target in like any other link.
+  - **`chdir` records where it landed**, not what was typed. The cwd is what a
+    relative path resolves against and what `getcwd` reports, and the kernel's
+    is the directory itself — so `chdir("/link"); open("../x")` has to back out
+    of the target's parent. It took the same derivation `-w/--work-dir` and the
+    exec path already use: the resolved host path, mapped back to the guest view.
+  - **`faccessat2 AT_SYMLINK_NOFOLLOW`** was ignored, so it answered for the
+    target: a dangling symlink reported ENOENT where the flag says it exists.
+    (`O_NOFOLLOW` was fixed with M17-1; this was the other half.)
+  - **Tests:** 8 legs in `m5_xlate.sh` on a new `-t xlate -R/-n` (the real
+    resolver, against a tree on disk, with and without final-symlink
+    dereference), 2 in `m5b_monitor.sh` on a new `dtest accessnf` (dangling link:
+    nofollow exists, follow ENOENT), and 1 in `m7_fidelity.sh` for the symlinked
+    `chdir`. Suite: 443 passed, 0 failed.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

@@ -84,6 +84,8 @@ check_contains "l2s unusable store falls back to the per-dir scheme" \
 check_contains "dirfd args tolerate dirty upper halves (glibc w-registers)" \
     "l2s-dirtyfd: rc=0 nlink2=1 -> OK" "$out"
 check_contains "fchdir updates virtual cwd" "fchdir: cwd=/w -> OK" "$out"
+check_contains "chdir through a symlink records the directory it landed in" \
+    "chdir-symlink: rc=0 cwd=/w -> OK" "$out"
 rm -rf "$L2"
 
 # --- auxv fidelity ---------------------------------------------------------

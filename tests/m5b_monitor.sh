@@ -16,6 +16,17 @@ check "dispatch faccessat: present file" 0 $?
 run -t dtest -r "$ROOT" access /etc/nope >/dev/null 2>&1
 check "dispatch faccessat: missing file" 1 $?
 
+# faccessat2's AT_SYMLINK_NOFOLLOW asks about the link itself, so a dangling one
+# exists while following it does not. Resolving the final component during
+# translation answered for the target and lost the distinction.
+ln -s /nowhere "$ROOT/dangling"
+check_contains "faccessat2 AT_SYMLINK_NOFOLLOW answers for the link itself" \
+    "accessnf: nofollow=0 follow=-2" \
+    "$(run -t dtest -r "$ROOT" accessnf /dangling 2>&1)"
+check_contains "...and for an ordinary file both forms agree" \
+    "accessnf: nofollow=0 follow=0" \
+    "$(run -t dtest -r "$ROOT" accessnf /etc/greeting 2>&1)"
+
 # Plant a file OUTSIDE the rootfs; guest /../ must not reach it.
 printf SECRET > "$ROOT/../esc_$$"
 check_contains "dispatch blocks .. escape" \
