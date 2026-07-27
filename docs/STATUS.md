@@ -1159,6 +1159,34 @@ vfork/`posix_spawn` child-stack handling.
     the guest root instead. Verified to fail on the pre-fix binary (`rc 134`,
     SIGABRT, on the relative legs) and pass after. Suite: 354 passed, 0 failed.
 
+- [x] **M17-17 — the guest's initial working directory is selectable** (`-w/--work-dir`)
+  The cwd a guest starts in was fixed: the guest root `/` under a real rootfs (the
+  host launch directory is never leaked — it names nothing inside the rootfs, and
+  a relative `<program>` would resolve against it), the host cwd under an identity
+  rootfs, and nothing could change either. `-w/--work-dir DIR` now names one, as
+  the oracle's option of the same name does.
+  - `DIR` is a guest path resolved through the rootfs and its binds by
+    `cng_resolve`, following symlinks, so a symlinked work directory reports what
+    it resolved to — which is what a real `chdir(2)` leaves `getcwd` reporting —
+    and `..` is canonicalized inside the guest root, so it cannot climb out.
+    Both the virtual cwd and the real one move (`cng_fs_set_cwd` + `chdir`): the
+    second is what an untranslated relative path resolves against, and on a host
+    where no monitor installs it is the only one there is.
+  - Applied before `<program>` is resolved, since that resolution is relative to
+    the cwd — `-w /a/b <rootfs> probe` runs `/a/b/probe`, exactly as it would from
+    a shell that had `cd`'d there first.
+  - A `DIR` that is empty, missing, or not a directory is fatal (exit 1, the same
+    code the neighbouring resolve/load failures use; the oracle spells all of its
+    setup failures 126). Quietly falling back to `/` would leave a guest running
+    in the wrong tree, which nothing downstream can detect.
+  - **Tests:** new `tests/m17_workdir.sh`, 33 legs on a new
+    `tests/guests/cwdprobe.c` (prints `getcwd`, `/proc/self/cwd`, and the contents
+    of a file opened relative to the cwd — a working directory that only *prints*
+    right is no working directory at all). Identity-rootfs legs run on every host;
+    the rootfs legs need a live translation tier (`guest_xlate_ready`) because
+    `getcwd` must come from the virtual cwd. Four of them are byte-for-byte
+    differentials against arm64chroot's own `-w`. Suite: 387 passed, 0 failed.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

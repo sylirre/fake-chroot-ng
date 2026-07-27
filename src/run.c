@@ -6,6 +6,8 @@
  *   libprefix  resolve the ELF interpreter under this dir (test aid; NULL on
  *              real hardware, where the interpreter and libraries resolve
  *              through the rootfs/bind map + the monitor)
+ *   workdir    -w/--work-dir: the guest's initial cwd, a guest path (NULL for
+ *              the default; see set_workdir)
  *   bind_g/h/ro  nb bind mounts: guest path bind_g[i] is backed by host path
  *              bind_h[i], read-only when bind_ro[i] (the CLI spells this
  *              SRC:DST[:ro], host first)
@@ -32,6 +34,7 @@
 #include "cng/rewrite.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
+#include "cng/uapi.h"
 
 static struct cng_fs g_fs; /* static: the monitor keeps a pointer after we jump */
 
@@ -98,7 +101,68 @@ static void build_guest_env(char *const *env_set, int ne, char **host,
     out[n] = 0;
 }
 
-int cng_run(const char *rootfs, const char *libprefix,
+/* AArch64 struct stat: the st_mode field, for the -w directory check below. */
+#define ST_MODE_OFF 16
+
+/* -w/--work-dir: make the guest path `wd` the initial cwd.
+ *
+ * `wd` is a guest path resolved through the rootfs and its binds like any other,
+ * following symlinks — an absolute one from the guest root, a relative one
+ * against the default cwd the caller has just set — so the guest lands exactly
+ * where chdir(wd) would have put it, and getcwd() reports the resolved name a
+ * real chdir leaves behind rather than the symlink that was typed.
+ *
+ * A path that does not name a directory is fatal instead of a quiet fallback to
+ * "/": the point of the option is to say where the guest starts, and a program
+ * started in the wrong directory misbehaves silently — a build in the wrong
+ * tree, a relative <program> resolved somewhere else.
+ *
+ * Returns 0, or -1 with a diagnostic. */
+static int set_workdir(struct cng_fs *fs, const char *wd) {
+    if (!*wd) {   /* "" would join to the cwd; chdir("") is ENOENT */
+        cng_dprintf(2, "chroot-ng: --work-dir: empty path\n");
+        return -1;
+    }
+    char host[CNG_PATH_MAX];
+    if (cng_resolve(wd, 1, host, sizeof host) != 0) {
+        cng_dprintf(2, "chroot-ng: --work-dir '%s': cannot resolve\n", wd);
+        return -1;
+    }
+    char st[128];   /* struct stat, aarch64 */
+    long r = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, (long)host, (long)st, 0, 0,
+                     0);
+    if (r == -ENOENT) {
+        cng_dprintf(2, "chroot-ng: --work-dir '%s': not found\n", wd);
+        return -1;
+    }
+    if (r != 0) {
+        cng_dprintf(2, "chroot-ng: --work-dir '%s': cannot stat (errno %d)\n",
+                    wd, (int)-r);
+        return -1;
+    }
+    if ((*(unsigned *)(st + ST_MODE_OFF) & CNG_S_IFMT) != CNG_S_IFDIR) {
+        cng_dprintf(2, "chroot-ng: --work-dir '%s': not a directory\n", wd);
+        return -1;
+    }
+    /* The guest-side name of what we resolved: absolute and symlink-free by
+     * construction. A host path outside the guest view has no such name — only
+     * possible for a resolution that left the map, e.g. through /proc/self/fd —
+     * so fall back to the lexical form there. */
+    char guest[CNG_PATH_MAX];
+    if (cng_fs_untranslate(fs, host, guest, sizeof guest) != 0 &&
+        cng_fs_abscanon(fs, wd, guest, sizeof guest) != 0) {
+        cng_dprintf(2, "chroot-ng: --work-dir '%s': path too long\n", wd);
+        return -1;
+    }
+    cng_fs_set_cwd(fs, guest);
+    /* And the real cwd with it, as the default does: a relative path that the
+     * monitor never sees — anything untrapped, and everything when no monitor
+     * installs at all — resolves against this one. */
+    sys_chdir(host);
+    return 0;
+}
+
+int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
             const char *const *bind_g, const char *const *bind_h,
             const int *bind_ro, int nb, char *const *env_set, int ne,
             int gargc, char **gargv, char **envp, unsigned long *auxv) {
@@ -159,10 +223,16 @@ int cng_run(const char *rootfs, const char *libprefix,
     cng_fs_init(&g_fs, rootfs);
     for (int j = 0; j < nb; j++)
         cng_fs_add_bind(&g_fs, bind_g[j], bind_h[j], bind_ro[j]);
+    /* The dispatcher (used by both the SIGSYS handler and M8 trampolines) needs
+     * the fs view even if the seccomp monitor never installs (e.g. -R only) —
+     * and so does cng_resolve, which -w/--work-dir and the program lookup below
+     * both go through. */
+    cng_g_fs = &g_fs;
+
     /* Initial guest cwd. With a real rootfs, default to "/" (never leak the host
      * launch dir) and chdir the real process into the rootfs so untranslated
-     * relative access stays contained; a -w option can override later. With an
-     * identity rootfs, the host cwd is the guest cwd. */
+     * relative access stays contained. With an identity rootfs, the host cwd is
+     * the guest cwd. */
     if (strcmp(rootfs, "/") != 0) {
         cng_fs_set_cwd(&g_fs, "/");
         char rhost[CNG_PATH_MAX];
@@ -173,10 +243,12 @@ int cng_run(const char *rootfs, const char *libprefix,
         if (sys_getcwd(cwd, sizeof cwd) > 0)
             cng_fs_set_cwd(&g_fs, cwd);
     }
+    /* -w/--work-dir overrides that default. It has to land here: <program> is
+     * resolved against the cwd just below, so a relative one follows -w, exactly
+     * as it would follow the cwd of a shell that ran the same command. */
+    if (workdir && set_workdir(&g_fs, workdir) < 0)
+        return 1;
 
-    /* The dispatcher (used by both the SIGSYS handler and M8 trampolines) needs
-     * the fs view even if the seccomp monitor never installs (e.g. -R only). */
-    cng_g_fs = &g_fs;
     cng_nl_init();
     if (cng_broker_env("CNG_NETLINK_FORCE_BLOCK"))
         cng_nl_force_block = 1;

@@ -27,7 +27,7 @@
 
 
 /* --- the run + probe + self-test entry points (own translation units) ----- */
-int cng_run(const char *rootfs, const char *libprefix,
+int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
             const char *const *bind_g, const char *const *bind_h,
             const int *bind_ro, int nb, char *const *env_set, int ne,
             int gargc, char **gargv, char **envp, unsigned long *auxv);
@@ -323,6 +323,15 @@ static void help(char **envp) {
                       "contain more of them; a spec with no '=' is an error. An "
                       "-E entry overrides an inherited TERM/COLORTERM, and a "
                       "repeated name keeps the last value."},
+        {"-w, --work-dir DIR", "Start the guest with DIR as its working "
+                      "directory. DIR is a guest path, resolved through the "
+                      "rootfs and its binds and following symlinks, and must "
+                      "be an existing directory; an absolute one resolves from "
+                      "the guest root, a relative one against the default. The "
+                      "default is the guest root '/' — the host directory "
+                      "chroot-ng was launched from is never leaked to the guest "
+                      "— except under an identity rootfs ('/'), where the host "
+                      "cwd already is a guest path and is kept."},
         {"-u, --fake-id[=ID]", "Present a fake user identity. ID is a uid or "
                       "uid:gid (a bare -u/--fake-id defaults to 0:0, root; a "
                       "single number sets both uid and gid). Credential syscalls "
@@ -413,6 +422,7 @@ static void help(char **envp) {
         "chroot-ng -u ./rootfs /bin/sh",
         "chroot-ng --fake-id 1000:1000 --setuid-root --setgid-root ./rootfs /bin/su -",
         "chroot-ng -u -E HOME=/root -E PATH=/usr/bin:/bin ./rootfs /bin/sh -l",
+        "chroot-ng -u -w /root ./rootfs /bin/sh",
         "chroot-ng -u -l ./rootfs /sbin/apk add busybox",
         "chroot-ng -R -b /data/local/tmp:/tmp ./rootfs /bin/busybox sh",
         "chroot-ng / /usr/bin/uname -a",
@@ -627,6 +637,7 @@ static int add_env(char *spec, char **env_set, int *ne) {
 int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
     const char *rootfs = 0;
     const char *libprefix = 0;
+    const char *workdir = 0;   /* -w/--work-dir: initial guest cwd */
     const char *bind_g[CNG_MAX_BINDS];
     const char *bind_h[CNG_MAX_BINDS];
     int bind_ro[CNG_MAX_BINDS];
@@ -712,6 +723,12 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
                     spec = argv[++i];
                 }
                 if (add_env(spec, env_set, &ne) < 0) return 2;
+            } else if (!strcmp(n, "work-dir")) {
+                if (val) workdir = val;
+                else {
+                    if (i + 1 >= argc) return err_needarg("--work-dir");
+                    workdir = argv[++i];
+                }
             } else if (!strcmp(n, "lib-prefix")) {
                 if (val) libprefix = val;
                 else {
@@ -757,6 +774,11 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
                     if (!spec) return err_needarg("-E");
                     if (add_env(spec, env_set, &ne) < 0) return 2;
                     break;
+                } else if (c == 'w') {
+                    char *v = *p ? p : (i + 1 < argc ? argv[++i] : 0);
+                    if (!v) return err_needarg("-w");
+                    workdir = v;
+                    break;
                 } else if (c == 'L') {
                     char *v = *p ? p : (i + 1 < argc ? argv[++i] : 0);
                     if (!v) return err_needarg("-L");
@@ -784,6 +806,6 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
     char **gargv = argv + i + 1;
     int gargc = argc - i - 1;
 
-    return cng_run(rootfs, libprefix, bind_g, bind_h, bind_ro, nb, env_set, ne,
-                   gargc, gargv, envp, auxv);
+    return cng_run(rootfs, libprefix, workdir, bind_g, bind_h, bind_ro, nb,
+                   env_set, ne, gargc, gargv, envp, auxv);
 }

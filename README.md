@@ -59,7 +59,8 @@ host-native binaries directly); `<program>` is an absolute path inside it.
 Common options: `-u/--fake-id[=ID]` (fake user identity — `ID` is a `uid` or
 `uid:gid`, defaulting to `0:0` root), `-b/--bind SRC:DST[:ro]` (expose host
 directory SRC at guest path DST, read-only with `:ro`), `-E/--env VAR=VAL` (set a
-guest environment variable — see below), `-l/--link2symlink` (emulate hardlinks where the host refuses `link(2)`),
+guest environment variable — see below), `-w/--work-dir DIR` (start the guest in
+DIR — see below), `-l/--link2symlink` (emulate hardlinks where the host refuses `link(2)`),
 `-R/--rewrite` (ahead-of-time `svc` rewriting), `--no-proc` (turn off the `/proc`
 emulation described below), `--no-dev` (turn off the `/dev` passthrough),
 `--share-abstract-sockets` (don't isolate abstract AF_UNIX names per rootfs), `--shared-proc` (share the process view between
@@ -132,8 +133,19 @@ the terminal both sides share, and everything else is spelled out with
 `TERM`/`COLORTERM`, and a repeated name keeps the last value). chroot-ng's own
 `CNG_*` knobs are read from its own environment and are not part of the guest's.
 
+**The working directory** a guest starts in is the guest root `/`, not the host
+directory chroot-ng was launched from: that path names nothing inside the rootfs,
+and passing it through would send a relative `<program>` — and every relative
+access the guest goes on to make — looking outside its own filesystem.
+`-w/--work-dir DIR` names a different one. `DIR` is a guest path, resolved
+through the rootfs and its binds and following symlinks like any other, and must
+be an existing directory; a bad one is refused rather than quietly demoted to
+`/`. An identity rootfs (`/`) is the exception to the default: there the host cwd
+already *is* a guest path, so it is kept.
+
 ```sh
 chroot-ng -u ./rootfs /bin/sh              # fake root (uid/gid 0)
+chroot-ng -u -w /root ./rootfs /bin/sh     # ...starting in /root
 chroot-ng -u -E HOME=/root -E TZ=UTC ./rootfs /bin/sh -l
 chroot-ng --fake-id 1000:1000 ./rootfs /bin/sh
 # non-root, but setuid-root `su` still works (--setuid/--setgid-root imply -u):

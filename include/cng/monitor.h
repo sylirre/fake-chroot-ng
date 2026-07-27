@@ -64,9 +64,11 @@ extern const char *cng_g_exe_guest;
 extern int cng_g_setuid_root;
 extern int cng_g_setgid_root;
 
-/* File-type / set-id mode bits used by the fake-id ownership fixups. */
+/* File-type / set-id mode bits: the fake-id ownership fixups test for a regular
+ * file, the -w/--work-dir check for a directory. */
 #define CNG_S_IFMT  0170000u
 #define CNG_S_IFREG 0100000u
+#define CNG_S_IFDIR 0040000u
 #define CNG_S_ISUID 0004000u
 #define CNG_S_ISGID 0002000u
 
