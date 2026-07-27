@@ -984,8 +984,13 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         if (is_open) {
             oflags = a2;
 #ifdef __NR_openat2
-            if (nr == __NR_openat2)
+            /* openat2's flags live in the open_how it points at, so reading
+             * them is a guest dereference like any other. */
+            if (nr == __NR_openat2) {
+                if (a2 && !cng_user_readable((void *)a2, sizeof(unsigned long)))
+                    return -EFAULT;
                 oflags = a2 ? (long)*(unsigned long *)a2 : 0;
+            }
 #endif
         }
         /* O_NOFOLLOW must reach the kernel as a symlink, or it has nothing to
@@ -1022,16 +1027,9 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         if (ro_denied(p)) {
             if (nr == __NR_mkdirat || nr == __NR_mknodat)
                 return -EROFS;
-            if (is_open) {
-                long of = a2;
-#ifdef __NR_openat2
-                if (nr == __NR_openat2)
-                    of = a2 ? (long)*(unsigned long *)a2 : 0;
-#endif
-                if ((of & 3) != CNG_O_RDONLY ||
-                    (of & (CNG_O_CREAT | CNG_O_TRUNC)))
-                    return -EROFS;
-            }
+            if (is_open && ((oflags & 3) != CNG_O_RDONLY ||
+                            (oflags & (CNG_O_CREAT | CNG_O_TRUNC))))
+                return -EROFS;
         }
         long r = reissue(a0, (long)p, a2, a3, a4, a5, nr);
         /* O_NOFOLLOW through a real dirfd lands on the l2s symlink and draws
@@ -1641,6 +1639,10 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     /* sendmsg: the address hangs off msg_name in the msghdr, so the header is
      * copied to swap that pointer — the guest's own struct is never written. */
     case __NR_sendmsg: {
+        /* The msghdr is read here, ahead of any kernel call that would have
+         * validated it, so a bad one must answer -EFAULT rather than fault. */
+        if (a1 && !cng_user_readable((void *)a1, sizeof(struct cng_msghdr)))
+            return -EFAULT;
         if (cng_nl_is_fake((int)a0)) {
             /* The payload is the first iovec; netlink requests are single-iov
              * in every library that builds them. */
@@ -1649,6 +1651,9 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             if (m) {
                 struct cng_iovec *iov = *(struct cng_iovec **)(m + 16);
                 unsigned long nio = *(unsigned long *)(m + 24);
+                if (iov && nio > 0 &&
+                    !cng_user_readable(iov, sizeof *iov))
+                    return -EFAULT;
                 if (iov && nio > 0)
                     cng_nl_send((int)a0, iov[0].base, (long)iov[0].len, &out);
             }
@@ -1707,9 +1712,13 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         if (cng_nl_is_fake((int)a0)) {
             long out = 0;
             char *m = (char *)a1;
+            if (m && !cng_user_readable(m, sizeof(struct cng_msghdr)))
+                return -EFAULT;
             if (m) {
                 struct cng_iovec *iov = *(struct cng_iovec **)(m + 16);
                 unsigned long nio = *(unsigned long *)(m + 24);
+                if (iov && nio > 0 && !cng_user_readable(iov, sizeof *iov))
+                    return -EFAULT;
                 if (iov && nio > 0)
                     cng_nl_recv((int)a0, iov[0].base, (long)iov[0].len, a2,
                                 &out);
@@ -1816,8 +1825,13 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         char *buf = (char *)a0;
         unsigned long size = (unsigned long)a1;
         size_t len = strlen(cng_g_fs->cwd) + 1;
+        /* ERANGE is decided before the buffer is touched, as the kernel does —
+         * which also keeps the write probe's zeroing invisible: it only ever
+         * runs immediately before the copy that overwrites it. */
         if (len > size)
             return -ERANGE;
+        if (!cng_user_writable(buf, len))
+            return -EFAULT;
         memcpy(buf, cng_g_fs->cwd, len);
         return (long)len;
     }
@@ -1862,6 +1876,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             return 0;
         if (a1) {
             unsigned char act[32];
+            if (!cng_user_readable((void *)a1, sizeof act))
+                return -EFAULT;
             memcpy(act, (void *)a1, sizeof act);
             *(unsigned long *)(act + 24) &= ~(1UL << (CNG_SIGSYS - 1));
             return cng_syscall6(a0, (long)act, a2, a3, a4, a5,
@@ -1874,6 +1890,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_rt_sigprocmask: {
         int how = (int)a0;
         if ((how == 0 /*BLOCK*/ || how == 2 /*SETMASK*/) && a1) {
+            if (!cng_user_readable((void *)a1, sizeof(unsigned long)))
+                return -EFAULT;
             unsigned long set = *(unsigned long *)a1 & ~(1UL << (CNG_SIGSYS - 1));
             return cng_syscall6(a0, (long)&set, a2, a3, a4, a5,
                                 __NR_rt_sigprocmask);

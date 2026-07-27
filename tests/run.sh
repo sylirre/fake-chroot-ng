@@ -89,6 +89,7 @@ if [ -f tests/m12_shm.sh ]; then . tests/m12_shm.sh; fi
 if [ -f tests/m14_dev.sh ]; then . tests/m14_dev.sh; fi
 if [ -f tests/m15_unixsock.sh ]; then . tests/m15_unixsock.sh; fi
 if [ -f tests/m16_netlink.sh ]; then . tests/m16_netlink.sh; fi
+if [ -f tests/m17_fault.sh ]; then . tests/m17_fault.sh; fi
 if [ -f tests/m17_env.sh ]; then . tests/m17_env.sh; fi
 if [ -f tests/m17_workdir.sh ]; then . tests/m17_workdir.sh; fi
 

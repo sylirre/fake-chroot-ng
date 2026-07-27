@@ -1187,6 +1187,47 @@ vfork/`posix_spawn` child-stack handling.
     `getcwd` must come from the virtual cwd. Four of them are byte-for-byte
     differentials against arm64chroot's own `-w`. Suite: 387 passed, 0 failed.
 
+- [x] **M17-7 — a bad guest pointer answers `EFAULT` instead of killing the guest**
+  The syscalls the monitor *emulates* rather than re-issues read and write the
+  guest's own pointers, so the kernel never validates them for us — and they do it
+  inside the SIGSYS handler, where every signal but SIGSYS is masked
+  (`cng_sig_install`). A `SIGSEGV` there is unblockable: the kernel force-defaults
+  it and the process dies. So `shmctl(id, IPC_SET, garbage)`,
+  `capget(garbage, ...)`, `setgroups(n, garbage)`, `getres*id(garbage, ...)`,
+  `getcwd(garbage, n)`, `rt_sigaction(sig, garbage, ...)` and
+  `rt_sigprocmask(how, garbage, ...)` each turned an ordinary `-EFAULT` into the
+  death of the guest, behind nothing more than a bare NULL check.
+  - New `src/monitor/uaccess.c`: `cng_user_readable` / `cng_user_writable` ask the
+    kernel whether a range is accessible rather than finding out by faulting —
+    the move `dbg_str` already makes for the debug log, generalized from a C
+    string to a byte range. The probe is a copy through a scratch memfd:
+    `pwrite64` is a `copy_from_user` of exactly that range, `pread64` a
+    `copy_to_user` of it, and both report `EFAULT` (or a short count, where the
+    fault is partway in) without touching anything else.
+  - The write probe's source region is never written, so it always delivers
+    zeros, and every caller uses it immediately before filling the buffer — which
+    is why `getcwd` decides `ERANGE` first, as the kernel does. The read probe's
+    scratch region is written and never read back, so concurrent probes on
+    different threads cannot disturb each other and no lock is needed.
+  - The descriptor carries the staleness discipline `procfs.c` uses for its
+    synthesized fds: we do not trap `close(2)`, so a guest can close ours and be
+    handed the number back for a file of its own, after which a probe would write
+    into it. The inode is recorded at creation and checked on every use; a stale
+    number is abandoned, never closed. Where no memfd can be had the probes answer
+    "accessible" and the old dereference stands — no protection, but no
+    regression either.
+  - Applied to the same class wherever it appears in these handlers, not only the
+    audited list: `openat2`'s `open_how`, `sendmsg`/`recvmsg`'s `msghdr` and first
+    iovec, and the `getcwd` output buffer. Path *strings* are a separate case (the
+    resolver walks them component by component) and are left for their own change.
+  - **Tests:** new `tests/m17_fault.sh` on a new `-t faulttest`, which drives the
+    dispatcher directly — so the emulation is exercised on every host, not only
+    where the seccomp tier is live. Eleven syscalls are called with a wild
+    (non-NULL, unmapped) pointer and must answer `-EFAULT`; the test surviving to
+    print at all is half the assertion. Valid pointers are asserted to still work,
+    and the leg reports SKIP where no memfd backs the probe. Suite: 400 passed,
+    0 failed.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

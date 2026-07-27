@@ -680,6 +680,95 @@ int cng_cmd_blocktest(int argc, char **argv, char **envp, unsigned long *auxv) {
     return fails ? 1 : 0;
 }
 
+/* _faulttest — a guest pointer the handler dereferences itself must answer
+ * -EFAULT, not kill the guest.
+ *
+ * These syscalls are emulated rather than re-issued, so the kernel never gets to
+ * validate their pointers for us; and the handler runs with SIGSEGV masked, so a
+ * fault there is unblockable and fatal. Every case below passes a wild (non-NULL,
+ * unmapped) pointer through the dispatcher: a pass means the run survived AND the
+ * errno is right, so the test failing to print at all is itself the diagnosis. */
+int cng_cmd_faulttest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    static struct cng_fs fs;
+    cng_fs_init(&fs, "/");
+    cng_g_fs = &fs;
+
+    void *bad = (void *)0x10; /* non-NULL, and no mapping starts that low */
+    char good[128];
+    int fails = 0;
+
+    /* The probe needs a memfd; where it cannot be had the helpers answer
+     * "accessible" and the dereferences below would really fault. */
+    if (cng_user_readable(bad, 8) || cng_user_writable(bad, 8)) {
+        cng_dprintf(1, "faulttest: memory probe unavailable here -> SKIP\n");
+        return 0;
+    }
+    int okg = cng_user_readable(good, sizeof good) &&
+              cng_user_writable(good, sizeof good);
+    cng_dprintf(1, "faulttest probe good=%d bad=0 -> %s\n", okg,
+                okg ? "OK" : "FAIL");
+    fails += !okg;
+
+    cng_g_fake_id = 1;
+    cng_g_fake_uid = cng_g_fake_gid = 0;
+    cng_cred_seed();
+
+    struct {
+        const char *name;
+        long r;
+    } t[] = {
+        {"rt_sigaction",
+         cng_dispatch(__NR_rt_sigaction, CNG_SIGUSR1, (long)bad, 0, 8, 0, 0, 1)},
+        {"rt_sigprocmask",
+         cng_dispatch(__NR_rt_sigprocmask, 0 /*SIG_BLOCK*/, (long)bad, 0, 8, 0,
+                      0, 1)},
+        {"getcwd", cng_dispatch(__NR_getcwd, (long)bad, 4096, 0, 0, 0, 0, 1)},
+        {"getresuid",
+         cng_dispatch(__NR_getresuid, (long)bad, (long)bad, (long)bad, 0, 0, 0,
+                      1)},
+        {"getresgid",
+         cng_dispatch(__NR_getresgid, (long)bad, (long)bad, (long)bad, 0, 0, 0,
+                      1)},
+        {"setgroups", cng_dispatch(__NR_setgroups, 4, (long)bad, 0, 0, 0, 0, 1)},
+        {"capget", cng_dispatch(__NR_capget, (long)bad, 0, 0, 0, 0, 0, 1)},
+        {"shmctl",
+         cng_dispatch(__NR_shmctl, 0, CNG_IPC_SET, (long)bad, 0, 0, 0, 1)},
+        {"sendmsg", cng_dispatch(__NR_sendmsg, 0, (long)bad, 0, 0, 0, 0, 1)},
+    };
+    for (unsigned i = 0; i < sizeof t / sizeof t[0]; i++) {
+        int ok = (t[i].r == -EFAULT);
+        cng_dprintf(1, "faulttest %s=%d want=%d -> %s\n", t[i].name, (int)t[i].r,
+                    (int)-EFAULT, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* getgroups writes only what it has: with no supplementary groups the bad
+     * pointer is never touched, so seed one and ask again. */
+    cng_g_cred.ngroups = 1;
+    cng_g_cred.groups[0] = 42;
+    long rg = cng_dispatch(__NR_getgroups, 4, (long)bad, 0, 0, 0, 0, 1);
+    int okgg = (rg == -EFAULT);
+    cng_dprintf(1, "faulttest getgroups=%d want=%d -> %s\n", (int)rg,
+                (int)-EFAULT, okgg ? "OK" : "FAIL");
+    fails += !okgg;
+
+    /* And the same calls with real memory still work. */
+    long rr = cng_dispatch(__NR_getresuid, (long)good, (long)(good + 8),
+                           (long)(good + 16), 0, 0, 0, 1);
+    long rc = cng_dispatch(__NR_getcwd, (long)good, sizeof good, 0, 0, 0, 0, 1);
+    int okv = (rr == 0 && rc > 0);
+    cng_dprintf(1, "faulttest valid getresuid=%d getcwd=%d -> %s\n", (int)rr,
+                (int)rc, okv ? "OK" : "FAIL");
+    fails += !okv;
+
+    cng_g_fake_id = 0;
+    return fails ? 1 : 0;
+}
+
 /* _loadtwice PATH — load the same ELF twice into this address space (as execve
  * emulation does, without tearing down the first) to surface re-load failures. */
 int cng_cmd_loadtwice(int argc, char **argv, char **envp, unsigned long *auxv) {

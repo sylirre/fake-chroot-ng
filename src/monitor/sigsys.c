@@ -99,6 +99,13 @@ void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si) {
         unsigned long *pset = (unsigned long *)r[1];
         unsigned long *pold = (unsigned long *)r[2];
         unsigned long cur = uc->uc_sigmask.sig[0];
+        /* Both are guest pointers we dereference ourselves rather than handing
+         * to the kernel, so a bad one must come back -EFAULT (see uaccess.c). */
+        if ((pset && !cng_user_readable(pset, sizeof *pset)) ||
+            (pold && !cng_user_writable(pold, sizeof *pold))) {
+            r[0] = (unsigned long long)(long)-EFAULT;
+            return;
+        }
         if (pold)
             *pold = cur;
         if (pset) {

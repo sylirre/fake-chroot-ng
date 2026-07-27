@@ -222,7 +222,9 @@ static long do_shmctl(s32 shmid, int cmd, void *buf) {
     q.arg = cmd;
     if (cmd == CNG_IPC_SET) {
         const struct cng_shmid64_ds *in = (const struct cng_shmid64_ds *)buf;
-        if (!in)
+        /* `buf` is guest memory and this runs with SIGSEGV masked, so a bad
+         * pointer has to be reported, not dereferenced (see uaccess.c). */
+        if (!cng_user_readable(in, sizeof *in))
             return -EFAULT;
         q.set_mode = in->shm_perm.mode;
         q.set_uid = in->shm_perm.uid;
@@ -238,7 +240,7 @@ static long do_shmctl(s32 shmid, int cmd, void *buf) {
      * error, so they write their struct before the sign check below. */
     if (cmd == CNG_SHM_INFO) {
         struct cng_shm_info si;
-        if (!buf)
+        if (!cng_user_writable(buf, sizeof si))
             return -EFAULT;
         memset(&si, 0, sizeof si);
         si.used_ids = r.info_used;
@@ -249,7 +251,7 @@ static long do_shmctl(s32 shmid, int cmd, void *buf) {
     }
     if (cmd == CNG_IPC_INFO) {
         struct cng_shminfo64 li;
-        if (!buf)
+        if (!cng_user_writable(buf, sizeof li))
             return -EFAULT;
         memset(&li, 0, sizeof li);
         li.shmmax = 0x7fffffffffffffffULL; /* effectively host-RAM bounded */
@@ -265,7 +267,7 @@ static long do_shmctl(s32 shmid, int cmd, void *buf) {
 
     if (cmd == CNG_IPC_STAT || cmd == CNG_SHM_STAT || cmd == CNG_SHM_STAT_ANY) {
         struct cng_shmid64_ds ds;
-        if (!buf)
+        if (!cng_user_writable(buf, sizeof ds))
             return -EFAULT;
         fill_ds(&ds, &r);
         memcpy(buf, &ds, sizeof ds);

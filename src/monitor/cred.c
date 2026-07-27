@@ -211,11 +211,15 @@ static long do_setfsgid(struct cng_cred *c, unsigned g) {
     return old;
 }
 
+/* The group list is guest memory, so it is validated before it is walked: the
+ * kernel answers -EFAULT for a bad one, and we run with SIGSEGV masked. */
 static long do_setgroups(struct cng_cred *c, int n, const unsigned *g) {
     if (!cred_priv(c))
         return -EPERM;
     if (n < 0 || n > CNG_NGROUPS_MAX)
         return -EINVAL;
+    if (n && !cng_user_readable(g, (unsigned long)n * sizeof *g))
+        return -EFAULT;
     for (int i = 0; i < n; i++)
         c->groups[i] = g[i];
     c->ngroups = n;
@@ -227,6 +231,8 @@ static long do_getgroups(const struct cng_cred *c, int size, unsigned *g) {
         return n;
     if (size < n)
         return -EINVAL;
+    if (n && !cng_user_writable(g, (unsigned long)n * sizeof *g))
+        return -EFAULT;
     for (int i = 0; i < n; i++)
         g[i] = c->groups[i];
     return n;
@@ -245,11 +251,13 @@ struct cap_data {
 };
 
 static long do_capget(const struct cap_header *hdr, struct cap_data *data) {
-    if (!hdr)
+    if (!cng_user_readable(hdr, sizeof *hdr))
         return -EFAULT;
     if (data) {
         unsigned all = cng_fake_root() ? 0xffffffffu : 0u;
         int n = (hdr->version == 0x19980330u) ? 1 : 2; /* v1 vs v2/v3 */
+        if (!cng_user_writable(data, (unsigned long)n * sizeof *data))
+            return -EFAULT;
         for (int i = 0; i < n; i++) {
             data[i].effective = all;
             data[i].permitted = all;
@@ -307,22 +315,21 @@ long cng_cred_handle(long nr, long a0, long a1, long a2, long a3, long a4,
         return (long)c->rgid;
     case __NR_getegid:
         return (long)c->egid;
+    /* getres*id take three out pointers. The kernel writes none of them if any
+     * is bad, so validate all three first — and a NULL one is -EFAULT there
+     * too, unlike the optional pointers elsewhere in this family. */
     case __NR_getresuid:
-        if (a0)
-            *(unsigned *)a0 = c->ruid;
-        if (a1)
-            *(unsigned *)a1 = c->euid;
-        if (a2)
-            *(unsigned *)a2 = c->suid;
+    case __NR_getresgid: {
+        if (!cng_user_writable((void *)a0, sizeof(unsigned)) ||
+            !cng_user_writable((void *)a1, sizeof(unsigned)) ||
+            !cng_user_writable((void *)a2, sizeof(unsigned)))
+            return -EFAULT;
+        int u = (nr == __NR_getresuid);
+        *(unsigned *)a0 = u ? c->ruid : c->rgid;
+        *(unsigned *)a1 = u ? c->euid : c->egid;
+        *(unsigned *)a2 = u ? c->suid : c->sgid;
         return 0;
-    case __NR_getresgid:
-        if (a0)
-            *(unsigned *)a0 = c->rgid;
-        if (a1)
-            *(unsigned *)a1 = c->egid;
-        if (a2)
-            *(unsigned *)a2 = c->sgid;
-        return 0;
+    }
     case __NR_setuid:
         return do_setuid(c, (unsigned)a0);
     case __NR_setgid:

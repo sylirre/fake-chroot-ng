@@ -182,6 +182,15 @@ int cng_proc_self_fd(const char *host);
  * under fake-root. Returns the new fd, or `err`. */
 long cng_fd_reopen(const char *host, long flags, long mode, long err);
 
+/* Is a guest byte range safe to dereference from the handler? Every signal but
+ * SIGSYS is masked there, so a SIGSEGV on a bad guest pointer is unblockable and
+ * kills the guest where a real kernel would have answered -EFAULT. Ask before
+ * dereferencing anything the guest handed us and return -EFAULT on 0. The write
+ * form zeroes the range it validates, so use it immediately before filling the
+ * buffer. Both answer 1 when they cannot ask (see uaccess.c). */
+int cng_user_readable(const void *p, unsigned long n);
+int cng_user_writable(void *p, unsigned long n);
+
 /* Ambient-seccomp block-list: cng_blocked[nr] != 0 means Android blocks that
  * syscall, so dispatch emulates ENOSYS instead of re-issuing it. Populated by
  * cng_probe_blocked() at monitor install (a no-op result off Android). */
