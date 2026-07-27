@@ -1228,6 +1228,36 @@ vfork/`posix_spawn` child-stack handling.
     and the leg reports SKIP where no memfd backs the probe. Suite: 400 passed,
     0 failed.
 
+- [x] **M17-9 — `seccomp(2)` and `prctl` are virtualized**
+  `docs/DESIGN.md` has listed this as required since M5 and it was never done: a
+  guest could install its own seccomp filter, and the kernel layers that filter
+  over ours on the same thread — including over the syscalls the SIGSYS handler
+  re-issues through the gate, which the guest's filter knows nothing about. A
+  guest that refuses `openat`, or kills on an unlisted syscall, would have taken
+  the monitor down with it. `PR_GET_SECCOMP` reported mode 2 — *our* filter — so
+  a program that checks whether it is already confined concluded it was and
+  installed nothing.
+  - `seccomp(2)` joins the designed-ENOSYS set, refused by the filter itself
+    (`RET_ERRNO`), which is the oracle's answer too; we never issue it (the
+    filter goes in through prctl), so refusing it ahead of the gate allowlist
+    costs nothing. `prctl(PR_SET_SECCOMP)` answers `EACCES` — what a kernel says
+    when the caller may not install a filter, and a case libseccomp, systemd and
+    browser sandboxes all have a path for.
+  - `PR_GET_SECCOMP` reports 0, and the `NO_NEW_PRIVS` pair reports what the
+    *guest* asked for rather than the bit `cng_install_seccomp` had to set to
+    install a filter at all. That bit told a guest setuid-on-exec was dead while
+    our emulated execve still honors it (`--setuid-root`).
+  - Only those four ops are trapped: the op is a scalar in `args[0]`, so the BPF
+    filter tests it, and `PR_SET_NAME`, `PR_SET_VMA`, `PR_SET_PDEATHSIG` and the
+    capability bounding set keep running natively. That matters on the hot path —
+    bionic's allocator calls `PR_SET_VMA` on every mapping. The filter is 119 of
+    256 instructions.
+  - **Tests:** new `tests/m17_seccomp.sh` on a new `-t prctltest`, which sets the
+    real `no_new_privs` bit first so "the guest sees 0" asserts the
+    virtualization rather than an untouched process, and checks an unowned op
+    (`PR_SET_NAME`) still reaches the kernel. Seven filter legs in
+    `m5b_monitor.sh` cover which ops trap. Suite: 412 passed, 0 failed.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

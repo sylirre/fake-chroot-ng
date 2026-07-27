@@ -189,6 +189,19 @@ static const int enosys_syscalls[] = {
 #ifdef __NR_listmount
     __NR_listmount,
 #endif
+    /* seccomp(2). A guest filter is layered on top of ours by the kernel and
+     * applies to every thread it is installed on — including the syscalls the
+     * SIGSYS handler re-issues through the gate, which the guest's filter knows
+     * nothing about. A guest that refuses openat, or kills on an unlisted
+     * syscall, would therefore take the monitor down with it. There is no way to
+     * honor a second filter here, so the capability is refused rather than
+     * half-granted; the prctl spelling is answered in the dispatcher (it shares
+     * its syscall number with ops we must keep working). We never issue
+     * seccomp(2) ourselves — the filter goes in via prctl — so refusing it ahead
+     * of the gate allowlist costs nothing. */
+#ifdef __NR_seccomp
+    __NR_seccomp,
+#endif
     /* System V semaphores and message queues. M12 gave the guest its own shm
      * namespace; these were left running natively, so on a desktop host the
      * guest shared the HOST's sem/msg namespace — it could attach to host
@@ -316,6 +329,40 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
         CNG_BPF_RET | CNG_BPF_K, CNG_SECCOMP_RET_ALLOW); /* 18: plain thread */
     f[n++] = (struct sock_filter)CNG_BPF_STMT(
         CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* 19: reload A=nr */
+
+    /* prctl: four ops are ours, the rest of the syscall is not.
+     *
+     *  - PR_SET_SECCOMP would stack a guest filter over ours (see the note on
+     *    seccomp(2) above), so it has to be refused;
+     *  - PR_GET_SECCOMP would answer 2 — the mode WE installed — and a program
+     *    that checks whether it is already confined would believe it is;
+     *  - the NO_NEW_PRIVS pair reports our own bit, which the guest never asked
+     *    for, and which tells it setuid-on-exec is dead when our emulated execve
+     *    still honors it.
+     *
+     * Everything else prctl does (PR_SET_NAME, PR_SET_VMA, PR_SET_PDEATHSIG, the
+     * capability bounding set) is real process state that works natively and must
+     * not pay for a trap — bionic's allocator calls PR_SET_VMA on every mapping.
+     * The op is a scalar in args[0], so BPF can tell them apart. */
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, (uint32_t)__NR_prctl, 0,
+        7); /* not prctl -> reload nr */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_ARGS); /* A = op */
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, CNG_PR_GET_SECCOMP, 4, 0);
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, CNG_PR_SET_SECCOMP, 3, 0);
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, CNG_PR_SET_NO_NEW_PRIVS, 2, 0);
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, CNG_PR_GET_NO_NEW_PRIVS, 1, 0);
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_RET | CNG_BPF_K, CNG_SECCOMP_RET_ALLOW); /* not ours */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
+                                              CNG_SECCOMP_RET_TRAP);
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* reload A=nr */
 
     /* Synthesized-file refresh: a read on one of the high fds reserved for the
      * time-varying /proc files (loadavg, uptime, stat) must reach the

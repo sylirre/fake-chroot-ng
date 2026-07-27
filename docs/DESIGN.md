@@ -177,7 +177,13 @@ way the reference emulator recommends `--fake-id` for apt/dpkg.
 
 - `execve` erases the in-process handler → emulate `execve` via the loader.
 - The guest (notably Go) can clobber the `SIGSYS` handler or block the signal →
-  virtualize `rt_sigaction`/`rt_sigprocmask`/`seccomp`/`prctl`.
+  virtualize `rt_sigaction`/`rt_sigprocmask`/`seccomp`/`prctl`. A guest filter is
+  layered on top of ours by the kernel and governs the syscalls the handler
+  re-issues through the gate as well, so `seccomp(2)` is refused `ENOSYS` and
+  `prctl(PR_SET_SECCOMP)` `EACCES`; `PR_GET_SECCOMP` and the `NO_NEW_PRIVS` pair
+  report the guest's own state rather than the bits we set to install the filter.
+  The remaining prctl ops are real process state and stay untrapped (the filter
+  tests `args[0]`).
 - `SIGSYS` signal-stack correctness on guest-created threads → per-thread
   `sigaltstack`, validate against Go.
 - `execmem` denied → no in-process path exists on a true `noexec` mount; only

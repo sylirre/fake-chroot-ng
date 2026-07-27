@@ -195,6 +195,19 @@ check_contains "clone3 is refused so spawns use the converted clone path" \
 # M12 gave the guest its own shm namespace but left sem/msg native, so it shared
 # the HOST's -- it could attach to host semaphores and host `ipcs -s` listed the
 # guest's. shm stays emulated; these are refused.
+# A guest-installed filter also governs the syscalls the SIGSYS handler
+# re-issues through the gate, which that filter knows nothing about -- so
+# seccomp(2) is refused outright. prctl carries the same capability under an op
+# number it shares with process state we must not slow down (bionic's allocator
+# calls PR_SET_VMA on every mapping), so the filter tests the op itself.
+check_contains "seccomp(2) is refused ENOSYS by the filter" \
+    "bpftest seccomp(2) is refused ENOSYS: ERRNO -> OK" "$out"
+check_contains "the prctl ops that describe our confinement trap" \
+    "bpftest prctl PR_SET_SECCOMP traps: TRAP -> OK" "$out"
+check_contains "PR_GET_SECCOMP traps, so it cannot report our mode 2" \
+    "bpftest prctl PR_GET_SECCOMP traps: TRAP -> OK" "$out"
+check_contains "the rest of prctl stays untrapped" \
+    "bpftest prctl PR_SET_VMA runs native: ALLOW -> OK" "$out"
 check_contains "SysV semaphores no longer reach the host namespace" \
     "bpftest semget is refused ENOSYS: ERRNO -> OK" "$out"
 check_contains "SysV message queues no longer reach the host namespace" \

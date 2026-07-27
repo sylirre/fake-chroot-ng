@@ -1899,6 +1899,43 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         return cng_syscall6(a0, a1, a2, a3, a4, a5, __NR_rt_sigprocmask);
     }
 
+    /* prctl: the four ops that describe OUR confinement rather than the guest's.
+     * Only these are trapped (seccomp.c tests args[0] in BPF); every other op is
+     * real process state and runs natively.
+     *
+     * The no_new_privs bit is ours — cng_install_seccomp sets it because a
+     * filter cannot be installed without it — so the guest is told what it
+     * itself asked for, not what we did. It survives fork (ordinary memory) and
+     * our emulated execve, which is where a real one would keep it too. */
+    case __NR_prctl: {
+        static int guest_nnp = 0;
+        switch ((int)a0) {
+        case CNG_PR_GET_SECCOMP:
+            /* Mode 2 is the filter WE installed. A sandbox that asks this to
+             * find out whether it still has work to do would conclude it is
+             * already confined and skip installing anything. */
+            return 0;
+        case CNG_PR_SET_SECCOMP:
+            /* A second filter would also govern the syscalls the handler
+             * re-issues through the gate, which the guest's filter has no way to
+             * know about — one that kills on an unlisted syscall would take the
+             * monitor down with it. EACCES is what a kernel answers when the
+             * caller may not install a filter, and the callers that matter
+             * (libseccomp, systemd, browser sandboxes) all have a path for it. */
+            if (cng_g_debug)
+                cng_dprintf(2, "[cng] prctl(PR_SET_SECCOMP) refused\n");
+            return -EACCES;
+        case CNG_PR_SET_NO_NEW_PRIVS:
+            if (a1 != 1 || a2 || a3 || a4)
+                return -EINVAL; /* the kernel's own argument check */
+            guest_nnp = 1;
+            return 0; /* already set for real, at install */
+        case CNG_PR_GET_NO_NEW_PRIVS:
+            return guest_nnp;
+        }
+        return reissue(a0, a1, a2, a3, a4, a5, nr);
+    }
+
     /* --- credential syscalls (trapped only when --fake-id is active) ---
      * All get/set uid/gid family, groups, and capability calls are emulated
      * against the synthetic credential set in cred.c, which enforces real POSIX

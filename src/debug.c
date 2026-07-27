@@ -769,6 +769,73 @@ int cng_cmd_faulttest(int argc, char **argv, char **envp, unsigned long *auxv) {
     return fails ? 1 : 0;
 }
 
+/* _prctltest — the confinement ops prctl must not answer honestly.
+ *
+ * We install a seccomp filter and set no_new_privs to do it, and both are
+ * visible through prctl: PR_GET_SECCOMP would report mode 2 and
+ * PR_GET_NO_NEW_PRIVS would report 1, neither of which the guest asked for. The
+ * test sets the real bit first, so "the guest sees 0" is an assertion about the
+ * virtualization rather than about an untouched process. */
+int cng_cmd_prctltest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    static struct cng_fs fs;
+    cng_fs_init(&fs, "/");
+    cng_g_fs = &fs;
+    int fails = 0;
+
+    /* As cng_install_seccomp does, before the guest ever runs. */
+    sys_prctl(CNG_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    long host_nnp = sys_prctl(CNG_PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
+
+    struct {
+        const char *name;
+        long r, want;
+    } t[] = {
+        {"GET_SECCOMP",
+         cng_dispatch(__NR_prctl, CNG_PR_GET_SECCOMP, 0, 0, 0, 0, 0, 1), 0},
+        {"GET_NO_NEW_PRIVS (host bit hidden)",
+         cng_dispatch(__NR_prctl, CNG_PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0, 0, 1), 0},
+        {"SET_SECCOMP refused",
+         cng_dispatch(__NR_prctl, CNG_PR_SET_SECCOMP, CNG_SECCOMP_MODE_FILTER,
+                      0, 0, 0, 0, 1),
+         -EACCES},
+        {"SET_NO_NEW_PRIVS 0 is EINVAL",
+         cng_dispatch(__NR_prctl, CNG_PR_SET_NO_NEW_PRIVS, 0, 0, 0, 0, 0, 1),
+         -EINVAL},
+        {"SET_NO_NEW_PRIVS 1",
+         cng_dispatch(__NR_prctl, CNG_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0, 0, 1), 0},
+        {"GET_NO_NEW_PRIVS after the guest set it",
+         cng_dispatch(__NR_prctl, CNG_PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0, 0, 1), 1},
+        {"seccomp(2) refused",
+         cng_dispatch(__NR_seccomp, CNG_SECCOMP_SET_MODE_FILTER, 0, 0, 0, 0, 0,
+                      1),
+         -ENOSYS},
+    };
+    cng_dprintf(1, "prctltest host no_new_privs=%d\n", (int)host_nnp);
+    for (unsigned i = 0; i < sizeof t / sizeof t[0]; i++) {
+        int ok = (t[i].r == t[i].want);
+        cng_dprintf(1, "prctltest %s=%d want=%d -> %s\n", t[i].name, (int)t[i].r,
+                    (int)t[i].want, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* An op we do not own still reaches the kernel. */
+    char nm[16] = "cngprctl";
+    long sr = cng_dispatch(__NR_prctl, CNG_PR_SET_NAME, (long)nm, 0, 0, 0, 0, 1);
+    char back[16] = {0};
+    sys_prctl(16 /*PR_GET_NAME*/, (unsigned long)back, 0, 0, 0);
+    int okn = (sr == 0 && !strcmp(back, nm));
+    cng_dprintf(1, "prctltest SET_NAME passthrough rc=%d comm=%s -> %s\n",
+                (int)sr, back, okn ? "OK" : "FAIL");
+    fails += !okn;
+
+    cng_dprintf(1, "prctltest: %d failure(s)\n", fails);
+    return fails ? 1 : 0;
+}
+
 /* _loadtwice PATH — load the same ELF twice into this address space (as execve
  * emulation does, without tearing down the first) to surface re-load failures. */
 int cng_cmd_loadtwice(int argc, char **argv, char **envp, unsigned long *auxv) {
@@ -2525,6 +2592,31 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
         {"plain clone still traps for the conversion", __NR_clone, 0x1000,
          CNG_CLONE_VM | CNG_CLONE_VFORK, CNG_SECCOMP_RET_TRAP},
 #endif
+        /* seccomp(2): a guest filter would also govern the syscalls the handler
+         * re-issues through the gate. Refused by the filter itself. */
+#ifdef __NR_seccomp
+        {"seccomp(2) is refused ENOSYS", __NR_seccomp, 0x1000, 0,
+         CNG_SECCOMP_RET_ERRNO | 38},
+        {"in-gate seccomp(2) is refused too", __NR_seccomp, gate, 0,
+         CNG_SECCOMP_RET_ERRNO | 38},
+#endif
+        /* prctl is selective: the four ops that describe OUR confinement are
+         * trapped, and the rest of the syscall — real process state, some of it
+         * on the hot path — is not. */
+        {"prctl PR_SET_SECCOMP traps", __NR_prctl, 0x1000, CNG_PR_SET_SECCOMP,
+         CNG_SECCOMP_RET_TRAP},
+        {"prctl PR_GET_SECCOMP traps", __NR_prctl, 0x1000, CNG_PR_GET_SECCOMP,
+         CNG_SECCOMP_RET_TRAP},
+        {"prctl PR_SET_NO_NEW_PRIVS traps", __NR_prctl, 0x1000,
+         CNG_PR_SET_NO_NEW_PRIVS, CNG_SECCOMP_RET_TRAP},
+        {"prctl PR_GET_NO_NEW_PRIVS traps", __NR_prctl, 0x1000,
+         CNG_PR_GET_NO_NEW_PRIVS, CNG_SECCOMP_RET_TRAP},
+        {"prctl PR_SET_NAME runs native", __NR_prctl, 0x1000, CNG_PR_SET_NAME,
+         CNG_SECCOMP_RET_ALLOW},
+        {"prctl PR_SET_VMA runs native", __NR_prctl, 0x1000, 0x53564d41,
+         CNG_SECCOMP_RET_ALLOW},
+        {"our own prctl re-issue is allowed", __NR_prctl, gate,
+         CNG_PR_SET_SECCOMP, CNG_SECCOMP_RET_ALLOW},
     };
     for (unsigned k = 0; k < sizeof cases / sizeof cases[0]; k++) {
         u32 d[16];
