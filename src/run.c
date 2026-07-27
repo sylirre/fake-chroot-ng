@@ -104,8 +104,10 @@ int cng_run(const char *rootfs, const char *libprefix,
             int gargc, char **gargv, char **envp, unsigned long *auxv) {
     const char *prog_guest = gargv[0];
 
-    /* Capture host auxv (for emulated execve), the guest exe path (for
-     * /proc/self/exe fixups) and our own environment (for the CNG_* knobs and
+    /* Capture host auxv (for emulated execve), the guest exe path (a placeholder
+     * for the /proc/self/exe fixups until the program is resolved below, which is
+     * what makes it absolute and symlink-resolved) and our own environment (for
+     * the CNG_* knobs and
      * for env lookups after argv/envp are out of reach — procreg.c's
      * shared_dir). This is the host environment throughout; the guest's is
      * `genv` below. */
@@ -194,6 +196,21 @@ int cng_run(const char *rootfs, const char *libprefix,
         cng_dprintf(2, "chroot-ng: cannot resolve %s\n", prog_guest);
         return 1;
     }
+    /* /proc/self/exe (and the comm derived from it) for the initial program. It
+     * was <program> verbatim, while a real kernel reports the absolute,
+     * symlink-resolved path of the image it actually loaded — and glibc does not
+     * merely tolerate that, it asserts the leading '/' in _dl_get_origin, so a
+     * relative <program> ("chroot-ng / build/tests/hello") aborted the guest
+     * before main. The host path we just resolved, untranslated back into the
+     * guest view, is absolute and symlink-resolved by construction, and it is the
+     * same derivation the emulated execve uses for every program after this one
+     * (execve.c) — so the first program in a session stops answering differently
+     * from its own children. */
+    static char exe_guest[CNG_PATH_MAX];
+    if (cng_fs_untranslate(&g_fs, host_prog, exe_guest, sizeof exe_guest) == 0 ||
+        cng_fs_abscanon(&g_fs, prog_guest, exe_guest, sizeof exe_guest) == 0)
+        cng_g_exe_guest = exe_guest;
+
     /* setuid/setgid-on-exec for the initial program (e.g. running /bin/su
      * directly), mirroring the emulated-execve path. */
     cng_cred_exec(host_prog);

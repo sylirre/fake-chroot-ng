@@ -118,3 +118,48 @@ elif guest_cc_report "$AXD/auxprobe" tests/guests/auxprobe.c; then
     fi
 fi
 rm -rf "$AXD"
+
+# --- the initial program's own /proc/self/exe ------------------------------
+# Every program after the first gets its exe link from the emulated execve; the
+# first one is the one nothing republishes, and it used to report <program>
+# verbatim. Two things follow from that, and both are asserted here because the
+# oracle answers the same in all four combinations (absolute/relative x
+# file/symlink): the link must be absolute — glibc does not merely tolerate that
+# but *asserts* the leading '/' inside _dl_get_origin, so a relative <program>
+# aborted the guest before main, making the first leg an acceptance check rather
+# than a string comparison — and it must name the file that was loaded rather than
+# the symlink that named it, which is what comm is derived from as well.
+EXG=build/tests
+EXD=$(mktemp -d)
+mkdir -p "$EXG"
+if ! guest_xlate_ready "initial-program exe legs"; then
+    :
+elif guest_cc_report "$EXG/exeprobe" tests/guests/exeprobe.c; then
+    mkdir -p "$EXD/rootfs/bin"
+    cp "$EXG/exeprobe" "$EXD/rootfs/bin/"
+    ln -s exeprobe "$EXD/rootfs/bin/exelink"
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+    exerun() { run -R $GUEST_BINDS "$@"; }
+
+    out=$(exerun "$EXD/rootfs" /bin/exeprobe 2>/dev/null); rc=$?
+    check "the initial program reports its own exe link" 0 $rc
+    check_contains "an absolute <program> names itself" "exe=/bin/exeprobe" "$out"
+
+    out=$(exerun "$EXD/rootfs" bin/exeprobe 2>/dev/null); rc=$?
+    check "a relative <program> starts at all" 0 $rc
+    check_contains "a relative <program> still reports an absolute exe" \
+        "exe=/bin/exeprobe" "$out"
+
+    out=$(exerun "$EXD/rootfs" /bin/exelink 2>/dev/null)
+    check_contains "a symlinked <program> reports the file, not the link" \
+        "exe=/bin/exeprobe" "$out"
+    check_contains "comm follows the file the program resolved to" \
+        "comm=exeprobe" "$out"
+
+    # The identity rootfs takes its cwd from the host, so a relative <program>
+    # there resolves against the launch directory rather than the guest root.
+    out=$(run -R / "$EXG/exeprobe" 2>/dev/null)
+    check_contains "identity rootfs: a relative <program> reports its host path" \
+        "exe=$(pwd -P)/$EXG/exeprobe" "$out"
+fi
+rm -rf "$EXD"

@@ -1136,6 +1136,29 @@ vfork/`posix_spawn` child-stack handling.
     scrubbing would otherwise have broken a working test rather than a leak.
     Suite: 347 passed, 0 failed.
 
+- [x] **Fix: the initial program's `/proc/self/exe` was `<program>` verbatim.**
+  Everything after the first program has its exe link republished by the emulated
+  execve, from the resolved host path (`execve.c`); the first program — the one
+  nothing republishes — kept whatever was typed on the command line. So
+  `chroot-ng -R / build/tests/hello` **aborted the guest before `main`**: glibc
+  does not merely tolerate an absolute `/proc/self/exe`, it asserts it
+  (`_dl_get_origin`, `dl-origin.c:41`), and a relative `<program>` produced a
+  relative link. Nothing outside `-R`/live-seccomp saw it, since without the
+  monitor the host's own (absolute) link is what the guest reads.
+  - `cng_run` now derives the link the same way the exec path does: the resolved
+    host path untranslated back into the guest view, which is absolute and
+    symlink-resolved by construction. That also fixes the quieter half — a
+    symlinked `<program>` reported the link rather than the file it named — and
+    `comm`, which is taken from the same recorded program.
+  - Oracle parity in all four combinations (absolute/relative x file/symlink):
+    arm64chroot answers `exe=/bin/exeprobe comm=exeprobe` for each, and so do we
+    now; two of the four used to abort and one was wrong.
+  - **Tests:** M7 gained five legs on a new `tests/guests/exeprobe.c` (reads its
+    own exe link and comm), including the reported form — identity rootfs plus a
+    relative `<program>` — and a rootfs form whose relative path resolves against
+    the guest root instead. Verified to fail on the pre-fix binary (`rc 134`,
+    SIGABRT, on the relative legs) and pass after. Suite: 354 passed, 0 failed.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes
