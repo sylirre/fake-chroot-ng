@@ -219,6 +219,11 @@ check_contains "PR_GET_SECCOMP traps, so it cannot report our mode 2" \
     "bpftest prctl PR_GET_SECCOMP traps: TRAP -> OK" "$out"
 check_contains "the rest of prctl stays untrapped" \
     "bpftest prctl PR_SET_VMA runs native: ALLOW -> OK" "$out"
+# fstat/fchmod are trapped only where they have something to do: under a fake
+# identity, where fstat must remap ownership the way stat does and fchmod needs
+# the same fail-soft. Off, an ordinary fstat must not pay for a trap.
+check_contains "the fake-id set adds fstat and fchmod, and only then" \
+    "bpftest fake-id: fstat_off=1 fstat_on=1 fchmod_on=1 -> OK" "$out"
 check_contains "SysV semaphores no longer reach the host namespace" \
     "bpftest semget is refused ENOSYS: ERRNO -> OK" "$out"
 check_contains "SysV message queues no longer reach the host namespace" \

@@ -1371,8 +1371,13 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * (apk fchown()s each extracted file to root and a non-root app gets EPERM).
      * Routed through reissue so an Android-blocked fchown emulates ENOSYS rather
      * than trapping from the handler (fchown is in the block-list probe set). */
+    /* fchmod(fd): the same fail-soft. A guest that opens a file and chmods the
+     * descriptor (tar, cp -p, install) has no path for the fchmodat branch to
+     * catch, so without this the fake root saw EPERM where the path form
+     * succeeded. */
     case __NR_fchown:
-        return chattr_result(reissue(a0, a1, a2, a3, a4, a5, __NR_fchown));
+    case __NR_fchmod:
+        return chattr_result(reissue(a0, a1, a2, a3, a4, a5, nr));
 
     /* fstat(fd): no path, but the fd may name an l2s backing file whose
      * st_nlink must reflect the live group count (tar/rsync/ls stat open

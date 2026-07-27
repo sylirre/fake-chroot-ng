@@ -12,6 +12,9 @@ check_contains "geteuid faked to 0"         "geteuid=0"           "$out"
 check_contains "stat ownership remapped to 0" "st_uid=0 st_gid=0" "$out"
 check_contains "/proc/self/exe fixup"       "exe=/bin/sh"         "$out"
 check_contains "fchown faked to success"    "fchown=0"            "$out"
+check_contains "fchmod on a descriptor faked to success" "fchmod=0" "$out"
+check_contains "stat and fstat agree about ownership under --fake-id" \
+    "stat_vs_fstat stat=0:0 fstat=0:0 -> OK" "$out"
 check_contains "fake-root reopens a file it may execute but not read" \
     "fakeroot_reopen: opened=1 mode_kept=1 -> OK" "$out"
 check_contains "a refused reopen is served from the fd we hold, rewound" \

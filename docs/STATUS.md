@@ -1335,6 +1335,22 @@ vfork/`posix_spawn` child-stack handling.
     nofollow exists, follow ENOENT), and 1 in `m7_fidelity.sh` for the symlinked
     `chdir`. Suite: 443 passed, 0 failed.
 
+- [x] **M17-12 — `fstat` and `stat` agree, and `fchmod` fails soft**
+  Two holes in the fake identity, both where an operation names a descriptor
+  instead of a path.
+  - `fstat` was trapped **only under `-l`**, so under `--fake-id` alone
+    `stat("f")` reported the fake owner and `fstat(open("f"))` reported the real
+    one — for the same file. Comparing those two is exactly what an installer
+    does before deciding whether to chown. It is now trapped whenever either
+    feature needs it.
+  - `fchmod(fd)` was never in the fail-soft set, so a guest that opens a file and
+    chmods the descriptor (`tar`, `cp -p`, `install`) got `EPERM` from the
+    unprivileged host where the identical `fchmodat` succeeded.
+  - **Tests:** two legs in `m7_fidelity.sh` (the `fchmod` fail-soft, and a
+    stat/fstat ownership differential on one file) and one in `m5b_monitor.sh`
+    that rebuilds the filter with the identity on and off — the only place the
+    conditional trap set is visible. Suite: 446 passed, 0 failed.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

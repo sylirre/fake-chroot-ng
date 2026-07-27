@@ -79,7 +79,11 @@ static const int id_syscalls[] = {
     __NR_getresuid, __NR_getresgid, __NR_getgroups, __NR_setuid,
     __NR_setgid,    __NR_setresuid, __NR_setresgid, __NR_setreuid,
     __NR_setregid,  __NR_setgroups, __NR_setfsuid,  __NR_setfsgid,
-    __NR_fchown,    __NR_capget,    __NR_capset,
+    /* fchown/fchmod act on an fd, so there is no path to translate — they are
+     * here for the fake-root fail-soft: the guest believes it is root, and a
+     * real chown/chmod it is not allowed to perform must not surface as EPERM
+     * (apk chowns every extracted file). */
+    __NR_fchown,    __NR_fchmod,    __NR_capget,    __NR_capset,
     /* SO_PEERCRED reports the real invoking uid, and ps/tmux/polkit-style peer
      * checks compare it against getuid() — which under --fake-id is the fake id.
      * A guest daemon would reject its own client on the mismatch. */
@@ -105,15 +109,6 @@ static const int ipc_syscalls[] = {
 #endif
 };
 #define NIPC ((int)(sizeof(ipc_syscalls) / sizeof(ipc_syscalls[0])))
-
-/* File syscalls trapped only when -l/--link2symlink is active: fstat must
- * report the emulated st_nlink, getdents64 must hide the backing files. Must
- * match the l2s hooks in dispatch.c. (getdents64 is also trapped for the /proc
- * hidden-process view — see below — so it is listed once, conditionally.) */
-static const int l2s_syscalls[] = {
-    __NR_fstat,
-};
-#define NL2S ((int)(sizeof(l2s_syscalls) / sizeof(l2s_syscalls[0])))
 
 /* The designed-ENOSYS set — arm64chroot's `quiet_enosys`, and the one piece of
  * policy chroot-ng needs that is not translation. These are syscalls a guest
@@ -233,8 +228,8 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
     uint32_t gate_end_lo = (uint32_t)ge;
 
     /* Build the trapped syscall list (path set + SysV IPC set, plus the id set
-     * when faking, plus the l2s set when hardlink emulation is on). */
-    int nr[NPATH + NIPC + NID + NL2S + 1]; /* +1: the conditional getdents64 */
+     * when faking, plus the two conditional entries below). */
+    int nr[NPATH + NIPC + NID + 2];
     int nsys = 0;
     for (int i = 0; i < NPATH; i++)
         nr[nsys++] = path_syscalls[i];
@@ -243,9 +238,13 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
     if (cng_g_fake_id)
         for (int i = 0; i < NID; i++)
             nr[nsys++] = id_syscalls[i];
-    if (cng_g_l2s)
-        for (int i = 0; i < NL2S; i++)
-            nr[nsys++] = l2s_syscalls[i];
+    /* fstat: under -l it must report the emulated st_nlink; under --fake-id it
+     * needs the same ownership remap stat() gets, or stat("f") and
+     * fstat(open("f")) disagree about who owns the very same file — which is
+     * exactly the comparison an installer makes before deciding to chown.
+     * Listed once for either. */
+    if (cng_g_l2s || cng_g_fake_id)
+        nr[nsys++] = __NR_fstat;
     /* getdents64: hides the l2s backing files, and — the reason it is trapped
      * by default — filters host processes out of a /proc listing, which is
      * what `ls /proc` and `ps` actually read. Listed once for either. */

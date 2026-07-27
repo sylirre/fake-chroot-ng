@@ -460,9 +460,39 @@ int cng_cmd_faketest(int argc, char **argv, char **envp, unsigned long *auxv) {
     cng_dprintf(1, "geteuid=%d\n",
                 (int)cng_dispatch(__NR_geteuid, 0, 0, 0, 0, 0, 0, 0));
     /* fchown a real fd (stdout) to root: the unprivileged host can't, so
-     * fake-root must turn the denial into success. */
+     * fake-root must turn the denial into success. fchmod on the same fd is the
+     * mirror image — a guest that opens a file and chmods the descriptor (tar,
+     * cp -p, install) never goes near the fchmodat branch. */
     cng_dprintf(1, "fchown=%d\n",
                 (int)cng_dispatch(__NR_fchown, 1, 0, 0, 0, 0, 0, 1));
+    cng_dprintf(1, "fchmod=%d\n",
+                (int)cng_dispatch(__NR_fchmod, 1, 0644, 0, 0, 0, 0, 1));
+
+    /* stat and fstat must agree about who owns the same file: an installer
+     * compares them before deciding to chown, and the remap used to be applied
+     * only on the path form (fstat was trapped only under -l). */
+    {
+        char fs1[128], fs2[128];
+        long pr = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)file,
+                               (long)fs1, 0, 0, 0, /*trapped=*/0);
+        long fd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)file,
+                               CNG_O_RDONLY, 0, 0, 0, /*trapped=*/0);
+        long fr = fd < 0 ? -1
+                         : cng_dispatch(__NR_fstat, fd, (long)fs2, 0, 0, 0, 0,
+                                        /*trapped=*/0);
+        if (fd >= 0)
+            sys_close((int)fd);
+        cng_dprintf(1, "stat_vs_fstat stat=%u:%u fstat=%u:%u -> %s\n",
+                    pr == 0 ? *(unsigned *)(fs1 + 24) : 0xffffffffu,
+                    pr == 0 ? *(unsigned *)(fs1 + 28) : 0xffffffffu,
+                    fr == 0 ? *(unsigned *)(fs2 + 24) : 0xffffffffu,
+                    fr == 0 ? *(unsigned *)(fs2 + 28) : 0xffffffffu,
+                    (pr == 0 && fr == 0 &&
+                     *(unsigned *)(fs1 + 24) == *(unsigned *)(fs2 + 24) &&
+                     *(unsigned *)(fs1 + 28) == *(unsigned *)(fs2 + 28))
+                        ? "OK"
+                        : "FAIL");
+    }
 
     char sb[256];
     long r = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)file, (long)sb,
@@ -2774,6 +2804,35 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
         int ok = !bad && got == CNG_SECCOMP_RET_KILL_THREAD;
         cng_dprintf(1, "bpftest foreign arch killed -> %s\n", ok ? "OK" : "FAIL");
         fails += !ok;
+    }
+
+    /* The --fake-id set is conditional, and this is the only place its effect on
+     * the filter can be seen: with the identity on, fstat joins the trapped set
+     * (stat and fstat must agree about ownership) along with fchmod (a chmod on
+     * a descriptor needs the same fail-soft the path form gets); with it off both
+     * stay untrapped, so an ordinary fstat costs nothing. Rebuilds the filter, so
+     * it runs after every case above. */
+    {
+        int was = cng_g_fake_id;
+        u32 d[16];
+        int bad = 0;
+        cng_g_fake_id = 0;
+        int n0 = cng_build_seccomp(f, CNG_SECCOMP_MAX_INSNS);
+        bpf_data(d, __NR_fstat, 0x1000, 3);
+        int off_ok = n0 > 0 && bpf_run(f, n0, d, &bad) == CNG_SECCOMP_RET_ALLOW;
+        cng_g_fake_id = 1;
+        int n1 = cng_build_seccomp(f, CNG_SECCOMP_MAX_INSNS);
+        bpf_data(d, __NR_fstat, 0x1000, 3);
+        int on_ok = n1 > 0 && bpf_run(f, n1, d, &bad) == CNG_SECCOMP_RET_TRAP;
+        bpf_data(d, __NR_fchmod, 0x1000, 3);
+        int ch_ok = n1 > 0 && bpf_run(f, n1, d, &bad) == CNG_SECCOMP_RET_TRAP;
+        cng_g_fake_id = was;
+        int ok2 = !bad && off_ok && on_ok && ch_ok;
+        cng_dprintf(1,
+                    "bpftest fake-id: fstat_off=%d fstat_on=%d fchmod_on=%d "
+                    "-> %s\n",
+                    off_ok, on_ok, ch_ok, ok2 ? "OK" : "FAIL");
+        fails += !ok2;
     }
 
     cng_dprintf(1, "bpftest: %d failure(s)\n", fails);
