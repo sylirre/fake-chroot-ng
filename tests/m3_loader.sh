@@ -19,13 +19,16 @@ if guest_cc_report "$GDIR/hello" tests/guests/hello.c; then
     check "guest ELF type matches the link mode ($m3_want)" \
         "$m3_want" "$(elf_type "$GDIR/hello")"
 
-    out=$(CNG_TEST=hello run / "$GDIR/hello" AA BB 2>&1); rc=$?
+    # CNG_TEST is set in BOTH environments and the guest must see the -E value:
+    # the host environment is not inherited at all (M17-16 covers the scrubbing
+    # itself; here it is the -E entry's trip through the stack builder).
+    out=$(CNG_TEST=host run -E CNG_TEST=hello / "$GDIR/hello" AA BB 2>&1); rc=$?
     check "loader exit code propagates (42)" 42 $rc
     check_contains "guest ran (argc)" "guest: argc=3" "$out"
     check_contains "argv0 forwarded" "argv0=$GDIR/hello" "$out"
     check_contains "argv1 forwarded" "guest: argv1=AA" "$out"
     check_contains "argv2 forwarded" "guest: argv2=BB" "$out"
-    check_contains "env forwarded" "guest: CNG_TEST=hello" "$out"
+    check_contains "-E env forwarded, host value not" "guest: CNG_TEST=hello" "$out"
     check_contains "guest made a syscall (pid)" "guest: pid=" "$out"
 
     # file-backed mapping path (-F): the fallback used on Android when the

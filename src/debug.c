@@ -1814,7 +1814,7 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
      * mktemp rootfs keys a fresh broker per run. */
     static char *gargv[] = {"/bin/busybox", "sh", "-c", "true", 0};
     static char *genvp[] = {"PATH=/usr/bin:/bin", "HOME=/root", 0};
-    cng_g_envp = envp; /* shared_dir env lookups (file-tier fallback) */
+    cng_g_host_envp = envp; /* shared_dir env lookups (file-tier fallback) */
     cng_g_shared_proc = 1;
     cng_procfs_init();
     cng_procreg_publish(gargv, genvp, 0, 0, cng_g_exe_guest, "/");
@@ -2506,7 +2506,7 @@ int cng_cmd_shmtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     (void)argc;
     (void)argv;
     (void)auxv;
-    cng_g_envp = envp; /* the broker's env lookups (CNG_SHM_FORCE_FILE, TMPDIR) */
+    cng_g_host_envp = envp; /* the broker's env lookups (CNG_SHM_FORCE_FILE, TMPDIR) */
     int fails = 0;
     int self = (int)sys_getpid();
     unsigned long pg = cng_page_size;

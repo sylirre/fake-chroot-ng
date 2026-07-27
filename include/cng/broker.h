@@ -103,7 +103,9 @@ int cng_broker_table_fd(const char *rootfs_key);
  * write, so the app's own tmp dirs are accepted next. */
 const char *cng_broker_shared_dir(void);
 
-/* Scan the exec-time environment for `name` (no libc getenv here). */
+/* Scan chroot-ng's own (host) environment for `name` (no libc getenv here). This
+ * is where every CNG_* knob is read; the guest's environment is a separate,
+ * deliberately clean vector (see cng_run) and is never consulted. */
 const char *cng_broker_env(const char *name);
 
 /* The namespace key hash (fnv1a32), shared with procreg.c's file tier so the

@@ -74,9 +74,10 @@ if [ -n "$GUESTCC" ] &&
     check_contains "argv0 survives the colliding load" "argv0=/bin/hello" "$out"
     check_contains "argv1 survives the colliding load" "argv1=from-execer" "$out"
     # envp goes through the same snapshot, so guard it too — though not against
-    # this bug: execer passes the inherited environ, which lives on the original
-    # stack and no image load touches. This one is a check on the copy itself.
-    out=$(CNG_TEST=collide run -R "$XR" /bin/execer 2>/dev/null)
+    # this bug: execer passes the environ it inherited (the environment chroot-ng
+    # built from -E), which lives on the original stack and no image load
+    # touches. This one is a check on the copy itself.
+    out=$(run -R -E CNG_TEST=collide "$XR" /bin/execer 2>/dev/null)
     check_contains "the environment still reaches the exec'd program" \
         "CNG_TEST=collide" "$out"
 else

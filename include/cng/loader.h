@@ -68,8 +68,15 @@ int cng_load_elf_fd(int fd, unsigned long base_hint, struct cng_loaded *out);
  * the kernel bounds ARG_MAX against RLIMIT_STACK. */
 #define CNG_GUEST_STACK_SIZE (64UL << 20)
 
+/* Upper bound on -E/--env entries. The guest environment is assembled from those
+ * plus the two inherited terminal variables (see cng_run), so a vector holding
+ * the result needs CNG_MAX_ENV + 3 slots. */
+#define CNG_MAX_ENV 128
+
 /* Build the initial process stack (argc/argv/envp/auxv) for the loaded program
- * (and optional interpreter) and return the guest stack pointer. */
+ * (and optional interpreter) and return the guest stack pointer. `envp` is the
+ * GUEST environment — for the initial program the one cng_run assembled, not the
+ * host's; for an emulated execve whatever the guest passed. */
 unsigned long cng_build_stack(int argc, char **argv, char **envp,
                               unsigned long *host_auxv,
                               const struct cng_loaded *prog,

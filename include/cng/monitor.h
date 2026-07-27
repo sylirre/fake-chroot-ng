@@ -158,9 +158,12 @@ void cng_note_blocked(int nr);
  * result is an error other than ENOENT, with the path where available. */
 extern int cng_g_debug;
 
-/* The exec-time environment, stashed at startup for the few places that need
- * an env lookup after argv/envp are out of reach (procreg.c's shared_dir). */
-extern char **cng_g_envp;
+/* chroot-ng's OWN (host) environment, stashed at startup for the few places that
+ * need an env lookup after argv/envp are out of reach (procreg.c's shared_dir,
+ * the CNG_* knobs). Never the guest's: the guest gets a clean environment built
+ * from -E/--env (see cng_run), and the two must not be confused — a CNG_* knob
+ * is read from here, an -E entry is only ever handed to the guest. */
+extern char **cng_g_host_envp;
 
 /* Resolve a guest path to a host path, following symlinks within the guest
  * (absolute link targets re-rooted into the rootfs). deref_final follows the

@@ -38,11 +38,15 @@ else
     else
         fail=$((fail + 1)); printf '  FAIL guest not dynamic\n'
     fi
+    # Both go in with -E: ld.so reads LD_LIBRARY_PATH from the environment on the
+    # stack the loader built, and that environment is not inherited from the host
+    # (M17-16) — so the host's copy of either variable would never arrive.
     if [ -n "$M4_SYSROOT" ]; then
-        out=$(CNG_TEST=dyn LD_LIBRARY_PATH="$M4_SYSROOT/lib" \
-            run -L "$M4_SYSROOT" / "$GDIR/hello_dyn" XX YY 2>&1); rc=$?
+        out=$(run -L "$M4_SYSROOT" -E CNG_TEST=dyn \
+            -E LD_LIBRARY_PATH="$M4_SYSROOT/lib" \
+            / "$GDIR/hello_dyn" XX YY 2>&1); rc=$?
     else
-        out=$(CNG_TEST=dyn run / "$GDIR/hello_dyn" XX YY 2>&1); rc=$?
+        out=$(run -E CNG_TEST=dyn / "$GDIR/hello_dyn" XX YY 2>&1); rc=$?
     fi
     check "dynamic exit code (42)" 42 $rc
     check_contains "ld.so bootstrapped main (argc)" "guest: argc=3" "$out"

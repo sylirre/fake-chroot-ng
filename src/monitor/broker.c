@@ -171,7 +171,7 @@ static int broker_recv(int sock, void *data, unsigned len, int *fd_out) {
 
 const char *cng_broker_env(const char *name) {
     size_t nl = strlen(name);
-    for (char **e = cng_g_envp; e && *e; e++)
+    for (char **e = cng_g_host_envp; e && *e; e++)
         if (!strncmp(*e, name, nl) && (*e)[nl] == '=' && (*e)[nl + 1])
             return *e + nl + 1;
     return 0;

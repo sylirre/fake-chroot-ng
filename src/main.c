@@ -29,7 +29,7 @@
 /* --- the run + probe + self-test entry points (own translation units) ----- */
 int cng_run(const char *rootfs, const char *libprefix,
             const char *const *bind_g, const char *const *bind_h,
-            const int *bind_ro, int nb,
+            const int *bind_ro, int nb, char *const *env_set, int ne,
             int gargc, char **gargv, char **envp, unsigned long *auxv);
 int cng_cmd_probe(int argc, char **argv, char **envp, unsigned long *auxv);
 
@@ -312,6 +312,17 @@ static void help(char **envp) {
                       "EROFS). DST must be absolute; host paths may not contain "
                       "':'. Note the order is host-first, matching arm64chroot "
                       "— it was GUEST:HOST before 0.1.0."},
+        {"-E, --env VAR=VAL", "Set a guest environment variable (repeatable, up "
+                      "to 128). The guest does NOT inherit chroot-ng's "
+                      "environment: a host variable describes the host, not the "
+                      "rootfs — PATH, HOME, LD_*, XDG_*, TMPDIR would each send "
+                      "a guest looking outside it — so only TERM and COLORTERM "
+                      "are carried over (they describe the terminal both sides "
+                      "share) and everything else the guest needs is set here. "
+                      "The name is the text before the first '=', so a value may "
+                      "contain more of them; a spec with no '=' is an error. An "
+                      "-E entry overrides an inherited TERM/COLORTERM, and a "
+                      "repeated name keeps the last value."},
         {"-u, --fake-id[=ID]", "Present a fake user identity. ID is a uid or "
                       "uid:gid (a bare -u/--fake-id defaults to 0:0, root; a "
                       "single number sets both uid and gid). Credential syscalls "
@@ -401,6 +412,7 @@ static void help(char **envp) {
         "chroot-ng --probe",
         "chroot-ng -u ./rootfs /bin/sh",
         "chroot-ng --fake-id 1000:1000 --setuid-root --setgid-root ./rootfs /bin/su -",
+        "chroot-ng -u -E HOME=/root -E PATH=/usr/bin:/bin ./rootfs /bin/sh -l",
         "chroot-ng -u -l ./rootfs /sbin/apk add busybox",
         "chroot-ng -R -b /data/local/tmp:/tmp ./rootfs /bin/busybox sh",
         "chroot-ng / /usr/bin/uname -a",
@@ -432,6 +444,10 @@ static void help(char **envp) {
     help_defs(fd, opts, (int)(sizeof opts / sizeof *opts), w);
 
     help_section(fd, "ENVIRONMENT");
+    help_wrap(fd, "Read from chroot-ng's own environment. None of it reaches the "
+                  "guest, whose environment is built from -E/--env plus an "
+                  "inherited TERM/COLORTERM.", w, 2, 0);
+    out_ch(fd, '\n');
     help_defs(fd, env, (int)(sizeof env / sizeof *env), w);
 
     help_section(fd, "EXAMPLES");
@@ -574,6 +590,38 @@ static int add_bind(char *spec, const char **bind_g, const char **bind_h,
     return 0;
 }
 
+/* Register an "-E VAR=VAL" entry for the guest environment (the guest inherits
+ * nothing else but TERM/COLORTERM — see build_guest_env in run.c).
+ *
+ * The name is everything before the first '=', so a value may contain more of
+ * them. A spec with no '=' at all is refused rather than guessed at: passing the
+ * bare string through would put an entry in envp that no getenv() can ever match,
+ * and silently inheriting the host's value of that name would make a mistyped
+ * name do nothing at all. A repeated name overwrites the earlier entry in place
+ * instead of appending a duplicate, which getenv() (first match) and a shell
+ * re-exporting envp (last match) would disagree about.
+ * Returns 0, or -1 with a diagnostic. */
+static int add_env(char *spec, char **env_set, int *ne) {
+    const char *eq = strchr(spec, '=');
+    if (!eq || eq == spec) {
+        cng_dprintf(2, "chroot-ng: --env '%s': expected VAR=VAL\n", spec);
+        return -1;
+    }
+    size_t klen = (size_t)(eq - spec) + 1;   /* compare through the '=' */
+    for (int k = 0; k < *ne; k++)
+        if (!strncmp(env_set[k], spec, klen)) {
+            env_set[k] = spec;
+            return 0;
+        }
+    if (*ne >= CNG_MAX_ENV) {
+        cng_dprintf(2, "chroot-ng: too many --env entries (max %d)\n",
+                    CNG_MAX_ENV);
+        return -1;
+    }
+    env_set[(*ne)++] = spec;
+    return 0;
+}
+
 /* --- entry point ---------------------------------------------------------- */
 
 int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
@@ -583,6 +631,8 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
     const char *bind_h[CNG_MAX_BINDS];
     int bind_ro[CNG_MAX_BINDS];
     int nb = 0;
+    char *env_set[CNG_MAX_ENV];   /* -E entries; every one points into argv */
+    int ne = 0;
 
     /* GNU-style options: single-letter short (-R), --word long. Value-taking
      * options accept "-b VAL"/"-bVAL" and "--bind VAL"/"--bind=VAL"; no-arg
@@ -655,6 +705,13 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
                     spec = argv[++i];
                 }
                 if (add_bind(spec, bind_g, bind_h, bind_ro, &nb) < 0) return 2;
+            } else if (!strcmp(n, "env")) {
+                char *spec = val;
+                if (!spec) {
+                    if (i + 1 >= argc) return err_needarg("--env");
+                    spec = argv[++i];
+                }
+                if (add_env(spec, env_set, &ne) < 0) return 2;
             } else if (!strcmp(n, "lib-prefix")) {
                 if (val) libprefix = val;
                 else {
@@ -695,6 +752,11 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
                     if (!spec) return err_needarg("-b");
                     if (add_bind(spec, bind_g, bind_h, bind_ro, &nb) < 0) return 2;
                     break;
+                } else if (c == 'E') {
+                    char *spec = *p ? p : (i + 1 < argc ? argv[++i] : 0);
+                    if (!spec) return err_needarg("-E");
+                    if (add_env(spec, env_set, &ne) < 0) return 2;
+                    break;
                 } else if (c == 'L') {
                     char *v = *p ? p : (i + 1 < argc ? argv[++i] : 0);
                     if (!v) return err_needarg("-L");
@@ -722,6 +784,6 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
     char **gargv = argv + i + 1;
     int gargc = argc - i - 1;
 
-    return cng_run(rootfs, libprefix, bind_g, bind_h, bind_ro, nb, gargc, gargv, envp,
-                   auxv);
+    return cng_run(rootfs, libprefix, bind_g, bind_h, bind_ro, nb, env_set, ne,
+                   gargc, gargv, envp, auxv);
 }

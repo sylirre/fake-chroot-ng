@@ -60,8 +60,11 @@ Source-level contract for a new `tests/mNN_*.sh`:
   emits the right diagnosis on its own. Never invoke a compiler by name.
 - `guest_xlate_ready WHAT` before any leg that needs a compiled guest's *own*
   path syscalls to be translated.
-- `check`, `check_contains`, `skip` for reporting — `skip` keeps the count
-  honest.
+- `check`, `check_contains`, `check_absent`, `skip` for reporting — `skip` keeps
+  the count honest.
+- A guest inherits no host environment (M17-16). What a guest program must see
+  goes in with `-E VAR=VAL`; a `VAR=val run …` prefix reaches chroot-ng only,
+  which is how the `CNG_*` knobs are set.
 - `elf_type` / `elf_machine` / `elf_has_interp` instead of `file(1)`, which a
   bare Termux does not have.
 - Prefer a directory you created over a host path (`/usr`, `/tmp`, `/run` and

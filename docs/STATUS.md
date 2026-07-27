@@ -1105,6 +1105,37 @@ vfork/`posix_spawn` child-stack handling.
     hides the bug entirely — and asserts argv0/argv1 survive; verified to fail
     on the pre-fix binary and pass after. Suite: 317 passed, 0 failed.
 
+- [x] **M17-16 — the guest environment is built, not inherited** (`-E/--env`)
+  A guest received our whole environment, and almost none of it described the
+  world it was about to run in: `PATH`, `HOME`, `LD_LIBRARY_PATH`, `XDG_*`,
+  `TMPDIR`, `SHELL` all named host locations the rootfs has its own copies of,
+  and chroot-ng's own `CNG_*` knobs went along for the ride. The guest now starts
+  from a clean environment: `-E/--env VAR=VAL` entries (repeatable, up to
+  `CNG_MAX_ENV` = 128) plus `TERM`/`COLORTERM`, the two that describe the
+  terminal both sides share. Oracle parity — `busybox env` under `-E FOO=bar`
+  prints the same three lines arm64chroot does.
+  - The host/guest split is explicit in the code now: `cng_g_envp` — read by every
+    `CNG_*` knob and by `cng_broker_env` — is `cng_g_host_envp`, and the guest's
+    vector is assembled by `build_guest_env` (`src/run.c`) and handed to
+    `cng_build_stack`. The emulated `execve` is untouched: it carries the guest's
+    own `envp`, exactly as a real one does.
+  - An `-E` entry *replaces* rather than shadows, both for a repeated name and for
+    an override of an inherited `TERM`: `getenv()` takes the first duplicate while
+    a shell re-exporting `envp` keeps the last, so emitting both would leave the
+    two disagreeing about which value won.
+  - A spec with no `=` is refused (exit 2) rather than passed through as an entry
+    no `getenv` could ever match — the oracle passes that string straight into
+    `envp`. Nothing is synthesized for the guest either: a shell supplies its own
+    default `PATH`, and inventing a `HOME` would be guessing.
+  - **Tests:** new `tests/m17_env.sh`, 30 legs. The entry *count* carries the
+    scrubbing assertion (host `CNG_*`, `HOME` and `LD_LIBRARY_PATH` canaries are
+    set on every run), and two exact-match legs make the Alpine guest's own
+    `env(1)` and its `/proc/self/environ` agree on the same three entries. M3, M4
+    and M8 proved env forwarding by setting a host variable and now use `-E` —
+    M4's `LD_LIBRARY_PATH` for ld.so among them, which is the one place the
+    scrubbing would otherwise have broken a working test rather than a leak.
+    Suite: 347 passed, 0 failed.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

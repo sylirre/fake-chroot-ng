@@ -9,6 +9,9 @@
  *   bind_g/h/ro  nb bind mounts: guest path bind_g[i] is backed by host path
  *              bind_h[i], read-only when bind_ro[i] (the CLI spells this
  *              SRC:DST[:ro], host first)
+ *   env_set/ne  the ne -E/--env "VAR=VAL" entries, in command-line order, one
+ *              per name; they and the inherited terminal pair are the guest's
+ *              whole environment (see build_guest_env)
  *   gargv/gargc  the guest program (gargv[0]) and its arguments
  *
  * The credential/rewrite/loader flags (cng_g_fake_id, cng_g_rewrite,
@@ -56,18 +59,59 @@ static char *join2(char *dst, size_t size, const char *a, const char *b) {
     return dst;
 }
 
+/* Assemble the guest environment into `out` (CNG_MAX_ENV + 3 slots) and
+ * NULL-terminate it.
+ *
+ * The guest starts from a clean slate rather than inheriting ours: a host
+ * variable describes the host, not the rootfs — PATH, HOME, LD_*, XDG_*,
+ * TMPDIR, SHELL would every one of them send a guest looking at host paths for
+ * things the rootfs has its own copies of — and our own CNG_* knobs have no
+ * business in a guest's environment either. Only the terminal-appearance pair is
+ * inherited, because TERM/COLORTERM describe the tty both sides share; anything
+ * else the guest needs is spelled out with -E/--env.
+ *
+ * An -E entry wins over the inherited value. Emitting both as duplicates would
+ * not be enough: getenv() takes the first match and a shell re-exporting envp
+ * keeps the last, so the two would disagree about which -E took effect. */
+static void build_guest_env(char *const *env_set, int ne, char **host,
+                            char **out) {
+    static const char *const keep[] = {"TERM=", "COLORTERM="};
+    int n = 0;
+    for (int i = 0; i < ne; i++)
+        out[n++] = env_set[i];
+    for (unsigned k = 0; k < sizeof keep / sizeof *keep; k++) {
+        size_t kl = strlen(keep[k]);
+        int overridden = 0;
+        for (int i = 0; i < ne; i++)
+            if (!strncmp(env_set[i], keep[k], kl)) {
+                overridden = 1;
+                break;
+            }
+        if (overridden)
+            continue;
+        for (char **e = host; e && *e; e++)
+            if (!strncmp(*e, keep[k], kl)) {
+                out[n++] = *e;
+                break;
+            }
+    }
+    out[n] = 0;
+}
+
 int cng_run(const char *rootfs, const char *libprefix,
             const char *const *bind_g, const char *const *bind_h,
-            const int *bind_ro, int nb,
+            const int *bind_ro, int nb, char *const *env_set, int ne,
             int gargc, char **gargv, char **envp, unsigned long *auxv) {
     const char *prog_guest = gargv[0];
 
     /* Capture host auxv (for emulated execve), the guest exe path (for
-     * /proc/self/exe fixups) and the environment (for env lookups after
-     * argv/envp are out of reach — procreg.c's shared_dir). */
+     * /proc/self/exe fixups) and our own environment (for the CNG_* knobs and
+     * for env lookups after argv/envp are out of reach — procreg.c's
+     * shared_dir). This is the host environment throughout; the guest's is
+     * `genv` below. */
     cng_host_auxv = auxv;
     cng_g_exe_guest = prog_guest;
-    cng_g_envp = envp;
+    cng_g_host_envp = envp;
 
     /* Key the System V shm namespace to this invocation (unless --shared-proc
      * widens it to the rootfs). Seeded here, in the root process while we are
@@ -95,6 +139,13 @@ int cng_run(const char *rootfs, const char *libprefix,
     if (cng_g_debug)
         cng_dprintf(2, "[cng] chroot-ng %s (built %s %s)\n", CNG_VERSION,
                     __DATE__, __TIME__);
+
+    /* The environment the guest will see, built from -E/--env plus TERM /
+     * COLORTERM — everything the knob scan above just read stays on our side of
+     * the line. It only has to outlive cng_build_stack, which copies the strings
+     * onto the guest stack. */
+    char *genv[CNG_MAX_ENV + 3];
+    build_guest_env(env_set, ne, envp, genv);
 
     /* Fake identity (--fake-id): establish it from the real invoking ids (which
      * are also the stat-remap source). See cng_cred_setup for the implied-vs-
@@ -173,11 +224,11 @@ int cng_run(const char *rootfs, const char *libprefix,
                         load_err(rc2));
             return 1;
         }
-        sp = cng_build_stack(gargc, gargv, envp, auxv, &prog, &interp,
+        sp = cng_build_stack(gargc, gargv, genv, auxv, &prog, &interp,
                              prog_guest);
         entry = interp.entry;
     } else {
-        sp = cng_build_stack(gargc, gargv, envp, auxv, &prog, 0, prog_guest);
+        sp = cng_build_stack(gargc, gargv, genv, auxv, &prog, 0, prog_guest);
         entry = prog.entry;
     }
     /* (svc rewriting + its pool are handled inside the loader, per object.) */

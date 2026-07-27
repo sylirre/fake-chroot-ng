@@ -58,7 +58,8 @@ chroot-ng --help                                   # full option reference
 host-native binaries directly); `<program>` is an absolute path inside it.
 Common options: `-u/--fake-id[=ID]` (fake user identity — `ID` is a `uid` or
 `uid:gid`, defaulting to `0:0` root), `-b/--bind SRC:DST[:ro]` (expose host
-directory SRC at guest path DST, read-only with `:ro`), `-l/--link2symlink` (emulate hardlinks where the host refuses `link(2)`),
+directory SRC at guest path DST, read-only with `:ro`), `-E/--env VAR=VAL` (set a
+guest environment variable — see below), `-l/--link2symlink` (emulate hardlinks where the host refuses `link(2)`),
 `-R/--rewrite` (ahead-of-time `svc` rewriting), `--no-proc` (turn off the `/proc`
 emulation described below), `--no-dev` (turn off the `/dev` passthrough),
 `--share-abstract-sockets` (don't isolate abstract AF_UNIX names per rootfs), `--shared-proc` (share the process view between
@@ -121,8 +122,19 @@ SysV IPC and no `/dev/shm`. Segments are shared by every process of one
 invocation and isolated between invocations, unless `--shared-proc` widens the
 namespace to the rootfs.
 
+**The environment** is built, not inherited. A host variable describes the host
+rather than the rootfs — `PATH`, `HOME`, `LD_LIBRARY_PATH`, `XDG_*`, `TMPDIR`
+would every one of them send a guest looking outside its own filesystem for
+things the rootfs has its own copies of — so the guest starts from a clean
+environment. Only `TERM` and `COLORTERM` are carried over, because they describe
+the terminal both sides share, and everything else is spelled out with
+`-E/--env VAR=VAL` (repeatable; an `-E` entry overrides an inherited
+`TERM`/`COLORTERM`, and a repeated name keeps the last value). chroot-ng's own
+`CNG_*` knobs are read from its own environment and are not part of the guest's.
+
 ```sh
 chroot-ng -u ./rootfs /bin/sh              # fake root (uid/gid 0)
+chroot-ng -u -E HOME=/root -E TZ=UTC ./rootfs /bin/sh -l
 chroot-ng --fake-id 1000:1000 ./rootfs /bin/sh
 # non-root, but setuid-root `su` still works (--setuid/--setgid-root imply -u):
 chroot-ng --fake-id 1000:1000 --setuid-root --setgid-root ./rootfs /bin/su -

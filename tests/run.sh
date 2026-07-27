@@ -37,6 +37,19 @@ check_contains() { # desc, needle, haystack
     esac
 }
 
+check_absent() { # desc, needle, haystack
+    case "$3" in
+    *"$2"*)
+        fail=$((fail + 1))
+        printf '  FAIL %s (present: %s)\n' "$1" "$2"
+        ;;
+    *)
+        pass=$((pass + 1))
+        printf '  ok   %s\n' "$1"
+        ;;
+    esac
+}
+
 cng_platform_init
 trap 'rm -rf "$CNG_TMP"' EXIT INT TERM
 cng_platform_banner
@@ -76,6 +89,7 @@ if [ -f tests/m12_shm.sh ]; then . tests/m12_shm.sh; fi
 if [ -f tests/m14_dev.sh ]; then . tests/m14_dev.sh; fi
 if [ -f tests/m15_unixsock.sh ]; then . tests/m15_unixsock.sh; fi
 if [ -f tests/m16_netlink.sh ]; then . tests/m16_netlink.sh; fi
+if [ -f tests/m17_env.sh ]; then . tests/m17_env.sh; fi
 
 echo
 echo "== summary: $pass passed, $fail failed, $skipped skipped =="
