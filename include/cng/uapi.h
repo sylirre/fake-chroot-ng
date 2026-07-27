@@ -93,6 +93,8 @@
 #define CNG_PR_GET_NO_NEW_PRIVS 39
 #define CNG_PR_SET_SECCOMP      22
 #define CNG_PR_GET_SECCOMP      21
+#define CNG_PR_SET_TAGGED_ADDR_CTRL 55
+#define CNG_PR_GET_TAGGED_ADDR_CTRL 56
 
 /* seccomp */
 #define CNG_SECCOMP_MODE_FILTER      2

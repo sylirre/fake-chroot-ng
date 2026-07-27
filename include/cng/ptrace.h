@@ -102,11 +102,18 @@ static inline struct cng_uregs *cng_pt_uregs(struct cng_ucontext *uc) {
 #define CNG_PTRACE_EVENT_EXIT        6
 #define CNG_PTRACE_EVENT_STOP        128
 
-/* NT_* regsets GETREGSET/SETREGSET understand. */
-#define CNG_NT_PRSTATUS         1
-#define CNG_NT_PRFPREG          2
-#define CNG_NT_ARM_TLS          0x401
-#define CNG_NT_ARM_SYSTEM_CALL  0x404
+/* NT_* regsets GETREGSET/SETREGSET understand. Everything else answers -EINVAL,
+ * which is what the kernel answers for a regset the machine does not have —
+ * and what gdb expects for the ones it merely probes (NT_ARM_SVE,
+ * NT_ARM_HW_BREAK/WATCH). The two below it does *not* merely probe are here for
+ * that reason: it asks for them whenever AT_HWCAP says the CPU has the feature,
+ * and treats a failure as fatal. */
+#define CNG_NT_PRSTATUS              1
+#define CNG_NT_PRFPREG               2
+#define CNG_NT_ARM_TLS               0x401
+#define CNG_NT_ARM_SYSTEM_CALL       0x404
+#define CNG_NT_ARM_PAC_MASK          0x406
+#define CNG_NT_ARM_TAGGED_ADDR_CTRL  0x409
 
 /* The signal chroot-ng reserves to kick a running task to a stop point
  * (PTRACE_ATTACH/SEIZE/INTERRUPT, a cooperative group-stop, and arming a

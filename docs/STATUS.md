@@ -1497,6 +1497,24 @@ vfork/`posix_spawn` child-stack handling.
     makes gdb work: a breakpoint is a `brk` poked into read-only text (we
     mprotect, write, flush the icache and put the mapping back), and it arrives
     as a `SIGTRAP` stop.
+  - **The regsets gdb needs, not just the ones we needed.** `GETREGSET`
+    answers `NT_PRSTATUS`, `NT_PRFPREG` (from the signal frame's FP record, so
+    `sigreturn` writes back what a tracer sets), `NT_ARM_TLS` and
+    `NT_ARM_SYSTEM_CALL`. gdb also asks for `NT_ARM_PAC_MASK` whenever
+    `AT_HWCAP` advertises pointer authentication — which we forward from the
+    host verbatim — and treats a failure as fatal ("unable to fetch pauth
+    registers"), which is what an on-device session first hit. The kernel's
+    answer is `GENMASK(54, vabits_actual)` and nothing exports the VA size, so
+    ours is *measured*: sign one pointer under 96 modifiers and OR the
+    differences, since every bit of the PAC field flips in about half of them
+    and every bit outside it never moves (bits above 54 are then dropped, as the
+    kernel's mask never includes the top byte). `NT_ARM_TAGGED_ADDR_CTRL` — the
+    same fatal ask on an MTE device — is answered from the task's own
+    `prctl(PR_GET_TAGGED_ADDR_CTRL)`, and settable the same way. Everything else
+    stays `-EINVAL`, which is what the kernel says for a regset the machine does
+    not have and what gdb expects for the ones it merely probes (`NT_ARM_SVE`,
+    `NT_ARM_HW_BREAK`/`WATCH` — so hardware watchpoints are unavailable and
+    software breakpoints carry debugging).
   - **`PTRACE_SINGLESTEP` in software** (`src/monitor/ptstep.c`), because
     hardware single-step is `PSTATE.SS` and only the kernel's own ptrace can arm
     it: decode the instruction at pc, evaluate the condition against the frame's

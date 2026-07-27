@@ -3114,7 +3114,7 @@ static int pt_sim_child(int wfd) {
     return (long)uc.uc_mcontext.regs[0] == sys_getpid() ? 0 : 92;
 }
 
-static int pt_sim_sigsys(void) {
+static int pt_sim_sigsys(unsigned long *auxv) {
     int fds[2];
     if (CNG_SYS(__NR_pipe2, fds, 0, 0, 0, 0, 0) < 0) {
         cng_dprintf(1, "ptracetest sigsys tier: no pipe -> FAIL\n");
@@ -3148,6 +3148,39 @@ static int pt_sim_sigsys(void) {
     cng_dprintf(1, "ptracetest sigsys tier: syscall-entry stop -> %s\n",
                 ok ? "OK" : "FAIL");
     fails += !ok;
+
+    /* NT_ARM_PAC_MASK, which gdb asks for whenever AT_HWCAP advertises pointer
+     * authentication and is fatal about ("unable to fetch pauth registers").
+     * The kernel's answer is GENMASK(54, vabits_actual); ours is measured, so
+     * check the shape it must have — a contiguous field ending at bit 54 — and
+     * print it, since no oracle here can confirm the exact width. */
+    {
+        u64 pac[2] = {0, 0};
+        u64 piov[2] = {(u64)(unsigned long)pac, sizeof pac};
+        long pr = cng_pt_syscall(CNG_PTRACE_GETREGSET, kid,
+                                 CNG_NT_ARM_PAC_MASK,
+                                 (u64)(unsigned long)piov);
+        unsigned long hwcap = 0;
+        for (unsigned long *a = auxv; a && a[0]; a += 2)
+            if (a[0] == 16 /*AT_HWCAP*/)
+                hwcap = a[1];
+        if (hwcap & (1UL << 30)) {
+            int shape = pac[0] != 0 && pac[0] == pac[1] &&
+                        (pac[0] & ~0x007FFFFFFFFFFFFFuLL) == 0 &&
+                        pac[0] + (pac[0] & (~pac[0] + 1)) ==
+                            0x0080000000000000uLL;
+            ok = pr == 0 && piov[1] == sizeof pac && shape;
+            cng_dprintf(1,
+                        "ptracetest sigsys tier: pauth mask 0x%lx -> %s\n",
+                        (unsigned long)pac[0], ok ? "OK" : "FAIL");
+        } else {
+            ok = pr < 0; /* no PAC here: the kernel refuses it too */
+            cng_dprintf(1,
+                        "ptracetest sigsys tier: no pauth, refused -> %s\n",
+                        ok ? "OK" : "FAIL");
+        }
+        fails += !ok;
+    }
 
     /* The register file the tracer sees is the trapped ucontext itself. */
     struct cng_uregs regs;
@@ -3186,6 +3219,10 @@ int cng_cmd_ptracetest(int argc, char **argv, char **envp, unsigned long *auxv) 
     (void)argv;
     (void)envp;
     (void)auxv;
+    /* The pauth-mask probe reads AT_HWCAP from here, as it does in a real run
+     * (cng_run sets it long before the monitor). */
+    if (!cng_host_auxv)
+        cng_host_auxv = auxv;
     int fails = 0;
     struct cng_uregs r;
     memset(&r, 0, sizeof r);
@@ -3242,7 +3279,7 @@ int cng_cmd_ptracetest(int argc, char **argv, char **envp, unsigned long *auxv) 
     fails += ptstep_case("braaz is refused, not guessed", 0xD61F0820u, &r, 0, 1);
 
     cng_pt_init();
-    fails += pt_sim_sigsys();
+    fails += pt_sim_sigsys(auxv);
 
     cng_dprintf(1, "ptracetest: %d failure(s)\n", fails);
     return fails ? 1 : 0;

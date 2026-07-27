@@ -390,6 +390,60 @@ static void *pt_fpsimd(struct pt_self *s, struct cng_uregs *r) {
 
 #define PT_FPSIMD_SZ 528 /* 32 * 16 vregs + fpsr + fpcr */
 
+/* PACIA <Xd>, <Xn>: 0xDAC10000 | (Rn << 5) | Rd, spelled as a raw instruction
+ * word so a baseline armv8-a assembler accepts it. Only ever executed once
+ * AT_HWCAP has said the CPU has address authentication — it is UNDEFINED, not a
+ * NOP, on one that does not. */
+static u64 pt_pac_sign(u64 ptr, u64 mod) {
+    register u64 x0 __asm__("x0") = ptr;
+    register u64 x1 __asm__("x1") = mod;
+    __asm__ volatile(".inst 0xdac10020" : "+r"(x0) : "r"(x1));
+    return x0;
+}
+
+static unsigned long pt_auxval(unsigned long tag) {
+    unsigned long *a = cng_host_auxv;
+    if (!a)
+        return 0;
+    for (; a[0]; a += 2)
+        if (a[0] == tag)
+            return a[1];
+    return 0;
+}
+
+/* The pointer-authentication mask, for NT_ARM_PAC_MASK.
+ *
+ * The kernel's answer is GENMASK(54, vabits_actual) — the bits a signed user
+ * pointer carries its PAC in — and we have no way to ask it for that: reading
+ * it back is itself a ptrace request, and the VA size is not exported anywhere
+ * a program can read. So it is measured instead. Sign one pointer under many
+ * modifiers and OR the differences: every bit of the PAC field flips in about
+ * half the samples, so after this many the union *is* the field, while every
+ * bit outside it never moves. Bits above 54 are dropped, since the kernel's
+ * mask never includes the top byte whether or not TBI is on.
+ *
+ * gdb asks for this whenever AT_HWCAP advertises PACA — which we forward from
+ * the host verbatim — and treats a failure as fatal, so an -EINVAL here is the
+ * "unable to fetch pauth registers" that stops a session before it starts. */
+#define PT_HWCAP_PACA (1UL << 30)
+
+static u64 pt_pac_mask(void) {
+    static u64 cached;
+    static int done;
+    if (__atomic_load_n(&done, __ATOMIC_ACQUIRE))
+        return cached;
+    u64 mask = 0;
+    if (pt_auxval(16 /*AT_HWCAP*/) & PT_HWCAP_PACA) {
+        u64 p = (u64)(unsigned long)&cached & 0x00FFFFFFFFFFFFFFuLL;
+        for (int i = 0; i < 96; i++)
+            mask |= pt_pac_sign(p, (u64)i * 0x9E3779B97F4A7C15uLL) ^ p;
+        mask &= 0x007FFFFFFFFFFFFFuLL;
+    }
+    cached = mask;
+    __atomic_store_n(&done, 1, __ATOMIC_RELEASE);
+    return mask;
+}
+
 static u32 pt_build_regset(struct pt_self *s, struct cng_uregs *r, u32 which,
                            u8 *out) {
     switch (which) {
@@ -413,6 +467,28 @@ static u32 pt_build_regset(struct pt_self *s, struct cng_uregs *r, u32 which,
         s32 nr = s && s->link ? (s32)s->link->sc_nr : -1;
         memcpy(out, &nr, 4);
         return 4;
+    }
+    case CNG_NT_ARM_PAC_MASK: {
+        /* struct user_pac_mask { data_mask, insn_mask } — one value twice, as
+         * the kernel reports it (the two can differ only under TCR_EL1.TBID*,
+         * which Linux does not use). */
+        u64 m = pt_pac_mask();
+        if (!m)
+            return 0; /* no address authentication: -EINVAL, as the kernel says */
+        u64 pac[2] = {m, m};
+        memcpy(out, pac, sizeof pac);
+        return (u32)sizeof pac;
+    }
+    case CNG_NT_ARM_TAGGED_ADDR_CTRL: {
+        /* MTE's tagged-address control. gdb asks for it whenever AT_HWCAP2 says
+         * MTE, and is fatal about a failure the same way. The task can read its
+         * own through prctl, so no ptrace is needed to answer. */
+        long v = sys_prctl(CNG_PR_GET_TAGGED_ADDR_CTRL, 0, 0, 0, 0);
+        if (v < 0)
+            return 0;
+        u64 ctl = (u64)v;
+        memcpy(out, &ctl, sizeof ctl);
+        return (u32)sizeof ctl;
     }
     default:
         return 0;
@@ -444,6 +520,17 @@ static long pt_apply_regset(struct pt_self *s, struct cng_uregs *r, u32 which,
         __asm__ volatile("msr tpidr_el0, %0" ::"r"(tls));
         return 0;
     }
+    case CNG_NT_ARM_TAGGED_ADDR_CTRL: {
+        u64 ctl;
+        if (len < 8)
+            return -EINVAL;
+        memcpy(&ctl, in, 8);
+        return sys_prctl(CNG_PR_SET_TAGGED_ADDR_CTRL, (long)ctl, 0, 0, 0) < 0
+                   ? -EINVAL
+                   : 0;
+    }
+    /* NT_ARM_PAC_MASK is read-only in the kernel too (its regset has no
+     * setter), so it falls through to the -EINVAL below. */
     case CNG_NT_ARM_SYSTEM_CALL: {
         s32 nr;
         if (len < 4)

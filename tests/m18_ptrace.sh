@@ -32,6 +32,17 @@ check_contains "SIGSYS tier: the tracer reads the trapped register file" \
     "sigsys tier: regs at the entry stop -> OK" "$ptout"
 check_contains "SIGSYS tier: syscall-exit stop carries the result" \
     "sigsys tier: syscall-exit stop -> OK" "$ptout"
+# The pointer-auth mask gdb asks for whenever AT_HWCAP says PACA, and is fatal
+# about ("unable to fetch pauth registers"). Measured rather than asked for, so
+# what is asserted is the shape the kernel's own answer always has.
+case "$ptout" in
+*"pauth mask"*) check_contains "pauth mask has the kernel's shape" \
+    "pauth mask 0x" "$ptout"
+    check_contains "...and is accepted" "-> OK" \
+        "$(echo "$ptout" | grep 'pauth mask')" ;;
+*) check_contains "no pauth here: the regset is refused as the kernel does" \
+    "no pauth, refused -> OK" "$ptout" ;;
+esac
 
 # The two filters a ptrace role stacks on a task, simulated: they are only
 # installed once a guest traces, and no guest filter runs under qemu-user, so
