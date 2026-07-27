@@ -14,8 +14,10 @@
 /* Generous fixed stack for each loaded program. A real main-thread stack grows
  * on demand to RLIMIT_STACK; ours is a fixed anonymous mapping, so size it well
  * above the common 8 MiB rlimit that recursion-heavy tools (e.g. gcc's cc1) size
- * themselves against. It is virtual — only touched pages commit. */
-#define GUEST_STACK_SIZE (64UL << 20)
+ * themselves against. It is virtual — only touched pages commit.
+ * (CNG_GUEST_STACK_SIZE in loader.h: the argv/envp bound is derived from it, the
+ * way the kernel derives ARG_MAX from RLIMIT_STACK.) */
+#define GUEST_STACK_SIZE CNG_GUEST_STACK_SIZE
 
 static unsigned long auxval(unsigned long *av, unsigned long t) {
     if (!av)

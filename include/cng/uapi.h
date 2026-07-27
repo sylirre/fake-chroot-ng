@@ -69,7 +69,9 @@
 #define CNG_CLOCK_BOOTTIME  7
 
 /* getrlimit/prlimit64 resources */
+#define CNG_RLIMIT_STACK  3
 #define CNG_RLIMIT_NOFILE 7
+#define CNG_RLIM_INFINITY (~0UL)
 
 /* sysinfo() load averages are fixed-point, scaled by 1 << SI_LOAD_SHIFT. */
 #define CNG_SI_LOAD_SHIFT 16

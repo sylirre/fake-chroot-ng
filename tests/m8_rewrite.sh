@@ -42,15 +42,7 @@ fi
 # execve from a rewritten svc site must be emulated in-process (translated,
 # monitor kept), not re-issued raw — raw would exec the untranslated guest path
 # on the host and fail with ENOENT.
-if [ "$GUESTLD" = "-static" ]; then
-    # With a plain -static toolchain both programs are ET_EXEC at the same fixed
-    # 0x400000, and the emulated execve MAP_FIXED-maps the new image there before
-    # it has copied the caller's argv strings — which are .rodata in the OLD
-    # image. The exec'd program then comes up with garbage argv. That is the M3
-    # fixed-vaddr collision (docs/STATUS.md), not something this leg is about, so
-    # it only runs with a relocatable guest.
-    skip "execve-via-rewrite leg: two ET_EXEC guests would collide at 0x400000"
-elif guest_xlate_ready "execve-via-rewrite leg" &&
+if guest_xlate_ready "execve-via-rewrite leg" &&
     guest_cc_report "$ROOT/bin/hello" tests/guests/hello.c &&
     guest_cc_report "$ROOT/bin/execer" tests/guests/execer.c; then
     out=$(m8run -R "$ROOT" /bin/execer 2>/dev/null); rc=$?
@@ -59,3 +51,35 @@ elif guest_xlate_ready "execve-via-rewrite leg" &&
 fi
 
 rm -rf "$ROOT"
+
+# ...and the same chain with BOTH programs non-PIE, which the emulation used to
+# corrupt. Two ET_EXEC images share the link-time vaddr 0x400000, so the
+# MAP_FIXED load of the new one lands on the .rodata/heap holding the very argv
+# strings the caller passed — and those reach the new stack only after the load.
+# The exec'd program still ran and still exited 42, so nothing but an argv
+# assertion catches it. Built here with an explicit -static -no-pie rather than
+# whatever link mode the harness picked, since the collision needs the fixed
+# vaddr: on the usual static-PIE guest each image gets its own base and the bug
+# is invisible.
+XR=$(mktemp -d); mkdir -p "$XR/bin"
+if [ -n "$GUESTCC" ] &&
+    $GUESTCC -static -no-pie -O2 -o "$XR/bin/hello" tests/guests/hello.c \
+        2>"$GUEST_CC_LOG" &&
+    $GUESTCC -static -no-pie -O2 -o "$XR/bin/execer" tests/guests/execer.c \
+        2>>"$GUEST_CC_LOG"; then
+    check "exec chain: both programs are fixed-address ET_EXEC" EXEC \
+        "$(elf_type "$XR/bin/execer")"
+    out=$(run -R "$XR" /bin/execer 2>/dev/null); rc=$?
+    check "ET_EXEC execs ET_EXEC at the same vaddr: exit code" 42 $rc
+    check_contains "argv0 survives the colliding load" "argv0=/bin/hello" "$out"
+    check_contains "argv1 survives the colliding load" "argv1=from-execer" "$out"
+    # envp goes through the same snapshot, so guard it too — though not against
+    # this bug: execer passes the inherited environ, which lives on the original
+    # stack and no image load touches. This one is a check on the copy itself.
+    out=$(CNG_TEST=collide run -R "$XR" /bin/execer 2>/dev/null)
+    check_contains "the environment still reaches the exec'd program" \
+        "CNG_TEST=collide" "$out"
+else
+    skip "fixed-vaddr exec-collision leg: no -static -no-pie AArch64 toolchain"
+fi
+rm -rf "$XR"

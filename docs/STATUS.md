@@ -1073,6 +1073,38 @@ vfork/`posix_spawn` child-stack handling.
     acceptance leg runs busybox `ip addr` from the Alpine rootfs under the
     split, asserting real output. Suite: 310 passed, 0 failed.
 
+- [x] **Fix: the emulated execve read its argv out of the image it had just
+  replaced.** `execve_core` loaded the new program and only then had
+  `cng_build_stack` copy the caller's argv/envp strings onto the new stack. For
+  an ET_EXEC guest the image goes in **MAP_FIXED at its own link-time vaddr**,
+  so when the program calling execve is itself ET_EXEC at that vaddr — which
+  every binary a plain `-static` toolchain produces is, all of them at 0x400000
+  — the load landed exactly on the `.rodata`/`.data`/heap holding those strings
+  (and, under `-R`, the trampoline pool extended the fixed span over the old
+  brk as well). The exec'd program came up with **garbage argv** while still
+  running and still exiting with the right status, so only an argv assertion
+  could see it. This is the M3 fixed-vaddr collision reaching the execve path:
+  relocating chroot-ng itself out of 0x400000 protected the monitor, not one
+  guest from the next.
+  - `path`/`argv`/`envp` are now snapshotted into one anonymous mapping before
+    anything is mapped, and the body works from that copy — so the resolution,
+    the shebang rewrite and the stack build all read memory the load cannot
+    reach (a kernel-placed mapping is in the high mmap region; no ET_EXEC vaddr
+    goes near it). Released once the stack is built, on every path.
+  - The snapshot is bounded and answers `-E2BIG`, which the emulation never did
+    before — argv/envp were simply copied onto the guest stack unchecked (part
+    of the M17-10 gap). The bound is the kernel's own formula, a quarter of
+    `RLIMIT_STACK` floored at 32 pages, clamped to what our fixed 64 MiB guest
+    stack can hold; being the kernel's own, it cannot refuse anything that
+    reached this process through a real execve. Both the pointer slots and the
+    string pool are bounds-checked on copy rather than trusted: the vectors are
+    guest memory and another thread of the exec'ing process can grow them
+    between the sizing pass and the copy.
+  - **Tests:** M8 gained a leg that builds both programs `-static -no-pie`
+    explicitly — the usual static-PIE guest gets a fresh base per image and
+    hides the bug entirely — and asserts argv0/argv1 survive; verified to fail
+    on the pre-fix binary and pass after. Suite: 317 passed, 0 failed.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

@@ -89,27 +89,127 @@ void cng_close_cloexec(void) {
     sys_close((int)dfd);
 }
 
-/* Shared emulation core: resolve the target (shebang-aware), load it, build its
- * stack, and pass the commit point (close FD_CLOEXEC fds, reset signal
- * dispositions, retarget /proc/self/exe). Returns -errno on failure (all of
- * which occur before the commit point), or 0 with *out_sp and *out_entry set
- * for the caller to transfer control into the new program. */
-static long execve_core(int dirfd, const char *path, char **argv, char **envp,
-                        unsigned long *out_sp, unsigned long *out_entry) {
-    if (cng_g_debug)
-        cng_dprintf(2, "[cng] execve enter path=%s\n", path ? path : "(null)");
+/* argv/envp snapshot.
+ *
+ * The strings the exec'ing program hands us are copied into the NEW program's
+ * stack, and that copy happens after the new image is mapped. An ET_EXEC guest
+ * is mapped MAP_FIXED at its own link-time vaddr — so when the program calling
+ * execve is itself ET_EXEC at that same vaddr (every binary a plain `-static`
+ * toolchain produces lands at 0x400000), the load lands right on top of the
+ * .rodata/.data/heap holding those strings, and the exec'd program came up with
+ * garbage argv. The old image is legitimately dead by then, being replaced; what
+ * was wrong is reading the caller's arguments out of it afterwards.
+ *
+ * So take our own copy of path/argv/envp up front, before anything is mapped.
+ * One kernel-placed anonymous mapping: it lands in the high mmap region, which
+ * no ET_EXEC vaddr reaches, and is released once the stack is built. The total
+ * is bounded the way a real execve bounds it, with the same -E2BIG (which the
+ * emulation never answered before — the strings just ran off the guest stack). */
+struct exec_args {
+    void *mem;
+    unsigned long len;
+    const char *path;
+    char **argv;
+    char **envp;
+};
 
-    if (!path)
-        return -EFAULT;
-    /* l2s machinery is invisible to the guest — not executable either. Both
-     * tiers (SIGSYS cng_emulate_execve, -R cng_execve_tramp) come through
-     * here, so this covers every exec path. */
-    if (cng_g_l2s && cng_l2s_deny(dirfd, path)) {
-        if (cng_g_debug)
-            cng_dprintf(2, "[cng] execve %s -> l2s-hidden\n", path);
-        return -ENOENT;
+/* What a real execve accepts: a quarter of RLIMIT_STACK, floored at 32 pages
+ * (fs/exec.c). Read the limit rather than inventing a number, so a command line
+ * the kernel would take is not refused here — but clamp to what the stack we
+ * actually hand the guest can hold, since ours is a fixed mapping rather than
+ * one that grows to RLIMIT_STACK. Being the kernel's own formula, it also cannot
+ * refuse anything that reached this process through a real execve: only a guest
+ * assembling an oversized argv itself can hit it, which is the case the kernel
+ * answers E2BIG for too. */
+static unsigned long exec_arg_max(void) {
+    unsigned long lim = CNG_GUEST_STACK_SIZE / 4;
+    struct cng_rlimit rl;
+    if (sys_prlimit64(0, CNG_RLIMIT_STACK, 0, &rl) == 0 &&
+        rl.cur != CNG_RLIM_INFINITY && rl.cur / 4 < lim)
+        lim = rl.cur / 4;
+    if (lim < 32 * cng_page_size)
+        lim = 32 * cng_page_size;
+    return lim;
+}
+
+/* Copy one NULL-terminated string vector in: pointers into dst_vec, strings out
+ * of *pool. Both bounds are enforced rather than trusted — src is guest memory,
+ * and another thread of the exec'ing process can grow it between the sizing pass
+ * and this one. Returns the slot after the terminator, or NULL if it would not
+ * fit (the caller answers -E2BIG, as the kernel does). */
+static char **copy_vec(char **src, char **dst_vec, int slots, char **pool,
+                       char *end) {
+    int i = 0;
+    for (; src && src[i]; i++) {
+        if (i + 1 >= slots) /* +1: the terminator needs a slot too */
+            return 0;
+        size_t n = strlen(src[i]) + 1;
+        if (n > (size_t)(end - *pool))
+            return 0;
+        memcpy(*pool, src[i], n);
+        dst_vec[i] = *pool;
+        *pool += n;
+    }
+    if (i >= slots)
+        return 0;
+    dst_vec[i] = 0;
+    return dst_vec + i + 1;
+}
+
+static void exec_args_free(struct exec_args *a) {
+    if (a->mem)
+        sys_munmap(a->mem, a->len);
+    a->mem = 0;
+}
+
+static long exec_args_take(struct exec_args *a, const char *path, char **argv,
+                           char **envp) {
+    int argc = 0, envc = 0;
+    unsigned long bytes = strlen(path) + 1;
+    while (argv && argv[argc])
+        bytes += strlen(argv[argc++]) + 1;
+    while (envp && envp[envc])
+        bytes += strlen(envp[envc++]) + 1;
+    /* Two NULL-terminated pointer arrays, 8-aligned, ahead of the strings. */
+    unsigned long vecs = ((unsigned long)argc + 1 + (unsigned long)envc + 1) * 8;
+    unsigned long max = exec_arg_max();
+    if (bytes > max || vecs > max - bytes)
+        return -E2BIG;
+
+    a->len = cng_page_up(vecs + bytes);
+    a->mem = sys_mmap(0, a->len, CNG_PROT_READ | CNG_PROT_WRITE,
+                      CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (a->mem == CNG_MAP_FAILED || cng_is_err((long)a->mem)) {
+        a->mem = 0;
+        return -ENOMEM;
     }
 
+    char *pool = (char *)a->mem + vecs;
+    char *end = (char *)a->mem + a->len;
+    a->argv = (char **)a->mem;
+    a->envp = copy_vec(argv, a->argv, argc + 1, &pool, end);
+    size_t pn = strlen(path) + 1;
+    if (!a->envp || !copy_vec(envp, a->envp, envc + 1, &pool, end) ||
+        pn > (size_t)(end - pool)) {
+        exec_args_free(a);
+        return -E2BIG; /* raced its own measurement: treat as too big */
+    }
+    memcpy(pool, path, pn);
+    a->path = pool;
+    return 0;
+}
+
+/* Emulation body: resolve the target (shebang-aware), load it, build its stack,
+ * and pass the commit point (close FD_CLOEXEC fds, reset signal dispositions,
+ * retarget /proc/self/exe). Returns -errno on failure (all of which occur before
+ * the commit point), or 0 with *out_sp and *out_entry set for the caller to
+ * transfer control into the new program.
+ *
+ * path/argv/envp are the snapshot taken by execve_core, not the guest's own
+ * pointers: everything from cng_load_elf onwards would otherwise be reading
+ * memory the load just replaced. */
+static long execve_load(int dirfd, const char *path, char **argv, char **envp,
+                        unsigned long *out_sp, unsigned long *out_entry) {
     /* Resolve the target through the rootfs/bind map, following symlinks
      * (absolute or AT_FDCWD); a real dirfd with a relative path is a rare case
      * we pass through. */
@@ -309,6 +409,39 @@ static long execve_core(int dirfd, const char *path, char **argv, char **envp,
     *out_sp = sp;
     *out_entry = entry;
     return 0;
+}
+
+/* Shared emulation core: the checks that need only the guest's own pointers,
+ * then the snapshot (see exec_args_take) around the part that maps the image. */
+static long execve_core(int dirfd, const char *path, char **argv, char **envp,
+                        unsigned long *out_sp, unsigned long *out_entry) {
+    if (cng_g_debug)
+        cng_dprintf(2, "[cng] execve enter path=%s\n", path ? path : "(null)");
+
+    if (!path)
+        return -EFAULT;
+    /* l2s machinery is invisible to the guest — not executable either. Both
+     * tiers (SIGSYS cng_emulate_execve, -R cng_execve_tramp) come through
+     * here, so this covers every exec path. */
+    if (cng_g_l2s && cng_l2s_deny(dirfd, path)) {
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] execve %s -> l2s-hidden\n", path);
+        return -ENOENT;
+    }
+
+    struct exec_args a;
+    long rc = exec_args_take(&a, path, argv, envp);
+    if (rc < 0) {
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] execve %s -> args snapshot errno=%ld\n", path,
+                        -rc);
+        return rc;
+    }
+    rc = execve_load(dirfd, a.path, a.argv, a.envp, out_sp, out_entry);
+    /* The new stack owns its own copy of everything by now (on the failure paths
+     * nothing was consumed at all), so the snapshot goes either way. */
+    exec_args_free(&a);
+    return rc;
 }
 
 void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,

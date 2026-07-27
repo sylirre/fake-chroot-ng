@@ -63,6 +63,11 @@ int cng_load_elf(const char *path, unsigned long base_hint,
  * file may have no readable name at all (memfd, O_TMPFILE, deleted). */
 int cng_load_elf_fd(int fd, unsigned long base_hint, struct cng_loaded *out);
 
+/* Size of the fixed anonymous stack each loaded program gets (see stack.c).
+ * Exposed because the emulated execve bounds argv/envp against it, exactly as
+ * the kernel bounds ARG_MAX against RLIMIT_STACK. */
+#define CNG_GUEST_STACK_SIZE (64UL << 20)
+
 /* Build the initial process stack (argc/argv/envp/auxv) for the loaded program
  * (and optional interpreter) and return the guest stack pointer. */
 unsigned long cng_build_stack(int argc, char **argv, char **envp,
