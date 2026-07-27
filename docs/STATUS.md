@@ -1115,6 +1115,13 @@ vfork/`posix_spawn` child-stack handling.
   difference (emulator, guest toolchain and link mode, which translation tier is
   live, rootfs images) and the milestone scripts assert against what it found.
   See `tests/README.md`.
+- M16 is the one milestone whose subject exists only on the target, so it asks
+  the unemulated guest which host it is on and asserts a different thing on each:
+  where raw rtnetlink works it must be reproduced byte-for-byte and must not
+  engage unforced; where the kernel refuses it (a device) there is nothing to
+  diff against, so the assertions are that the emulation engages *unforced* and
+  turns each refusal into a working dump — which is the on-device acceptance bar
+  and the one thing a devbox cannot check.
 - qemu-user does NOT emulate guest seccomp filters faithfully → M5's mechanism
   needs simulated-SIGSYS unit tests + real-hardware validation. Loader (M3/M4)
   and path logic are fully qemu-testable. On an AArch64 host the harness detects

@@ -67,6 +67,13 @@ Source-level contract for a new `tests/mNN_*.sh`:
 - Prefer a directory you created over a host path (`/usr`, `/tmp`, `/run` and
   `/etc/passwd` are not universal), and derive an expected errno from a control
   run rather than pinning one that depends on the filesystem.
+- When a leg is gated on a host capability, test *that* capability, not a proxy
+  for it. M16 gated its rtnetlink differential on `getifaddrs` succeeding — but
+  bionic has its own fallback for the very restriction being emulated, so on a
+  device `getifaddrs` succeeds while `bind`/`sendto` on a NETLINK_ROUTE socket
+  are refused; the gate took the devbox branch there and failed four legs for
+  exactly the reason the emulation exists. Where a capability splits hosts,
+  give each side its own assertions rather than skipping one.
 - The `-t` debug subcommands that build their own filesystem view (`_dtest`,
   `_exectest`) accept `-b SRC:DST[:ro]`, so `$GUEST_BINDS` can be spliced into
   them exactly as into a real invocation.
