@@ -1989,6 +1989,27 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         return cng_syscall6(a0, a1, a2, a3, a4, a5, __NR_rt_sigprocmask);
     }
 
+    /* uname: a fixed kernel identity (CNG_KREL/CNG_KVER), which /proc/version
+     * repeats word for word. The host's release describes the device rather
+     * than the rootfs — on Android it carries `-android14-11-...`/`-perf`
+     * vendor suffixes that identify the phone — and a modern glibc rootfs
+     * refuses to start on a release below its build-time minimum whatever else
+     * is true. nodename and domainname are the host's: they name the machine
+     * the guest really is on, which is what a guest expects to see and what
+     * `hostname` reports either way. The buffer is six 65-byte fields
+     * (__NEW_UTS_LEN + 1); the kernel filled and validated it just now. */
+    case __NR_uname: {
+        long r = reissue(a0, a1, a2, a3, a4, a5, nr);
+        if (r != 0 || !a0)
+            return r;
+        char *u = (char *)a0;
+        cng_strlcpy(u + 0 * 65, "Linux", 65);
+        cng_strlcpy(u + 2 * 65, CNG_KREL, 65);
+        cng_strlcpy(u + 3 * 65, CNG_KVER, 65);
+        cng_strlcpy(u + 4 * 65, "aarch64", 65);
+        return 0;
+    }
+
     /* POSIX timers do not survive an execve, and ours is emulated — the address
      * space stays, so a timer would go on firing into a program that never
      * armed it, through a handler that no longer exists. Nothing enumerates a

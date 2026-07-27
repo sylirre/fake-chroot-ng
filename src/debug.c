@@ -284,6 +284,20 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
         cng_dprintf(1, "denied: %d failures\n", fails);
         return fails ? 1 : 0;
     }
+    /* uname must report a fixed kernel identity, and /proc/version must repeat
+     * it word for word — while nodename stays the host's, which is what names
+     * the machine the guest is really on. */
+    if (!strcmp(op, "uname")) {
+        char host[390], guest[390];
+        memset(host, 0, sizeof host);
+        memset(guest, 0, sizeof guest);
+        sys_uname(host);
+        long r = cng_dispatch(__NR_uname, (long)guest, 0, 0, 0, 0, 0, 0);
+        cng_dprintf(1, "uname: rc=%d sys=%s rel=%s ver=%s mach=%s node_kept=%d\n",
+                    (int)r, guest, guest + 2 * 65, guest + 3 * 65, guest + 4 * 65,
+                    !strcmp(host + 65, guest + 65));
+        return r == 0 ? 0 : 1;
+    }
     /* chroot(2) is privileged: without CAP_SYS_CHROOT — for us, a fake identity
      * whose effective uid is 0 — the kernel refuses it. Both answers in one run,
      * since the gate is the whole point. */

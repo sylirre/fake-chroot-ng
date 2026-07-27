@@ -1367,6 +1367,27 @@ vfork/`posix_spawn` child-stack handling.
     both ways in one run — unprivileged `EPERM`, fake-root success — since the
     gate is the whole point.
 
+- [x] **M17-14 — one kernel identity, told the same way twice**
+  `uname(2)` passed the host's release straight through. Inside a rootfs that
+  describes nothing the guest can act on, and on the target platform it is a
+  device fingerprint: Android releases carry `-android14-11-<sha>`/`-perf`
+  vendor suffixes. The guest now sees `6.1.0-chroot-ng` / `#1 SMP chroot-ng`
+  (`CNG_KREL`/`CNG_KVER`), matching the oracle's choice of a fixed modern
+  release — which also lifts the effective floor for a glibc rootfs that refuses
+  to start below its build-time minimum.
+  - `/proc/version` is synthesized from the same two strings and joins the
+    existing `procfs` machinery. This is the half that makes the change worth
+    anything: faking the syscall while the host file passed through would leave
+    the two contradicting each other, and a distro install script reads whichever
+    one it was written against.
+  - `nodename` and `domainname` stay the host's. They name the machine the guest
+    is really on — `hostname` reports it either way, and inventing one would only
+    confuse the user reading it.
+  - **Tests:** new `tests/m17_uname.sh`, 9 legs on a new `dtest uname`. Both
+    readers are asserted to carry the fixed identity, and both to contain no
+    occurrence of the *host's* actual release, which is the leak the change is
+    about. Suite: 457 passed, 0 failed.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

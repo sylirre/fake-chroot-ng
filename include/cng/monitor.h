@@ -17,6 +17,18 @@
  * carries the old GUEST:HOST order from one that does not. */
 #define CNG_VERSION "0.1.0"
 
+/* The kernel identity the guest is told about, by uname(2) and by
+ * /proc/version, which must agree — faking one and leaking the other through
+ * the second is the failure mode, since anything that cross-checks them (and
+ * distro install scripts do) then sees a contradiction.
+ *
+ * Fixed rather than passed through: the host release is meaningless inside the
+ * rootfs and, on Android, carries `-android14-11-...`/`-perf` vendor suffixes
+ * that identify the device. It also lifts the effective floor for a modern
+ * glibc rootfs, which refuses to start below its build-time minimum. */
+#define CNG_KREL "6.1.0-chroot-ng"
+#define CNG_KVER "#1 SMP chroot-ng"
+
 /* Active filesystem view used by the dispatcher (set before install). */
 extern struct cng_fs *cng_g_fs;
 

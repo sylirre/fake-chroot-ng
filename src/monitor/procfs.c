@@ -18,7 +18,7 @@
 enum {
     PF_CMDLINE = 1, PF_ENVIRON, PF_AUXV, PF_MAPS,
     PF_MOUNTS, PF_MOUNTINFO, PF_MOUNTSTATS,
-    PF_LOADAVG, PF_UPTIME, PF_STAT, PF_STATUS,
+    PF_LOADAVG, PF_UPTIME, PF_STAT, PF_STATUS, PF_VERSION,
 };
 
 /* put_mounts rendering. */
@@ -348,6 +348,15 @@ static void put_uptime(int fd) {
                 idle_j % 100);
 }
 
+/* /proc/version, in the kernel's own format. It exists only to agree with what
+ * uname(2) reports (dispatch.c): faking the syscall and letting the host file
+ * through would leave the two contradicting each other, and distro install
+ * scripts read whichever one they were written against. */
+static void put_version(int fd) {
+    cng_dprintf(fd, "Linux version %s (chroot-ng@localhost) (chroot-ng) %s\n",
+                CNG_KREL, CNG_KVER);
+}
+
 /* The guest /proc/stat where the host's is unreadable (see stat_blocked). CPU
  * time comes from stat_estimate, all attributed to user; intr and ctxt are
  * honest zeros; btime is exact; processes/procs_running match put_loadavg. */
@@ -650,6 +659,8 @@ int cng_procfs_open(const char *canon, long gflags, long *ret) {
         kind = PF_LOADAVG;
     } else if (!strcmp(canon, "/proc/uptime")) {
         kind = PF_UPTIME;
+    } else if (!strcmp(canon, "/proc/version")) {
+        kind = PF_VERSION;
     } else if (!strcmp(canon, "/proc/stat")) {
         if (!stat_blocked())
             return 0; /* a readable host file is strictly richer */
@@ -706,6 +717,9 @@ int cng_procfs_open(const char *canon, long gflags, long *ret) {
         break;
     case PF_UPTIME:
         put_uptime((int)fd);
+        break;
+    case PF_VERSION:
+        put_version((int)fd);
         break;
     case PF_STAT:
         put_stat((int)fd);
