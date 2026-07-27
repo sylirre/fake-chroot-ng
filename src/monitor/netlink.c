@@ -92,10 +92,19 @@ int cng_nl_deny_getlink = 0;
 #define ARPHRD_LOOPBACK_ 772
 #define IFNAMSIZ_        16
 
-#define SIOCGIFNAME_   0x8910
-#define SIOCGIFFLAGS_  0x8913
-#define SIOCGIFMTU_    0x8921
-#define SIOCGIFHWADDR_ 0x8927
+#define SIOCGIFNAME_    0x8910
+#define SIOCGIFCONF_    0x8912
+#define SIOCGIFFLAGS_   0x8913
+#define SIOCGIFADDR_    0x8915
+#define SIOCGIFDSTADDR_ 0x8917
+#define SIOCGIFBRDADDR_ 0x8919
+#define SIOCGIFNETMASK_ 0x891b
+#define SIOCGIFMETRIC_  0x891d
+#define SIOCGIFMTU_     0x8921
+#define SIOCGIFHWADDR_  0x8927
+#define SIOCGIFINDEX_   0x8933
+#define SIOCGIFTXQLEN_  0x8942
+#define SIOCGIFMAP_     0x8970
 
 #define NL_SLOTS 4
 /* Per-slot reply capacity, matching the oracle's NL_REPLY_MAX. A synthesized
@@ -414,7 +423,8 @@ static long put_error(unsigned char *buf, long off, long max, unsigned seq,
  * carries at least one address; an interface with none stays invisible,
  * because an app has no way to learn of it. `scratch` is borrowed for the
  * receive buffer (the caller's reply buffer, not yet written). */
-static int addr_dump_indices(int *idx, int cap, unsigned char *scratch,
+static int addr_dump_indices(int *idx, unsigned *v4, unsigned char *plen,
+                             int cap, unsigned char *scratch,
                              long scratch_len) {
     long fd = open_hostfd();
     int n = 0;
@@ -447,13 +457,38 @@ static int addr_dump_indices(int *idx, int cap, unsigned char *scratch,
             }
             /* ifaddrmsg: family, prefixlen, flags, scope, then u32 index. */
             if (m->type == RTM_NEWADDR_ && m->len >= sizeof *m + 8) {
-                int ifi = *(int *)((unsigned char *)m + sizeof *m + 4);
-                int dup = 0;
+                unsigned char *ifa = (unsigned char *)m + sizeof *m;
+                int ifi = *(int *)(ifa + 4);
+                int slot = -1;
                 for (int i = 0; i < n; i++)
                     if (idx[i] == ifi)
-                        dup = 1;
-                if (!dup && n < cap)
-                    idx[n++] = ifi;
+                        slot = i;
+                if (slot < 0 && n < cap) {
+                    slot = n++;
+                    idx[slot] = ifi;
+                    if (v4)
+                        v4[slot] = 0;
+                    if (plen)
+                        plen[slot] = 0;
+                }
+                /* The first IPv4 address of each interface, for the SIOCGIF*
+                 * family — which has no way to express anything else, and which
+                 * must describe the same interfaces this dump defines. */
+                if (slot >= 0 && v4 && !v4[slot] && ifa[0] == AF_INET_) {
+                    for (long q = (long)sizeof *m + 8; q + 4 <= (long)m->len;) {
+                        unsigned short al = *(unsigned short *)((char *)m + q);
+                        unsigned short at = *(unsigned short *)((char *)m + q + 2);
+                        if (al < 4 || q + al > (long)m->len)
+                            break;
+                        if ((at == IFA_LOCAL_ || at == IFA_ADDRESS_) &&
+                            al >= 8 && !v4[slot]) {
+                            memcpy(&v4[slot], (char *)m + q + 4, 4);
+                            if (plen)
+                                plen[slot] = ifa[1];
+                        }
+                        q += (al + 3) & ~3u;
+                    }
+                }
             }
             p += (long)((m->len + 3) & ~3u);
         }
@@ -543,7 +578,7 @@ static long synth_links(unsigned char *out, long max, const unsigned char *req,
         want_index = link_target(req, rlen, want);
 
     int idx[32];
-    int nidx = addr_dump_indices(idx, 32, out, max);
+    int nidx = addr_dump_indices(idx, 0, 0, 32, out, max);
     long ioctlfd = CNG_SYS(__NR_socket, AF_INET_, SOCK_DGRAM_ | CNG_O_CLOEXEC,
                            0, 0, 0, 0);
     long off = 0;
@@ -858,6 +893,235 @@ void cng_nl_poke(int fd) {
     struct nl_slot *s = slot_of(fd);
     if (s)
         drain_requests(s);
+}
+
+/* ---- the SIOCGIF* family -------------------------------------------------
+ *
+ * These arrive on an ordinary AF_INET socket, not on a netlink one, and they
+ * answer the same questions the dumps do: `ifconfig` and `getifaddrs`'s oldest
+ * fallback are built on them. Where the netlink emulation is engaged they have
+ * to agree with it — otherwise a guest told by `ip addr` that it has only
+ * loopback is shown the host's entire interface list by `ifconfig`, which is
+ * both a contradiction and a description of a network the guest cannot reach.
+ * So both views come from one enumeration.
+ *
+ * Where the host's own rtnetlink works nothing is emulated, here or there, and
+ * these pass straight through: the kernel's answer is the truth and the dumps
+ * are the same kernel's. Only the getters are modelled; SIOCSIF* changes the
+ * host's network configuration and stays unemulated (and unprivileged, so the
+ * host refuses it anyway). */
+
+/* One interface as the guest sees it: the link facts, plus the first IPv4
+ * address of the interface — all this family can express. */
+struct ifview {
+    struct ifinfo fi;
+    unsigned addr; /* network byte order; 0 = the interface has none */
+    unsigned char plen;
+};
+
+static int enum_ifviews(struct ifview *out, int cap) {
+    static unsigned char scratch[NL_REPLY_MAX];
+    int idx[32];
+    unsigned v4[32];
+    unsigned char pl[32];
+    int nidx = addr_dump_indices(idx, v4, pl, 32, scratch, sizeof scratch);
+    long ioctlfd = CNG_SYS(__NR_socket, AF_INET_, SOCK_DGRAM_ | CNG_O_CLOEXEC,
+                           0, 0, 0, 0);
+    int n = 0;
+    for (int i = 0; i < nidx && n < cap; i++) {
+        if (!gather_ifinfo(ioctlfd, idx[i], &out[n].fi))
+            continue;
+        out[n].addr = v4[i];
+        out[n].plen = pl[i];
+        n++;
+    }
+    if (ioctlfd >= 0)
+        sys_close((int)ioctlfd);
+    if (!n && cap > 0) {
+        /* Enumeration unavailable: loopback is still real, and it is exactly
+         * what the link dump falls back to (synth_links). */
+        memset(&out[0], 0, sizeof out[0]);
+        out[0].fi.index = 1;
+        out[0].fi.flags = IFF_UP_ | IFF_LOOPBACK_ | IFF_RUNNING_;
+        out[0].fi.mtu = 65536;
+        out[0].fi.hwtype = ARPHRD_LOOPBACK_;
+        out[0].fi.hwlen = 6;
+        out[0].fi.name[0] = 'l';
+        out[0].fi.name[1] = 'o';
+        out[0].addr = 0x0100007f; /* 127.0.0.1, network order */
+        out[0].plen = 8;
+        n = 1;
+    }
+    return n;
+}
+
+/* A sockaddr_in carrying `a` into the 24-byte ifreq union. */
+static void put_sin(unsigned char *u, unsigned a) {
+    memset(u, 0, 24);
+    *(unsigned short *)u = AF_INET_;
+    memcpy(u + 4, &a, 4);
+}
+
+static unsigned mask_of(unsigned char plen) {
+    if (plen == 0)
+        return 0;
+    if (plen > 32)
+        plen = 32;
+    unsigned m = 0xffffffffu << (32 - plen); /* host order */
+    return __builtin_bswap32(m);             /* the ifreq wants network order */
+}
+
+int cng_nl_ioctl(int fd, unsigned long req, void *arg, long *out) {
+    (void)fd;
+    if (!host_blocks())
+        return 0; /* the host's own answers and its dumps agree already */
+
+    struct ifview v[32];
+    int n = enum_ifviews(v, 32);
+
+    if (req == SIOCGIFCONF_) {
+        /* struct ifconf { int ifc_len; char *ifc_buf; } — 16 bytes on LP64.
+         * A NULL buffer asks for the size only, which is how every caller
+         * sizes its allocation. */
+        if (!cng_user_readable(arg, 16)) {
+            *out = -EFAULT;
+            return 1;
+        }
+        int len = *(int *)arg;
+        char *buf = *(char **)((char *)arg + 8);
+        /* SIOCGIFCONF is an IPv4 interface list: the kernel reports only
+         * interfaces that carry an AF_INET address, and an interface with none
+         * simply is not in it (it is still nameable by every getter below). */
+        int nv4 = 0;
+        for (int i = 0; i < n; i++)
+            if (v[i].addr)
+                nv4++;
+        int need = nv4 * (int)sizeof(struct ifreq_);
+        /* Only ifc_len is written back — the kernel leaves ifc_buf alone, and
+         * the write probe would zero whatever it validates. */
+        if (!cng_user_writable(arg, sizeof(int))) {
+            *out = -EFAULT;
+            return 1;
+        }
+        if (!buf) {
+            *(int *)arg = need;
+            *out = 0;
+            return 1;
+        }
+        if (len > need)
+            len = need;
+        if (len < 0 || !cng_user_writable(buf, (unsigned long)len)) {
+            *out = -EFAULT;
+            return 1;
+        }
+        int w = 0;
+        for (int i = 0; i < n && w + (int)sizeof(struct ifreq_) <= len; i++) {
+            if (!v[i].addr)
+                continue;
+            struct ifreq_ r;
+            memset(&r, 0, sizeof r);
+            cng_strlcpy(r.name, v[i].fi.name, IFNAMSIZ_);
+            put_sin(r.u, v[i].addr);
+            memcpy(buf + w, &r, sizeof r);
+            w += (int)sizeof r;
+        }
+        *(int *)arg = w;
+        *out = 0;
+        return 1;
+    }
+
+    /* Read before probing for write: every request here names its target in the
+     * same buffer it answers into, and the write probe zeroes what it
+     * validates (see uaccess.c). */
+    if (!cng_user_readable(arg, sizeof(struct ifreq_))) {
+        *out = -EFAULT;
+        return 1;
+    }
+    struct ifreq_ ifr;
+    memcpy(&ifr, arg, sizeof ifr);
+    ifr.name[IFNAMSIZ_ - 1] = '\0';
+
+    /* SIOCGIFNAME is the one that names its target by index; every other form
+     * names it by ifr_name.
+     *
+     * An interface we did not enumerate is left to the host rather than refused.
+     * Refusing it would be the tidier story — "what the dump did not show does
+     * not exist" — but a guest can learn a name from /proc/net/dev, which is a
+     * host passthrough, and busybox `ifconfig` does exactly that: an ENODEV
+     * there stops it on its first interface. This emulation exists to answer
+     * where the host will not, so it never takes away an answer the host is
+     * willing to give. */
+    const struct ifview *f = 0;
+    for (int i = 0; i < n && !f; i++) {
+        if (req == SIOCGIFNAME_) {
+            if (v[i].fi.index == *(int *)ifr.u)
+                f = &v[i];
+        } else if (!strcmp(v[i].fi.name, ifr.name)) {
+            f = &v[i];
+        }
+    }
+    if (!f)
+        return 0;
+
+    memset(ifr.u, 0, sizeof ifr.u);
+    switch (req) {
+    case SIOCGIFNAME_:
+        cng_strlcpy(ifr.name, f->fi.name, IFNAMSIZ_);
+        break;
+    case SIOCGIFINDEX_:
+        *(int *)ifr.u = f->fi.index;
+        break;
+    case SIOCGIFFLAGS_:
+        *(unsigned short *)ifr.u = (unsigned short)f->fi.flags;
+        break;
+    case SIOCGIFMTU_:
+        *(int *)ifr.u = (int)f->fi.mtu;
+        break;
+    case SIOCGIFTXQLEN_:
+        *(int *)ifr.u = 1000; /* what the link dump reports for every device */
+        break;
+    case SIOCGIFMETRIC_:
+        *(int *)ifr.u = 0; /* the kernel has always answered 0 here */
+        break;
+    case SIOCGIFMAP_:
+        break; /* no memory/irq/dma to report: all zeros, as for any modern nic */
+    case SIOCGIFHWADDR_:
+        *(unsigned short *)ifr.u = f->fi.hwtype;
+        if (f->fi.hwlen)
+            memcpy(ifr.u + 2, f->fi.hwaddr, f->fi.hwlen);
+        break;
+    case SIOCGIFADDR_:
+    case SIOCGIFDSTADDR_:
+        if (!f->addr) {
+            *out = -EADDRNOTAVAIL; /* the interface has no IPv4 address */
+            return 1;
+        }
+        put_sin(ifr.u, f->addr);
+        break;
+    case SIOCGIFNETMASK_:
+        if (!f->addr) {
+            *out = -EADDRNOTAVAIL;
+            return 1;
+        }
+        put_sin(ifr.u, mask_of(f->plen));
+        break;
+    case SIOCGIFBRDADDR_:
+        if (!f->addr) {
+            *out = -EADDRNOTAVAIL;
+            return 1;
+        }
+        put_sin(ifr.u, (f->addr & mask_of(f->plen)) | ~mask_of(f->plen));
+        break;
+    default:
+        return 0; /* not one of ours: let the host answer */
+    }
+    if (!cng_user_writable(arg, sizeof ifr)) {
+        *out = -EFAULT;
+        return 1;
+    }
+    memcpy(arg, &ifr, sizeof ifr);
+    *out = 0;
+    return 1;
 }
 
 void cng_nl_init(void) {

@@ -70,6 +70,23 @@ else
         # echoed, and real RTM_NEWLINK records in it.
         check_contains "m16 an RTM_GETLINK dump is relayed and parseable" \
             "dump: got>0=1 msgs>0=1 seq_ok=1 newlink>0=1" "$em"
+        # The SIOCGIF* family answers the same questions over an AF_INET socket
+        # (`ifconfig`, getifaddrs's oldest fallback). It comes from the same
+        # enumeration as the dump, so the two views cannot contradict each
+        # other -- a guest told it has only loopback must not be shown the
+        # host's whole interface list here.
+        check_contains "m16 SIOCGIFCONF lists the same interfaces the dump did" \
+            "ifconf: size_ok=1 entries>0=1 lo=1 lo_addr=1" "$em"
+        check_contains "m16 the per-interface getters agree with it" \
+            "ifget: lo idx=1 up=1 loopback=1 mtu=65536 mask8=1 byidx=1" "$em"
+        # A name nobody has is still ENODEV. An interface the host DOES know but
+        # our enumeration did not is deliberately left to the host: a guest can
+        # learn a name from /proc/net/dev (a passthrough), and busybox
+        # `ifconfig` reads exactly that, so refusing it would stop the tool on
+        # its first interface. This emulation answers where the host will not;
+        # it never takes away an answer the host is willing to give.
+        check_contains "m16 an interface nobody has is ENODEV" \
+            "ifget: nodev=1" "$em"
 
         # --- 2. against the kernel, where there is a kernel to compare to ---
         if [ "$m16_raw" = 1 ]; then
@@ -120,6 +137,11 @@ else
             check_contains "m16 unforced: getifaddrs works" "getifaddrs: ok" "$pt"
             check_contains "m16 unforced: the loopback interface is visible" \
                 "lo=1" "$pt"
+            check_contains "m16 unforced: SIOCGIFCONF answers from the same view" \
+                "ifconf: size_ok=1 entries>0=1 lo=1 lo_addr=1" "$pt"
+            check_contains "m16 unforced: the per-interface getters agree" \
+                "ifget: lo idx=1 up=1 loopback=1 mtu=65536 mask8=1 byidx=1" \
+                "$pt"
         fi
 
         # --- 3. iproute2's dump contract, which glibc's getifaddrs does NOT
@@ -181,6 +203,14 @@ else
             check_contains "m16 a relay-less dump presents loopback only" \
                 "nldone: done=1 done_len_ok=1 links>0=1 named>0=1 skipped=0" \
                 "$knr"
+            # ...and the ioctl view degrades with it, to the same one interface.
+            # Without that, `ifconfig` would still be listing the host's real
+            # network while `ip addr` showed loopback alone.
+            enr=$(CNG_NETLINK_NO_RELAY=1 m16run -R "$R" /bin/netif 2>/dev/null)
+            check_contains "m16 a relay-less SIOCGIFCONF presents loopback only" \
+                "ifcount: 1" "$enr"
+            check_contains "m16 that loopback carries 127.0.0.1" \
+                "ifconf: size_ok=1 entries>0=1 lo=1 lo_addr=1" "$enr"
 
             # busybox ip submits its request with plain write(2) — a syscall
             # deliberately left untrapped — and that is what Alpine runs. The

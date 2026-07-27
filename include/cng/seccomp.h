@@ -31,6 +31,7 @@ struct sock_fprog {
 #define CNG_BPF_JMP 0x05
 #define CNG_BPF_JEQ 0x10
 #define CNG_BPF_JGE 0x30
+#define CNG_BPF_JGT 0x20
 #define CNG_BPF_K   0x00
 #define CNG_BPF_RET 0x06
 #define CNG_BPF_ALU 0x04

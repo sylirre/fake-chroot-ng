@@ -10,11 +10,16 @@
  * the output is byte-comparable between a run under the emulation and a run
  * straight under qemu (where the guest talks to the real kernel).
  */
+#include <arpa/inet.h>
+#include <errno.h>
 #include <ifaddrs.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
+#include <net/if.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -98,5 +103,72 @@ int main(void) {
     printf("dump: got>0=%d msgs>0=%d seq_ok=%d newlink>0=%d\n", n > 0, msgs > 0,
            seq_ok, newlink > 0);
     close(fd);
+
+    /* --- the SIOCGIF* family, the same questions over an AF_INET socket ---
+     * `ifconfig` and getifaddrs's oldest fallback ask this way, and the answers
+     * have to describe the same interfaces the dump above did — a guest told it
+     * has only loopback must not be shown the host's whole interface list here.
+     * Only properties that hold in both views are printed, so an emulated run
+     * and a raw one are directly comparable. */
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) {
+        printf("ifconf: FAILED\n");
+        return 0;
+    }
+    struct ifconf ifc;
+    memset(&ifc, 0, sizeof ifc);
+    int size_ok = (ioctl(s, SIOCGIFCONF, &ifc) == 0 && ifc.ifc_len > 0);
+    char ibuf[8192];
+    int nif = 0, saw_lo = 0, lo_addr = 0;
+    ifc.ifc_len = (int)sizeof ibuf;
+    ifc.ifc_buf = ibuf;
+    if (ioctl(s, SIOCGIFCONF, &ifc) == 0) {
+        nif = (int)(ifc.ifc_len / sizeof(struct ifreq));
+        struct ifreq *r = (struct ifreq *)ibuf;
+        for (int i = 0; i < nif; i++) {
+            if (strcmp(r[i].ifr_name, "lo"))
+                continue;
+            saw_lo = 1;
+            struct sockaddr_in *sin = (struct sockaddr_in *)&r[i].ifr_addr;
+            lo_addr = (sin->sin_family == AF_INET &&
+                       sin->sin_addr.s_addr == htonl(0x7f000001));
+        }
+    }
+    printf("ifconf: size_ok=%d entries>0=%d lo=%d lo_addr=%d\n", size_ok,
+           nif > 0, saw_lo, lo_addr);
+    /* The exact count differs between the host's view and a synthesized one, so
+     * it gets its own line: only the leg that pins the degraded (loopback-only)
+     * view asserts it. */
+    printf("ifcount: %d\n", nif);
+
+    struct ifreq r;
+    memset(&r, 0, sizeof r);
+    strcpy(r.ifr_name, "lo");
+    int idx = ioctl(s, SIOCGIFINDEX, &r) == 0 ? r.ifr_ifindex : -1;
+    memset(&r.ifr_ifru, 0, sizeof r.ifr_ifru);
+    strcpy(r.ifr_name, "lo");
+    int flags = ioctl(s, SIOCGIFFLAGS, &r) == 0 ? r.ifr_flags : 0;
+    memset(&r.ifr_ifru, 0, sizeof r.ifr_ifru);
+    strcpy(r.ifr_name, "lo");
+    int mtu = ioctl(s, SIOCGIFMTU, &r) == 0 ? r.ifr_mtu : -1;
+    memset(&r.ifr_ifru, 0, sizeof r.ifr_ifru);
+    strcpy(r.ifr_name, "lo");
+    unsigned mask = 0;
+    if (ioctl(s, SIOCGIFNETMASK, &r) == 0)
+        mask = ((struct sockaddr_in *)&r.ifr_netmask)->sin_addr.s_addr;
+    /* SIOCGIFNAME goes the other way: index in, name out. */
+    memset(&r, 0, sizeof r);
+    r.ifr_ifindex = idx;
+    int byidx = (ioctl(s, SIOCGIFNAME, &r) == 0 && !strcmp(r.ifr_name, "lo"));
+    printf("ifget: lo idx=%d up=%d loopback=%d mtu=%d mask8=%d byidx=%d\n", idx,
+           (flags & IFF_UP) != 0, (flags & IFF_LOOPBACK) != 0, mtu,
+           mask == htonl(0xff000000), byidx);
+
+    memset(&r, 0, sizeof r);
+    strcpy(r.ifr_name, "cngnope0");
+    errno = 0;
+    int nodev = (ioctl(s, SIOCGIFFLAGS, &r) < 0 && errno == ENODEV);
+    printf("ifget: nodev=%d\n", nodev);
+    close(s);
     return 0;
 }

@@ -1417,6 +1417,40 @@ vfork/`posix_spawn` child-stack handling.
     same testing convention as `CNG_SHM_FORCE_FILE`). Suite: 464 passed, 0
     failed.
 
+- [x] **M16b — the `SIOCGIF*` ioctls answer from the same enumeration as the dumps**
+  Split out of M16 because it needs a different trap key. These arrive on an
+  ordinary `AF_INET` socket, so there is no fd range to filter on the way the
+  synthesized `/proc` files have — and trapping `ioctl` wholesale would put every
+  terminal `TCGETS` through the handler. The filter tests the *request* instead:
+  `0x8910..0x8970` is the `SIOCxIF` band, two BPF instructions, and everything
+  else stays untrapped.
+  - They ask the same questions the netlink dumps do (`ifconfig`, and
+    `getifaddrs`'s oldest fallback), so they are answered from the same
+    enumeration: `SIOCGIFCONF` lists exactly the interfaces the link dump
+    describes, and `SIOCGIF{NAME,INDEX,FLAGS,ADDR,NETMASK,BRDADDR,DSTADDR,MTU,
+    METRIC,HWADDR,TXQLEN,MAP}` describe them the same way. Where the emulation
+    degrades to loopback alone — no relay at all — the ioctl view degrades with
+    it, instead of `ifconfig` listing the host's whole network while `ip addr`
+    showed only `lo`.
+  - The address dump now also yields each interface's first IPv4 address and
+    prefix length, which is all this family can express; the netmask and
+    broadcast follow from the prefix.
+  - An interface the host knows but our enumeration did not is **left to the
+    host**, not refused. Refusing would be the tidier story, but a guest can
+    learn a name from `/proc/net/dev` (a passthrough) and busybox `ifconfig`
+    reads exactly that — an `ENODEV` there stops it on its first interface. This
+    emulation answers where the host will not; it does not take away answers the
+    host is willing to give. Where the host's own rtnetlink works nothing is
+    emulated on either side and the ioctls pass straight through.
+  - `SIOCSIF*` stays unemulated: it changes the host's network configuration,
+    and the host refuses it to an unprivileged process anyway.
+  - **Tests:** `tests/guests/netif.c` gained the whole family, so the existing
+    byte-for-byte differential against the real kernel covers it; plus 7 legs in
+    `m16_netlink.sh` (including a relay-less run asserting the ioctl view is the
+    same single interface `ip addr` shows) and 6 in `bpftest` pinning the band's
+    two edges, `TCGETS`, and the requests just outside it. Suite: 469 passed,
+    0 failed.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

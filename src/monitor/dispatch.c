@@ -1989,6 +1989,20 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         return cng_syscall6(a0, a1, a2, a3, a4, a5, __NR_rt_sigprocmask);
     }
 
+    /* ioctl, trapped only for the SIOCxIF request band (seccomp.c tests the
+     * request in BPF, so every other ioctl runs native). The interface getters
+     * are answered from the same enumeration the netlink dumps are built on —
+     * a guest told by `ip addr` that it has only loopback must not be shown the
+     * host's whole interface list by `ifconfig`. The setters and anything else
+     * in the band fall through to the host, which refuses them to an
+     * unprivileged process exactly as it should. */
+    case __NR_ioctl: {
+        long r = 0;
+        if (cng_nl_ioctl((int)a0, (unsigned long)a1, (void *)a2, &r))
+            return r;
+        return reissue(a0, a1, a2, a3, a4, a5, nr);
+    }
+
     /* uname: a fixed kernel identity (CNG_KREL/CNG_KVER), which /proc/version
      * repeats word for word. The host's release describes the device rather
      * than the rootfs — on Android it carries `-android14-11-...`/`-perf`

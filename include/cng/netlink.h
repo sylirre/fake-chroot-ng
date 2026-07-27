@@ -60,6 +60,14 @@ int cng_nl_srcaddr(int fd, void *addr, unsigned *alen);
 /* bind(2) on an emulated socket is a silent success. Returns 1 if handled. */
 int cng_nl_bind(int fd);
 
+/* The SIOCGIF* interface-query ioctls, which arrive on an ordinary AF_INET
+ * socket and answer the same questions the dumps do (`ifconfig`, and
+ * getifaddrs's oldest fallback). Answered from the same enumeration, so the two
+ * views cannot contradict each other. Returns 1 when handled (result in *out),
+ * 0 when the host's own rtnetlink works — then nothing here is emulated and the
+ * real ioctl is the right answer. */
+int cng_nl_ioctl(int fd, unsigned long req, void *arg, long *out);
+
 /* Serve any requests the guest submitted with untrapped write(2)/send(2), so
  * their replies are in the pair before a passthrough read runs. No-op unless
  * `fd` is an emulated netlink socket. */

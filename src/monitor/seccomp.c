@@ -372,6 +372,30 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
     f[n++] = (struct sock_filter)CNG_BPF_STMT(
         CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* reload A=nr */
 
+    /* ioctl, for the interface-query band only. SIOCGIF* answers the same
+     * questions the netlink dumps do and has to agree with them, but the
+     * requests arrive on an ordinary AF_INET socket — there is no fd range to
+     * key on, the way the synthesized /proc files have. Trapping ioctl wholesale
+     * would put every terminal TCGETS and every driver call through the handler,
+     * so the request itself is tested instead: 0x8910..0x8970 is the SIOCxIF
+     * band, which is small enough to trap whole (the setters land in the
+     * dispatcher and are passed straight through). */
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, (uint32_t)__NR_ioctl, 0,
+        5); /* not ioctl -> reload nr */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_ARGS + 8); /* A = request */
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JGE | CNG_BPF_K, 0x8910, 0, 2); /* below -> allow */
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JGT | CNG_BPF_K, 0x8970, 1, 0); /* above -> allow */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
+                                              CNG_SECCOMP_RET_TRAP);
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_RET | CNG_BPF_K, CNG_SECCOMP_RET_ALLOW); /* not the band */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* reload A=nr */
+
     /* Synthesized-file refresh: a read on one of the high fds reserved for the
      * time-varying /proc files (loadavg, uptime, stat) must reach the
      * dispatcher, which regenerates the content when the read starts at offset

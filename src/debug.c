@@ -2694,6 +2694,9 @@ static u32 bpf_run(const struct sock_filter *f, int n, const u32 *data,
         case CNG_BPF_JMP | CNG_BPF_JGE | CNG_BPF_K:
             pc += 1 + (A >= i->k ? i->jt : i->jf);
             break;
+        case CNG_BPF_JMP | CNG_BPF_JGT | CNG_BPF_K:
+            pc += 1 + (A > i->k ? i->jt : i->jf);
+            break;
         case CNG_BPF_RET | CNG_BPF_K:
             return i->k;
         default:
@@ -2709,7 +2712,10 @@ static u32 bpf_run(const struct sock_filter *f, int n, const u32 *data,
     return 0;
 }
 
-/* Fill a seccomp_data image: nr, arch, instruction_pointer, args[0]. */
+/* Fill a seccomp_data image: nr, arch, instruction_pointer, args[0]. args[1]
+ * mirrors args[0] so an ioctl case can drive the request without a second
+ * column: nothing reads args[1] except the ioctl band test, and that only after
+ * the syscall number has matched. */
 static void bpf_data(u32 *d, int nr, unsigned long ip, unsigned long arg0) {
     memset(d, 0, 64);
     d[0] = (u32)nr;
@@ -2718,6 +2724,8 @@ static void bpf_data(u32 *d, int nr, unsigned long ip, unsigned long arg0) {
     d[3] = (u32)(ip >> 32);
     d[4] = (u32)arg0;
     d[5] = (u32)(arg0 >> 32);
+    d[6] = (u32)arg0;
+    d[7] = (u32)(arg0 >> 32);
 }
 
 int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
@@ -2868,6 +2876,20 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
          CNG_SECCOMP_RET_ALLOW},
         {"our own prctl re-issue is allowed", __NR_prctl, gate,
          CNG_PR_SET_SECCOMP, CNG_SECCOMP_RET_ALLOW},
+        /* ioctl: only the SIOCxIF request band traps, so a terminal TCGETS and
+         * every driver call keep running native. The request is args[1]. */
+        {"SIOCGIFCONF traps", __NR_ioctl, 0x1000, 0x8912,
+         CNG_SECCOMP_RET_TRAP},
+        {"SIOCGIFADDR traps", __NR_ioctl, 0x1000, 0x8915,
+         CNG_SECCOMP_RET_TRAP},
+        {"the band's last request traps", __NR_ioctl, 0x1000, 0x8970,
+         CNG_SECCOMP_RET_TRAP},
+        {"TCGETS runs native", __NR_ioctl, 0x1000, 0x5401,
+         CNG_SECCOMP_RET_ALLOW},
+        {"just below the band runs native", __NR_ioctl, 0x1000, 0x890f,
+         CNG_SECCOMP_RET_ALLOW},
+        {"just above the band runs native", __NR_ioctl, 0x1000, 0x8971,
+         CNG_SECCOMP_RET_ALLOW},
     };
     for (unsigned k = 0; k < sizeof cases / sizeof cases[0]; k++) {
         u32 d[16];
