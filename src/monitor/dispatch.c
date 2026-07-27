@@ -1925,6 +1925,16 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         const char *gp = (const char *)a0;
         if (!gp)
             return -EFAULT;
+        /* chroot(2) needs CAP_SYS_CHROOT, which for us means the guest's
+         * effective uid is 0 under --fake-id. Ungated, an unprivileged guest
+         * could move its own root where a real kernel would have refused —
+         * a privilege check the guest's own code may be relying on (a daemon
+         * that drops privileges and then expects chroot to fail). The /proc
+         * passthrough surviving into the new root is a deliberate divergence:
+         * a real chroot leaves /proc unmounted, but a guest that cannot see
+         * /proc cannot run apk's package scripts, which chroot(".") first. */
+        if (!cng_fake_root())
+            return -EPERM;
         char gc[CNG_PATH_MAX], hp[CNG_PATH_MAX];
         if (cng_fs_abscanon(cng_g_fs, gp, gc, sizeof gc) != 0)
             return -ENAMETOOLONG;

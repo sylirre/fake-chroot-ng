@@ -20,6 +20,14 @@ check "dispatch faccessat: missing file" 1 $?
 # exists while following it does not. Resolving the final component during
 # translation answered for the target and lost the distinction.
 ln -s /nowhere "$ROOT/dangling"
+# chroot(2) is privileged. Ungated, an unprivileged guest could move its own
+# root where a real kernel refuses -- a check the guest's own code may rely on
+# (a daemon that drops privileges and expects chroot to fail afterwards).
+mkdir -p "$ROOT/sub"
+check_contains "chroot needs CAP_SYS_CHROOT (fake-root), else EPERM" \
+    "chroot: unpriv=-1 root=0 cwd=/" \
+    "$(run -t dtest -r "$ROOT" chroot /sub 2>&1)"
+
 check_contains "faccessat2 AT_SYMLINK_NOFOLLOW answers for the link itself" \
     "accessnf: nofollow=0 follow=-2" \
     "$(run -t dtest -r "$ROOT" accessnf /dangling 2>&1)"

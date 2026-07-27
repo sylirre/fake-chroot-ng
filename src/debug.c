@@ -284,6 +284,21 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
         cng_dprintf(1, "denied: %d failures\n", fails);
         return fails ? 1 : 0;
     }
+    /* chroot(2) is privileged: without CAP_SYS_CHROOT — for us, a fake identity
+     * whose effective uid is 0 — the kernel refuses it. Both answers in one run,
+     * since the gate is the whole point. */
+    if (!strcmp(op, "chroot")) {
+        cng_g_fake_id = 0;
+        long unpriv = cng_dispatch(__NR_chroot, (long)gpath, 0, 0, 0, 0, 0, 0);
+        cng_g_fake_id = 1;
+        cng_g_fake_uid = cng_g_fake_gid = 0;
+        cng_cred_seed();
+        long priv = cng_dispatch(__NR_chroot, (long)gpath, 0, 0, 0, 0, 0, 0);
+        cng_dprintf(1, "chroot: unpriv=%d root=%d cwd=%s\n", (int)unpriv,
+                    (int)priv, cng_g_fs->cwd);
+        cng_g_fake_id = 0;
+        return 0;
+    }
     if (!strcmp(op, "access")) {
         long r = cng_dispatch(__NR_faccessat, CNG_AT_FDCWD, (long)gpath, 0, 0, 0,
                               0, /*trapped=*/0);

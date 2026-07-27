@@ -1351,6 +1351,22 @@ vfork/`posix_spawn` child-stack handling.
     that rebuilds the filter with the identity on and off — the only place the
     conditional trap set is visible. Suite: 446 passed, 0 failed.
 
+- [x] **M17-13 — `chroot(2)` is privileged again**
+  It was ungated: any guest could move its own root, where a real kernel demands
+  `CAP_SYS_CHROOT`. That is a check guest code relies on the other way round too
+  — a daemon that drops privileges and then expects `chroot` to fail was told it
+  had succeeded. It now needs the same thing every other privileged operation
+  here needs: a fake identity whose effective uid is 0 (`cng_fake_root`), and
+  answers `EPERM` otherwise. The documented use (apk, which chroots before every
+  package script) runs under `--fake-id` already.
+  - The `/proc` and `/dev` zones surviving into the new root stays a **deliberate**
+    divergence, now written down where the gate is: a real chroot leaves them
+    unmounted, but a guest that cannot see `/proc` cannot run those same package
+    scripts. Same trade as the M14 note above, for the same reason.
+  - **Tests:** one leg in `m5b_monitor.sh` on a new `dtest chroot`, which asks
+    both ways in one run — unprivileged `EPERM`, fake-root success — since the
+    gate is the whole point.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes
