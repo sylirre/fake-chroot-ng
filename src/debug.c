@@ -11,6 +11,7 @@
 #include "cng/path.h"
 #include "cng/procfs.h"
 #include "cng/procreg.h"
+#include "cng/ptrace.h"
 #include "cng/rewrite.h"
 #include "cng/seccomp.h"
 #include "cng/shm.h"
@@ -2948,7 +2949,302 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
         fails += !ok2;
     }
 
+    /* The two filters a ptrace role stacks on a task. Neither can be observed
+     * any other way — they are only installed once a guest traces, and a guest
+     * filter never runs under qemu-user — so simulating them here is the only
+     * check they get before a device sees them. */
+    {
+        static struct sock_filter tf[CNG_SECCOMP_TRACEALL_INSNS];
+        int tn = cng_build_seccomp_traceall(tf, CNG_SECCOMP_TRACEALL_INSNS);
+        struct {
+            const char *what;
+            int nr;
+            unsigned long ip, arg0;
+            u32 want;
+        } tcases[] = {
+            /* The point of the filter: a tracee must stop on everything, not
+             * just the path-bearing set the base filter traps. */
+            {"traceall: read traps", __NR_read, 0x1000, 0,
+             CNG_SECCOMP_RET_TRAP},
+            {"traceall: getpid traps", __NR_getpid, 0x1000, 0,
+             CNG_SECCOMP_RET_TRAP},
+            {"traceall: openat traps", __NR_openat, 0x1000, 0,
+             CNG_SECCOMP_RET_TRAP},
+            /* Our own re-issue must not re-trap, or the handler recurses. */
+            {"traceall: in-gate reissue allowed", __NR_read, gate, 0,
+             CNG_SECCOMP_RET_ALLOW},
+            /* rt_sigreturn must execute with sp still on the kernel's signal
+             * frame; there is no way to re-issue it from the handler, so it
+             * has to stay native. */
+            {"traceall: rt_sigreturn stays native", __NR_rt_sigreturn, 0x1000,
+             0, CNG_SECCOMP_RET_ALLOW},
+            /* A thread-creating clone likewise cannot be re-issued from the
+             * handler; process creation can, and must trap so the fork event
+             * and the child's attach happen. */
+            {"traceall: thread clone stays native", __NR_clone, 0x1000,
+             CNG_CLONE_VM | 0x10000, CNG_SECCOMP_RET_ALLOW},
+            {"traceall: fork traps", __NR_clone, 0x1000, 17 /*SIGCHLD*/,
+             CNG_SECCOMP_RET_TRAP},
+            {"traceall: vfork traps", __NR_clone, 0x1000,
+             CNG_CLONE_VM | CNG_CLONE_VFORK, CNG_SECCOMP_RET_TRAP},
+        };
+        int tf_ok = tn > 0;
+        for (unsigned k = 0; tf_ok && k < sizeof tcases / sizeof tcases[0];
+             k++) {
+            u32 d[16];
+            int bad = 0;
+            bpf_data(d, tcases[k].nr, tcases[k].ip, tcases[k].arg0);
+            u32 got = bpf_run(tf, tn, d, &bad);
+            int ok = !bad && got == tcases[k].want;
+            cng_dprintf(1, "bpftest %s -> %s\n", tcases[k].what,
+                        ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+        if (!tf_ok) {
+            cng_dprintf(1, "bpftest traceall: build failed -> FAIL\n");
+            fails++;
+        }
+
+        static struct sock_filter rf[CNG_SECCOMP_TRACER_INSNS];
+        int rn = cng_build_seccomp_tracer(rf, CNG_SECCOMP_TRACER_INSNS);
+        struct {
+            const char *what;
+            int nr;
+            u32 want;
+        } rcases[] = {
+            /* A tracer's wait has to account for stops that are not the
+             * kernel's, and its SIGSTOP has to become a cooperative one. */
+            {"tracer: wait4 traps", __NR_wait4, CNG_SECCOMP_RET_TRAP},
+            {"tracer: waitid traps", __NR_waitid, CNG_SECCOMP_RET_TRAP},
+            {"tracer: kill traps", __NR_kill, CNG_SECCOMP_RET_TRAP},
+            {"tracer: tgkill traps", __NR_tgkill, CNG_SECCOMP_RET_TRAP},
+            {"tracer: process_vm_readv traps", __NR_process_vm_readv,
+             CNG_SECCOMP_RET_TRAP},
+            /* ...and nothing else does: this is the filter an ordinary tracer
+             * (gdb, strace) runs its own work through. */
+            {"tracer: read stays native", __NR_read, CNG_SECCOMP_RET_ALLOW},
+            {"tracer: openat stays native", __NR_openat,
+             CNG_SECCOMP_RET_ALLOW},
+        };
+        int rf_ok = rn > 0;
+        for (unsigned k = 0; rf_ok && k < sizeof rcases / sizeof rcases[0];
+             k++) {
+            u32 d[16];
+            int bad = 0;
+            bpf_data(d, rcases[k].nr, 0x1000, 0);
+            u32 got = bpf_run(rf, rn, d, &bad);
+            int ok = !bad && got == rcases[k].want;
+            cng_dprintf(1, "bpftest %s -> %s\n", rcases[k].what,
+                        ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+        if (!rf_ok) {
+            cng_dprintf(1, "bpftest tracer: build failed -> FAIL\n");
+            fails++;
+        }
+    }
+
     cng_dprintf(1, "bpftest: %d failure(s)\n", fails);
+    return fails ? 1 : 0;
+}
+
+/* ---- M18: ptrace single-step decoder (-t ptracetest) ---------------------
+ *
+ * The next-PC decoder is the one piece of the ptrace emulation with no safety
+ * net: everything else fails visibly (a stop that does not arrive, a request
+ * that answers an error), but a branch this misreads plants the breakpoint at
+ * an address the tracee never executes, and the "stepped" tracee runs away.
+ * It is also pure — registers in, address out — so it is checked directly here
+ * rather than through a guest, and on every host.
+ */
+/* `absolute` distinguishes "the answer is this address" (a register-form
+ * branch, or the 0 that means "not decodable") from "the answer is this far
+ * past pc". */
+static int ptstep_case(const char *what, u32 insn, struct cng_uregs *r, u64 want,
+                       int absolute) {
+    static u32 code[2];
+    code[0] = insn;
+    code[1] = 0xD503201Fu; /* nop, so a fall-through lands on something real */
+    r->pc = (u64)(unsigned long)&code[0];
+    if (!absolute)
+        want += r->pc;
+    u64 got = cng_pt_next_pc(r);
+    int ok = got == want;
+    cng_dprintf(1, "ptracetest %s: %s\n", what, ok ? "OK" : "FAIL");
+    if (!ok)
+        cng_dprintf(1, "  want=+%ld got=%ld\n", (long)(want - r->pc),
+                    (long)((long)got - (long)r->pc));
+    return !ok;
+}
+
+/* The SIGSYS tier's stop path, driven without a filter.
+ *
+ * On a device that tier is the one that runs, and on a cross host it cannot be
+ * reached at all: qemu-user does not apply a guest seccomp filter, so every
+ * live-guest ptrace test in the suite goes through the -R trampoline instead.
+ * Both tiers call the same emulation, but the wrapper around it is separate
+ * code, so this drives the SIGSYS one directly — a real fork, a real
+ * tracer/tracee pair over the real registry and mailbox, with the trap itself
+ * synthesized: a ucontext whose x8 says getpid and a siginfo that says seccomp,
+ * which is exactly what the kernel hands cng_sigsys_body.
+ */
+static int pt_sim_child(int wfd) {
+    cng_pt_sig_install_kick();
+    if (cng_pt_syscall(CNG_PTRACE_TRACEME, 0, 0, 0) != 0)
+        return 91;
+    char c = 'r';
+    sys_write(wfd, &c, 1);
+    /* Stop cooperatively so the tracer can arm us, the way a tracee's own
+     * SIGSTOP is routed. The kick lands as soon as the queueing syscall
+     * returns, and its handler parks us. */
+    cng_pt_signal_route(sys_getpid(), 19 /*SIGSTOP*/);
+
+    /* Now the synthesized trap. */
+    static struct cng_ucontext uc;
+    static cng_siginfo_t si;
+    memset(&uc, 0, sizeof uc);
+    memset(&si, 0, sizeof si);
+    uc.uc_mcontext.regs[8] = __NR_getpid;
+    uc.uc_mcontext.pc = 0x1000;
+    uc.uc_mcontext.sp = 0x2000;
+    si.si_code = CNG_SYS_SECCOMP;
+    si._u._sigsys.call_addr = (void *)0x1000; /* outside the gate */
+    si._u._sigsys.syscall = __NR_getpid;
+    cng_sigsys_body(&uc, &si);
+    return (long)uc.uc_mcontext.regs[0] == sys_getpid() ? 0 : 92;
+}
+
+static int pt_sim_sigsys(void) {
+    int fds[2];
+    if (CNG_SYS(__NR_pipe2, fds, 0, 0, 0, 0, 0) < 0) {
+        cng_dprintf(1, "ptracetest sigsys tier: no pipe -> FAIL\n");
+        return 1;
+    }
+    long kid = CNG_SYS(__NR_clone, 17 /*SIGCHLD*/, 0, 0, 0, 0, 0);
+    if (kid == 0) {
+        sys_close(fds[0]);
+        CNG_SYS(__NR_exit_group, pt_sim_child(fds[1]), 0, 0, 0, 0, 0);
+    }
+    sys_close(fds[1]);
+    char c = 0;
+    sys_read(fds[0], &c, 1);
+    sys_close(fds[0]);
+    if (kid < 0) {
+        cng_dprintf(1, "ptracetest sigsys tier: no fork -> FAIL\n");
+        return 1;
+    }
+
+    int fails = 0, st = 0;
+    long r = cng_pt_wait4(kid, (u64)(unsigned long)&st, 0, 0, 0);
+    int ok = r == kid && (st & 0xff) == 0x7f && ((st >> 8) & 0xff) == 19;
+    cng_dprintf(1, "ptracetest sigsys tier: cooperative stop -> %s\n",
+                ok ? "OK" : "FAIL");
+    fails += !ok;
+
+    cng_pt_syscall(CNG_PTRACE_SETOPTIONS, kid, 0, CNG_PTRACE_O_TRACESYSGOOD);
+    cng_pt_syscall(CNG_PTRACE_SYSCALL, kid, 0, 0);
+    r = cng_pt_wait4(kid, (u64)(unsigned long)&st, 0, 0, 0);
+    ok = r == kid && (st & 0xff) == 0x7f && ((st >> 8) & 0xff) == (5 | 0x80);
+    cng_dprintf(1, "ptracetest sigsys tier: syscall-entry stop -> %s\n",
+                ok ? "OK" : "FAIL");
+    fails += !ok;
+
+    /* The register file the tracer sees is the trapped ucontext itself. */
+    struct cng_uregs regs;
+    memset(&regs, 0, sizeof regs);
+    u64 iov[2] = {(u64)(unsigned long)&regs, sizeof regs};
+    cng_pt_syscall(CNG_PTRACE_GETREGSET, kid, CNG_NT_PRSTATUS,
+                   (u64)(unsigned long)iov);
+    ok = (long)regs.x[8] == __NR_getpid && regs.pc == 0x1000;
+    cng_dprintf(1, "ptracetest sigsys tier: regs at the entry stop -> %s\n",
+                ok ? "OK" : "FAIL");
+    fails += !ok;
+
+    cng_pt_syscall(CNG_PTRACE_SYSCALL, kid, 0, 0);
+    r = cng_pt_wait4(kid, (u64)(unsigned long)&st, 0, 0, 0);
+    ok = r == kid && (st & 0xff) == 0x7f && ((st >> 8) & 0xff) == (5 | 0x80);
+    fails += !ok;
+    iov[1] = sizeof regs;
+    cng_pt_syscall(CNG_PTRACE_GETREGSET, kid, CNG_NT_PRSTATUS,
+                   (u64)(unsigned long)iov);
+    int rok = (long)regs.x[0] == kid; /* the syscall really ran */
+    cng_dprintf(1, "ptracetest sigsys tier: syscall-exit stop -> %s\n",
+                (ok && rok) ? "OK" : "FAIL");
+    fails += !(ok && rok);
+
+    cng_pt_syscall(CNG_PTRACE_CONT, kid, 0, 0);
+    r = cng_pt_wait4(kid, (u64)(unsigned long)&st, 0, 0, 0);
+    ok = r == kid && (st & 0x7f) == 0 && ((st >> 8) & 0xff) == 0;
+    cng_dprintf(1, "ptracetest sigsys tier: tracee exited clean -> %s\n",
+                ok ? "OK" : "FAIL");
+    fails += !ok;
+    return fails;
+}
+
+int cng_cmd_ptracetest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    int fails = 0;
+    struct cng_uregs r;
+    memset(&r, 0, sizeof r);
+
+    /* Anything that is not a branch simply advances. */
+    fails += ptstep_case("nop advances by 4", 0xD503201Fu, &r, 4, 0);
+    fails += ptstep_case("svc advances by 4", 0xD4000001u, &r, 4, 0);
+
+    /* Unconditional, PC-relative. */
+    fails += ptstep_case("b +8", 0x14000002u, &r, 8, 0);
+    fails += ptstep_case("b -8", 0x17FFFFFEu, &r, (u64)-8, 0);
+    fails += ptstep_case("bl +4", 0x94000001u, &r, 4, 0);
+
+    /* Conditional: the flags in the frame decide, so exactly one target is
+     * planted rather than one on each side. */
+    r.pstate = 0x40000000u; /* Z set */
+    fails += ptstep_case("b.eq taken when Z", 0x54000040u, &r, 8, 0);
+    r.pstate = 0;
+    fails += ptstep_case("b.eq falls through when !Z", 0x54000040u, &r, 4, 0);
+    r.pstate = 0x40000000u;
+    fails += ptstep_case("b.ne falls through when Z", 0x54000041u, &r, 4, 0);
+    r.pstate = 0;
+
+    /* Compare-and-branch, including the 32-bit form's upper half. */
+    r.x[3] = 0;
+    fails += ptstep_case("cbz x3 taken when zero", 0xB4000043u, &r, 8, 0);
+    r.x[3] = 1;
+    fails += ptstep_case("cbz x3 falls through", 0xB4000043u, &r, 4, 0);
+    r.x[4] = 0x100000000uLL; /* w4 == 0, x4 != 0 */
+    fails += ptstep_case("cbnz w4 judges the low word", 0x35000044u, &r, 4, 0);
+    fails += ptstep_case("cbnz x4 judges all 64 bits", 0xB5000044u, &r, 8, 0);
+
+    /* Test-and-branch, both halves of the split bit number. */
+    r.x[5] = 0;
+    fails += ptstep_case("tbz x5,#3 taken when clear", 0x36180045u, &r, 8, 0);
+    r.x[5] = 8;
+    fails += ptstep_case("tbz x5,#3 falls through when set", 0x36180045u, &r, 4,
+                         0);
+    r.x[6] = 1uLL << 40;
+    fails += ptstep_case("tbnz x6,#40 taken (bit 5 of the index)", 0xB7400046u,
+                         &r, 8, 0);
+
+    /* Register forms read the frame. */
+    r.x[30] = 0x0BEE0;
+    fails += ptstep_case("ret follows x30", 0xD65F03C0u, &r, 0x0BEE0, 1);
+    r.x[7] = 0x12340;
+    fails += ptstep_case("br follows xn", 0xD61F00E0u, &r, 0x12340, 1);
+    r.x[9] = 0x9000;
+    fails += ptstep_case("blr follows xn", 0xD63F0120u, &r, 0x9000, 1);
+
+    /* A pointer-authenticated branch is not decoded, and must say so rather
+     * than guess: 0 makes the caller report the step in place instead of
+     * planting a breakpoint somewhere the tracee will never reach. */
+    fails += ptstep_case("braaz is refused, not guessed", 0xD61F0820u, &r, 0, 1);
+
+    cng_pt_init();
+    fails += pt_sim_sigsys();
+
+    cng_dprintf(1, "ptracetest: %d failure(s)\n", fails);
     return fails ? 1 : 0;
 }
 

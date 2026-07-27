@@ -65,7 +65,8 @@ DIR — see below), `-l/--link2symlink` (emulate hardlinks where the host refuse
 emulation described below), `--no-dev` (turn off the `/dev` passthrough),
 `--share-abstract-sockets` (don't isolate abstract AF_UNIX names per rootfs), `--shared-proc` (share the process view between
 independent invocations of the same rootfs, for both the process view and the
-System V shm namespace).
+System V shm namespace), `--no-ptrace` (refuse guest `ptrace(2)` instead of
+emulating it).
 
 `/proc` is visible to the guest without a bind, and describes the guest rather
 than chroot-ng: host processes are hidden from it (by path and from listings,
@@ -123,6 +124,27 @@ SysV IPC and no `/dev/shm`. Segments are shared by every process of one
 invocation and isolated between invocations, unless `--shared-proc` widens the
 namespace to the rootfs.
 
+**`ptrace(2)` works inside the rootfs** — `strace`, `gdb` and `proot` all run
+there — even though chroot-ng itself uses none. It has to be emulated rather
+than passed through: the host kernel would show a guest tracer *our* re-issued
+syscalls, host paths with the rootfs prefix attached, and no post-`execve`
+`SIGTRAP` at all, since our execve never enters the kernel's exec path. So a
+tracee stops in our own code — the point where its registers are the frame the
+kernel just handed us and its memory is our memory — publishes the stop into a
+shared registry, and services `PEEK`/`POKE`/`GETREGSET`/`SETREGSET`/resume for
+itself over a futex mailbox. That needs no host ptrace permission, which
+Android's policy does not grant. Syscall stops, signal and fault stops (so gdb's
+breakpoints arrive), the fork/clone/exec/exit events, group-stops and
+`PTRACE_ATTACH` to a running process all behave as the kernel's do; the suite
+proves it by running the same program under chroot-ng and against the real
+kernel and requiring identical output. Two things are out of reach and
+documented as such: `rt_sigreturn` and thread-creating `clone` are never
+reported (neither can be re-issued from a signal handler), so `strace -f`
+follows forks but not new threads. Single-step is emulated with breakpoints,
+since arming the hardware kind needs the kernel's own ptrace. A traced task
+stops on *every* syscall, which is slow by construction; a guest that never
+traces pays nothing at all, and `--no-ptrace` turns the whole thing off.
+
 **The environment** is built, not inherited. A host variable describes the host
 rather than the rootfs — `PATH`, `HOME`, `LD_LIBRARY_PATH`, `XDG_*`, `TMPDIR`
 would every one of them send a guest looking outside its own filesystem for
@@ -151,6 +173,7 @@ chroot-ng --fake-id 1000:1000 ./rootfs /bin/sh
 # non-root, but setuid-root `su` still works (--setuid/--setgid-root imply -u):
 chroot-ng --fake-id 1000:1000 --setuid-root --setgid-root ./rootfs /bin/su -
 chroot-ng -u -l ./rootfs /sbin/apk add busybox   # hardlinked packages
+chroot-ng -u ./rootfs /usr/bin/strace -f /bin/ls  # tracing inside the rootfs
 ```
 
 Run `chroot-ng --probe` on any target device **first** — the whole in-process

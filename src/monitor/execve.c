@@ -16,6 +16,7 @@
 #include "cng/monitor.h"
 #include "cng/path.h"
 #include "cng/procfs.h"
+#include "cng/ptrace.h"
 #include "cng/rt.h"
 #include "cng/shm.h"
 #include "cng/syscall.h"
@@ -51,6 +52,11 @@ static void cng_reset_signals(void) {
     /* stack_t: ss_sp(8), ss_flags(4)@8, ss_size(8)@16 => 24 bytes. SS_DISABLE=2. */
     unsigned long ss[3] = {0, 2, 0};
     CNG_SYS(__NR_sigaltstack, ss, 0, 0, 0, 0, 0);
+    /* Same reset applied to the record ptsig.c keeps of what the guest asked
+     * for, and reinstatement of the dispositions that must outlive an exec:
+     * the ptrace kick handler, and our own hooks if this task is still traced
+     * (ptrace survives execve — that is what strace relies on). */
+    cng_pt_sig_exec_reset();
 }
 
 void cng_close_cloexec(void) {
@@ -617,6 +623,12 @@ void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
         r[i] = 0;
     uc->uc_mcontext.sp = sp;
     uc->uc_mcontext.pc = entry;
+    /* The post-execve stop. A real execve traps to the tracer with SIGTRAP once
+     * the new image is in place — the stop strace waits for before it starts
+     * following the program it launched, and the one our emulation would
+     * otherwise never produce, since it never enters the kernel's exec path. */
+    cng_pt_set_frame(cng_pt_uregs(uc), uc);
+    cng_pt_report_exec(cng_pt_uregs(uc));
 }
 
 long cng_execve_tramp(int dirfd, const char *path, char **argv, char **envp,
@@ -627,5 +639,19 @@ long cng_execve_tramp(int dirfd, const char *path, char **argv, char **envp,
         return rc;
     /* Ordinary call context (no signal frame): abandon the old program's stack
      * and enter the new image directly, like the initial `run` does. */
+    if (cng_pt_active()) {
+        /* The post-execve stop, on a frame describing the entry state we are
+         * about to jump to — there is no signal context here to rewrite, so the
+         * tracer's register edits are read back before the jump. */
+        struct cng_uregs regs;
+        memset(&regs, 0, sizeof regs);
+        regs.sp = sp;
+        regs.pc = entry;
+        cng_pt_set_frame(&regs, 0);
+        cng_pt_report_exec(&regs);
+        sp = regs.sp;
+        entry = regs.pc;
+        cng_pt_set_frame(0, 0);
+    }
     cng_enter(sp, entry);
 }

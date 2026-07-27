@@ -173,6 +173,31 @@ For a real container you want `-u`/`--fake-id` (fake user identity, default
 credential set instead of returning ENOSYS — mirroring proot's `-0`/`-i` and the
 way the reference emulator recommends `--fake-id` for apt/dpkg.
 
+### Guest ptrace
+
+chroot-ng uses no ptrace, but guests do — `strace`, `gdb`, `proot` — and letting
+those reach the host kernel is worse than refusing them: the tracer sees our own
+re-issued syscalls, reads host paths with the rootfs prefix attached, and never
+gets the post-`execve` `SIGTRAP`, since our execve is emulated and never enters
+the kernel's exec path. So ptrace is emulated like every other kernel service
+here, from inside the processes involved: a shared registry created before the
+first fork holds one link per traced task, a tracee publishes its stop there and
+then parks in a service loop answering `PEEK`/`POKE`/`GETREGSET`/`SETREGSET`/
+resume *about itself* over a futex mailbox, and the tracer discovers stops from
+its `wait4`. Nothing in that needs host ptrace permission, `/proc/pid/mem` or
+`process_vm_readv`, all of which Android's policy can deny.
+
+The stop points are exactly where the guest already reaches our code — the
+SIGSYS trap, our signal handlers, the emulated execve, clone and exit — and at
+each of them the full register file is addressable, because the AArch64
+sigcontext's `regs/sp/pc/pstate` tail *is* a `struct user_pt_regs`. Two things
+have to be added on top: a traced task stacks a second filter that traps every
+syscall (the base filter only traps the path-bearing set, and strace must see
+all of them), and while traced its signals are mediated by handlers of ours that
+mirror the guest's own flags and mask — which is what makes a gdb breakpoint, a
+`brk` poked into read-only text, arrive as a stop rather than kill the guest.
+See `src/monitor/ptrace.c`, `ptsig.c` and `ptstep.c`.
+
 ### Known hazards (why the tiers exist)
 
 - `execve` erases the in-process handler → emulate `execve` via the loader.

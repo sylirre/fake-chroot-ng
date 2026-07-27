@@ -33,7 +33,7 @@ static char *emit(unsigned long pool, unsigned long cap, unsigned long *used,
     memcpy(slot, cng_svc_tramp_tpl, tsz);
     size_t disp_off = (size_t)(cng_svc_tramp_disp - cng_svc_tramp_tpl);
     size_t ret_off = (size_t)(cng_svc_tramp_ret - cng_svc_tramp_tpl);
-    *(unsigned long *)(slot + disp_off) = (unsigned long)&cng_dispatch;
+    *(unsigned long *)(slot + disp_off) = (unsigned long)&cng_tramp_dispatch;
     *(unsigned long *)(slot + ret_off) = ret_site;
     *used += tsz;
     return slot;

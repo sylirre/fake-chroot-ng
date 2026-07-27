@@ -19,6 +19,7 @@
 #include "cng/monitor.h"
 #include "cng/path.h"
 #include "cng/procreg.h"
+#include "cng/ptrace.h"
 #include "cng/rewrite.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
@@ -39,6 +40,8 @@ int cng_cmd_sigtest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_jmptest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_faketest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_rwtest(int argc, char **argv, char **envp, unsigned long *auxv);
+int cng_cmd_ptracetest(int argc, char **argv, char **envp,
+                       unsigned long *auxv);
 int cng_cmd_nettest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_blocktest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_loadtwice(int argc, char **argv, char **envp, unsigned long *auxv);
@@ -67,6 +70,7 @@ static const struct test_entry g_tests[] = {
     {"xlate", cng_cmd_xlate},           {"dtest", cng_cmd_dtest},
     {"sigtest", cng_cmd_sigtest},       {"jmptest", cng_cmd_jmptest},
     {"faketest", cng_cmd_faketest},     {"rwtest", cng_cmd_rwtest},
+    {"ptracetest", cng_cmd_ptracetest},
     {"nettest", cng_cmd_nettest},       {"blocktest", cng_cmd_blocktest},
     {"loadtwice", cng_cmd_loadtwice},   {"l2stest", cng_cmd_l2stest},
     {"exectest", cng_cmd_exectest},     {"cloexectest", cng_cmd_cloexectest},
@@ -391,6 +395,13 @@ static void help(char **envp) {
                       "and stat where the host denies them. With this flag the "
                       "guest sees only whatever /proc its rootfs (or an "
                       "explicit -b) provides."},
+        {"    --no-ptrace", "Refuse guest ptrace(2) with EPERM instead of "
+                      "emulating it. By default a guest tracer (strace, gdb, "
+                      "proot) works: chroot-ng emulates the whole stop protocol "
+                      "in-process, since the host kernel's ptrace would show a "
+                      "tracer our own re-issued syscalls and host paths. The "
+                      "machinery costs nothing until something actually traces, "
+                      "but a traced task then stops on every syscall."},
         {"    --shared-proc", "Share the guest process view between independent "
                       "chroot-ng invocations of the same rootfs, so ps/top in "
                       "one session see the guest processes of another. The "
@@ -704,6 +715,9 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
             } else if (!strcmp(n, "no-proc")) {
                 if (val) return err_noval(arg);
                 cng_g_no_proc = 1;
+            } else if (!strcmp(n, "no-ptrace")) {
+                if (val) return err_noval(arg);
+                cng_g_no_ptrace = 1;
             } else if (!strcmp(n, "no-dev")) {
                 if (val) return err_noval(arg);
                 cng_g_no_dev = 1;

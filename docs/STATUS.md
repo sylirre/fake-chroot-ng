@@ -1451,6 +1451,93 @@ vfork/`posix_spawn` child-stack handling.
     two edges, `TCGETS`, and the requests just outside it. Suite: 469 passed,
     0 failed.
 
+- [x] **M18 — guest `ptrace(2)`: strace, gdb and proot inside the rootfs**
+  Until now `ptrace` was neither trapped nor refused, so a guest tracer reached
+  the host kernel — which is worse than nothing here: the tracer saw *our*
+  re-issued syscalls interleaved with the guest's, the path arguments it read
+  were host paths with the rootfs prefix attached, exit-stop return values
+  described the re-issue rather than the guest's call, and there was no
+  post-`execve` `SIGTRAP` at all, because our execve never enters the kernel's
+  exec path. It is now emulated end to end, in-process, needing no host ptrace
+  permission (Android denies it), no `/proc/pid/mem` and no `process_vm_readv`.
+  Model ported from arm64chroot's `ptracetab.c`, with the register file coming
+  from the frame the kernel hands us at a stop rather than from an emulated CPU:
+  - **The registry** (`src/monitor/ptrace.c`): one `MAP_SHARED` anonymous
+    mapping created before the guest's first fork, so every guest process has it
+    at the same address. One link per traced *task* (keyed by tid, as the kernel
+    keys tracing), holding the relationship, the current stop, and a futex
+    mailbox. Lock-free throughout — all of it runs inside the SIGSYS handler,
+    where a sleeping lock could deadlock against the thread it interrupted.
+  - **The tracee answers for itself.** It is parked in our code at the stop, so
+    its memory is our memory (guest VA == host VA) and its registers are the
+    frame we are holding: `PEEK`/`POKE`/`GETREGSET`/`SETREGSET`/`CONT`/
+    `SYSCALL`/`DETACH` are mailbox messages it services while stopped. The
+    AArch64 sigcontext's `regs/sp/pc/pstate` tail *is* a `struct user_pt_regs`,
+    so the tracer reads and writes the real thing.
+  - **Stops:** syscall entry/exit (with the tracer able to rewrite arguments,
+    redirect the call via `NT_ARM_SYSTEM_CALL`, or cancel it outright — proot's
+    whole method), signal-delivery and fault stops, `PTRACE_EVENT_`
+    `FORK`/`VFORK`/`CLONE`/`VFORK_DONE`/`EXEC`/`EXIT`/`STOP`, group-stops,
+    the initial attach stop, and synthetic exits for a tracee the tracer cannot
+    host-reap. `PTRACE_ATTACH`/`SEIZE`/`INTERRUPT`/`LISTEN` reach a *running*
+    task through a reserved kick signal (SIGRTMAX where it can be queued; probed
+    downwards, because qemu-user refuses the top of the range).
+  - **Seeing every syscall** needs more than the base filter's path set, so a
+    task that becomes a tracee stacks a filter that traps everything
+    (`cng_install_seccomp_traceall`), and a task that becomes a tracer stacks a
+    narrow one over `wait4`/`waitid`/`kill`/`process_vm_*`. Both are installed
+    on demand, so a guest that never traces — every guest — pays nothing, and in
+    particular keeps a native, interruptible `wait4`.
+  - **Signals are mediated while traced** (`src/monitor/ptsig.c`): our handler is
+    installed for every catchable signal, mirroring the flags and mask the guest
+    asked for (so `SA_RESTART`, `SA_ONSTACK` and the blocked set behave as it
+    expects), the stop is reported, and only then is the signal handed to the
+    guest's own disposition — its handler, or the default action emulated in
+    place, including dying with the right `WIFSIGNALED` status. This is what
+    makes gdb work: a breakpoint is a `brk` poked into read-only text (we
+    mprotect, write, flush the icache and put the mapping back), and it arrives
+    as a `SIGTRAP` stop.
+  - **`PTRACE_SINGLESTEP` in software** (`src/monitor/ptstep.c`), because
+    hardware single-step is `PSTATE.SS` and only the kernel's own ptrace can arm
+    it: decode the instruction at pc, evaluate the condition against the frame's
+    NZCV and register-form branches against its registers, plant a `brk` at the
+    single resulting next PC, and report the `SIGTRAP` as a step. A step over a
+    syscall reports once the syscall returns, where `TIF_SINGLESTEP` reports it.
+    An instruction it cannot decode (a pointer-authenticated branch) reports the
+    step in place rather than let a "stepping" tracee run away.
+  - **`-R` tier parity:** `tramp.S` now builds a full `struct user_pt_regs` on
+    its own stack and restores every register from it, including `sp` and `pc`,
+    so a tracer's edits take effect on the rewriting tier too. That is also what
+    makes any of this testable on a cross host, where no guest filter runs.
+  - `--no-ptrace` refuses guest `ptrace` with `EPERM` and leaves the registry
+    unmapped.
+  - Fixed along the way: the SIGSYS tier's `clone` never published the child
+    into the PID registry (only the `-R` tier did), so a forked guest process was
+    invisible in `/proc` on the tier that runs on devices.
+  - **Tests:** `tests/guests/pt_probe.c` is built twice — as the AArch64 guest
+    and for the host — and 15 scenarios must print the same lines both ways, so
+    the oracle is the real kernel's ptrace: stops and resumption, syscall stops,
+    `GET_SYSCALL_INFO`, cancellation with a substituted return value, memory
+    read/write, signal stops suppressed and delivered, the fork event with its
+    auto-attached child, exec with and without `TRACEEXEC`, `TRACEEXIT`, a
+    poked breakpoint, single-stepping, and attach/detach to a running process.
+    One of them (`patharg`) pins the specific thing native host ptrace got
+    wrong: the path a tracer reads is the guest's own string, asserted again
+    with a real rootfs in the way. Plus the next-PC decoder in `-t ptracetest`
+    (18 encodings) and both stacked filters simulated in `-t bpftest` — neither
+    can be observed any other way on a cross host. Suite: 493 passed, 0 failed.
+  - Accepted divergences (deliberate, documented):
+    `rt_sigreturn` is never reported (it must execute with `sp` on the kernel's
+    signal frame, so it cannot be re-issued from the handler); thread-creating
+    `clone` is likewise left native, so `strace -f` follows forks but not new
+    threads; a stacked filter cannot be removed, so a task keeps trapping after
+    `PTRACE_DETACH` (a cost, not a correctness problem); a `SIGSTOP` sent to a
+    tracee by a process that is neither its tracer nor traced itself is a real
+    host stop, which freezes it inside its service loop; single-stepping is one
+    thread at a time; an exit stop is only reported for a syscall whose entry
+    stop was; and tracing spans one chroot-ng invocation's process tree, not
+    independent invocations.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

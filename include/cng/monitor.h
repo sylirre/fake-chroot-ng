@@ -177,6 +177,11 @@ void cng_close_cloexec(void);
 long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                   int trapped);
 
+/* The -R trampoline's entry point (tramp.S calls it with the frame it built):
+ * runs one rewritten syscall site, with the ptrace stops around it. */
+struct cng_uregs;
+void cng_tramp_dispatch(struct cng_uregs *r);
+
 /* One-shot-per-number diagnostic for a syscall we emulate away. */
 void cng_note_blocked(int nr);
 
@@ -248,6 +253,23 @@ void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si);
 /* Build and install the seccomp filter (traps the path syscall set, allows the
  * gate IP range, allows everything else). Returns 0 or -errno. */
 int cng_install_seccomp(void);
+
+/* Stack a second filter on the calling task when it enters a ptrace role:
+ * _traceall traps every syscall (a tracee must stop on all of them), _tracer
+ * traps only wait4/waitid/kill/process_vm_* (a tracer's answers must account
+ * for emulated stops). Both keep the gate allowlist. Filters cannot be
+ * removed, so each is installed at most once per task (see cng_pt_arm_*). */
+int cng_install_seccomp_traceall(void);
+int cng_install_seccomp_tracer(void);
+
+/* ...and the same split the base filter has, so a self-test can simulate them.
+ * Neither can be observed any other way: they are only installed once a guest
+ * traces, and guest filters do not run under qemu-user at all. */
+#define CNG_SECCOMP_TRACEALL_INSNS 24
+#define CNG_SECCOMP_TRACER_INSNS   24
+struct sock_filter;
+int cng_build_seccomp_traceall(struct sock_filter *f, int cap);
+int cng_build_seccomp_tracer(struct sock_filter *f, int cap);
 
 /* Upper bound on the filter's instruction count: prologue + clone block +
  * synthesized-fd block + one check per trapped syscall + the two tail RETs. */

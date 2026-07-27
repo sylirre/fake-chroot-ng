@@ -11,6 +11,7 @@
 #include "cng/path.h"
 #include "cng/procfs.h"
 #include "cng/procreg.h"
+#include "cng/ptrace.h"
 #include "cng/netlink.h"
 #include "cng/unixsock.h"
 #include "cng/rt.h"
@@ -1478,12 +1479,30 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * this itself: nothing guarantees it makes another traced syscall before
      * something reads its /proc entry. */
     case __NR_clone: {
+        /* Decided from the flags the guest asked for, before the conversion
+         * below erases CLONE_VFORK. */
+        int ev = cng_pt_clone_event((unsigned long)a0);
+        /* Sampled before the clone: in the child the per-task lookup is keyed
+         * by a tid that has no entry yet, so it would answer NULL. The frame
+         * itself is on the trampoline's stack, which the child inherits at the
+         * same address. */
+        struct cng_uregs *ur = cng_pt_cur_regs();
         long flags = a0 & ~(long)(CNG_CLONE_VM | CNG_CLONE_VFORK);
         long r = cng_syscall6(flags, a1, a2, a3, a4, a5, __NR_clone);
-        if (r > 0)
+        if (r > 0) {
             cng_procreg_fork((int)r);
-        else if (r == 0)
+            if (ur) {
+                cng_pt_report_event(ur, ev, (u64)r);
+                /* Our fork does not suspend the parent the way a real vfork
+                 * would, so "vfork done" is reported as soon as the child is. */
+                if (a0 & CNG_CLONE_VFORK)
+                    cng_pt_report_event(ur, CNG_PTRACE_EVENT_VFORK_DONE, (u64)r);
+            }
+        } else if (r == 0) {
             cng_shm_fork_child(); /* the child inherited our shm attaches */
+            if (ur)
+                cng_pt_fork_child(ur, ev);
+        }
         return r;
     }
 
@@ -1961,9 +1980,16 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * strip SIGSYS from any handler's sa_mask so it can't be masked while a
      * guest handler runs. Kernel struct sigaction: handler,flags,restorer,mask
      * (mask at offset 24). */
-    case __NR_rt_sigaction:
+    case __NR_rt_sigaction: {
         if ((int)a0 == CNG_SIGSYS)
             return 0;
+        /* While the task is traced, ptsig.c owns the real disposition of every
+         * signal (a tracee must stop before its own handler runs), and it owns
+         * the kick signal's slot always. It answers from its mirror of what the
+         * guest asked for; otherwise it just records and lets this through. */
+        long ptr;
+        if (cng_pt_sigaction((int)a0, (u64)a1, (u64)a2, (u64)a3, &ptr))
+            return ptr;
         if (a1) {
             unsigned char act[32];
             if (!cng_user_readable((void *)a1, sizeof act))
@@ -1974,6 +2000,67 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                                 __NR_rt_sigaction);
         }
         return cng_syscall6(a0, a1, a2, a3, a4, a5, __NR_rt_sigaction);
+    }
+
+    /* ---- ptrace(2) and the syscalls its emulation has to account for ----
+     *
+     * ptrace is trapped for every guest (it is the only way to see a
+     * PTRACE_TRACEME, and no ordinary program calls it); the rest are trapped
+     * only on tasks that have entered a ptrace role, by the filter stacked in
+     * cng_pt_arm_tracer/tracee. See src/monitor/ptrace.c. */
+    case __NR_ptrace:
+        return cng_pt_syscall(a0, a1, (u64)a2, (u64)a3);
+
+    case __NR_wait4:
+        return cng_pt_wait4(a0, (u64)a1, a2, (u64)a3, cng_pt_cur_uc());
+
+    case __NR_waitid:
+        return cng_pt_waitid(a0, a1, (u64)a2, a3, (u64)a4, cng_pt_cur_uc());
+
+    /* A stop signal aimed at a tracee becomes a cooperative group-stop: a real
+     * SIGSTOP would freeze it inside its ptrace service loop, and every later
+     * tracer request would deadlock (strace sends exactly that on ^C). SIGCONT
+     * ends a PTRACE_LISTEN group-stop the same way. Everything else, and every
+     * target that is not a tracee, is sent for real. */
+    case __NR_kill:
+        if (cng_pt_signal_route(a0, (int)a1))
+            return 0;
+        return reissue(a0, a1, a2, a3, a4, a5, nr);
+    case __NR_tkill:
+        if (cng_pt_signal_route(a0, (int)a1))
+            return 0;
+        return reissue(a0, a1, a2, a3, a4, a5, nr);
+    case __NR_tgkill:
+        if (cng_pt_signal_route(a1, (int)a2))
+            return 0;
+        return reissue(a0, a1, a2, a3, a4, a5, nr);
+
+    /* strace reads tracee memory with these before falling back to PEEKDATA.
+     * When the peer is one of our stopped tracees they are served from the
+     * ptrace mailbox, because the host has no reason to believe the caller is
+     * attached to it and may refuse (Yama ptrace_scope, SELinux). Any other
+     * peer runs natively. */
+    case __NR_process_vm_readv:
+    case __NR_process_vm_writev: {
+        long out;
+        if (cng_pt_vm_rw(nr, a0, (u64)a1, (u64)a2, (u64)a3, (u64)a4, &out))
+            return out;
+        return reissue(a0, a1, a2, a3, a4, a5, nr);
+    }
+
+    /* exit/exit_group are trapped only on a tracee (the trap-everything
+     * filter). The death has to reach the tracer: PTRACE_EVENT_EXIT first if it
+     * asked for one, then either a synthetic exit in the registry or a plain
+     * link drop when the tracer is our parent and reaps us for real. */
+    case __NR_exit:
+    case __NR_exit_group: {
+        int wstatus = ((int)a0 & 0xff) << 8;
+        struct cng_uregs *ur = cng_pt_cur_regs(); /* either tier's frame */
+        if (ur)
+            cng_pt_exit_stop(ur, wstatus);
+        cng_pt_exit_report(wstatus);
+        return reissue(a0, a1, a2, a3, a4, a5, nr);
+    }
 
     /* rt_sigprocmask on the trampoline path (the SIGSYS path handles it via
      * uc_sigmask): apply the mask but never block SIGSYS. */
@@ -2105,6 +2192,16 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         return cng_cred_handle(nr, a0, a1, a2, a3, a4, a5);
 
     default:
+        /* A tracee carries the trap-everything filter, so an unhandled syscall
+         * here is an ordinary one that simply has to run — the Android-blocked
+         * reading below does not apply, and the designed-ENOSYS set (which that
+         * filter converts from the base filter's RET_ERRNO into a trap) has to
+         * be refused by hand. */
+        if (trapped && cng_pt_traceall()) {
+            if (cng_denied_syscall(nr))
+                return -ENOSYS;
+            return reissue(a0, a1, a2, a3, a4, a5, nr);
+        }
         /* From a seccomp trap, an unhandled syscall was blocked by Android
          * (our filter only traps handled ones) => emulate ENOSYS rather than
          * re-issue and die on the nested trap. From a trampoline it is just an
@@ -2115,4 +2212,32 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         }
         return reissue(a0, a1, a2, a3, a4, a5, nr);
     }
+}
+
+/* The -R trampoline's entry point: one rewritten `svc` site, with a full
+ * register frame the trampoline built on its own stack (see tramp.S).
+ *
+ * It is the SIGSYS handler's counterpart on a tier that has no signal frame,
+ * and it exists so the two tiers behave the same for a ptrace tracee: the same
+ * entry/exit stops around the syscall, the same register file for the tracer to
+ * read and write, and the same single-step report. `trapped` is 0 here — an
+ * unhandled syscall on this path is an ordinary one to re-issue, not one
+ * Android blocked. */
+void cng_tramp_dispatch(struct cng_uregs *r) {
+    long nr = (long)r->x[8];
+    cng_pt_set_frame(r, 0);
+    if (!cng_pt_active()) {
+        r->x[0] = (u64)cng_dispatch(nr, (long)r->x[0], (long)r->x[1],
+                                    (long)r->x[2], (long)r->x[3], (long)r->x[4],
+                                    (long)r->x[5], 0);
+        return;
+    }
+    if (!cng_pt_syscall_entry(r, &nr)) {
+        cng_pt_syscall_exit(r); /* cancelled: x0 is the tracer's own answer */
+        return;
+    }
+    r->x[0] = (u64)cng_dispatch(nr, (long)r->x[0], (long)r->x[1], (long)r->x[2],
+                                (long)r->x[3], (long)r->x[4], (long)r->x[5], 0);
+    cng_pt_syscall_exit(r);
+    cng_pt_step_report(r);
 }

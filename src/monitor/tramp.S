@@ -2,12 +2,22 @@
  *
  * A rewritten `svc #0` at site S becomes `b tramp`. `b` (not `bl`) preserves
  * x30, which is live across the ubiquitous libc `svc; ret` wrapper. The
- * trampoline saves the syscall-preserved registers (x0..x18 and x30 — x18 is
- * Android's shadow-call-stack register, x19..x29 are preserved by the AAPCS
- * callee cng_dispatch), marshals the trapped args, calls the dispatcher, writes
- * the result to x0, restores the rest, and branches back to S+4. The two 64-bit
- * literals (dispatcher address, return address) are patched per copy; the
- * PC-relative LDRs survive verbatim copying.
+ * trampoline builds a full `struct cng_uregs` (x0..x30, sp, pc, pstate) on its
+ * own stack, hands it to cng_tramp_dispatch, and then restores every register
+ * from that frame — including sp and pc.
+ *
+ * It saves and restores far more than a syscall clobbers because the frame is
+ * also the register file a ptrace tracer reads and writes at a syscall stop on
+ * this tier (PTRACE_GETREGSET/SETREGSET); restoring pc and sp from it is what
+ * makes a tracer's edits take effect. x16/x17 (IP0/IP1) are the exception:
+ * they are this trampoline's own scratch, as they are any veneer's.
+ *
+ * pc is recorded as S+4 — where the kernel reports a syscall stop, the
+ * instruction after the svc — and pstate carries NZCV only, which is what the
+ * flags-dependent parts (single-step's condition evaluation) need.
+ *
+ * The two 64-bit literals (dispatcher address, return address) are patched per
+ * copy; the PC-relative LDRs survive verbatim copying.
  */
     .text
 
@@ -17,7 +27,7 @@
     .global cng_svc_tramp_ret
     .balign 8
 cng_svc_tramp_tpl:
-    sub     sp, sp, #176
+    sub     sp, sp, #288
     stp     x0, x1,   [sp, #0]
     stp     x2, x3,   [sp, #16]
     stp     x4, x5,   [sp, #32]
@@ -27,21 +37,34 @@ cng_svc_tramp_tpl:
     stp     x12, x13, [sp, #96]
     stp     x14, x15, [sp, #112]
     stp     x16, x17, [sp, #128]
-    stp     x18, x30, [sp, #144]
-    /* cng_dispatch(nr=x8, a0=x0..a5=x5, trapped=0) — trampoline path, so an
-     * unhandled syscall is re-issued rather than turned into ENOSYS. */
-    mov     x6, x5
-    mov     x5, x4
-    mov     x4, x3
-    mov     x3, x2
-    mov     x2, x1
-    mov     x1, x0
-    mov     x0, x8
-    mov     x7, xzr             /* trapped = 0 */
+    stp     x18, x19, [sp, #144]
+    stp     x20, x21, [sp, #160]
+    stp     x22, x23, [sp, #176]
+    stp     x24, x25, [sp, #192]
+    stp     x26, x27, [sp, #208]
+    stp     x28, x29, [sp, #224]
+    str     x30,      [sp, #240]
+    add     x16, sp, #288           /* sp as the guest had it at the site */
+    str     x16,      [sp, #248]
+    ldr     x16, cng_svc_tramp_ret  /* pc = S+4 */
+    str     x16,      [sp, #256]
+    mrs     x16, nzcv
+    str     x16,      [sp, #264]
+    mov     x0, sp                  /* cng_tramp_dispatch(&frame) */
     ldr     x16, cng_svc_tramp_disp
     blr     x16
-    str     x0, [sp, #160]          /* result */
-    ldr     x1, [sp, #8]
+    ldr     x16,      [sp, #264]
+    msr     nzcv, x16
+    ldp     x18, x19, [sp, #144]
+    ldp     x20, x21, [sp, #160]
+    ldp     x22, x23, [sp, #176]
+    ldp     x24, x25, [sp, #192]
+    ldp     x26, x27, [sp, #208]
+    ldp     x28, x29, [sp, #224]
+    ldr     x30,      [sp, #240]
+    ldr     x17,      [sp, #248]    /* sp and pc last: both are ours to use */
+    ldr     x16,      [sp, #256]
+    ldp     x0, x1,   [sp, #0]
     ldp     x2, x3,   [sp, #16]
     ldp     x4, x5,   [sp, #32]
     ldp     x6, x7,   [sp, #48]
@@ -49,15 +72,11 @@ cng_svc_tramp_tpl:
     ldp     x10, x11, [sp, #80]
     ldp     x12, x13, [sp, #96]
     ldp     x14, x15, [sp, #112]
-    ldr     x18, [sp, #144]
-    ldr     x30, [sp, #152]
-    ldr     x0,  [sp, #160]         /* x0 = result */
-    add     sp, sp, #176
-    ldr     x16, cng_svc_tramp_ret
+    mov     sp, x17
     br      x16
     .balign 8
 cng_svc_tramp_disp:
-    .quad   0                       /* patched: &cng_dispatch */
+    .quad   0                       /* patched: &cng_tramp_dispatch */
 cng_svc_tramp_ret:
     .quad   0                       /* patched: return site S+4 */
 cng_svc_tramp_tpl_end:

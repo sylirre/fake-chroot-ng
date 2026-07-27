@@ -94,6 +94,7 @@ if [ -f tests/m17_seccomp.sh ]; then . tests/m17_seccomp.sh; fi
 if [ -f tests/m17_uname.sh ]; then . tests/m17_uname.sh; fi
 if [ -f tests/m17_env.sh ]; then . tests/m17_env.sh; fi
 if [ -f tests/m17_workdir.sh ]; then . tests/m17_workdir.sh; fi
+if [ -f tests/m18_ptrace.sh ]; then . tests/m18_ptrace.sh; fi
 
 echo
 echo "== summary: $pass passed, $fail failed, $skipped skipped =="

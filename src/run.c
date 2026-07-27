@@ -31,6 +31,7 @@
 #include "cng/netlink.h"
 #include "cng/path.h"
 #include "cng/procfs.h"
+#include "cng/ptrace.h"
 #include "cng/rewrite.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
@@ -335,6 +336,11 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
         cng_procfs_init();
         cng_procfs_publish_stack(sp);
     }
+
+    /* The ptrace link registry: one MAP_SHARED region that every guest process
+     * must inherit, so it has to exist before the guest can fork — and before
+     * the filter, whose install is the last thing that happens here. */
+    cng_pt_init();
 
     /* Install the monitor last, after all of our own path syscalls are done.
      * Only when translation was actually requested; identity needs none. */

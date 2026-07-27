@@ -7,6 +7,8 @@
  */
 #include "cng/loader.h"
 #include "cng/monitor.h"
+#include "cng/procreg.h"
+#include "cng/ptrace.h"
 #include "cng/rt.h"
 #include "cng/shm.h"
 #include "cng/syscall.h"
@@ -63,6 +65,121 @@ int cng_sig_install(int signo, cng_sighandler_t h) {
     return (int)r;
 }
 
+/* The trapped syscall itself: the cases the handler must own (they need the
+ * signal context), then the dispatcher for everything else. Returns 1 when the
+ * result is in x0 and the caller still owes a syscall-exit stop, 0 when the
+ * context was redirected instead — an emulated execve enters the new program
+ * and reports its own post-exec stop, so there is no exit stop to give. */
+static int sigsys_syscall(struct cng_ucontext *uc, long nr) {
+    unsigned long long *r = uc->uc_mcontext.regs;
+    struct cng_uregs *ur = cng_pt_uregs(uc);
+
+    /* rt_sigprocmask: apply the guest's requested mask but never let SIGSYS be
+     * blocked (a masked seccomp SIGSYS force-kills). We edit uc_sigmask, which
+     * sigreturn restores — re-issuing the syscall here would be undone by that
+     * same restore. */
+    if (nr == __NR_rt_sigprocmask) {
+        int how = (int)r[0];
+        unsigned long *pset = (unsigned long *)r[1];
+        unsigned long *pold = (unsigned long *)r[2];
+        unsigned long cur = uc->uc_sigmask.sig[0];
+        /* Both are guest pointers we dereference ourselves rather than handing
+         * to the kernel, so a bad one must come back -EFAULT (see uaccess.c). */
+        if ((pset && !cng_user_readable(pset, sizeof *pset)) ||
+            (pold && !cng_user_writable(pold, sizeof *pold))) {
+            r[0] = (unsigned long long)(long)-EFAULT;
+            return 1;
+        }
+        if (pold)
+            *pold = cur;
+        if (pset) {
+            unsigned long set = *pset;
+            unsigned long neu = (how == 0)   ? (cur | set)   /* SIG_BLOCK */
+                                : (how == 1) ? (cur & ~set)  /* SIG_UNBLOCK */
+                                             : set;          /* SIG_SETMASK */
+            uc->uc_sigmask.sig[0] = neu & ~(1UL << (CNG_SIGSYS - 1));
+        }
+        r[0] = 0;
+        return 1;
+    }
+
+    /* execve/execveat are emulated in-process (they'd otherwise wipe us). */
+    if (nr == __NR_execve) {
+        cng_emulate_execve(uc, CNG_AT_FDCWD, (const char *)r[0], (char **)r[1],
+                           (char **)r[2], 0);
+        return cng_is_err((long)r[0]); /* success redirected the context */
+    }
+#ifdef __NR_execveat
+    if (nr == __NR_execveat) {
+        cng_emulate_execve(uc, (int)r[0], (const char *)r[1], (char **)r[2],
+                           (char **)r[3], (int)r[4]);
+        return cng_is_err((long)r[0]);
+    }
+#endif
+
+    /* clone with CLONE_VFORK (only these trap; see seccomp.c): a vfork-style
+     * spawn shares the parent's address space and suspends us until the child
+     * execs. Our execve is emulated in-process, so a shared-VM child would load
+     * the new program over the parent and never issue the real execve that
+     * resumes it. Convert to a plain COW fork, with two stack adjustments:
+     *  - pass child_stack=0 to the real clone so the forked child inherits (COW)
+     *    the parent's current SP — which here is the *scratch stack* our handler
+     *    frames sit on. The child must unwind those frames and sigreturn; giving
+     *    it the caller-supplied child stack instead sets its SP into a buffer
+     *    with no such frames -> Bus error before it can even execve.
+     *  - then point uc->sp at that caller-supplied child stack for the child, so
+     *    after sigreturn it resumes on the stack the guest's clone wrapper
+     *    expects (musl's __clone/posix_spawn stored the child fn+arg there).
+     *    child_stack==0 is a bare vfork: the child just continues on the
+     *    parent's stack, so leave uc->sp alone. */
+    if (nr == __NR_clone) {
+        unsigned long child_stack = (unsigned long)r[1];
+        unsigned long orig_flags = (unsigned long)r[0];
+        /* Decided before the fork, from the flags the guest asked for: the
+         * conversion below erases CLONE_VFORK, and a tracer following vforks
+         * must still see EVENT_VFORK rather than EVENT_FORK. */
+        int ev = cng_pt_clone_event(orig_flags);
+        long flags = (long)(orig_flags & ~(unsigned long)(CNG_CLONE_VM |
+                                                          CNG_CLONE_VFORK));
+        long ret = cng_syscall6(flags, 0, (long)r[2], (long)r[3], (long)r[4],
+                                (long)r[5], __NR_clone);
+        if (ret == 0) {
+            /* The child inherited both the mappings and the attach list, so
+             * the broker must count those attaches again (shm.c). */
+            cng_shm_fork_child();
+            if (child_stack)
+                uc->uc_mcontext.sp = child_stack;
+            r[0] = 0;
+            cng_pt_fork_child(ur, ev);
+            return 1;
+        }
+        if (ret > 0) {
+            /* Publish the child into the PID registry: it cannot do that for
+             * itself, because nothing guarantees it makes another trapped
+             * syscall before something reads its /proc entry — and a tracer
+             * attaching to it by pid needs it to be a known guest process. */
+            cng_procreg_fork((int)ret);
+            r[0] = (unsigned long long)ret;
+            cng_pt_report_event(ur, ev, (u64)ret);
+            /* A real vfork would have suspended us until the child exec'd or
+             * exited; ours does not, so the "vfork done" event is reported as
+             * soon as the child exists. */
+            if (orig_flags & CNG_CLONE_VFORK)
+                cng_pt_report_event(ur, CNG_PTRACE_EVENT_VFORK_DONE, (u64)ret);
+            return 1;
+        }
+        r[0] = (unsigned long long)ret;
+        return 1;
+    }
+
+    long res = cng_dispatch(nr, (long)r[0], (long)r[1], (long)r[2], (long)r[3],
+                            (long)r[4], (long)r[5], /*trapped=*/1);
+    if (cng_g_debug && res < 0 && res != -ENOENT)
+        cng_dprintf(2, "[cng] dispatch nr=%ld -> errno=%ld\n", nr, -res);
+    r[0] = (unsigned long long)res;
+    return 1;
+}
+
 void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si) {
     unsigned long long *r = uc->uc_mcontext.regs;
 
@@ -90,86 +207,29 @@ void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si) {
 
     long nr = (long)r[8];
 
-    /* rt_sigprocmask: apply the guest's requested mask but never let SIGSYS be
-     * blocked (a masked seccomp SIGSYS force-kills). We edit uc_sigmask, which
-     * sigreturn restores — re-issuing the syscall here would be undone by that
-     * same restore. */
-    if (nr == __NR_rt_sigprocmask) {
-        int how = (int)r[0];
-        unsigned long *pset = (unsigned long *)r[1];
-        unsigned long *pold = (unsigned long *)r[2];
-        unsigned long cur = uc->uc_sigmask.sig[0];
-        /* Both are guest pointers we dereference ourselves rather than handing
-         * to the kernel, so a bad one must come back -EFAULT (see uaccess.c). */
-        if ((pset && !cng_user_readable(pset, sizeof *pset)) ||
-            (pold && !cng_user_writable(pold, sizeof *pold))) {
-            r[0] = (unsigned long long)(long)-EFAULT;
-            return;
-        }
-        if (pold)
-            *pold = cur;
-        if (pset) {
-            unsigned long set = *pset;
-            unsigned long neu = (how == 0)   ? (cur | set)   /* SIG_BLOCK */
-                                : (how == 1) ? (cur & ~set)  /* SIG_UNBLOCK */
-                                             : set;          /* SIG_SETMASK */
-            uc->uc_sigmask.sig[0] = neu & ~(1UL << (CNG_SIGSYS - 1));
-        }
-        r[0] = 0;
+    /* Untraced — which is every guest until something in the session starts
+     * tracing — goes straight to the syscall with no ptrace work at all. A
+     * tracee's syscall is wrapped in the two stops the kernel would have given
+     * it: the tracer sees the arguments before the call and may rewrite them,
+     * redirect the call or cancel it outright (proot's whole method), and sees
+     * the result afterwards. */
+    cng_pt_set_frame(cng_pt_uregs(uc), uc);
+    if (!cng_pt_active()) {
+        sigsys_syscall(uc, nr);
         return;
     }
-
-    /* execve/execveat are emulated in-process (they'd otherwise wipe us). */
-    if (nr == __NR_execve) {
-        cng_emulate_execve(uc, CNG_AT_FDCWD, (const char *)r[0], (char **)r[1],
-                           (char **)r[2], 0);
+    struct cng_uregs *ur = cng_pt_uregs(uc);
+    if (!cng_pt_syscall_entry(ur, &nr)) {
+        cng_pt_syscall_exit(ur); /* cancelled: x0 is the tracer's own answer */
         return;
     }
-#ifdef __NR_execveat
-    if (nr == __NR_execveat) {
-        cng_emulate_execve(uc, (int)r[0], (const char *)r[1], (char **)r[2],
-                           (char **)r[3], (int)r[4]);
-        return;
-    }
-#endif
-
-    /* clone with CLONE_VFORK (only these trap; see seccomp.c): a vfork-style
-     * spawn shares the parent's address space and suspends it until the child
-     * execs. Our execve is emulated in-process, so a shared-VM child would load
-     * the new program over the parent and never issue the real execve that
-     * resumes it. Convert to a plain COW fork, with two stack adjustments:
-     *  - pass child_stack=0 to the real clone so the forked child inherits (COW)
-     *    the parent's current SP — which here is the *scratch stack* our handler
-     *    frames sit on. The child must unwind those frames and sigreturn; giving
-     *    it the caller-supplied child stack instead sets its SP into a buffer
-     *    with no such frames -> Bus error before it can even execve.
-     *  - then point uc->sp at that caller-supplied child stack for the child, so
-     *    after sigreturn it resumes on the stack the guest's clone wrapper
-     *    expects (musl's __clone/posix_spawn stored the child fn+arg there).
-     *    child_stack==0 is a bare vfork: the child just continues on the
-     *    parent's stack, so leave uc->sp alone. */
-    if (nr == __NR_clone) {
-        unsigned long child_stack = (unsigned long)r[1];
-        long flags = (long)(r[0] & ~(unsigned long long)(CNG_CLONE_VM |
-                                                         CNG_CLONE_VFORK));
-        long ret = cng_syscall6(flags, 0, (long)r[2], (long)r[3], (long)r[4],
-                                (long)r[5], __NR_clone);
-        if (ret == 0) {
-            /* The child inherited both the mappings and the attach list, so
-             * the broker must count those attaches again (shm.c). */
-            cng_shm_fork_child();
-            if (child_stack)
-                uc->uc_mcontext.sp = child_stack;
-        }
-        r[0] = (unsigned long long)ret;
-        return;
-    }
-
-    long res = cng_dispatch(nr, (long)r[0], (long)r[1], (long)r[2], (long)r[3],
-                            (long)r[4], (long)r[5], /*trapped=*/1);
-    if (cng_g_debug && res < 0 && res != -ENOENT)
-        cng_dprintf(2, "[cng] dispatch nr=%ld -> errno=%ld\n", nr, -res);
-    r[0] = (unsigned long long)res;
+    if (!sigsys_syscall(uc, nr))
+        return; /* redirected into a new program, which reported its own stop */
+    cng_pt_syscall_exit(ur);
+    /* A single-step over a syscall stops once the syscall is done and before
+     * the next instruction — where TIF_SINGLESTEP reports it — so it needs no
+     * breakpoint. */
+    cng_pt_step_report(ur);
 }
 
 /* Per-thread scratch stacks for the handler. The path dispatcher needs tens of
@@ -258,6 +318,14 @@ int cng_install_monitor(struct cng_fs *fs) {
     cng_g_fs = fs;
     if (cng_sig_install(CNG_SIGSYS, sigsys_handler) < 0)
         return -1;
+    /* From here a trapping filter is survivable. Anything that stacks one on
+     * demand (the ptrace roles) must not do so before this point: a
+     * SECCOMP_RET_TRAP with no handler for the signal kills the process. */
+    cng_g_sigsys_ready = 1;
+    /* The ptrace kick signal is answered by every guest process, whether or not
+     * it ever traces anything: it is how a tracer reaches a running task
+     * (PTRACE_ATTACH), and how a process is told its child asked to be traced. */
+    cng_pt_sig_install_kick();
     /* Measure which syscalls Android blocks (before our own filter is active)
      * so dispatch emulates them rather than trapping on a re-issue. */
     cng_probe_blocked();

@@ -71,6 +71,13 @@ static const int path_syscalls[] = {
      * Android carries vendor suffixes that identify it. Faked to a fixed
      * identity that /proc/version repeats verbatim (procfs.c). */
     __NR_uname,
+    /* ptrace: emulated in full (ptrace.c). It has to be trapped from the start
+     * — PTRACE_TRACEME is the first ptrace call in a session and the tracer has
+     * made none at all yet — but nothing else pays for it: no ordinary program
+     * calls ptrace, and everything the emulation additionally needs (wait4,
+     * kill, the tracee's whole syscall stream) is trapped by a second filter
+     * stacked on demand, only on the tasks that trace or are traced. */
+    __NR_ptrace,
 };
 
 #define NPATH ((int)(sizeof(path_syscalls) / sizeof(path_syscalls[0])))
@@ -444,6 +451,135 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
                                               CNG_SECCOMP_RET_TRAP);
 
     return n;
+}
+
+/* The prologue every filter starts with: kill a non-AArch64 caller, allow
+ * anything issued from inside our gate (that is our own re-issue, and it must
+ * never trap again), and leave A holding the syscall number. Returns the
+ * instruction count; `f` must hold at least 10. */
+static int emit_prologue(struct sock_filter *f) {
+    unsigned long gs = (unsigned long)__cng_gate_start;
+    unsigned long ge = (unsigned long)__cng_gate_end;
+    int n = 0;
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_ARCH);
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, CNG_AUDIT_ARCH_AARCH64, 1, 0);
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
+                                              CNG_SECCOMP_RET_KILL_THREAD);
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_IP + 4);
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, (uint32_t)(gs >> 32), 0, 4);
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_IP);
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JGE | CNG_BPF_K, (uint32_t)gs, 0, 2);
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JGE | CNG_BPF_K, (uint32_t)ge, 1, 0);
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
+                                              CNG_SECCOMP_RET_ALLOW);
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR);
+    return n;
+}
+
+static int install_filter(const struct sock_filter *f, int n) {
+    struct sock_fprog prog = {.len = (uint16_t)n, .filter = (struct sock_filter *)f};
+    return (int)sys_prctl(CNG_PR_SET_SECCOMP, CNG_SECCOMP_MODE_FILTER,
+                          (unsigned long)&prog, 0, 0);
+}
+
+/* The filter a task stacks when it becomes a ptrace tracee: trap *everything*,
+ * because a tracee must stop on every syscall and the base filter only traps
+ * the path-bearing set. Three exceptions, each mandatory rather than an
+ * optimization:
+ *
+ *  - our gate (the prologue), or the handler's own re-issue would trap;
+ *  - rt_sigreturn, which must execute with sp still pointing at the kernel's
+ *    signal frame. We can only "execute" a trapped syscall by re-issuing it
+ *    from the gate, where sp is the handler's — so trapping it would restore a
+ *    garbage context. It carries nothing a tracer needs, and the -R rewriter
+ *    skips its site for the same reason;
+ *  - a thread-creating clone (CLONE_VM without CLONE_VFORK). A re-issued clone
+ *    returns into the handler on the new thread's stack, with no frame to
+ *    sigreturn through; the base filter lets threads run natively for exactly
+ *    that reason. The cost is that a tracer does not see thread creation
+ *    (process creation, which is what strace -f follows, traps normally).
+ *
+ * Stacked filters compose by most-restrictive-action-wins, so this also
+ * converts the base filter's RET_ERRNO answers into traps; the dispatcher
+ * turns those back into -ENOSYS (see cng_denied_syscall). */
+int cng_build_seccomp_traceall(struct sock_filter *f, int cap) {
+    if (cap < CNG_SECCOMP_TRACEALL_INSNS)
+        return -1;
+    int n = emit_prologue(f);
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, (uint32_t)__NR_rt_sigreturn, 7, 0);
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, (uint32_t)__NR_clone, 0, 7);
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_ARGS);
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_ALU | CNG_BPF_AND | CNG_BPF_K, CNG_CLONE_VM);
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, 0, 4, 0); /* no VM -> trap */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_ARGS);
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_ALU | CNG_BPF_AND | CNG_BPF_K, CNG_CLONE_VFORK);
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, 0, 0, 1); /* thread -> allow */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
+                                              CNG_SECCOMP_RET_ALLOW);
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
+                                              CNG_SECCOMP_RET_TRAP);
+    return n;
+}
+
+int cng_install_seccomp_traceall(void) {
+    struct sock_filter f[CNG_SECCOMP_TRACEALL_INSNS];
+    int n = cng_build_seccomp_traceall(f, (int)(sizeof f / sizeof f[0]));
+    return n < 0 ? -1 : install_filter(f, n);
+}
+
+/* The filter a task stacks when it becomes a ptrace tracer. Far narrower than
+ * the tracee's: only the calls whose answer has to account for emulated stops.
+ * wait4/waitid are the reason this is on-demand rather than in the base filter
+ * — trapping them for every guest would put every shell's blocking wait inside
+ * the SIGSYS handler, where all signals are masked. */
+int cng_build_seccomp_tracer(struct sock_filter *f, int cap) {
+    static const int nrs[] = {
+        __NR_wait4, __NR_waitid,
+        /* Stop signals aimed at a tracee become cooperative group-stops: a real
+         * SIGSTOP would freeze it inside its service loop and deadlock the
+         * tracer's next request (strace sends exactly that on ^C). */
+        __NR_kill, __NR_tkill, __NR_tgkill,
+        /* strace reads tracee memory with these first; served from the mailbox
+         * when the peer is one of our stopped tracees, since the host may
+         * refuse the real thing (Yama, SELinux) for a process it does not see
+         * as ptrace-attached. */
+        __NR_process_vm_readv, __NR_process_vm_writev,
+    };
+    const int k = (int)(sizeof nrs / sizeof nrs[0]);
+    if (cap < CNG_SECCOMP_TRACER_INSNS)
+        return -1;
+    int n = emit_prologue(f);
+    for (int i = 0; i < k; i++)
+        f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+            CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, (uint32_t)nrs[i],
+            (uint8_t)(k - i), 0);
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
+                                              CNG_SECCOMP_RET_ALLOW);
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
+                                              CNG_SECCOMP_RET_TRAP);
+    return n;
+}
+
+int cng_install_seccomp_tracer(void) {
+    struct sock_filter f[CNG_SECCOMP_TRACER_INSNS];
+    int n = cng_build_seccomp_tracer(f, (int)(sizeof f / sizeof f[0]));
+    return n < 0 ? -1 : install_filter(f, n);
 }
 
 int cng_install_seccomp(void) {
