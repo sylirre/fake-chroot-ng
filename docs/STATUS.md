@@ -1696,7 +1696,53 @@ vfork/`posix_spawn` child-stack handling.
     fd must not half-work. `cng_denied_syscall` covers the `-R` trampoline tier,
     which has no filter.
   - Tests: three `-t bpftest` cases and one `-t dtest denied` case, mirroring how
-    the sem/msg refusal above is pinned.
+    the sem/msg refusal was pinned before it became an emulation.
+
+- [x] **M21 — AF_UNIX readback into a buffer too small for the address**
+  Every readback call reports the address's **untruncated** length while copying
+  only as much as the caller's buffer holds (`move_addr_to_user`, and 1003.1g:
+  "fromlen shall refer to the value before truncation"). M15 read that length
+  back *after* the syscall and translated the address in the guest's own buffer,
+  so a guest with a short buffer left the emulation a truncated **host** path
+  plus a length describing bytes that were never written. Three consequences,
+  all real:
+  - `cng_sun_out` walked up to 108 bytes past the guest's buffer. A fault there
+    is not an `-EFAULT` — the SIGSYS handler runs with SIGSEGV masked, so it is
+    the death of the process, reachable from a guest that merely passed
+    `sizeof(struct sockaddr)` to `accept`.
+  - The shortened guest path was written back at the buffer's start regardless of
+    its size, so it could overflow a buffer the kernel had only partly filled.
+  - The length handed back was the **host** one, which both breaks the caller's
+    arithmetic and tells it how long the rootfs prefix is.
+  - **Fixed by bouncing the address**, which is what the oracle does and what
+    removes the reconstruction problem entirely: the kernel writes into a
+    128-byte buffer of ours (`sockaddr_storage` is its own upper bound), the
+    translation runs on a whole address, and `addr_out` reproduces the kernel's
+    truncation rule over the *guest-view* result. `accept`/`accept4` close the
+    new descriptor if that writeback fails, as the kernel does. `recvmsg` bounces
+    `msg_name` inside a copied header and carries `msg_controllen`/`msg_flags`
+    back to the guest's own — without which a caller loses `MSG_TRUNC`/
+    `MSG_CTRUNC` and the length of the control data it is about to walk.
+    `recvmmsg` takes an **AF_UNIX** batch apart into per-message `recvmsg` calls
+    to do the same (one `getsockopt(SO_DOMAIN)` keeps every other family on the
+    whole-batch path, as `sendmmsg` already did).
+  - **A trap worth naming:** `cng_user_writable()` validates a range by *zeroing*
+    it (uaccess.c). The first cut of this probed the address-length pointer
+    before reading it and got 0 back, and probed the guest's `msghdr` before
+    copying it and sent the kernel a zeroed one. Anything that must be read out
+    of a range now happens before the range is probed for writing.
+  - The empty abstract name (`addrlen == offsetof(sun_path) + 1`) was passing
+    through untagged, so a guest could meet the host on it. It is a name two
+    processes can rendezvous on like any other and is now tagged; only a genuinely
+    unnamed (autobind) address, whose `addrlen` stops at `sun_family`, is left
+    alone.
+  - **Tests** (`tests/guests/uxtrunc.c`): the address buffer sits at the end of a
+    page whose successor is `PROT_NONE` and the bytes in front of it are poisoned,
+    so an overread dies and an overwrite shows. The pre-fix binary segfaults
+    before printing a line. With an abstract name the guest-visible address is
+    the same string with and without a rootfs, so that leg is a byte-for-byte
+    differential against the real kernel; the pathname leg asserts the guest-view
+    length and that the four bytes which fit are `/run`, not the rootfs prefix.
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 

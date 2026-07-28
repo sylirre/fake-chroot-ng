@@ -125,7 +125,12 @@ int cng_sun_in(struct cng_sun_xlate *x, const void *addr, long alen,
      * name that will not fit the tag under 108 bytes passes through untagged
      * (as does an unnamed/autobind address, which has no name at all). */
     if (gp[0] == '\0') {
-        if (cng_g_share_abstract || plen < 2)
+        /* plen is at least 1 here (the leading NUL), and 1 exactly is the
+         * zero-length abstract name — a real name two processes can meet on, so
+         * it is tagged like any other rather than passed through. An address
+         * with no name at all (autobind) never reaches this far: its addrlen
+         * stops at sun_family and the caller returned above. */
+        if (cng_g_share_abstract)
             return 0;
         if (plen + ABS_TAG_LEN > SUN_PATH_MAX)
             return 0;

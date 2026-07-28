@@ -171,6 +171,47 @@ else
             "msg[2]: hello-2 from @uxmc" "$out"
     fi
 
+    # --- readback into a buffer too small for the address (M21) -----------
+    # Every readback call reports the UNtruncated length while copying only what
+    # the caller's buffer holds, so a short buffer left the emulation a truncated
+    # HOST address plus a length describing bytes that were never written.
+    # uxtrunc puts that buffer at the end of a page backed by PROT_NONE and
+    # poisons the bytes in front of it, so an overread dies and an overwrite
+    # shows -- the pre-M21 binary segfaults here before printing a line.
+    if ! guest_cc_report "$M15D/uxtrunc" tests/guests/uxtrunc.c; then
+        :
+    else
+        cp "$M15D/uxtrunc" "$R1/bin/uxtrunc"
+        # An abstract name is the same string with and without a rootfs under it,
+        # so this leg is a byte-for-byte differential against the real kernel.
+        k=$(emu_t 60 "$M15D/uxtrunc" @m15trunc 2>/dev/null)
+        e=$(m15run -R "$R1" /bin/uxtrunc @m15trunc 2>/dev/null)
+        if [ -z "$k" ]; then
+            skip "m15 truncated-readback differential: no reference run"
+        elif [ "$k" = "$e" ]; then
+            pass=$((pass + 1))
+            echo "  ok   m15 a truncated readback matches the real kernel byte-for-byte"
+        else
+            fail=$((fail + 1))
+            echo "  FAIL m15 a truncated readback diverges from the real kernel"
+            printf '    kernel: %s\n' "$(echo "$k" | tr '\n' '|')"
+            printf '    cng   : %s\n' "$(echo "$e" | tr '\n' '|')"
+        fi
+        # The pathname leg has no such oracle (the host path differs), so it is
+        # asserted directly: the length must be the guest view's -- 2 + the 11
+        # bytes of /run/s.sock + its NUL -- and the four bytes that fit must be
+        # the guest path's, never the rootfs prefix's.
+        out=$(m15run -R "$R1" /bin/uxtrunc /run/s.sock 2>&1)
+        check_contains "m15 a truncated readback reports the guest-view length" \
+            "short getsockname: rc=0 len=14 bytes=2f72756e poison=1" "$out"
+        check_contains "m15 ...and getpeername agrees" \
+            "short getpeername: rc=0 len=14 bytes=2f72756e poison=1" "$out"
+        check_contains "m15 a zero-length address buffer is written not at all" \
+            "zero getsockname: rc=0 len=14 poison=1" "$out"
+        check_contains "m15 recvmsg still returns its control length and flags" \
+            "recvmsg: n=2 namelen=0 controllen=0 flags=0 poison=1" "$out"
+    fi
+
     rm -rf "$R1" "$R2"
 fi
 rm -rf "$M15D"

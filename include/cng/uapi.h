@@ -138,6 +138,10 @@ struct cng_sockaddr_un {
     unsigned short family;
     char path[108]; /* path[0] == NUL => abstract namespace */
 };
+/* sizeof(struct sockaddr_storage): the kernel's own upper bound on an address
+ * of any family (it BUG_ONs above it in move_addr_to_user), so a buffer this
+ * size always receives a whole address whatever the caller asked for. */
+#define CNG_SOCKADDR_MAX 128
 struct cng_timeval {
     long tv_sec;
     long tv_usec;

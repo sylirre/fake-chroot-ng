@@ -1041,6 +1041,56 @@ static int empty_path_ok(long nr, long a0, long a2, long a3, long a4) {
     }
 }
 
+/* Deliver a translated sockaddr to the guest exactly as move_addr_to_user()
+ * would: copy at most what the caller's buffer holds, then report the
+ * UNtruncated length ("fromlen shall refer to the value before truncation",
+ * 1003.1g). `src`/`slen` is the guest-view address in our own buffer; `aa`/`alp`
+ * are the guest's buffer and its in/out length. Returns 0 or -errno.
+ *
+ * The reason the readback side bounces through our buffer at all: the kernel
+ * writes only min(caller's length, real length) bytes but stores the *real*
+ * length back, so a guest with a short buffer left us a truncated host path and
+ * a length describing bytes that were never written. Translating that in place
+ * read past the guest's buffer — a fault the SIGSYS handler cannot survive,
+ * since it runs with SIGSEGV masked — and could write the shortened guest path
+ * past its end. With the whole address in hand there is nothing to reconstruct:
+ * the guest sees precisely what a kernel with no rootfs under it would have
+ * written, short buffer and all. */
+static long addr_out(const void *src, long slen, long aa, long alp) {
+    if (!aa || !alp)
+        return 0;
+    /* The writability probe validates a range by zeroing it (uaccess.c), so the
+     * caller's length has to be read out before anything is probed for writing. */
+    if (!cng_user_readable((void *)alp, sizeof(int)))
+        return -EFAULT;
+    int n = *(int *)alp;
+    if (n > (int)slen)
+        n = (int)slen;
+    if (n < 0)
+        return -EINVAL;
+    if (n) {
+        if (!cng_user_writable((void *)aa, (unsigned long)n))
+            return -EFAULT;
+        memcpy((void *)aa, src, (size_t)n);
+    }
+    if (!cng_user_writable((void *)alp, sizeof(int)))
+        return -EFAULT;
+    *(int *)alp = (int)slen;
+    return 0;
+}
+
+/* Run the readback translation over an address the kernel just wrote into our
+ * bounce buffer, and hand the result to the guest. `al` is what the kernel
+ * reported; it cannot exceed the buffer (the kernel bounds every address by
+ * sockaddr_storage), but it is clamped rather than trusted. */
+static long sun_deliver(char *ab, unsigned al, long aa, long alp) {
+    long got = (long)al;
+    if (got > CNG_SOCKADDR_MAX)
+        got = CNG_SOCKADDR_MAX;
+    cng_sun_out(ab, &got);
+    return addr_out(ab, got, aa, alp);
+}
+
 long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                   int trapped) {
     char b1[CNG_PATH_MAX], b2[CNG_PATH_MAX];
@@ -1586,6 +1636,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         return r;
     }
 
+
     /* The read family is trapped only for fds in the reserved synthesized
      * range (the seccomp filter compares fd against cng_g_synth_fd_base),
      * where a read starting at offset 0 regenerates a time-varying file —
@@ -1912,17 +1963,20 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
 
     /* The readback side. The kernel writes a HOST sun_path here; handing that to
      * the guest leaks where the rootfs lives and breaks any program comparing it
-     * against what it bound. addrlen is an in/out pointer, so it is rewritten
-     * with the shortened length. */
+     * against what it bound. The address is fetched into a buffer of ours and
+     * delivered by addr_out, which reproduces the kernel's own truncation rule
+     * over the *translated* address — see the note there for why the guest's own
+     * buffer cannot be translated in place. */
     case __NR_getsockname:
     case __NR_getpeername:
     case __NR_accept:
     case __NR_accept4:
     case __NR_recvfrom: {
-        long aa = (nr == __NR_recvfrom) ? a4 : a1;
-        long alp = (nr == __NR_recvfrom) ? a5 : a2;
+        int is_recv = (nr == __NR_recvfrom);
+        long aa = is_recv ? a4 : a1;
+        long alp = is_recv ? a5 : a2;
         if (cng_nl_is_fake((int)a0)) {
-            if (nr == __NR_recvfrom) {
+            if (is_recv) {
                 long out = 0;
                 cng_nl_recv((int)a0, (void *)a1, a2, a3, &out);
                 if (aa && alp)
@@ -1934,11 +1988,22 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             if (cng_nl_getname((int)a0, (void *)aa, (unsigned *)alp))
                 return 0;
         }
-        long r = reissue(a0, a1, a2, a3, a4, a5, nr);
-        if (r >= 0 && aa && alp) {
-            long got = (long)*(unsigned *)alp;
-            cng_sun_out((void *)aa, &got);
-            *(unsigned *)alp = (unsigned)got;
+        if (!aa || !alp) /* no address wanted: nothing to translate */
+            return reissue(a0, a1, a2, a3, a4, a5, nr);
+        char ab[CNG_SOCKADDR_MAX];
+        unsigned al = sizeof ab;
+        long r = is_recv ? reissue(a0, a1, a2, a3, (long)ab, (long)&al, nr)
+                         : reissue(a0, (long)ab, (long)&al, a3, a4, a5, nr);
+        if (r < 0)
+            return r;
+        long e = sun_deliver(ab, al, aa, alp);
+        if (e) {
+            /* accept has already created the descriptor. The kernel drops it
+             * when the address writeback fails rather than returning an fd the
+             * caller never learned the peer of, so this must too. */
+            if (nr == __NR_accept || nr == __NR_accept4)
+                sys_close((int)r);
+            return e;
         }
         return r;
     }
@@ -1964,24 +2029,43 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             }
             return out;
         }
-        long r = reissue(a0, a1, a2, a3, a4, a5, nr);
-        if (r >= 0 && a1) {
-            void *name = *(void **)(char *)a1;
-            unsigned *nlp = (unsigned *)((char *)a1 + 8);
-            if (name && *nlp) {
-                long got = (long)*nlp;
-                cng_sun_out(name, &got);
-                *nlp = (unsigned)got;
-            }
-        }
-        return r;
+        /* msg_name is an output buffer of the guest's, so it gets the same
+         * bounce the single-address calls get. The header is copied to point at
+         * ours; the three fields the kernel writes back into the header it was
+         * given (msg_namelen, msg_controllen, msg_flags) then have to be carried
+         * over to the guest's own, or a caller loses MSG_TRUNC/MSG_CTRUNC and
+         * the length of the control data it is about to walk. */
+        struct cng_msghdr *g = (struct cng_msghdr *)a1;
+        if (!a1 || !cng_user_readable(g, sizeof *g))
+            return reissue(a0, a1, a2, a3, a4, a5, nr);
+        struct cng_msghdr snap = *g; /* the guest's header, before any probe */
+        if (!snap.name || !snap.namelen)
+            return reissue(a0, a1, a2, a3, a4, a5, nr);
+        char ab[CNG_SOCKADDR_MAX];
+        struct cng_msghdr mh = snap;
+        mh.name = ab;
+        mh.namelen = sizeof ab;
+        long r = reissue(a0, (long)&mh, a2, a3, a4, a5, nr);
+        if (r < 0)
+            return r;
+        /* Restored whole rather than field by field: the writability probe
+         * zeroes what it validates, so a partial update would leave the rest of
+         * the guest's header zeroed. */
+        if (!cng_user_writable(g, sizeof *g))
+            return -EFAULT;
+        *g = snap;
+        g->controllen = mh.controllen;
+        g->flags = mh.flags;
+        long e = sun_deliver(ab, mh.namelen, (long)snap.name, (long)&g->namelen);
+        return e ? e : r;
     }
 
-    /* recvmmsg: the readback side of the array forms. Nothing has to be rewritten
-     * on the way in — msg_name is an output buffer here — so the batch is
-     * re-issued whole and each of the messages the kernel actually filled has its
-     * source address mapped back to guest spelling in place, the way recvmsg's
-     * single one is. Only [0, r) were written, so only those are touched. */
+    /* recvmmsg: the readback side of the array forms. A source address cannot be
+     * mapped back in the guest's own buffer (see addr_out), so an AF_UNIX batch
+     * is taken apart into per-message recvmsg calls, each with the bounce the
+     * single form uses — which is what the kernel's own loop does anyway. Only
+     * AF_UNIX pays for that: no other family can carry a sun_path, so the socket
+     * is asked once and everything else is re-issued whole and left untouched. */
     case __NR_recvmmsg: {
         struct cng_mmsghdr *v = (struct cng_mmsghdr *)a1;
         unsigned long vlen = (unsigned)a2;
@@ -2031,18 +2115,66 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             return got ? (long)got : r;
         }
 
-        long r = reissue(a0, a1, a2, a3, a4, a5, nr);
-        if (r <= 0 || !v)
-            return r;
-        for (long i = 0; i < r && (unsigned long)i < vlen; i++) {
-            void *name = v[i].hdr.name;
-            if (!name || !v[i].hdr.namelen)
-                continue;
-            long got = (long)v[i].hdr.namelen;
-            cng_sun_out(name, &got);
-            v[i].hdr.namelen = (unsigned)got;
+        /* One question to the socket instead of a scan of the array: a family
+         * other than AF_UNIX has no sun_path to map back, and a UDP batch is
+         * what this call exists for. (The same shortcut sendmmsg takes.) */
+        int dom = 0;
+        unsigned dlen = sizeof dom;
+        if (!v || !vlen ||
+            (CNG_SYS(__NR_getsockopt, a0, CNG_SOL_SOCKET, CNG_SO_DOMAIN, &dom,
+                     &dlen, 0) == 0 &&
+             dom != CNG_AF_UNIX))
+            return reissue(a0, a1, a2, a3, a4, a5, nr);
+
+        /* Per message from here. The kernel blocks for the whole batch unless
+         * MSG_WAITFORONE, and bounds that with the timeout argument; a loop of
+         * recvmsg calls has no timeout to give, so a batch that carries one
+         * behaves as if it had asked for MSG_WAITFORONE — returning early, never
+         * blocking past where the kernel would have stopped. */
+        int first_only = (a3 & CNG_MSG_WAITFORONE) != 0 || a4 != 0;
+        unsigned long got = 0;
+        long r = 0;
+        for (; got < vlen; got++) {
+            struct cng_mmsghdr *m = &v[got];
+            if (!cng_user_readable(m, sizeof *m)) {
+                r = -EFAULT;
+                break;
+            }
+            char ab[CNG_SOCKADDR_MAX];
+            struct cng_msghdr snap = m->hdr; /* before any probe zeroes it */
+            struct cng_msghdr mh = snap;
+            if (snap.name) {
+                mh.name = ab;
+                mh.namelen = sizeof ab;
+            }
+            long fl = a3 & ~(long)CNG_MSG_WAITFORONE;
+            if (got && first_only)
+                fl |= CNG_MSG_DONTWAIT;
+            long n = reissue(a0, (long)&mh, fl, 0, 0, 0, __NR_recvmsg);
+            if (n < 0) {
+                r = n;
+                break;
+            }
+            if (!cng_user_writable(m, sizeof *m)) {
+                r = -EFAULT;
+                break;
+            }
+            m->hdr = snap; /* the probe zeroed it: restore, then update */
+            m->hdr.controllen = mh.controllen;
+            m->hdr.flags = mh.flags;
+            m->len = (unsigned)n;
+            if (snap.name) {
+                long e = sun_deliver(ab, mh.namelen, (long)snap.name,
+                                     (long)&m->hdr.namelen);
+                if (e) {
+                    r = e; /* the message is consumed either way, as it is
+                            * for the single form */
+                    break;
+                }
+            }
         }
-        return r;
+        /* Whatever arrived is reported; the error only if nothing did. */
+        return got ? (long)got : r;
     }
 
     /* getsockopt(SOL_SOCKET, SO_PEERCRED): the kernel reports the real invoking
