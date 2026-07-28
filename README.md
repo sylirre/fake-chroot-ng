@@ -116,6 +116,19 @@ Where even the socket is refused, dumps degrade to an empty result so
 engages where rtnetlink already works; `CNG_NETLINK_FORCE_BLOCK=1` forces the
 emulated path for testing.
 
+**The audit interface** is the other netlink protocol Android takes away, and it
+is answered rather than emulated — a guest has no business seeing the host's
+audit log, but it does need a refusal it recognises. `libaudit`'s `audit_open()`
+is a bare `socket(…, NETLINK_AUDIT)`, and shadow-utils treats
+`EINVAL`/`EPROTONOSUPPORT`/`EAFNOSUPPORT` as "this kernel has no audit" and
+carries on, while treating anything else as fatal. The `EACCES` SELinux returns
+is not one of the three, which is why `useradd`, `usermod`, `passwd`, `chage`,
+`groupadd` and shadow's `su` all die with *"Cannot open audit interface -
+aborting"* inside a rootfs on a device. So a refused audit socket is reported as
+`EPROTONOSUPPORT` — what the kernel itself returns for a protocol nobody
+registered — and those tools proceed. A host that grants the socket is left
+alone; `CNG_NETLINK_DENY_AUDIT=1` forces the refusal for testing.
+
 **System V shared memory** works too. Android denies `shmget`/`shmat`/`shmdt`/
 `shmctl` outright, so chroot-ng serves them itself: the same broker daemon owns
 each segment as an anonymous `memfd` (or a private file where `memfd_create` is

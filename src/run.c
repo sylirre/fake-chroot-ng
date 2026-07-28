@@ -266,6 +266,10 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
         cng_nl_force_block = 1;
         cng_nl_deny_getlink = 1;
     }
+    /* Stands alone: the audit refusal has nothing to do with the rtnetlink
+     * emulation, so forcing one must not force the other. */
+    if (cng_broker_env("CNG_NETLINK_DENY_AUDIT"))
+        cng_nl_deny_audit = 1;
 
     /* Resolve the program itself through the map (following symlinks) to find
      * the host file. */

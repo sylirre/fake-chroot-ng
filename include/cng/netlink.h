@@ -28,6 +28,12 @@ extern int cng_nl_no_relay;
  * works. Implies CNG_NETLINK_FORCE_BLOCK. */
 extern int cng_nl_deny_getlink;
 
+/* CNG_NETLINK_DENY_AUDIT=1: pretend the host refuses a NETLINK_AUDIT socket the
+ * way Android's SELinux policy does (EACCES), so the answer that refusal is
+ * turned into can be exercised on a host that grants the socket. Independent of
+ * the rtnetlink knobs above — it does not imply CNG_NETLINK_FORCE_BLOCK. */
+extern int cng_nl_deny_audit;
+
 void cng_nl_init(void);
 
 /* 1 if `fd` is one of our emulated netlink sockets. */
@@ -37,6 +43,15 @@ int cng_nl_is_fake(int fd);
  * case (wrong family/protocol, host rtnetlink works, or the table is full) and
  * the real syscall should run. */
 long cng_nl_socket(long domain, long type, long protocol);
+
+/* NETLINK_AUDIT is refused, not emulated — but with the errno libaudit's callers
+ * recognise. shadow-utils (`useradd`, `usermod`, `passwd`, `chage`, `su`) treats
+ * EINVAL/EPROTONOSUPPORT/EAFNOSUPPORT as "this kernel has no audit" and carries
+ * on, and anything else — such as the EACCES Android's policy returns — as fatal
+ * ("Cannot open audit interface - aborting"). Pass the result of the real
+ * socket(2); returns what the guest should see, unchanged unless this was an
+ * audit socket the host refused on permission grounds. */
+long cng_nl_audit_refusal(long domain, long protocol, long r);
 
 /* send/recv hooks. Return 1 when the call was handled (result in *out), 0 when
  * `fd` is not ours and the real syscall should run. A send builds the reply; the

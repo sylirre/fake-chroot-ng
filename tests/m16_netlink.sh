@@ -233,6 +233,61 @@ else
         fi
     fi
 
+    # --- 4. M16c: the audit interface ---------------------------------------
+    #
+    # The other netlink protocol Android's policy takes away. Nothing is
+    # emulated -- the guest has no business seeing the host's audit log -- but
+    # the refusal has to be one libaudit's callers recognise, because they
+    # branch on it: EINVAL/EPROTONOSUPPORT/EAFNOSUPPORT mean "no audit in this
+    # kernel" and every shadow-utils tool carries on, while the EACCES the
+    # policy actually returns is fatal ("Cannot open audit interface -
+    # aborting", which is what `useradd` and shadow's `su` print in a rootfs on
+    # a device). These legs do not depend on the rtnetlink probe above.
+    if guest_cc "$M16D/auditsock" tests/guests/auditsock.c; then
+        cp "$M16D/auditsock" "$R/bin/auditsock"
+        # The reference: the same binary with no emulation, on this kernel.
+        abase=$(emu_t 60 "$M16D/auditsock" 2>/dev/null | grep '^audit:')
+        a_raw=0
+        case "$abase" in *"open=1"*) a_raw=1 ;; esac
+
+        # Forced: the refusal Android returns, turned into the one the tools
+        # survive. EPROTONOSUPPORT is 93 -- what netlink_create itself returns
+        # for a protocol nobody registered, i.e. a kernel built without audit.
+        ad=$(CNG_NETLINK_DENY_AUDIT=1 m16run -R "$R" /bin/auditsock 2>/dev/null)
+        check_contains "m16c a refused audit socket reads as 'no audit in this kernel'" \
+            "audit: open=0 errno=93 survives=1" "$ad"
+        # ...and it is that narrow: no other socket is touched by the answer.
+        check_contains "m16c the audit answer leaves other sockets alone" \
+            "other: route=1 inet=1" "$ad"
+
+        if [ "$a_raw" = 1 ]; then
+            # This kernel grants the socket (audit built in, no policy in the
+            # way). Then there is no refusal to rephrase and the guest must see
+            # exactly what it would have seen unemulated.
+            apt=$(m16run -R "$R" /bin/auditsock 2>/dev/null | grep '^audit:')
+            if [ "$apt" = "$abase" ]; then
+                pass=$((pass + 1))
+                echo "  ok   m16c a granted audit socket is passed through untouched"
+            else
+                fail=$((fail + 1))
+                echo "  FAIL m16c a granted audit socket is passed through untouched"
+                echo "    want: $abase"
+                echo "    got:  $apt"
+            fi
+        else
+            # This host is the target: the kernel (or its policy) refuses the
+            # socket on its own, so the guest must be rescued without being
+            # asked -- the on-device acceptance bar, and the whole reason
+            # `useradd` aborts there today.
+            printf '  (this kernel refuses the audit socket: %s)\n' "$abase"
+            apt=$(m16run -R "$R" /bin/auditsock 2>/dev/null)
+            check_contains "m16c unforced: the refusal is rephrased where the kernel refuses it" \
+                "audit: open=0 errno=93 survives=1" "$apt"
+        fi
+    else
+        skip "audit interface legs: could not build tests/guests/auditsock.c"
+    fi
+
     rm -rf "$R"
 fi
 rm -rf "$M16D"

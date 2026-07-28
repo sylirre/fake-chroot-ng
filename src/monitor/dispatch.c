@@ -1748,7 +1748,12 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         long fd = cng_nl_socket(a0, a1, a2);
         if (fd >= 0)
             return fd;
-        return reissue(a0, a1, a2, a3, a4, a5, nr);
+        long r = reissue(a0, a1, a2, a3, a4, a5, nr);
+        /* The same policy denies NETLINK_AUDIT, which is not emulated but does
+         * need the refusal libaudit's callers survive: a permission error there
+         * aborts every shadow-utils tool (`useradd`, `su`), while "no audit in
+         * this kernel" is a case they all handle. */
+        return cng_nl_audit_refusal(a0, a2, r);
     }
 
     /* AF_UNIX addresses. A pathname socket's sun_path is a filesystem path and

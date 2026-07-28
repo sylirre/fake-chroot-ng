@@ -1451,6 +1451,57 @@ vfork/`posix_spawn` child-stack handling.
     two edges, `TCGETS`, and the requests just outside it. Suite: 469 passed,
     0 failed.
 
+- [x] **M16c — the audit interface: the refusal `libaudit`'s callers recognise**
+  The other netlink protocol Android's policy takes away, and the one that stops
+  a whole package of ordinary software. Nothing is emulated — a guest has no
+  business seeing the host's audit log, and asks for none — but the *refusal*
+  has to be one the caller recognises, because it branches on which one it gets.
+  - `libaudit`'s `audit_open()` is a bare `socket(PF_NETLINK, SOCK_RAW,
+    NETLINK_AUDIT)`, and shadow-utils wraps it in `audit_help_open()`, which
+    treats `EINVAL`/`EPROTONOSUPPORT`/`EAFNOSUPPORT` as "this kernel was built
+    without audit" and carries on — and anything else as fatal:
+    `useradd: Cannot open audit interface - aborting.` SELinux refuses the app
+    domain a `netlink_audit_socket` with `EACCES`, which is not one of the
+    three. In a Debian/Ubuntu rootfs that is 22 binaries — the whole of
+    shadow-utils: `useradd`, `usermod`, `userdel`, `passwd`, `chage`, `chsh`,
+    `chfn`, `gpasswd`, `groupadd`, `groupdel`, `groupmod`, `newusers`,
+    `chpasswd`, `chgpasswd`, `vipw`, `vigr`, `pwck`, `grpck`, `pw{,un}conv`,
+    `grp{,un}conv` — plus `su` on the distributions where `su` is shadow's
+    rather than util-linux's.
+  - So a refused audit socket answers `EPROTONOSUPPORT` — literally what
+    `netlink_create` returns for a protocol nobody registered, i.e. a kernel
+    with `CONFIG_AUDIT` off. Two conditions, in the `socket()` case that already
+    exists for `NETLINK_ROUTE` (`cng_nl_audit_refusal`, `netlink.c`). A host
+    that grants the socket is untouched, and no other family or protocol is
+    looked at.
+  - **Divergence from the oracle, deliberate:** arm64chroot gates the same shim
+    on `fake_id && euid == 0`, framing it as part of the pretend-to-be-root
+    story (`src/sys_net.c`). Here it is gated on the host's refusal alone. The
+    refusal is the policy's and does not depend on the guest's credentials —
+    real or synthetic — so "this container has no audit subsystem" is equally
+    true for every guest in it; the rest of `netlink.c` already answers the same
+    policy's rtnetlink denial without asking who the guest claims to be; and the
+    gate's only live effect would be to leave `useradd` aborting in a rootfs
+    whose files the invoking user already owns, which is the one case where it
+    would otherwise have worked.
+  - **Tests:** `tests/guests/auditsock.c` prints `audit_help_open()`'s decision
+    rule, not just the errno, so a run is judged the way the tools judge it.
+    3 legs in `m16_netlink.sh`: the forced refusal reads as `errno=93
+    survives=1`; it is that narrow (a `NETLINK_ROUTE` and an `AF_INET` socket in
+    the same run are untouched); and where the host grants the socket the guest
+    sees exactly what an unemulated run saw. The host split is M16's — a devbox
+    asserts passthrough, a device asserts the unforced rescue.
+    `CNG_NETLINK_DENY_AUDIT=1` synthesizes the refusal (it does **not** imply
+    `CNG_NETLINK_FORCE_BLOCK`; the two subjects are unrelated). Suite: 521
+    passed, 0 failed, 1 skipped.
+  - Not reachable end-to-end on a cross host: `useradd` is dynamically linked
+    and its `socket()` lives in `libaudit.so.1`, which the guest's `ld.so` maps
+    itself — and `cng_rewrite_seg` only rewrites images *our* loader maps, so
+    under qemu-user (seccomp inert) that call escapes untranslated, as its
+    `openat("/etc/.pwd.lock")` already does. On a device the filter traps
+    `socket` from any object. The static guest above is what pins the behaviour
+    here.
+
 - [x] **M18 — guest `ptrace(2)`: strace, gdb and proot inside the rootfs**
   Until now `ptrace` was neither trapped nor refused, so a guest tracer reached
   the host kernel — which is worse than nothing here: the tracer saw *our*

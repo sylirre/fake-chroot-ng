@@ -31,6 +31,10 @@
  * untrapped for speed — queue on our end and are drained at the next trapped
  * netlink call (busybox ip writes its request with write() and then calls
  * recvmsg(), which traps and finds the request waiting).
+ *
+ * The same socket(2) trap carries the other netlink protocol Android takes
+ * away, NETLINK_AUDIT — not emulated but *rephrased*, since the whole of what
+ * libaudit's callers need is a refusal they recognise. See cng_nl_audit_refusal.
  */
 #include "cng/monitor.h"
 #include "cng/netlink.h"
@@ -46,11 +50,13 @@
 int cng_nl_force_block = 0;
 int cng_nl_no_relay = 0;
 int cng_nl_deny_getlink = 0;
+int cng_nl_deny_audit = 0;
 
 #define AF_NETLINK_    16
 #define AF_INET_       2
 #define AF_INET6_      10
 #define NETLINK_ROUTE_ 0
+#define NETLINK_AUDIT_ 9
 #define SOCK_DGRAM_    2
 #define SOCK_RAW_      3
 #define SOCK_TYPE_MASK 0xf /* SOCK_CLOEXEC/NONBLOCK ride the upper bits */
@@ -822,6 +828,57 @@ long cng_nl_socket(long domain, long type, long protocol) {
                     "pair peer %d, relay fd %d\n",
                     s->fd, s->monfd, s->hostfd);
     return sv[0];
+}
+
+/* ---- the audit interface --------------------------------------------------
+ *
+ * NETLINK_AUDIT is the other netlink protocol Android's policy takes away, and
+ * unlike rtnetlink there is nothing to emulate: the guest cannot have a view of
+ * the host's audit log, and does not want one. What it needs is the *right
+ * refusal*, because libaudit's callers branch on which one they get.
+ *
+ * `audit_open()` is a bare socket(PF_NETLINK, SOCK_RAW, NETLINK_AUDIT), and
+ * shadow-utils wraps it in audit_help_open(), which treats EINVAL /
+ * EPROTONOSUPPORT / EAFNOSUPPORT as "this kernel was built without audit" and
+ * carries on — and treats anything else as fatal:
+ *
+ *     useradd: Cannot open audit interface - aborting.
+ *
+ * That is what a Debian/Ubuntu rootfs prints on a device for `useradd`,
+ * `usermod`, `passwd`, `chage`, `groupadd` and shadow's `su`: the socket is
+ * refused by SELinux (EACCES on the app domain's netlink_audit_socket, no
+ * capability involved), which is not one of the three the tool survives. The
+ * kernel's own way of saying "no audit here" is EPROTONOSUPPORT — netlink_create
+ * returns exactly that for a protocol nobody registered — so that is what the
+ * guest is told, and every one of those tools proceeds.
+ *
+ * Deviation from the oracle, deliberate: arm64chroot gates this on
+ * `fake_id && euid == 0`, framing it as part of the pretend-to-be-root story.
+ * Here it is gated on the host's refusal alone, for two reasons. The refusal is
+ * the SELinux policy's and does not depend on the guest's credentials — real or
+ * synthetic — so "this container has no audit subsystem" is equally true for
+ * every guest in it; and the rest of this file already answers the same policy's
+ * rtnetlink denial without asking who the guest claims to be. Gating on fake
+ * root would leave `useradd` aborting in a rootfs whose files the invoking user
+ * already owns, which is the one case where it would otherwise have worked.
+ *
+ * Called with the result of the real socket(2); returns what the guest sees. */
+long cng_nl_audit_refusal(long domain, long protocol, long r) {
+    if (domain != AF_NETLINK_ || protocol != NETLINK_AUDIT_)
+        return r;
+    if (cng_nl_deny_audit && r >= 0) {
+        sys_close((int)r); /* test aid: Android's SELinux refusal, on a host
+                            * that grants the socket */
+        r = -EACCES;
+    }
+    if (r != -EPERM && r != -EACCES)
+        return r; /* the host answered: its answer is the guest's */
+    if (cng_g_debug)
+        cng_dprintf(2,
+                    "[cng] netlink: audit socket refused (%ld) -> "
+                    "EPROTONOSUPPORT (no audit in this kernel)\n",
+                    r);
+    return -EPROTONOSUPPORT;
 }
 
 int cng_nl_send(int fd, const void *buf, long len, long *out) {
