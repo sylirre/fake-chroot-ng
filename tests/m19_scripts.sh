@@ -35,6 +35,15 @@ M19=$(mktemp -d)
 mkdir -p "$M19/real/lib/apk/exec" "$M19/real/root"
 ln -s real "$M19/link"
 
+# A `#!` script well under the 64 bytes an Elf64_Ehdr occupies -- the shape of
+# the .config scripts debconf extracts, and the one that must not be mistaken
+# for a truncated ELF. Its interpreter is the probe itself: the synthetic
+# rootfs has no shell. Beside it, a genuinely empty executable file, which is
+# ENOEXEC on the kernel and has to be here too.
+printf '#!/scriptprobe shortok\n' >"$M19/real/short.sh"
+: >"$M19/real/empty.bin"
+chmod 755 "$M19/real/short.sh" "$M19/real/empty.bin"
+
 if ! guest_xlate_ready "M19 script legs"; then
     :
 elif guest_cc_report "$GDIR/scriptprobe" tests/guests/scriptprobe.c; then
@@ -61,6 +70,25 @@ elif guest_cc_report "$GDIR/scriptprobe" tests/guests/scriptprobe.c; then
     check_contains "a relative execve after it finds the script" \
         "relexec=SCRIPT-OK" "$out"
     check_contains "and the script exits 0" "relexec-rc=0" "$out"
+
+    # --- the two file shapes the exec path must tell apart -----------------
+    out=$(m19_run -w /root "$M19/real" /scriptprobe lib/apk/exec/scriptprobe \
+        /short.sh /empty.bin 2>/dev/null)
+    check_contains "a shebang script shorter than an ELF header still runs" \
+        "shortscript=SCRIPT-OK" "$out"
+    check_contains "and exits 0" "shortscript-rc=0" "$out"
+    check_contains "an empty file is ENOEXEC, as it is on the kernel" \
+        "emptyfile=ENOEXEC" "$out"
+
+    # And it says so with the errno alone. A failed exec used to narrate itself
+    # onto the guest's own stderr naming the resolved host path -- the one
+    # thing the path layer exists to keep from the guest -- in a stream package
+    # managers capture and log.
+    err=$(m19_run -w /root "$M19/real" /scriptprobe lib/apk/exec/scriptprobe \
+        /short.sh /empty.bin 2>&1 >/dev/null)
+    check_absent "a failed exec leaks no host path to the guest" "$M19" "$err"
+    check_absent "and narrates nothing at all, as the kernel does" \
+        "chroot-ng: exec" "$err"
 
     # The same, with the rootfs named through a symlink — the device's spelling.
     out=$(m19_run -w /root "$M19/link" /scriptprobe lib/apk/exec/scriptprobe \
@@ -95,6 +123,9 @@ elif guest_cc_report "$GDIR/scriptprobe" tests/guests/scriptprobe.c; then
         m19_diff "the empty pathname" "$M19/real" /scriptprobe
         m19_diff "fchdir + relative execve" -w /root "$M19/real" \
             /scriptprobe lib/apk/exec/scriptprobe
+        m19_diff "a short shebang script and an empty file" -w /root \
+            "$M19/real" /scriptprobe lib/apk/exec/scriptprobe /short.sh \
+            /empty.bin
         m19_diff "the same through a symlinked rootfs" -w /root "$M19/link" \
             /scriptprobe lib/apk/exec/scriptprobe
     fi

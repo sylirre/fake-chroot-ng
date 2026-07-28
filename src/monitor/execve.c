@@ -390,7 +390,23 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
                 return fd; /* the real errno (EACCES, ELOOP, ENOENT, ...) */
             }
         }
-        long n = sys_pread64((int)fd, hdr, 256, 0);
+        /* Read the header the way the loader reads its own (read_exact in
+         * elf.c): accumulate and retry EINTR. A single pread may come back
+         * short of what was asked for, and treating that as "not a script"
+         * hands a perfectly good `#!` file to the ELF loader, which then
+         * rejects it as a short read — a valid script answered ENOEXEC. */
+        long n = 0;
+        for (;;) {
+            long r = sys_pread64((int)fd, hdr + n, (size_t)(256 - n), n);
+            if (r < 0) {
+                if (r == -EINTR)
+                    continue;
+                n = r; /* a hard error: let the loader produce the errno */
+                break;
+            }
+            if (r == 0 || (n += r) >= 256)
+                break; /* EOF, or the whole shebang line and then some */
+        }
         if (gfd < 0)
             sys_close((int)fd);
         if (!(n >= 2 && hdr[0] == '#' && hdr[1] == '!'))
@@ -451,8 +467,16 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
     struct cng_loaded prog;
     int rc = gfd >= 0 ? cng_load_elf_fd(gfd, 0, &prog) : cng_load_elf(host, 0, &prog);
     if (rc != CNG_LOAD_OK) {
-        cng_dprintf(2, "chroot-ng: exec %s (%s): load failed rc=%d\n", path,
-                    host, rc);
+        /* A failed exec tells the guest what the kernel would: the errno, and
+         * nothing else. This was an unconditional line on the guest's own
+         * stderr, and it named `host` — the one thing the whole path layer
+         * exists to keep from the guest, since it spells out where the rootfs
+         * lives on the device. It also put text no real execve produces into a
+         * stream package managers capture and log. Both belong under CNG_DEBUG
+         * with the rest of the exec tracing. */
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] exec %s (%s): load failed rc=%d\n", path,
+                        host, rc);
         return rc == CNG_LOAD_EOPEN ? -ENOENT : -ENOEXEC;
     }
     if (cng_g_debug)
@@ -468,8 +492,9 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
         char ip[CNG_PATH_MAX];
         if (cng_resolve(prog.interp, 1, ip, sizeof ip) != 0 ||
             cng_load_elf(ip, 0, &interp) != CNG_LOAD_OK) {
-            cng_dprintf(2, "chroot-ng: exec %s: interp %s load failed\n", path,
-                        prog.interp);
+            if (cng_g_debug) /* guest-visible stderr: see the load failure above */
+                cng_dprintf(2, "[cng] exec %s: interp %s load failed\n", path,
+                            prog.interp);
             return -ENOENT;
         }
         have_interp = 1;

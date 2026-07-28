@@ -14,10 +14,16 @@
  *    working directory has to follow the fchdir, or the script name resolves
  *    under wherever the cwd was left standing.
  *
- * Run as `scriptprobe [relpath]`: with an argument, re-executes itself through
- * that relative path after the fchdir, and the re-execed copy prints the
- * relexec line. Every line is a fixed string so the whole output can be
- * compared against the oracle's.
+ * 3. The two file shapes the exec path has to tell apart without reading a
+ *    whole ELF header. A `#!` script is routinely shorter than the 64 bytes an
+ *    Elf64_Ehdr occupies (debconf's extracted .config scripts are ~50), so the
+ *    shebang probe must not depend on one read returning everything it asked
+ *    for; and a genuinely empty file is ENOEXEC, the same as on the kernel.
+ *
+ * Run as `scriptprobe [relpath [shortscript emptyfile]]`: with an argument,
+ * re-executes itself through that relative path after the fchdir, and the
+ * re-execed copy prints the relexec line. Every line is a fixed string so the
+ * whole output can be compared against the oracle's.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -34,6 +40,7 @@ static const char *how(long r) {
         return "OK";
     switch (errno) {
     case ENOENT: return "ENOENT";
+    case ENOEXEC: return "ENOEXEC";
     case EACCES: return "EACCES";
     case EINVAL: return "EINVAL";
     case ELOOP:  return "ELOOP";
@@ -45,6 +52,14 @@ static const char *how(long r) {
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "child") == 0) {
         printf("relexec=SCRIPT-OK\n");
+        fflush(stdout);
+        return 0;
+    }
+    /* Reached as the interpreter of the short script below, whose shebang
+     * line is "#!/scriptprobe shortok" — this binary is the only interpreter
+     * the synthetic test rootfs has. */
+    if (argc > 1 && strcmp(argv[1], "shortok") == 0) {
+        printf("shortscript=SCRIPT-OK\n");
         fflush(stdout);
         return 0;
     }
@@ -82,5 +97,27 @@ int main(int argc, char **argv) {
     waitpid(pid, &status, 0);
     printf("relexec-rc=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
     fflush(stdout);
+
+    /* argv[2]: a `#!` script shorter than an ELF header, which must run.
+     * argv[3]: an empty file, which must be ENOEXEC. Each in its own child,
+     * since a successful exec does not come back. */
+    for (int i = 2; i < argc && i <= 3; i++) {
+        const char *label = i == 2 ? "shortscript" : "emptyfile";
+        fflush(stdout);
+        pid = fork();
+        if (pid == 0) {
+            char *av[] = {(char *)argv[i], NULL};
+            char *ev[] = {NULL};
+            execve(argv[i], av, ev);
+            printf("%s=%s\n", label, how(-1));
+            fflush(stdout);
+            _exit(126);
+        }
+        status = 0;
+        waitpid(pid, &status, 0);
+        printf("%s-rc=%d\n", label,
+               WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        fflush(stdout);
+    }
     return 0;
 }
