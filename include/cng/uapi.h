@@ -123,9 +123,16 @@
 #define CNG_SO_RCVTIMEO  20 /* SO_RCVTIMEO_OLD: takes the 64-bit timeval */
 #define CNG_SO_SNDTIMEO  21 /* SO_SNDTIMEO_OLD, likewise */
 #define CNG_SO_PEERCRED  17
+#define CNG_SO_DOMAIN    39 /* the socket's own address family, in one call */
 #define CNG_SCM_RIGHTS   1
 #define CNG_MSG_NOSIGNAL 0x4000
+#define CNG_MSG_DONTWAIT 0x40
+#define CNG_MSG_WAITFORONE 0x10000 /* recvmmsg: return once one message is in */
 #define CNG_POLLIN       1
+
+/* The kernel clamps sendmmsg/recvmmsg's vlen to this (UIO_MAXIOV) before it
+ * loops, so the array forms bound their own walk the same way. */
+#define CNG_UIO_MAXIOV   1024
 
 struct cng_sockaddr_un {
     unsigned short family;
@@ -152,6 +159,13 @@ struct cng_msghdr {
     void *control;
     unsigned long controllen;
     unsigned flags;
+};
+/* sendmmsg/recvmmsg's array element: a message plus the byte count the kernel
+ * writes back for it. 64 bytes here, as in the kernel's own struct — natural
+ * alignment supplies the four bytes of tail padding after msg_len. */
+struct cng_mmsghdr {
+    struct cng_msghdr hdr;
+    unsigned len;
 };
 struct cng_cmsghdr { /* 8-aligned header, payload follows in place */
     unsigned long len; /* header + payload bytes (CMSG_LEN) */

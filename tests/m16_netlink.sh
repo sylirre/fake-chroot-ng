@@ -70,6 +70,12 @@ else
         # echoed, and real RTM_NEWLINK records in it.
         check_contains "m16 an RTM_GETLINK dump is relayed and parseable" \
             "dump: got>0=1 msgs>0=1 seq_ok=1 newlink>0=1" "$em"
+        # recvmmsg fills a source address per message, and a netlink client
+        # discards any reply whose source is not the kernel — so the array form
+        # has to answer sockaddr_nl with nl_pid 0, exactly as recvmsg does. The
+        # underlying socketpair would report an unnamed AF_UNIX address instead.
+        check_contains "m16 recvmmsg sources each reply from the kernel" \
+            "mmsg: got>0=1 msgs>0=1 src_nl=1 src_pid0=1" "$em"
         # The SIOCGIF* family answers the same questions over an AF_INET socket
         # (`ifconfig`, getifaddrs's oldest fallback). It comes from the same
         # enumeration as the dump, so the two views cannot contradict each

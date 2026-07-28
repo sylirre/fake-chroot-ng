@@ -824,10 +824,11 @@ vfork/`posix_spawn` child-stack handling.
     taking the same name, and `--share-abstract-sockets` is the control that makes
     them collide — so the isolation cannot pass by luck. An over-long rootfs path
     exercises the `/proc/self/fd` fallback.
-  - Not covered, deliberately: `sendmmsg`/`recvmmsg` are left native. They are
-    array forms whose per-message addresses would need the same treatment; no
-    guest we run uses them with pathname addresses, and trapping them costs two
-    more filter entries plus a loop over guest memory. Noted rather than hidden.
+  - Not covered here, deliberately: `sendmmsg`/`recvmmsg` were left native. They
+    are array forms whose per-message addresses need the same treatment; no guest
+    we run uses them with pathname addresses, and trapping them costs two more
+    filter entries plus a loop over guest memory. Noted rather than hidden — and
+    closed later, as **M15b** below.
 
 - [x] **M16 — NETLINK_ROUTE emulation**
   Android denies app domains rtnetlink, and everything that asks the kernel about
@@ -1606,6 +1607,72 @@ vfork/`posix_spawn` child-stack handling.
     thread at a time; an exit stop is only reported for a syscall whose entry
     stop was; and tracing spans one chroot-ng invocation's process tree, not
     independent invocations.
+
+- [x] **M15b — the AF_UNIX array forms: `sendmmsg`/`recvmmsg`**
+  M15 trapped the ten single-message socket calls and left the array forms
+  native, which is the one hole it knowingly left open: `sendmmsg` and
+  `recvmmsg` carry a `msg_name` **per message**, so a pathname `sun_path` sent
+  through one went to the host untranslated and a source address returned by the
+  other came back as a raw host path. The same escape as M15's, one loop further
+  in. Closed here, with no new machinery — `cng_sun_in`/`cng_sun_out` per
+  element, as the plan said it would take.
+  - **`recvmmsg` needs no decomposition.** `msg_name` is an *output* buffer, so
+    the batch is re-issued whole and only the messages the kernel actually
+    filled — `[0, r)` — have their source addresses mapped back in place.
+  - **`sendmmsg` is re-issued whole too, unless a message really carries an
+    AF_UNIX address.** The call exists to spend one syscall on a batch, and
+    taking a 1024-message UDP send apart into 1024 `sendmsg` calls to look for a
+    `sun_path` that cannot be there would be a real regression. The socket is
+    asked instead — one `getsockopt(SO_DOMAIN)` — and a batch on anything but an
+    `AF_UNIX` socket goes straight to the kernel. On an `AF_UNIX` socket the
+    array is scanned (free: a NULL `msg_name`, which is what a stream socket
+    sends, is rejected without touching guest memory) and only a batch that
+    really does carry an address is decomposed.
+  - **The decomposition is the kernel's own loop**, so it answers the way the
+    kernel does: send until one fails, write each `msg_len` back as it goes,
+    report the count if any went out and the error only if none did — including
+    not counting a message whose length writeback faults, even though it has
+    already gone out. `vlen` is clamped to `UIO_MAXIOV` first, as the kernel
+    clamps it. Each translated header is a copy; the guest's array is never
+    rewritten.
+  - **An emulated netlink socket** (M16) had to be taken apart per message on
+    the receive side, and this is the part that was silently broken before rather
+    than merely uncontained: the stand-in is an `AF_UNIX` socketpair, so a native
+    `recvmmsg` filled each `msg_name` with an unnamed `AF_UNIX` address — and a
+    netlink client discards any reply whose source is not `nl_pid == 0`. The
+    per-message path fills a `sockaddr_nl` from `cng_nl_srcaddr`, drains pending
+    requests first, and implements `MSG_WAITFORONE` itself (without it a batch
+    larger than the pending replies blocks on a socket nothing else will feed).
+    The send side needs nothing: a native `sendmmsg` puts the request datagrams
+    into the pair, which is the same route an untrapped `write(2)` takes.
+  - **Fault safety** (the M17-7 property) came with it. `cng_sun_in` copies
+    `sun_path` before any kernel call would have validated the pointer, and it
+    was doing so unprobed — so `bind(fd, (void *)0x10, 110)` was a SIGSEGV inside
+    the handler, where SIGSEGV is masked and therefore fatal, rather than the
+    `EFAULT` the kernel answers. One `cng_user_readable` in `cng_sun_in` fixes
+    that for every caller (`bind`/`connect`/`sendto`/`sendmsg` as well as the new
+    array forms); an unreadable address is passed through untouched so the kernel
+    faults on the guest's own pointer. The array walk is probed the same way —
+    once for the whole vector where it is all readable, per element otherwise,
+    since the kernel stops at the first unreadable element rather than refusing
+    the batch. Also fixed: `sendmsg` with a NULL `msghdr` ran `cng_sun_done` on
+    an uninitialized `cng_sun_xlate`, which could close an arbitrary fd.
+  - Two more filter entries (130 → 132 instructions of 256) and two more
+    entries in the Android block-probe, since both are re-issued.
+  - **Tests:** `tests/guests/uxmmsg.c` binds a datagram socket at a guest path,
+    sends a batch to it with `sendmmsg` from a second named socket, and reads it
+    back with `recvmmsg` — asserting the source of the **last** message as well
+    as the first, because the containment is per element and a loop that only
+    looked at the first would leak every message after it. The host `/run` is
+    unwritable, so the batch arrives at all only if every address was translated;
+    5 of the 9 legs fail against the pre-change binary. The abstract-name leg
+    proves the per-rootfs tag is stripped per message too, and two legs pin the
+    other half of the bargain — a socketpair batch and a loopback UDP batch,
+    neither of which has an address to contain, must come back exactly as they
+    would unemulated. `netif.c` gained a `recvmmsg` dump leg, so the emulated
+    netlink source address is covered by M16's byte-for-byte differential
+    against the real kernel (it reads `src_nl=0` without the fix). `-t faulttest`
+    gained the bad-sockaddr case, which segfaults the run without the probe.
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 

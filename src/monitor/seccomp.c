@@ -53,6 +53,10 @@ static const int path_syscalls[] = {
     __NR_bind,        __NR_connect,      __NR_sendto,      __NR_sendmsg,
     __NR_getsockname, __NR_getpeername,  __NR_accept,      __NR_accept4,
     __NR_recvfrom,    __NR_recvmsg,
+    /* The array forms carry one address per message. Left native, a pathname
+     * sun_path passed through sendmmsg went untranslated and one returned by
+     * recvmmsg went unstripped — the same hole, one loop further in. */
+    __NR_sendmmsg,    __NR_recvmmsg,
     /* fchmodat2 (6.6+) is what glibc >= 2.39 reaches for first, and the only
      * way to chmod a symlink itself. Translated rather than refused, so the
      * guest keeps the capability. */

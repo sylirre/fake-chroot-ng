@@ -113,6 +113,64 @@ else
     check_contains "m15 --share-abstract-sockets shares the host namespace" \
         "Address already in use" "$out"
 
+    # --- the array forms (sendmmsg/recvmmsg) -----------------------------
+    # One address per message, so the containment is per element and a loop that
+    # only looked at the first would leak every message after it. The proof is
+    # the same one the pathname legs above make — the host /run is unwritable, so
+    # a datagram only reaches the server if its address was translated — with the
+    # readback asserted on the LAST message rather than the first.
+    if ! guest_cc_report "$M15D/uxmmsg" tests/guests/uxmmsg.c; then
+        :
+    else
+        cp "$M15D/uxmmsg" "$R1/bin/uxmmsg"
+        out=$(m15run -R "$R1" /bin/uxmmsg /run/d.sock /run/c.sock 2>&1)
+        check_contains "m15 mmsg both array-form sockets bind in the rootfs" \
+            "bind: ok" "$out"
+        check_contains "m15 sendmmsg translates every message's address" \
+            "sendmmsg: 3" "$out"
+        check_contains "m15 recvmmsg delivers the whole batch" "recvmmsg: 3" \
+            "$out"
+        check_contains "m15 recvmmsg strips the first source address" \
+            "msg[0]: hello-0 from /run/c.sock" "$out"
+        check_contains "m15 recvmmsg strips the last one too" \
+            "msg[2]: hello-2 from /run/c.sock" "$out"
+        case "$out" in
+        *"$R1"*) fail=$((fail + 1))
+            echo "  FAIL m15 an mmsg source address leaked the host rootfs path"
+            echo "    got: $out" ;;
+        *) pass=$((pass + 1))
+            echo "  ok   m15 no mmsg source address leaks a host path" ;;
+        esac
+        if [ -e /run/d.sock ] || [ -e /run/c.sock ]; then
+            fail=$((fail + 1))
+            echo "  FAIL m15 the host gained an array-form socket"
+        else
+            pass=$((pass + 1))
+            echo "  ok   m15 the host filesystem is untouched by the array forms"
+        fi
+
+        # The other half of the bargain: a batch with no address to contain must
+        # come back exactly as it would unemulated. A socketpair has nowhere to
+        # put one, and a UDP socket cannot be carrying a sun_path at all — which
+        # is the case the emulation answers with one getsockopt rather than a
+        # walk over every message.
+        check_contains "m15 an address-less batch is untouched" \
+            "pair: sent=3 got=3 ok=1" "$out"
+        case "$out" in
+        *"udp: skip"*)
+            skip "m15 udp batch leg: no loopback UDP on this host" ;;
+        *)
+            check_contains "m15 an ordinary UDP batch is untouched" \
+                "udp: sent=3 got=3 ok=1" "$out" ;;
+        esac
+
+        # An abstract source address carries the per-rootfs tag on the wire, and
+        # recvmmsg has to strip it per message like recvmsg does for its one.
+        out=$(m15run -R "$R1" /bin/uxmmsg /run/d.sock @uxmc 2>&1)
+        check_contains "m15 recvmmsg strips the abstract tag per message" \
+            "msg[2]: hello-2 from @uxmc" "$out"
+    fi
+
     rm -rf "$R1" "$R2"
 fi
 rm -rf "$M15D"

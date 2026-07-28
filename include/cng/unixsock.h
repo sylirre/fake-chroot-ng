@@ -24,11 +24,19 @@ struct cng_sun_xlate {
     int applied; /* 0: pass the guest's own address through unchanged */
 };
 
-/* Translate an outbound guest sockaddr (bind/connect/sendto/sendmsg). `follow`
- * dereferences a final symlink — bind keeps the last component literal, since it
- * is the name being created. Returns 1 when x->buf/x->len should be used, 0 to
- * pass the guest's address through untouched. Always pair with cng_sun_done(). */
+/* Translate an outbound guest sockaddr (bind/connect/sendto/sendmsg, and each
+ * message of a sendmmsg). `follow` dereferences a final symlink — bind keeps the
+ * last component literal, since it is the name being created. Returns 1 when
+ * x->buf/x->len should be used, 0 to pass the guest's address through untouched
+ * — which is also the answer for an address that cannot be read, so the kernel
+ * gets to fault on the guest's own pointer rather than the handler dying on it.
+ * Always pair with cng_sun_done(). */
 int cng_sun_in(struct cng_sun_xlate *x, const void *addr, long alen, int follow);
+
+/* Would cng_sun_in() rewrite this address? Lets the mmsg array forms re-issue a
+ * batch of ordinary (UDP) messages whole, and take one apart only when a message
+ * really does carry an AF_UNIX address. Reads the family bytes only. */
+int cng_sun_needed(const void *addr, long alen);
 
 /* Release anything cng_sun_in() held (the fallback dirfd). */
 void cng_sun_done(struct cng_sun_xlate *x);

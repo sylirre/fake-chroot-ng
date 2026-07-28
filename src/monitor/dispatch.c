@@ -1818,6 +1818,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         struct cng_sun_xlate x;
         char mh[56];
         long r;
+        x.dirfd = -1; /* a NULL msghdr never reaches cng_sun_in, and cng_sun_done
+                       * must not then close whatever the stack held */
         if (a1 && cng_sun_in(&x, *(void **)(char *)a1,
                              (long)*(unsigned *)((char *)a1 + 8), 1)) {
             memcpy(mh, (const void *)a1, sizeof mh);
@@ -1829,6 +1831,83 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         }
         cng_sun_done(&x);
         return r;
+    }
+
+    /* sendmmsg: sendmsg's array form, and one msg_name per message is the whole
+     * of what it adds. The call exists to spend one syscall on a batch — UDP is
+     * what it is for — so a batch carrying no AF_UNIX address is re-issued
+     * whole and costs a scan. Only when a message really does carry one is the
+     * array taken apart into per-message sendmsg calls, which is what the
+     * kernel's own loop does anyway: send until one fails, write each msg_len
+     * back as it goes, report the count if any went out and the error only if
+     * none did. The guest's array is never rewritten — each translated header is
+     * a copy, exactly as in sendmsg above.
+     *
+     * (An emulated netlink socket needs nothing here: a native sendmmsg puts the
+     * request datagrams into the stand-in socketpair, which is the same route an
+     * untrapped write(2) takes, and the matching receive serves them.) */
+    case __NR_sendmmsg: {
+        struct cng_mmsghdr *v = (struct cng_mmsghdr *)a1;
+        unsigned long vlen = (unsigned)a2;
+        if (vlen > CNG_UIO_MAXIOV) /* as the kernel clamps it */
+            vlen = CNG_UIO_MAXIOV;
+        if (!v || !vlen)
+            return reissue(a0, a1, a2, a3, a4, a5, nr);
+        /* A socket that is not AF_UNIX cannot carry a sun_path at all, and a UDP
+         * batch is what this call exists for — so ask the socket once instead of
+         * reading up to 1024 addresses out of guest memory to find that out.
+         * (Each of those reads has to be probed first, since a fault in the
+         * handler is unblockable, and a probe is itself a syscall: the whole
+         * point of sendmmsg is not to spend one per message.) */
+        int dom = 0;
+        unsigned dlen = sizeof dom;
+        if (CNG_SYS(__NR_getsockopt, a0, CNG_SOL_SOCKET, CNG_SO_DOMAIN, &dom,
+                    &dlen, 0) == 0 &&
+            dom != CNG_AF_UNIX)
+            return reissue(a0, a1, a2, a3, a4, a5, nr);
+        /* One probe for the whole array where it is all readable, which is the
+         * usual case; per element otherwise, since the kernel stops at the first
+         * unreadable one rather than refusing the batch. */
+        int whole = cng_user_readable(v, vlen * sizeof *v);
+        int any = 0;
+        for (unsigned long i = 0; i < vlen; i++) {
+            if (!whole && !cng_user_readable(&v[i], sizeof v[i]))
+                break; /* the kernel never gets past here either */
+            if (cng_sun_needed(v[i].hdr.name, (long)v[i].hdr.namelen)) {
+                any = 1;
+                break;
+            }
+        }
+        if (!any)
+            return reissue(a0, a1, a2, a3, a4, a5, nr);
+
+        unsigned long sent = 0;
+        long r = 0;
+        for (unsigned long i = 0; i < vlen; i++) {
+            if (!whole && !cng_user_readable(&v[i], sizeof v[i])) {
+                r = -EFAULT;
+                break;
+            }
+            struct cng_msghdr mh = v[i].hdr;
+            struct cng_sun_xlate x;
+            if (cng_sun_in(&x, mh.name, (long)mh.namelen, 1)) {
+                mh.name = x.buf;
+                mh.namelen = (unsigned)x.len;
+            }
+            r = reissue(a0, (long)&mh, a3, 0, 0, 0, __NR_sendmsg);
+            cng_sun_done(&x);
+            if (r < 0)
+                break;
+            /* The kernel does not count a message whose length writeback
+             * faults, even though it has already gone out. Neither do we. */
+            if (!cng_user_writable(&v[i].len, sizeof v[i].len)) {
+                r = -EFAULT;
+                break;
+            }
+            v[i].len = (unsigned)r;
+            sent++;
+        }
+        return sent ? (long)sent : r;
     }
 
     /* The readback side. The kernel writes a HOST sun_path here; handing that to
@@ -1894,6 +1973,74 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 cng_sun_out(name, &got);
                 *nlp = (unsigned)got;
             }
+        }
+        return r;
+    }
+
+    /* recvmmsg: the readback side of the array forms. Nothing has to be rewritten
+     * on the way in — msg_name is an output buffer here — so the batch is
+     * re-issued whole and each of the messages the kernel actually filled has its
+     * source address mapped back to guest spelling in place, the way recvmsg's
+     * single one is. Only [0, r) were written, so only those are touched. */
+    case __NR_recvmmsg: {
+        struct cng_mmsghdr *v = (struct cng_mmsghdr *)a1;
+        unsigned long vlen = (unsigned)a2;
+        if (vlen > CNG_UIO_MAXIOV)
+            vlen = CNG_UIO_MAXIOV;
+
+        /* An emulated netlink socket has to be taken apart per message instead:
+         * its replies are built on demand, and a client discards any whose
+         * source address is not the kernel's — which means msg_name must be
+         * filled by cng_nl_srcaddr from the guest's own buffer length, not
+         * overwritten by the socketpair's AF_UNIX answer first. The timeout is
+         * not honored (a reply is already waiting or is never coming); the
+         * MSG_WAITFORONE rule is, since without it a batch larger than the
+         * pending replies would block on a socket nothing else will feed. */
+        if (cng_nl_is_fake((int)a0) && v && vlen) {
+            unsigned long got = 0;
+            long r = 0;
+            for (; got < vlen; got++) {
+                struct cng_mmsghdr *m = &v[got];
+                if (!cng_user_readable(m, sizeof *m)) {
+                    r = -EFAULT;
+                    break;
+                }
+                struct cng_iovec *iov = m->hdr.iov;
+                if (!iov || !m->hdr.iovlen ||
+                    !cng_user_readable(iov, sizeof *iov)) {
+                    r = -EFAULT;
+                    break;
+                }
+                long fl = a3 & ~(long)CNG_MSG_WAITFORONE;
+                if (got && (a3 & CNG_MSG_WAITFORONE))
+                    fl |= CNG_MSG_DONTWAIT;
+                long out = 0;
+                cng_nl_recv((int)a0, iov[0].base, (long)iov[0].len, fl, &out);
+                if (out < 0) {
+                    r = out;
+                    break;
+                }
+                if (!cng_user_writable(&m->len, sizeof m->len)) {
+                    r = -EFAULT;
+                    break;
+                }
+                m->len = (unsigned)out;
+                if (m->hdr.name)
+                    cng_nl_srcaddr((int)a0, m->hdr.name, &m->hdr.namelen);
+            }
+            return got ? (long)got : r;
+        }
+
+        long r = reissue(a0, a1, a2, a3, a4, a5, nr);
+        if (r <= 0 || !v)
+            return r;
+        for (long i = 0; i < r && (unsigned long)i < vlen; i++) {
+            void *name = v[i].hdr.name;
+            if (!name || !v[i].hdr.namelen)
+                continue;
+            long got = (long)v[i].hdr.namelen;
+            cng_sun_out(name, &got);
+            v[i].hdr.namelen = (unsigned)got;
         }
         return r;
     }

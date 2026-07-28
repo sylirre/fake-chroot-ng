@@ -854,6 +854,22 @@ int cng_cmd_faulttest(int argc, char **argv, char **envp, unsigned long *auxv) {
                 (int)-EFAULT, okgg ? "OK" : "FAIL");
     fails += !okgg;
 
+    /* Socket addresses are the other thing read ahead of the kernel: cng_sun_in
+     * copies sun_path before any call that would have validated the pointer, and
+     * the mmsg array forms walk a whole vector of guest msghdrs the same way. The
+     * fd here is not a socket, so the kernel's own refusal arrives before it ever
+     * looks at the address — which is the point. What is being asserted is that
+     * an answer arrives at all, rather than the handler dying on the pointer; the
+     * specific errno is the host's to choose. */
+    long rb = cng_dispatch(__NR_bind, 0, (long)bad, 110, 0, 0, 0, 1);
+    long rsm = cng_dispatch(__NR_sendmmsg, 0, (long)bad, 2, 0, 0, 0, 1);
+    long rrm = cng_dispatch(__NR_recvmmsg, 0, (long)bad, 2, 0, 0, 0, 1);
+    int oksa = (rb < 0 && rsm < 0 && rrm < 0);
+    cng_dprintf(1,
+                "faulttest socket-addr bind=%d sendmmsg=%d recvmmsg=%d -> %s\n",
+                (int)rb, (int)rsm, (int)rrm, oksa ? "OK" : "FAIL");
+    fails += !oksa;
+
     /* And the same calls with real memory still work. */
     long rr = cng_dispatch(__NR_getresuid, (long)good, (long)(good + 8),
                            (long)(good + 16), 0, 0, 0, 1);

@@ -26,6 +26,13 @@ case "$out" in
         check_contains "$_c answers EFAULT" "faulttest $_c=-14 want=-14 -> OK" \
             "$out"
     done
+    # A sockaddr, and a whole mmsg vector of them, are read before the kernel
+    # would have validated either. The errno is the host's to choose here (the
+    # test fd is not a socket, so its refusal comes first) — what is asserted is
+    # that the dispatcher answers rather than faulting, which the "no case
+    # faulted" leg above enforces and a crash would take the whole run down.
+    check_contains "a bad socket address answers rather than faults" \
+        "faulttest socket-addr" "$out"
     check_contains "valid pointers still work" \
         "faulttest valid getresuid=0" "$out"
     ;;

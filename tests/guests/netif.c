@@ -4,12 +4,14 @@
  *   - getifaddrs(3), which glibc/musl implement over an unbound netlink dump and
  *     which apt, dnf, `ip addr`, and Java/Go runtimes all reach for;
  *   - a raw RTM_GETLINK dump, the shape iproute2 issues, plus the getsockname
- *     that iproute2 insists must return a 12-byte sockaddr_nl.
+ *     that iproute2 insists must return a 12-byte sockaddr_nl, and the same dump
+ *     read back with recvmmsg, which fills a source address per message.
  *
  * Prints one line per interface name found, then the raw-dump message count, so
  * the output is byte-comparable between a run under the emulation and a run
  * straight under qemu (where the guest talks to the real kernel).
  */
+#define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
 #include <ifaddrs.h>
@@ -103,6 +105,54 @@ int main(void) {
     printf("dump: got>0=%d msgs>0=%d seq_ok=%d newlink>0=%d\n", n > 0, msgs > 0,
            seq_ok, newlink > 0);
     close(fd);
+
+    /* --- the same dump read back with recvmmsg --------------------------- */
+    /* The array form fills one source address per message, and what a netlink
+     * client does with that address is decide whether the reply came from the
+     * kernel at all: glibc discards anything whose source is not nl_pid == 0.
+     * So the assertion here is the shape of the source, not the payload. A
+     * fresh socket, because a second dump on a socket whose first one is still
+     * draining is EBUSY on a real kernel. A receive timeout keeps a missing
+     * reply a failed check rather than a hung test. */
+    int mfd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+    int mgot = 0, mmsgs = 0, src_nl = 1, src_pid0 = 1;
+    if (mfd >= 0) {
+        struct timeval tv = {2, 0};
+        setsockopt(mfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        if (bind(mfd, (struct sockaddr *)&sa, sizeof sa) == 0 &&
+            sendto(mfd, &req, sizeof req, 0, (struct sockaddr *)&sa,
+                   sizeof sa) >= 0) {
+            char mbuf[2][8192];
+            struct sockaddr_nl from[2];
+            struct iovec miov[2];
+            struct mmsghdr mvec[2];
+            memset(mvec, 0, sizeof mvec);
+            memset(from, 0, sizeof from);
+            for (int i = 0; i < 2; i++) {
+                miov[i].iov_base = mbuf[i];
+                miov[i].iov_len = sizeof mbuf[i];
+                mvec[i].msg_hdr.msg_name = &from[i];
+                mvec[i].msg_hdr.msg_namelen = sizeof from[i];
+                mvec[i].msg_hdr.msg_iov = &miov[i];
+                mvec[i].msg_hdr.msg_iovlen = 1;
+            }
+            mgot = recvmmsg(mfd, mvec, 2, MSG_WAITFORONE, NULL);
+            for (int i = 0; i < mgot; i++) {
+                if (mvec[i].msg_hdr.msg_namelen != sizeof(struct sockaddr_nl) ||
+                    from[i].nl_family != AF_NETLINK)
+                    src_nl = 0;
+                if (from[i].nl_pid != 0)
+                    src_pid0 = 0;
+                struct nlmsghdr *mh = (struct nlmsghdr *)mbuf[i];
+                size_t mlen = mvec[i].msg_len;
+                for (; NLMSG_OK(mh, mlen); mh = NLMSG_NEXT(mh, mlen))
+                    mmsgs++;
+            }
+        }
+        close(mfd);
+    }
+    printf("mmsg: got>0=%d msgs>0=%d src_nl=%d src_pid0=%d\n", mgot > 0,
+           mmsgs > 0, src_nl, src_pid0);
 
     /* --- the SIOCGIF* family, the same questions over an AF_INET socket ---
      * `ifconfig` and getifaddrs's oldest fallback ask this way, and the answers

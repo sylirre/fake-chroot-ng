@@ -13,6 +13,10 @@
  *   in  — bind/connect/sendto/sendmsg: guest path -> host path;
  *   out — getsockname/getpeername/accept/accept4/recvfrom/recvmsg: host -> guest.
  *
+ * The array forms (sendmmsg/recvmmsg) carry one address per message and get the
+ * same two directions applied per element; the loop is in dispatch.c, which is
+ * also where the decision to take a batch apart at all is made.
+ *
  * Abstract names (a leading NUL) have no filesystem node, so the rootfs prefix
  * cannot scope them, and an unprivileged process cannot be handed its own
  * network namespace. They are isolated by splicing a short per-rootfs tag after
@@ -82,12 +86,32 @@ void cng_sun_done(struct cng_sun_xlate *x) {
     }
 }
 
+/* Is this an address cng_sun_in() would rewrite? Asked per message by the mmsg
+ * array forms, where the answer decides between re-issuing the batch whole and
+ * taking it apart — so it reads the two family bytes and nothing more. */
+int cng_sun_needed(const void *addr, long alen) {
+    struct cng_sun_xlate probe;
+    if (!addr || alen < SUN_HDR + 1 || alen > (long)sizeof probe.buf)
+        return 0;
+    unsigned short fam;
+    if (!cng_user_readable(addr, sizeof fam))
+        return 0;
+    memcpy(&fam, addr, sizeof fam);
+    return fam == CNG_AF_UNIX;
+}
+
 int cng_sun_in(struct cng_sun_xlate *x, const void *addr, long alen,
                int follow) {
     x->applied = 0;
     x->dirfd = -1;
     x->len = alen;
     if (!addr || alen < SUN_HDR + 1 || alen > (long)sizeof x->buf)
+        return 0;
+    /* The address is read here, ahead of the kernel call that would have
+     * validated it, and a fault inside the handler is unblockable. An
+     * unreadable one is passed through untouched so the kernel answers the
+     * guest's own pointer with -EFAULT, which is what it would have done. */
+    if (!cng_user_readable(addr, (unsigned long)alen))
         return 0;
     unsigned short fam;
     memcpy(&fam, addr, sizeof fam);
