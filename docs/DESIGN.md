@@ -79,16 +79,26 @@ fork-inherited registry that tells a guest pid from a host one).
 
 A detached per-namespace daemon (`src/monitor/broker.c`) that owns shared state
 no guest process can hold itself, because **host fd == guest fd** here: anything
-we keep open is visible to — and closable by — the guest. It serves two things
-over one abstract-socket rendezvous: the `--shared-proc` PID table (as a memfd),
-and the **System V shared-memory** registry, whose segments Android leaves us no
-choice but to emulate (`shmget`/`shmat`/`shmdt`/`shmctl` are all denied, and
-there is no writable tmpfs for `/dev/shm`). Each segment is an anonymous memfd
-the daemon holds and hands to attachers over `SCM_RIGHTS`; `shmat` maps it
-`MAP_SHARED` — into our own address space, which is also the guest's — and
-closes the fd immediately, so a process holds a segment only as a mapping. The
-daemon uses those registries as its own liveness signal and exits once nothing
-is left, leaving no file and no socket name. See `src/monitor/shm.c`.
+we keep open is visible to — and closable by — the guest. Over one abstract-socket
+rendezvous it serves the `--shared-proc` PID table (as a memfd) and the whole of
+**System V IPC**, which Android leaves us no choice but to emulate: every syscall
+in the family is denied, and there is no writable tmpfs for `/dev/shm`.
+
+Shared memory needs only an owner for the pages: each segment is an anonymous
+memfd the daemon holds and hands to attachers over `SCM_RIGHTS`, and `shmat` maps
+it `MAP_SHARED` — into our own address space, which is also the guest's — then
+closes the fd at once, so a process holds a segment only as a mapping
+(`src/monitor/shm.c`). Semaphore sets and message queues instead live *entirely*
+in the daemon (`src/monitor/ipcreg.c`), because they need an arbiter rather than
+a landlord: with every operation an RPC, all mutation is single-threaded, a
+multi-operation `semop` is atomic for free, and a guest that dies mid-call cannot
+leave the registry torn. An operation that must sleep parks its connection there
+and is answered when it can proceed, when its deadline passes, when the object is
+removed, or when the caller cancels it — which is how a blocking `semop` stays
+interruptible even though our SIGSYS handler runs with every other signal masked.
+
+The daemon uses those registries as its own liveness signal and exits once
+nothing is left, leaving no file and no socket name.
 
 ### Interception mechanism — tiered, auto-selected
 

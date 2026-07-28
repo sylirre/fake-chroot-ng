@@ -13,6 +13,7 @@
  * not be translated into the rootfs.)
  */
 #include "cng/broker.h"
+#include "cng/ipcreg.h"
 #include "cng/loader.h"
 #include "cng/monitor.h"
 #include "cng/path.h"
@@ -32,6 +33,14 @@ static u64 now_sec(void) {
     struct cng_timespec ts = {0, 0};
     sys_clock_gettime(CNG_CLOCK_REALTIME, &ts);
     return (u64)ts.tv_sec;
+}
+
+/* Monotonic milliseconds, for the loop's own timing: grace windows, reclaim
+ * ticks and semtimedop deadlines must not move when the wall clock is set. */
+static u64 now_ms(void) {
+    struct cng_timespec ts = {0, 0};
+    sys_clock_gettime(CNG_CLOCK_MONOTONIC, &ts);
+    return (u64)ts.tv_sec * 1000 + (u64)ts.tv_nsec / 1000000;
 }
 
 /* The root pid makes the nonce unique among live invocations; mixing in the
@@ -63,19 +72,20 @@ u32 cng_broker_key_hash(const char *s) {
 
 /* Abstract rendezvous name (path[0] == NUL => no filesystem entry), keyed by
  * uid plus either the rootfs hash (`sess` == 0: --shared-proc, one daemon per
- * rootfs) or the per-invocation nonce. The v1 tag covers the request protocol
- * AND struct proc_ent's layout: bump it if either changes, so a differently
- * versioned build never joins an incompatible daemon. Returns the sockaddr
- * length. */
+ * rootfs) or the per-invocation nonce. The version tag covers the request
+ * protocol AND struct proc_ent's layout: bump it if either changes, so a
+ * differently versioned build never joins an incompatible daemon. (v2 added the
+ * semaphore and message-queue operations, which widened struct cng_breq.)
+ * Returns the sockaddr length. */
 static unsigned broker_addr(struct cng_sockaddr_un *a, u32 hash, u64 sess) {
     memset(a, 0, sizeof *a);
     a->family = CNG_AF_UNIX;
     size_t n;
     if (sess)
-        n = cng_snprintf(a->path + 1, sizeof a->path - 1, "cng-ipc.v1.%u.s%016llx",
+        n = cng_snprintf(a->path + 1, sizeof a->path - 1, "cng-ipc.v2.%u.s%016llx",
                          (unsigned)sys_getuid(), (unsigned long long)sess);
     else
-        n = cng_snprintf(a->path + 1, sizeof a->path - 1, "cng-ipc.v1.%u.%08x",
+        n = cng_snprintf(a->path + 1, sizeof a->path - 1, "cng-ipc.v2.%u.%08x",
                          (unsigned)sys_getuid(), hash);
     return (unsigned)(sizeof a->family + 1 + n);
 }
@@ -90,10 +100,44 @@ static unsigned ipc_addr(struct cng_sockaddr_un *a) {
 
 /* ---- transport ---------------------------------------------------------- */
 
+/* Exactly `len` bytes in each direction, looping over short transfers. The
+ * variable-length payloads (a semop's operation vector, a message's bytes)
+ * ride behind their fixed request on the same stream, so both ends have to be
+ * able to insist on a whole one. MSG_NOSIGNAL on the write: a dead peer must
+ * yield EPIPE, never a signal — a host SIGPIPE here would be indistinguishable
+ * from one meant for the guest. */
+int cng_broker_read_full(int fd, void *buf, unsigned len) {
+    char *p = (char *)buf;
+    while (len) {
+        long n = sys_read(fd, p, len);
+        if (n == -EINTR)
+            continue;
+        if (n <= 0)
+            return -1;
+        p += n;
+        len -= (unsigned)n;
+    }
+    return 0;
+}
+
+int cng_broker_write_full(int fd, const void *buf, unsigned len) {
+    const char *p = (const char *)buf;
+    while (len) {
+        long n = CNG_SYS(__NR_sendto, fd, p, len, CNG_MSG_NOSIGNAL, 0, 0);
+        if (n == -EINTR)
+            continue;
+        if (n <= 0)
+            return -1;
+        p += n;
+        len -= (unsigned)n;
+    }
+    return 0;
+}
+
 /* Send a fixed-size payload plus an optional fd (fd < 0: none) over a connected
  * AF_UNIX stream; the fd rides as SCM_RIGHTS ancillary data. MSG_NOSIGNAL: a
  * dead peer must yield EPIPE, not kill the daemon. */
-static int broker_send(int sock, const void *data, unsigned len, int fd) {
+int cng_broker_send(int sock, const void *data, unsigned len, int fd) {
     struct cng_iovec iov = {(void *)data, len};
     struct {
         struct cng_cmsghdr h;
@@ -132,7 +176,7 @@ static int broker_send(int sock, const void *data, unsigned len, int fd) {
 }
 
 /* Receive a fixed-size payload plus an optional fd; *fd_out gets it or -1. */
-static int broker_recv(int sock, void *data, unsigned len, int *fd_out) {
+int cng_broker_recv(int sock, void *data, unsigned len, int *fd_out) {
     if (fd_out)
         *fd_out = -1;
     struct cng_iovec iov = {data, len};
@@ -428,7 +472,7 @@ static s32 shm_do_get(const struct cng_breq *q) {
 }
 
 static s32 shm_do_at(const struct cng_breq *q, struct cng_bresp *r, int *outfd) {
-    struct seg *s = shm_find(q->shmid);
+    struct seg *s = shm_find(q->id);
     if (!s)
         return -EINVAL;
     /* A plain attach is a write attach; SHM_RDONLY asks for read only, and
@@ -447,7 +491,7 @@ static s32 shm_do_at(const struct cng_breq *q, struct cng_bresp *r, int *outfd) 
 }
 
 static s32 shm_do_dt(const struct cng_breq *q) {
-    struct seg *s = shm_find(q->shmid);
+    struct seg *s = shm_find(q->id);
     if (!s)
         return 0; /* already gone: a detach is a no-op */
     if (s->nattch)
@@ -461,7 +505,7 @@ static s32 shm_do_dt(const struct cng_breq *q) {
 }
 
 static s32 shm_do_fork(const struct cng_breq *q) {
-    struct seg *s = shm_find(q->shmid);
+    struct seg *s = shm_find(q->id);
     if (!s)
         return 0;
     s->nattch++;
@@ -509,7 +553,7 @@ static s32 shm_do_ctl(const struct cng_breq *q, struct cng_bresp *r) {
     }
     case CNG_SHM_STAT:
     case CNG_SHM_STAT_ANY: {
-        s32 idx = q->shmid;
+        s32 idx = q->id;
         if (idx < 0 || idx >= SHM_SEG_MAX || !g_seg[idx].used)
             return -EINVAL;
         struct seg *s = &g_seg[idx];
@@ -523,7 +567,7 @@ static s32 shm_do_ctl(const struct cng_breq *q, struct cng_bresp *r) {
     }
     }
 
-    struct seg *s = shm_find(q->shmid);
+    struct seg *s = shm_find(q->id);
     if (!s)
         return -EINVAL;
     switch (q->arg) {
@@ -621,16 +665,18 @@ static int tab_memfd(void **tab_out) {
     return memfd;
 }
 
-/* Serve one connected client: dispatch the request and reply. */
-static void ipc_serve(int cfd, const struct cng_breq *q, void **tab) {
+/* Serve one connected client: dispatch the request and reply. Returns 1 when the
+ * connection has been parked in a waiter slot (a blocking semop/msgsnd/msgrcv),
+ * in which case the caller must not close it. */
+static int ipc_serve(int cfd, const struct cng_breq *q, void **tab) {
     struct cng_bresp r;
     memset(&r, 0, sizeof r);
     int outfd = -1;
     if (q->op == CNG_REQ_TAB) {
         outfd = tab_memfd(tab);
         r.ret = outfd < 0 ? -ENOSYS : 0;
-        broker_send(cfd, &r, sizeof r, outfd);
-        return;
+        cng_broker_send(cfd, &r, sizeof r, outfd);
+        return 0;
     }
     switch (q->op) {
     case CNG_REQ_SHMGET:
@@ -649,16 +695,30 @@ static void ipc_serve(int cfd, const struct cng_breq *q, void **tab) {
         r.ret = shm_do_ctl(q, &r);
         break;
     default:
-        r.ret = -EINVAL;
-        break;
+        /* Semaphores and message queues stream payloads and can park, so they
+         * drive the connection themselves (ipcreg.c). */
+        return cng_ipc_serve(cfd, q);
     }
-    broker_send(cfd, &r, sizeof r, outfd);
+    cng_broker_send(cfd, &r, sizeof r, outfd);
+    return 0;
 }
 
+/* How many fds the poll array holds: the listener plus one per parked waiter. */
+#define BROKER_POLL_MAX (1 + CNG_IPC_WAITER_MAX)
+
+#define BROKER_GRACE_MS 10000 /* linger this long past the last user's exit */
+#define BROKER_TICK_MS  1000  /* reclaim cadence while waiters or undo exist */
+
 /* Daemon main loop; never returns. Owns the rendezvous socket, the table memfd
- * (once asked for) and every segment backing, and exits once neither a live
- * guest nor a live segment has anchored the namespace for the grace window —
- * freeing all backings and the socket name. */
+ * (once asked for), every segment backing and all semaphore / message-queue
+ * state, and exits once nothing — a live guest, segment, set, queue, undo row or
+ * parked waiter — has anchored the namespace for the grace window.
+ *
+ * The loop watches the listener and every parked waiter's connection at once,
+ * which is what lets a blocking semop sleep without wedging the daemon for
+ * everyone else. A timed wait's deadline bounds the poll directly, so it expires
+ * on time rather than at tick granularity; the tick is only for the /proc reads
+ * that notice a dead waiter or apply a dead process's SEM_UNDO. */
 static _Noreturn void broker_main(struct cng_sockaddr_un *a, unsigned al) {
     long ls = CNG_SYS(__NR_socket, CNG_AF_UNIX,
                       CNG_SOCK_STREAM | CNG_SOCK_CLOEXEC, 0, 0, 0, 0);
@@ -668,6 +728,13 @@ static _Noreturn void broker_main(struct cng_sockaddr_un *a, unsigned al) {
         sys_exit_group(0); /* lost the spawn race: the winner serves */
     if (CNG_SYS(__NR_listen, ls, 64, 0, 0, 0, 0) != 0)
         sys_exit_group(0);
+    /* Every parked waiter holds one fd, so lift the soft descriptor limit to the
+     * hard one: a default soft limit must not starve accept() under sleepers. */
+    struct cng_rlimit rl;
+    if (sys_prlimit64(0, CNG_RLIMIT_NOFILE, 0, &rl) == 0 && rl.cur < rl.max) {
+        rl.cur = rl.max;
+        sys_prlimit64(0, CNG_RLIMIT_NOFILE, &rl, 0);
+    }
     void *p = sys_mmap(0, (unsigned long)SHM_SEG_MAX * sizeof(struct seg),
                        CNG_PROT_READ | CNG_PROT_WRITE,
                        CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
@@ -676,34 +743,64 @@ static _Noreturn void broker_main(struct cng_sockaddr_un *a, unsigned al) {
     g_seg = (struct seg *)p;
     void *tab = 0;
 
-    struct cng_pollfd pf = {(int)ls, CNG_POLLIN, 0};
+    static struct cng_pollfd pf[BROKER_POLL_MAX];
+    s64 last_active = (s64)now_ms(), last_tick = last_active;
     for (;;) {
-        struct cng_timespec grace = {10, 0}; /* linger past the last exit */
-        long r = CNG_SYS(__NR_ppoll, &pf, 1, &grace, 0, 8 /*sigsetsize*/, 0);
+        s64 now = (s64)now_ms();
+        pf[0].fd = (int)ls;
+        pf[0].events = CNG_POLLIN;
+        pf[0].revents = 0;
+        s64 next = last_active + BROKER_GRACE_MS - now; /* the idle-exit check */
+        if (cng_ipc_pending() && next > BROKER_TICK_MS)
+            next = BROKER_TICK_MS;
+        int nfds = cng_ipc_poll_add(pf, 1, BROKER_POLL_MAX, now, &next);
+        if (next < 0)
+            next = 0;
+        struct cng_timespec to = {next / 1000, (next % 1000) * 1000000};
+        long r = CNG_SYS(__NR_ppoll, pf, nfds, &to, 0, 8 /*sigsetsize*/, 0);
         if (r < 0) {
             if (r == -EINTR)
                 continue;
             break;
         }
-        if (r > 0 && (pf.revents & CNG_POLLIN)) {
-            long c = CNG_SYS(__NR_accept4, ls, 0, 0, CNG_SOCK_CLOEXEC, 0, 0);
-            if (c >= 0) {
-                struct cng_timeval tv = {2, 0}; /* never wedge on a client */
-                CNG_SYS(__NR_setsockopt, c, CNG_SOL_SOCKET, CNG_SO_RCVTIMEO,
-                        &tv, sizeof tv, 0);
-                struct cng_breq q;
-                if (broker_recv((int)c, &q, sizeof q, 0) == 0)
-                    ipc_serve((int)c, &q, &tab);
-                sys_close((int)c);
+        now = (s64)now_ms();
+        if (r > 0) {
+            last_active = now;
+            /* Parked connections first: cancels, deaths, protocol garbage. */
+            cng_ipc_poll_ready(pf, 1, nfds);
+            if (pf[0].revents & CNG_POLLIN) {
+                long c = CNG_SYS(__NR_accept4, ls, 0, 0, CNG_SOCK_CLOEXEC, 0, 0);
+                if (c >= 0) {
+                    struct cng_timeval tv = {2, 0}; /* never wedge on a client */
+                    CNG_SYS(__NR_setsockopt, c, CNG_SOL_SOCKET, CNG_SO_RCVTIMEO,
+                            &tv, sizeof tv, 0);
+                    struct cng_breq q;
+                    int parked = 0;
+                    if (cng_broker_recv((int)c, &q, sizeof q, 0) == 0)
+                        parked = ipc_serve((int)c, &q, &tab);
+                    if (!parked)
+                        sys_close((int)c);
+                }
             }
-            continue; /* served a joiner: re-arm the full grace window */
+            cng_ipc_rescan(); /* any request served may have unblocked a waiter */
         }
-        /* Idle grace elapsed: leave once nothing anchors the namespace. */
-        shm_reclaim_all();
-        if (!(tab && cng_procreg_table_live(tab)) && !shm_any_live())
-            break;
+        cng_ipc_expire(now); /* cheap: no /proc reads */
+        if (cng_ipc_pending() && now - last_tick >= BROKER_TICK_MS) {
+            last_tick = now;
+            cng_ipc_reclaim();
+        }
+        if (r == 0 && now - last_active >= BROKER_GRACE_MS) {
+            /* Idle grace elapsed: leave once nothing anchors the namespace. */
+            shm_reclaim_all();
+            cng_ipc_reclaim();
+            if (!(tab && cng_procreg_table_live(tab)) && !shm_any_live() &&
+                !cng_ipc_any_live())
+                break;
+            last_active = now; /* still anchored: re-arm the grace window */
+        }
     }
     shm_free_all();
+    cng_ipc_free_all();
     sys_exit_group(0);
 }
 
@@ -810,18 +907,24 @@ static int broker_connect(struct cng_sockaddr_un *a, unsigned al) {
     return -1; /* pathological churn */
 }
 
-int cng_broker_rpc(struct cng_breq *q, struct cng_bresp *r, int *fd_out) {
+int cng_broker_open(struct cng_breq *q) {
+    /* The daemon has no other way to know who is asking, and the permission
+     * checks are against the guest's (possibly faked) identity, not the host's. */
     q->pid = (s32)sys_getpid();
     q->uid = cng_g_fake_id ? cng_g_cred.euid : (u32)sys_geteuid();
     q->gid = cng_g_fake_id ? cng_g_cred.egid : (u32)sys_getegid();
     struct cng_sockaddr_un a;
     unsigned al = ipc_addr(&a);
-    int s = broker_connect(&a, al);
+    return broker_connect(&a, al);
+}
+
+int cng_broker_rpc(struct cng_breq *q, struct cng_bresp *r, int *fd_out) {
+    int s = cng_broker_open(q);
     if (s < 0)
         return -1;
     int ok = -1;
-    if (broker_send(s, q, sizeof *q, -1) == 0 &&
-        broker_recv(s, r, sizeof *r, fd_out) == 0)
+    if (cng_broker_send(s, q, sizeof *q, -1) == 0 &&
+        cng_broker_recv(s, r, sizeof *r, fd_out) == 0)
         ok = 0;
     sys_close(s); /* transient: keep no persistent broker fd */
     return ok;
@@ -846,8 +949,8 @@ int cng_broker_table_fd(const char *rootfs_key) {
     q.pid = (s32)sys_getpid();
     struct cng_bresp r;
     int memfd = -1;
-    if (broker_send(s, &q, sizeof q, -1) != 0 ||
-        broker_recv(s, &r, sizeof r, &memfd) != 0) {
+    if (cng_broker_send(s, &q, sizeof q, -1) != 0 ||
+        cng_broker_recv(s, &r, sizeof r, &memfd) != 0) {
         sys_close(s);
         if (memfd >= 0)
             sys_close(memfd);

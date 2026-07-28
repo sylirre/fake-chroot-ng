@@ -1744,6 +1744,79 @@ vfork/`posix_spawn` child-stack handling.
     differential against the real kernel; the pathname leg asserts the guest-view
     length and that the four bytes which fit are `/run`, not the rootfs prefix.
 
+- [x] **M22 — System V semaphores and message queues, broker-backed**
+  The richer answer M12's follow-up note asked for, replacing the ENOSYS refusal:
+  `semget`/`semop`/`semtimedop`/`semctl` and `msgget`/`msgsnd`/`msgrcv`/`msgctl`
+  are emulated from the same per-namespace daemon shm uses. Ported from
+  arm64chroot's `sys_ipc.c` and the sem/msg half of its `proctab.c`. This is also
+  the only way the guest has them at all on Android, where the whole SysV family
+  is off the app seccomp allow-list.
+  - **All state lives in the daemon** (`src/monitor/ipcreg.c`), unlike shm, whose
+    payload is a memfd the guest maps. Every operation is an RPC, so mutation is
+    single-threaded and needs no locking, a multi-operation `semop` is atomic for
+    free, and a guest that dies mid-call cannot leave the registry torn. The
+    daemon is freestanding like everything else here, so the variable-sized
+    allocations — a value vector per set, an adjustment vector per undo row, a
+    block per queued message — come from a small boundary-tagged arena rather
+    than the `malloc` the original could lean on.
+  - **Blocking operations park.** The connection stays open in a waiter slot and
+    the poll loop watches it alongside the listener, so one sleeper does not wedge
+    the daemon for everyone else. Parked operations are retried in arrival order
+    after every state change, repeating until a pass makes no progress — which is
+    also what reproduces the kernel's pipelined `msgsnd` → parked-receiver handoff,
+    as an enqueue and a dequeue inside one pass. A `semtimedop` deadline bounds the
+    poll directly, so it expires on time rather than at tick granularity.
+  - **Interruption is the part chroot-ng has to work hardest for.** The client half
+    runs inside the SIGSYS handler, which masks every signal but SIGSYS — so a
+    sleeping `semop` is never woken by a signal *arriving*. The wait polls in
+    100 ms slices and asks whether a signal the guest would take delivery of has
+    become pending, judged against the mask the signal frame will restore and
+    against the disposition (a signal the guest ignores would not have interrupted
+    a real `semop` either, and neither would one that is only pending because
+    *we* blocked it and whose default action is to discard it). On interruption a
+    cancel goes down the same connection and the next message is definitive — the
+    daemon's grant if it won the race, else the cancel-ack. The ordered stream is
+    what makes that exact: a granted operation is never reported as EINTR, and a
+    cancelled one was never applied. On the `-R` trampoline tier, which runs with
+    the guest's own mask, the delivery itself is the interruption and `ppoll`'s
+    EINTR is taken as one directly.
+  - **SEM_UNDO with no exit hook anywhere.** chroot-ng traps neither `exit` nor
+    `exit_group` (a `SIGKILL` could never be trapped either), so a dead process's
+    adjustments are applied from its pid incarnation — and applied *when the set
+    is next touched*, not on a timer, because the observation that catches a lazy
+    implementation is exactly `waitpid(child); semctl(GETVAL)`. The same principle
+    settles shm's `nattch`, including the zombie test: a process that has exited
+    but not been reaped still owns its pid, yet the kernel has already run its
+    exit.
+  - **Protocol.** `struct cng_breq`/`cng_bresp` grew the fields the three object
+    types share and eight new operations; the payloads that cannot fit a
+    fixed-size request (an operation vector, a message's bytes, a `GETALL`/
+    `SETALL` array) stream behind it on the same connection. The rendezvous tag
+    went `cng-ipc.v1` → `v2`, so a differently versioned build never joins an
+    incompatible daemon. `semctl`'s vector is the one unbounded array, and it is
+    streamed through a 1024-value window rather than sized by `SEMMSL` — the
+    handler's scratch stack has no room for 32000 of them.
+  - **Namespace scope** is shm's: per invocation by default, widened to
+    per-rootfs by `--shared-proc`.
+  - **Tested two ways, for two reasons.** `-t ipctest` drives the dispatcher
+    directly in thirteen groups — including a real fork, a blocking wake, and
+    SEM_UNDO across a child's death — so it runs on a host with no working SysV
+    IPC of its own, which is exactly the target platform. The guest programs
+    (`tests/guests/sem_sysv.c`, `sem_block.c`, `sem_undo.c`) run once under the
+    emulation and once straight under qemu, and must agree byte for byte; unlike
+    the shm differential, which leans on qemu's own `shmat`, nothing is emulated
+    on the reference side here — every call is forwarded to the host kernel, so
+    the comparison is against the genuine article. Between them they pin the
+    atomic rollback, the whole `msgrcv` selection rule, `MSG_EXCEPT`,
+    `E2BIG`/`MSG_NOERROR`, the keyed-lookup and error orders, every way a sleeper
+    can end (grant, wait-for-zero, timeout, EINTR, EIDRM, an *ignored* signal
+    that must **not** interrupt), and SEM_UNDO through both an ordinary exit and
+    a SIGKILL. `sem_key.c` pins the namespace scope, which is the one part with
+    no oracle — the host has exactly one IPC namespace — and the suite also
+    asserts the point of the whole exercise: the guest's keyed objects never
+    appear in the host's `ipcs`.
+  - Filter is 138 of 256 instructions.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

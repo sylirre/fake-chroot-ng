@@ -65,7 +65,7 @@ DIR — see below), `-l/--link2symlink` (emulate hardlinks where the host refuse
 emulation described below), `--no-dev` (turn off the `/dev` passthrough),
 `--share-abstract-sockets` (don't isolate abstract AF_UNIX names per rootfs), `--shared-proc` (share the process view between
 independent invocations of the same rootfs, for both the process view and the
-System V shm namespace), `--no-ptrace` (refuse guest `ptrace(2)` instead of
+System V IPC namespace), `--no-ptrace` (refuse guest `ptrace(2)` instead of
 emulating it).
 
 `/proc` is visible to the guest without a bind, and describes the guest rather
@@ -129,13 +129,26 @@ aborting"* inside a rootfs on a device. So a refused audit socket is reported as
 registered — and those tools proceed. A host that grants the socket is left
 alone; `CNG_NETLINK_DENY_AUDIT=1` forces the refusal for testing.
 
-**System V shared memory** works too. Android denies `shmget`/`shmat`/`shmdt`/
-`shmctl` outright, so chroot-ng serves them itself: the same broker daemon owns
-each segment as an anonymous `memfd` (or a private file where `memfd_create` is
-unavailable) and hands it to attachers over `SCM_RIGHTS`, which needs no host
-SysV IPC and no `/dev/shm`. Segments are shared by every process of one
+**System V IPC** works too — shared memory, semaphores and message queues.
+Android denies the whole family outright, so chroot-ng serves it itself from a
+per-namespace broker daemon, with no host SysV IPC and no `/dev/shm` anywhere in
+the path. A shared-memory segment is an anonymous `memfd` (or a private file
+where `memfd_create` is unavailable) that the daemon owns and hands to attachers
+over `SCM_RIGHTS`; semaphore sets and message queues live entirely in the daemon,
+so a multi-operation `semop` is atomic and a guest that dies mid-call cannot
+corrupt anything. Blocking operations really block: a `semop`, `msgsnd` or
+`msgrcv` that must sleep parks in the daemon and is answered when it can proceed,
+when its `semtimedop` deadline passes, when the object is removed (`EIDRM`), or
+when a signal the guest would take delivery of arrives (`EINTR`). `SEM_UNDO` is
+honored even for a `SIGKILL`ed process. Objects are shared by every process of one
 invocation and isolated between invocations, unless `--shared-proc` widens the
-namespace to the rootfs.
+namespace to the rootfs — and in no configuration do they reach the host's, where
+`ipcs` never sees them.
+
+POSIX message queues (`mq_open` and friends) are the one IPC namespace with no
+emulation behind it: an mq name is not a filesystem path, so nothing can scope it
+to the rootfs, and running them natively would put the guest in the host's queue
+namespace. They answer `ENOSYS`, which is what Android gives anyway.
 
 **`ptrace(2)` works inside the rootfs** — `strace`, `gdb` and `proot` all run
 there — even though chroot-ng itself uses none. It has to be emulated rather

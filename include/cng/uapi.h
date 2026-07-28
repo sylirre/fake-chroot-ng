@@ -66,6 +66,7 @@
 /* clock_gettime clocks. BOOTTIME counts suspend, which is what /proc/uptime
  * reports (CLOCK_MONOTONIC does not). */
 #define CNG_CLOCK_REALTIME  0
+#define CNG_CLOCK_MONOTONIC 1
 #define CNG_CLOCK_BOOTTIME  7
 
 /* getrlimit/prlimit64 resources */

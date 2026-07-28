@@ -247,6 +247,11 @@ static struct {
     long tid;
     unsigned long lo, hi;
     int busy;
+    /* The signal frame the dispatcher on this stack is running for. Its
+     * uc_sigmask is the guest's own mask — the one sigreturn will restore —
+     * which the blocking IPC waits need and cannot get any other way, since the
+     * live mask while the handler runs is ours. */
+    struct cng_ucontext *uc;
 } cng_scr[CNG_SCR_N];
 
 /* Claim `*p` from 0 to `tid` (inline LL/SC so we need no libgcc atomics helper;
@@ -310,8 +315,70 @@ static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {
         return;
     }
     cng_scr[i].busy = 1;
+    cng_scr[i].uc = (struct cng_ucontext *)ucv;
     cng_run_on_stack((void *)cng_scr[i].hi, (void *)cng_sigsys_body, ucv, si);
+    cng_scr[i].uc = 0;
     cng_scr[i].busy = 0;
+}
+
+/* Is a signal pending that the guest would take delivery of?
+ *
+ * A blocking System V IPC wait has to end in EINTR exactly when a real one
+ * would, and it cannot find out the usual way: the handler runs with every
+ * signal but SIGSYS masked (see cng_sig_install), so a signal arriving mid-wait
+ * queues instead of interrupting anything. The pending set is therefore polled
+ * against the mask the signal frame will restore — the guest's own — and against
+ * the disposition, since a signal the guest ignores would not have interrupted a
+ * real semop either. A signal that is pending only because *we* blocked it, and
+ * whose default action is to be discarded, is likewise not an interruption.
+ *
+ * The -R trampoline tier has no signal frame; there the live mask is already the
+ * guest's, so it is read straight from the kernel. */
+int cng_sig_deliverable(void) {
+    unsigned long pend = 0;
+    if (CNG_SYS(__NR_rt_sigpending, &pend, sizeof pend, 0, 0, 0, 0) < 0 || !pend)
+        return 0;
+
+    unsigned long blocked = 0;
+    long tid = sys_gettid();
+    unsigned h = (unsigned)((unsigned long)tid * 2654435761u) % CNG_SCR_N;
+    struct cng_ucontext *uc = 0;
+    for (unsigned k = 0; k < CNG_SCR_N; k++) {
+        unsigned i = (h + k) % CNG_SCR_N;
+        if (__atomic_load_n(&cng_scr[i].tid, __ATOMIC_ACQUIRE) == tid) {
+            uc = cng_scr[i].uc;
+            break;
+        }
+    }
+    if (uc)
+        blocked = uc->uc_sigmask.sig[0];
+    else if (CNG_SYS(__NR_rt_sigprocmask, 0 /*SIG_BLOCK*/, 0, &blocked,
+                     sizeof blocked, 0, 0) < 0)
+        blocked = 0;
+
+    unsigned long live = pend & ~blocked;
+    for (int sig = 1; sig <= 64 && live; sig++) {
+        unsigned long bit = 1UL << (sig - 1);
+        if (!(live & bit))
+            continue;
+        live &= ~bit;
+        /* SIGCHLD, SIGCONT, SIGURG and SIGWINCH are discarded at delivery when
+         * the disposition is still the default, so their arrival is not an
+         * interruption; every other default action is (it terminates). */
+        struct cng_ksigaction sa;
+        memset(&sa, 0, sizeof sa);
+        if (CNG_SYS(__NR_rt_sigaction, sig, 0, &sa, sizeof(cng_sigset_t), 0,
+                    0) < 0)
+            return 1; /* cannot ask: assume it interrupts, as the kernel would */
+        if (sa.handler == (void *)1) /* SIG_IGN */
+            continue;
+        if (!sa.handler && /* SIG_DFL */
+            (sig == 17 /*CHLD*/ || sig == 18 /*CONT*/ || sig == 23 /*URG*/ ||
+             sig == 28 /*WINCH*/))
+            continue;
+        return 1;
+    }
+    return 0;
 }
 
 int cng_install_monitor(struct cng_fs *fs) {

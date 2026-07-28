@@ -106,9 +106,11 @@ static const int id_syscalls[] = {
 };
 #define NID ((int)(sizeof(id_syscalls) / sizeof(id_syscalls[0])))
 
-/* System V shared memory: always trapped, always emulated (shm.c). Android
- * denies all four, and trapping them everywhere keeps one guest namespace
- * whatever the host would have allowed — the same choice arm64chroot makes. */
+/* System V IPC: always trapped, always emulated (shm.c, sysvipc.c). Android
+ * denies the whole family, and trapping them everywhere keeps one guest
+ * namespace whatever the host would have allowed — the same choice arm64chroot
+ * makes, and the reason a guest cannot reach a host semaphore or have its
+ * queues turn up in the host's `ipcs`. */
 static const int ipc_syscalls[] = {
 #ifdef __NR_shmget
     __NR_shmget,
@@ -122,6 +124,8 @@ static const int ipc_syscalls[] = {
 #ifdef __NR_shmctl
     __NR_shmctl,
 #endif
+    __NR_semget,      __NR_semop,       __NR_semctl,      __NR_semtimedop,
+    __NR_msgget,      __NR_msgsnd,      __NR_msgrcv,      __NR_msgctl,
 };
 #define NIPC ((int)(sizeof(ipc_syscalls) / sizeof(ipc_syscalls[0])))
 
@@ -217,17 +221,9 @@ static const int enosys_syscalls[] = {
 #ifdef __NR_seccomp
     __NR_seccomp,
 #endif
-    /* System V semaphores and message queues. M12 gave the guest its own shm
-     * namespace; these were left running natively, so on a desktop host the
-     * guest shared the HOST's sem/msg namespace — it could attach to host
-     * semaphores, and host `ipcs -s`/`-q` listed the guest's objects. That is
-     * exactly the isolation the shm broker exists to provide. Refusing them is
-     * the oracle's answer; a broker-backed emulation would be the richer one. */
-    __NR_semget,      __NR_semop,       __NR_semctl,      __NR_semtimedop,
-    __NR_msgget,      __NR_msgsnd,      __NR_msgrcv,      __NR_msgctl,
-    /* POSIX message queues — the same leak one namespace over, and the one the
-     * System V sweep above did not reach. An mq name is not a filesystem path:
-     * it names an entry in the per-IPC-namespace mqueue mount,
+    /* POSIX message queues — the same escape as the System V family's, in the
+     * one namespace the emulation cannot take over. An mq name is not a
+     * filesystem path: it names an entry in the per-IPC-namespace mqueue mount,
      * which an unprivileged process cannot be given one of, so there is nothing
      * for the path traps to translate and nothing the rootfs prefix can scope.
      * Left native, a guest mq_open("/x") created the queue in the HOST's

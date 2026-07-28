@@ -1,5 +1,6 @@
 /* Unified IPC broker: one per-namespace daemon serving the guest-PID registry
- * table AND the System V shared-memory registry.
+ * table AND the whole of System V IPC — shared memory, semaphores and message
+ * queues.
  *
  * Ported from arm64chroot's proctab.c, whose daemon multiplexes both over a
  * single abstract-socket rendezvous. chroot-ng grew the daemon first for
@@ -49,32 +50,56 @@ enum {
     CNG_REQ_SHMDT,   /* nattch-- */
     CNG_REQ_SHMFORK, /* nattch++ for an attachment a fork child inherited */
     CNG_REQ_SHMCTL,  /* stat / set / rmid / the ipcs enumeration commands */
+    CNG_REQ_SEMGET,  /* find-or-create a semaphore set */
+    CNG_REQ_SEMOP,   /* arg = nsops; that many cng_sembuf follow the request */
+    CNG_REQ_SEMCTL,  /* SETALL streams nsems u16 after the request; GETALL
+                      * streams them back after the reply */
+    CNG_REQ_MSGGET,  /* find-or-create a message queue */
+    CNG_REQ_MSGSND,  /* size payload bytes follow the request */
+    CNG_REQ_MSGRCV,  /* a grant streams ret payload bytes after the reply */
+    CNG_REQ_MSGCTL,
+    CNG_REQ_CANCEL,  /* on a parked connection: abandon the wait (-> EINTR) */
 };
 
 /* One fixed-size request; small enough to be delivered atomically on a local
  * stream socket. The caller's pid and effective credentials are stamped by
  * cng_broker_rpc — the daemon has no other way to know them, and the perm
- * checks are against the guest's (possibly faked) identity, not the host's. */
+ * checks are against the guest's (possibly faked) identity, not the host's.
+ *
+ * The fields are shared across the three object types, which is what keeps one
+ * request struct (and one daemon) serving all of them; each comment lists the
+ * meanings in shm / sem / msg order. */
 struct cng_breq {
     u32 op;
-    s32 key;  /* shmget: IPC key (0 = IPC_PRIVATE) */
-    u64 size; /* shmget: requested size */
-    s32 shmid;/* at/dt/fork/ctl: target segment (SHM_STAT: array index) */
-    s32 arg;  /* shmget shmflg | shmat CNG_SHMAT_* | shmctl cmd */
+    s32 key;  /* *get: IPC key (0 = IPC_PRIVATE) */
+    u64 size; /* shmget size | semget nsems | msgsnd/msgrcv msgsz */
+    s32 id;   /* target segment / set / queue (*_STAT: an array index) */
+    s32 arg;  /* *get flags | shmat CNG_SHMAT_* | *ctl cmd | semop nsops |
+               * msgsnd/msgrcv msgflg */
     s32 pid;  /* caller's pid (guest pid == host pid here) */
     u32 uid, gid;                   /* caller's effective guest credentials */
-    u32 set_mode, set_uid, set_gid; /* shmctl IPC_SET payload */
+    u32 set_mode, set_uid, set_gid; /* *ctl IPC_SET payload */
+    s32 semnum;                     /* semctl: which semaphore in the set */
+    s32 val;                        /* semctl SETVAL | msgctl IPC_SET qbytes */
+    s64 mtype;                      /* msgsnd type | msgrcv msgtyp */
+    s64 timeout_ns;                 /* semtimedop timeout; -1 = untimed */
 };
 
 struct cng_bresp {
-    s32 ret; /* shmid / 0 / SHM_INFO max index / -errno */
-    s32 key; /* shm_perm.key (IPC_STAT / SHM_STAT) */
-    u64 size, nattch;
+    s32 ret;   /* id / 0 / a semaphore value / byte count / *_INFO max index /
+                * -errno */
+    s32 key;   /* ipc_perm.key (IPC_STAT / *_STAT) */
+    u64 size;  /* shm segsz | sem nsems | msg qbytes */
+    u64 nattch;/* shm nattch | msg qnum */
     u32 mode, uid, gid, cuid, cgid;
-    s32 cpid, lpid;
-    s64 atime, dtime, ctime;
-    s32 info_used; /* SHM_INFO: used_ids */
-    u64 info_tot;  /* SHM_INFO: total pages over all segments */
+    s32 cpid, lpid; /* shm creator/last-op | msg lspid/lrpid */
+    s64 atime;      /* shm atime | sem otime | msg stime */
+    s64 dtime;      /* shm dtime | msg rtime */
+    s64 ctime;
+    s32 info_used;  /* *_INFO: used ids */
+    u64 info_tot;   /* *_INFO: pages | semaphores | messages, over all objects */
+    u64 cbytes;     /* msg: bytes on the queue (STAT), over all queues (INFO) */
+    s64 mtype;      /* msgrcv grant: the delivered message's type */
     /* CNG_REQ_TAB / a successful CNG_REQ_SHMAT also carry an fd (SCM_RIGHTS). */
 };
 
@@ -90,6 +115,13 @@ void cng_broker_seed_session(void);
  * non-NULL, receives an SCM_RIGHTS fd or -1. Returns 0 on a completed exchange,
  * -1 if no daemon could be reached (the caller then fails the syscall). */
 int cng_broker_rpc(struct cng_breq *q, struct cng_bresp *r, int *fd_out);
+
+/* The same connection, handed over instead of driven: for the exchanges that
+ * connect-ask-close cannot express — a payload streaming behind the request, a
+ * reply streaming one back, or a blocking operation that parks in the daemon and
+ * is cancelled from this end. Stamps q->pid/uid/gid as cng_broker_rpc does.
+ * Returns a connected socket (the caller closes it) or -1. */
+int cng_broker_open(struct cng_breq *q);
 
 /* Fetch the procreg table memfd from the per-rootfs daemon (--shared-proc),
  * spawning it if absent. Returns the fd (caller mmaps and closes it) or -1 to
@@ -111,5 +143,20 @@ const char *cng_broker_env(const char *name);
 /* The namespace key hash (fnv1a32), shared with procreg.c's file tier so the
  * socket name and the file name agree on what identifies a rootfs. */
 u32 cng_broker_key_hash(const char *s);
+
+/* ---- transport, shared with the sem/msg registry (ipcreg.c) -------------
+ * The semaphore and message-queue operations stream a payload alongside the
+ * fixed request (a semop's operation vector, a message's bytes), and a parked
+ * waiter is answered long after its request was served — so the registry drives
+ * its own connection rather than returning a reply for broker.c to send. These
+ * are the same four primitives the request/response path uses. */
+
+/* One fixed-size payload plus an optional SCM_RIGHTS fd (fd < 0: none). */
+int cng_broker_send(int sock, const void *data, unsigned len, int fd);
+int cng_broker_recv(int sock, void *data, unsigned len, int *fd_out);
+/* Exactly `len` bytes, looping over short reads/writes. 0 on success, -1 on a
+ * closed or failing peer. */
+int cng_broker_read_full(int fd, void *buf, unsigned len);
+int cng_broker_write_full(int fd, const void *buf, unsigned len);
 
 #endif /* CNG_BROKER_H */

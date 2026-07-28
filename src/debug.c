@@ -15,6 +15,7 @@
 #include "cng/rewrite.h"
 #include "cng/seccomp.h"
 #include "cng/shm.h"
+#include "cng/sysvipc.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
 #include "cng/uapi.h"
@@ -264,8 +265,6 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
 #ifdef __NR_open_tree
             {"open_tree", __NR_open_tree},
 #endif
-            {"semget", __NR_semget},
-            {"msgget", __NR_msgget},
 #ifdef __NR_mq_open
             {"mq_open", __NR_mq_open},
 #endif
@@ -2856,12 +2855,15 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
         {"clone3 is refused ENOSYS", __NR_clone3, 0x1000, 0,
          CNG_SECCOMP_RET_ERRNO | 38},
 #endif
-        /* SysV sem/msg: M12 gave the guest its own shm namespace but left these
-         * native, so it shared the HOST's sem/msg namespace. */
-        {"semget is refused ENOSYS", __NR_semget, 0x1000, 0,
-         CNG_SECCOMP_RET_ERRNO | 38},
-        {"msgget is refused ENOSYS", __NR_msgget, 0x1000, 0,
-         CNG_SECCOMP_RET_ERRNO | 38},
+        /* SysV sem/msg: emulated from the same broker as shm, and trapped
+         * unconditionally for the same reason — one guest namespace whatever
+         * the host's own IPC would have allowed. */
+        {"semget traps", __NR_semget, 0x1000, 0, CNG_SECCOMP_RET_TRAP},
+        {"semop traps", __NR_semop, 0x1000, 0, CNG_SECCOMP_RET_TRAP},
+        {"semtimedop traps", __NR_semtimedop, 0x1000, 0, CNG_SECCOMP_RET_TRAP},
+        {"msgget traps", __NR_msgget, 0x1000, 0, CNG_SECCOMP_RET_TRAP},
+        {"msgsnd traps", __NR_msgsnd, 0x1000, 0, CNG_SECCOMP_RET_TRAP},
+        {"msgrcv traps", __NR_msgrcv, 0x1000, 0, CNG_SECCOMP_RET_TRAP},
         /* POSIX mqueue: the same leak in the namespace next door. An mq name is
          * not a path, so nothing translates it — left native the guest opened
          * queues in the HOST's mqueue namespace. */
@@ -3566,5 +3568,280 @@ int cng_cmd_shmtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     }
 
     cng_dprintf(1, "shmtest: %d failure(s)\n", fails);
+    return fails ? 1 : 0;
+}
+
+/* ---- _ipctest: System V semaphores and message queues ------------------- */
+
+/* The differential guests (tests/guests/sem_*.c) are the real coverage here —
+ * they diff the emulation against the host kernel's own SysV IPC. This drives
+ * the same dispatcher without a libc or a working host implementation, which is
+ * what makes it the only coverage available on Android, where bionic drops the
+ * API and the app domain is denied the syscalls outright. */
+
+static long ipc_call(long nr, long a0, long a1, long a2, long a3, long a4) {
+    return cng_dispatch(nr, a0, a1, a2, a3, a4, 0, /*trapped=*/0);
+}
+
+static long sem_ctl(long id, long num, long cmd, long arg) {
+    return ipc_call(__NR_semctl, id, num, cmd | 0x100 /*IPC_64*/, arg, 0);
+}
+
+int cng_cmd_ipctest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)auxv;
+    cng_g_host_envp = envp; /* the broker's env lookups (TMPDIR, ...) */
+    int fails = 0;
+    int self = (int)sys_getpid();
+
+    long sid = ipc_call(__NR_semget, 0 /*IPC_PRIVATE*/, 3, CNG_IPC_CREAT | 0600,
+                        0, 0);
+    if (sid <= 0) {
+        cng_dprintf(1, "ipctest semget -> FAIL (%ld)\n", sid);
+        return 1;
+    }
+
+    /* 1) fresh semaphores read zero; SETVAL/GETVAL round-trip; a multi-op
+     *    vector applies as a whole and stamps sempid on every member. */
+    {
+        int ok = sem_ctl(sid, 0, CNG_GETVAL, 0) == 0 &&
+                 sem_ctl(sid, 2, CNG_GETVAL, 0) == 0 &&
+                 sem_ctl(sid, 1, CNG_SETVAL, 5) == 0 &&
+                 sem_ctl(sid, 1, CNG_GETVAL, 0) == 5;
+        struct cng_sembuf ops[2] = {{1, -2, 0}, {0, +3, 0}};
+        ok = ok && ipc_call(__NR_semop, sid, (long)ops, 2, 0, 0) == 0 &&
+             sem_ctl(sid, 0, CNG_GETVAL, 0) == 3 &&
+             sem_ctl(sid, 1, CNG_GETVAL, 0) == 3 &&
+             sem_ctl(sid, 0, CNG_GETPID, 0) == self;
+        cng_dprintf(1, "ipctest semget+setval+semop -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 2) the vector is atomic: an operation that cannot proceed rolls the whole
+     *    thing back, so the +9 in front of the blocking -99 must not stick. */
+    {
+        struct cng_sembuf mixed[2] = {{0, +9, 0}, {2, -99, CNG_IPC_NOWAIT}};
+        long r = ipc_call(__NR_semop, sid, (long)mixed, 2, 0, 0);
+        int ok = r == -EAGAIN && sem_ctl(sid, 0, CNG_GETVAL, 0) == 3;
+        cng_dprintf(1, "ipctest semop atomic rollback -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 3) GETALL/SETALL, which stream their vector over the broker connection
+     *    rather than riding in the fixed request. */
+    {
+        u16 set[3] = {7, 8, 9}, got[3] = {0, 0, 0};
+        int ok = sem_ctl(sid, 0, CNG_SETALL, (long)set) == 0 &&
+                 sem_ctl(sid, 0, CNG_GETALL, (long)got) == 0 && got[0] == 7 &&
+                 got[1] == 8 && got[2] == 9;
+        cng_dprintf(1, "ipctest semctl getall+setall -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 4) IPC_STAT / IPC_SET, and the ipcs enumeration commands. */
+    {
+        struct cng_semid64_ds ds;
+        memset(&ds, 0, sizeof ds);
+        int ok = sem_ctl(sid, 0, CNG_IPC_STAT, (long)&ds) == 0 &&
+                 ds.sem_nsems == 3 && (ds.sem_perm.mode & 0777) == 0600;
+        ds.sem_perm.mode = 0640;
+        ok = ok && sem_ctl(sid, 0, CNG_IPC_SET, (long)&ds) == 0 &&
+             sem_ctl(sid, 0, CNG_IPC_STAT, (long)&ds) == 0 &&
+             (ds.sem_perm.mode & 0777) == 0640;
+        struct cng_seminfo si;
+        memset(&si, 0, sizeof si);
+        long maxidx = sem_ctl(sid, 0, CNG_SEM_INFO, (long)&si);
+        ok = ok && maxidx >= 0 && si.semusz >= 1 && si.semaem >= 3 &&
+             si.semmsl == CNG_SEMMSL;
+        /* SEM_STAT takes the array index SEM_INFO just reported, not an id. */
+        memset(&ds, 0, sizeof ds);
+        ok = ok && sem_ctl(maxidx, 0, CNG_SEM_STAT, (long)&ds) == sid;
+        cng_dprintf(1, "ipctest semctl stat+set+enumeration -> %s\n",
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 5) a blocking semop, woken by a fork child — which also proves the daemon
+     *    keeps serving while one connection sits parked. */
+    {
+        u16 zero[3] = {0, 0, 0};
+        sem_ctl(sid, 0, CNG_SETALL, (long)zero);
+        long kid = cng_dispatch(__NR_clone, 17 /*SIGCHLD*/, 0, 0, 0, 0, 0, 0);
+        if (kid == 0) {
+            struct cng_timespec ms = {0, 200000000};
+            CNG_SYS(__NR_nanosleep, &ms, 0, 0, 0, 0, 0);
+            struct cng_sembuf up = {0, +1, 0};
+            ipc_call(__NR_semop, sid, (long)&up, 1, 0, 0);
+            sys_exit_group(0);
+        }
+        struct cng_sembuf down = {0, -1, 0};
+        long r = ipc_call(__NR_semop, sid, (long)&down, 1, 0, 0);
+        sys_wait4((int)kid, 0, 0, 0);
+        int ok = kid > 0 && r == 0;
+        cng_dprintf(1, "ipctest blocking semop woken -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 6) semtimedop's deadline, which the daemon owns (the client sets no
+     *    timeout of its own). */
+    {
+        struct cng_sembuf down = {0, -1, 0};
+        struct cng_timespec to = {0, 200000000};
+        long r = ipc_call(__NR_semtimedop, sid, (long)&down, 1, (long)&to, 0);
+        cng_dprintf(1, "ipctest semtimedop timeout -> %s\n",
+                    r == -EAGAIN ? "OK" : "FAIL");
+        fails += !(r == -EAGAIN);
+    }
+
+    /* 7) SEM_UNDO across a child's death. chroot-ng traps no exit path, so this
+     *    is the broker's incarnation check doing what the kernel does at exit —
+     *    and it has to be visible immediately after the reap, not a tick later. */
+    {
+        sem_ctl(sid, 0, CNG_SETVAL, 2);
+        long kid = cng_dispatch(__NR_clone, 17, 0, 0, 0, 0, 0, 0);
+        if (kid == 0) {
+            struct cng_sembuf d = {0, -2, CNG_SEM_UNDO};
+            ipc_call(__NR_semop, sid, (long)&d, 1, 0, 0);
+            sys_exit_group(0);
+        }
+        sys_wait4((int)kid, 0, 0, 0);
+        long v = sem_ctl(sid, 0, CNG_GETVAL, 0);
+        cng_dprintf(1, "ipctest sem_undo after exit val=%ld -> %s\n", v,
+                    v == 2 ? "OK" : "FAIL");
+        fails += !(v == 2);
+    }
+
+    /* 8) the error cases, in the kernel's order. */
+    {
+        struct cng_sembuf bad = {99, -1, 0};
+        struct cng_sembuf ok1 = {0, 0, 0};
+        int ok = ipc_call(__NR_semop, sid, (long)&bad, 1, 0, 0) == -EFBIG &&
+                 ipc_call(__NR_semop, sid, (long)&ok1, 0, 0, 0) == -EINVAL &&
+                 sem_ctl(999999, 0, CNG_GETVAL, 0) == -EINVAL &&
+                 sem_ctl(sid, 0, CNG_SETVAL, 99999) == -ERANGE &&
+                 ipc_call(__NR_semget, 0, -1, CNG_IPC_CREAT | 0600, 0, 0) ==
+                     -EINVAL;
+        cng_dprintf(1, "ipctest sem error cases -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 9) keyed lookup, IPC_EXCL, and the id dying with IPC_RMID. */
+    {
+        long a = ipc_call(__NR_semget, 0x63bb0002, 2, CNG_IPC_CREAT | 0600, 0, 0);
+        long b = ipc_call(__NR_semget, 0x63bb0002, 2, 0, 0, 0);
+        int ok = a > 0 && a == b &&
+                 ipc_call(__NR_semget, 0x63bb0002, 2,
+                          CNG_IPC_CREAT | CNG_IPC_EXCL | 0600, 0, 0) == -EEXIST &&
+                 sem_ctl(a, 0, CNG_IPC_RMID, 0) == 0 &&
+                 ipc_call(__NR_semget, 0x63bb0002, 2, 0, 0, 0) == -ENOENT;
+        cng_dprintf(1, "ipctest sem keyed lookup -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+    sem_ctl(sid, 0, CNG_IPC_RMID, 0);
+
+    /* ---- message queues ---- */
+    long qid = ipc_call(__NR_msgget, 0, CNG_IPC_CREAT | 0600, 0, 0, 0);
+    if (qid <= 0) {
+        cng_dprintf(1, "ipctest msgget -> FAIL (%ld)\n", qid);
+        cng_dprintf(1, "ipctest: %d failure(s)\n", fails + 1);
+        return 1;
+    }
+
+    struct {
+        s64 mtype;
+        char t[32];
+    } m;
+
+    /* 10) send three types, then take them back by type, by "at most", and by
+     *     FIFO — the whole msgrcv selection rule in one group. */
+    {
+        int ok = 1;
+        for (long t = 1; t <= 3; t++) {
+            memset(&m, 0, sizeof m);
+            m.mtype = t;
+            m.t[0] = (char)('0' + t);
+            ok = ok && ipc_call(__NR_msgsnd, qid, (long)&m, sizeof m.t, 0, 0) == 0;
+        }
+        struct cng_msqid64_ds ds;
+        memset(&ds, 0, sizeof ds);
+        ok = ok &&
+             ipc_call(__NR_msgctl, qid, CNG_IPC_STAT | 0x100, (long)&ds, 0, 0) ==
+                 0 &&
+             ds.msg_qnum == 3 && ds.msg_cbytes == 96 && ds.msg_lspid == self &&
+             ds.msg_qbytes == CNG_MSGMNB;
+        memset(&m, 0, sizeof m);
+        ok = ok && ipc_call(__NR_msgrcv, qid, (long)&m, sizeof m.t, 2, 0) == 32 &&
+             m.mtype == 2 && m.t[0] == '2';
+        memset(&m, 0, sizeof m);
+        ok = ok && ipc_call(__NR_msgrcv, qid, (long)&m, sizeof m.t, -3, 0) == 32 &&
+             m.mtype == 1;
+        memset(&m, 0, sizeof m);
+        ok = ok && ipc_call(__NR_msgrcv, qid, (long)&m, sizeof m.t, 0, 0) == 32 &&
+             m.mtype == 3;
+        ok = ok && ipc_call(__NR_msgrcv, qid, (long)&m, sizeof m.t, 0,
+                            CNG_IPC_NOWAIT) == -ENOMSG;
+        cng_dprintf(1, "ipctest msgsnd+msgrcv selection -> %s\n",
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 11) a buffer too small is E2BIG and leaves the message queued; with
+     *     MSG_NOERROR it is truncated instead. */
+    {
+        memset(&m, 0, sizeof m);
+        m.mtype = 9;
+        ipc_call(__NR_msgsnd, qid, (long)&m, sizeof m.t, 0, 0);
+        struct {
+            s64 mtype;
+            char t[4];
+        } sm;
+        int ok = ipc_call(__NR_msgrcv, qid, (long)&sm, 4, 0, 0) == -E2BIG &&
+                 ipc_call(__NR_msgrcv, qid, (long)&sm, 4, 0, CNG_MSG_NOERROR) ==
+                     4 &&
+                 sm.mtype == 9;
+        cng_dprintf(1, "ipctest msgrcv E2BIG+MSG_NOERROR -> %s\n",
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 12) a receive that waits for a sender in another process. */
+    {
+        long kid = cng_dispatch(__NR_clone, 17, 0, 0, 0, 0, 0, 0);
+        if (kid == 0) {
+            struct cng_timespec ms = {0, 200000000};
+            CNG_SYS(__NR_nanosleep, &ms, 0, 0, 0, 0, 0);
+            memset(&m, 0, sizeof m);
+            m.mtype = 5;
+            m.t[0] = 'L';
+            ipc_call(__NR_msgsnd, qid, (long)&m, sizeof m.t, 0, 0);
+            sys_exit_group(0);
+        }
+        memset(&m, 0, sizeof m);
+        long n = ipc_call(__NR_msgrcv, qid, (long)&m, sizeof m.t, 0, 0);
+        sys_wait4((int)kid, 0, 0, 0);
+        int ok = kid > 0 && n == 32 && m.mtype == 5 && m.t[0] == 'L';
+        cng_dprintf(1, "ipctest blocking msgrcv woken -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 13) the message error cases and IPC_RMID. */
+    {
+        memset(&m, 0, sizeof m);
+        m.mtype = 0;
+        int ok = ipc_call(__NR_msgsnd, qid, (long)&m, sizeof m.t, 0, 0) ==
+                     -EINVAL &&
+                 ipc_call(__NR_msgsnd, qid, (long)&m, CNG_MSGMAX + 1, 0, 0) ==
+                     -EINVAL &&
+                 ipc_call(__NR_msgctl, 999999, CNG_IPC_STAT | 0x100, (long)&m, 0,
+                          0) == -EINVAL &&
+                 ipc_call(__NR_msgctl, qid, CNG_IPC_RMID, 0, 0, 0) == 0 &&
+                 ipc_call(__NR_msgctl, qid, CNG_IPC_STAT | 0x100, (long)&m, 0,
+                          0) == -EINVAL;
+        cng_dprintf(1, "ipctest msg error cases+rmid -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    cng_dprintf(1, "ipctest: %d failure(s)\n", fails);
     return fails ? 1 : 0;
 }

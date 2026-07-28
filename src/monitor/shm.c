@@ -61,7 +61,7 @@ static int shm_at(s32 shmid, int readonly, int exec, u64 *size_out) {
     struct cng_breq q;
     memset(&q, 0, sizeof q);
     q.op = CNG_REQ_SHMAT;
-    q.shmid = shmid;
+    q.id = shmid;
     q.arg = (readonly ? CNG_SHMAT_RDONLY : 0) | (exec ? CNG_SHMAT_EXEC : 0);
     struct cng_bresp r;
     int fd = -1;
@@ -82,7 +82,7 @@ static void shm_dt(s32 shmid) {
     struct cng_breq q;
     memset(&q, 0, sizeof q);
     q.op = CNG_REQ_SHMDT;
-    q.shmid = shmid;
+    q.id = shmid;
     struct cng_bresp r;
     cng_broker_rpc(&q, &r, 0); /* best effort: the daemon reclaims on death */
 }
@@ -218,7 +218,7 @@ static long do_shmctl(s32 shmid, int cmd, void *buf) {
     struct cng_breq q;
     memset(&q, 0, sizeof q);
     q.op = CNG_REQ_SHMCTL;
-    q.shmid = shmid; /* a segment id, or an array index for SHM_STAT */
+    q.id = shmid; /* a segment id, or an array index for SHM_STAT */
     q.arg = cmd;
     if (cmd == CNG_IPC_SET) {
         const struct cng_shmid64_ds *in = (const struct cng_shmid64_ds *)buf;
@@ -308,7 +308,7 @@ void cng_shm_fork_child(void) {
         struct cng_breq q;
         memset(&q, 0, sizeof q);
         q.op = CNG_REQ_SHMFORK; /* stamped with our pid: the child's */
-        q.shmid = g_att[i].shmid;
+        q.id = g_att[i].shmid;
         struct cng_bresp r;
         cng_broker_rpc(&q, &r, 0);
     }

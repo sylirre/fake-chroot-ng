@@ -16,6 +16,7 @@
 #include "cng/unixsock.h"
 #include "cng/rt.h"
 #include "cng/shm.h"
+#include "cng/sysvipc.h"
 #include "cng/syscall.h"
 #include "cng/uapi.h"
 
@@ -1636,6 +1637,23 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         return r;
     }
 
+    /* System V semaphores and message queues, served from the same broker
+     * (sysvipc.c). Trapped unconditionally for the same reason shm is: the
+     * guest gets one namespace of its own whatever the host's own IPC would
+     * have allowed, and Android denies the whole family anyway. */
+    case __NR_semget:
+    case __NR_semop:
+    case __NR_semtimedop:
+    case __NR_semctl:
+    case __NR_msgget:
+    case __NR_msgsnd:
+    case __NR_msgrcv:
+    case __NR_msgctl: {
+        long r = cng_sysvipc_handle(nr, a0, a1, a2, a3, a4);
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] sysv-ipc nr=%ld -> %ld\n", nr, r);
+        return r;
+    }
 
     /* The read family is trapped only for fds in the reserved synthesized
      * range (the seccomp filter compares fd against cng_g_synth_fd_base),

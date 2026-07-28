@@ -211,9 +211,6 @@ check_contains "io_uring is refused even from inside the gate" \
 # reach the emulated execve and load the new program over its parent.
 check_contains "clone3 is refused so spawns use the converted clone path" \
     "bpftest clone3 is refused ENOSYS: ERRNO -> OK" "$out"
-# M12 gave the guest its own shm namespace but left sem/msg native, so it shared
-# the HOST's -- it could attach to host semaphores and host `ipcs -s` listed the
-# guest's. shm stays emulated; these are refused.
 # A guest-installed filter also governs the syscalls the SIGSYS handler
 # re-issues through the gate, which that filter knows nothing about -- so
 # seccomp(2) is refused outright. prctl carries the same capability under an op
@@ -232,10 +229,17 @@ check_contains "the rest of prctl stays untrapped" \
 # the same fail-soft. Off, an ordinary fstat must not pay for a trap.
 check_contains "the fake-id set adds fstat and fchmod, and only then" \
     "bpftest fake-id: fstat_off=1 fstat_on=1 fchmod_on=1 -> OK" "$out"
-check_contains "SysV semaphores no longer reach the host namespace" \
-    "bpftest semget is refused ENOSYS: ERRNO -> OK" "$out"
-check_contains "SysV message queues no longer reach the host namespace" \
-    "bpftest msgget is refused ENOSYS: ERRNO -> OK" "$out"
+# SysV sem/msg are emulated from the same broker as shm, so they trap rather
+# than being refused -- and they trap unconditionally, so the guest gets its own
+# namespace whatever the host's own IPC would have allowed.
+check_contains "SysV semaphores trap for emulation" \
+    "bpftest semget traps: TRAP -> OK" "$out"
+check_contains "...including the blocking operation" \
+    "bpftest semtimedop traps: TRAP -> OK" "$out"
+check_contains "SysV message queues trap for emulation" \
+    "bpftest msgget traps: TRAP -> OK" "$out"
+check_contains "...including both ends of the queue" \
+    "bpftest msgrcv traps: TRAP -> OK" "$out"
 # POSIX mqueue: the same leak one namespace over. An mq name is not a filesystem
 # path -- it names an entry in the per-IPC-namespace mqueue mount -- so no path
 # trap can translate it and the rootfs prefix cannot scope it. Left native, a
@@ -264,10 +268,6 @@ check_contains "clone3 is refused on the -R tier" \
     "denied clone3: rc=-38 -> OK" "$out"
 check_contains "an ordinary syscall still runs on the -R tier" \
     "denied control getpid: rc=" "$out"
-check_contains "SysV semaphores are refused on the -R tier" \
-    "denied semget: rc=-38 -> OK" "$out"
-check_contains "SysV message queues are refused on the -R tier" \
-    "denied msgget: rc=-38 -> OK" "$out"
 check_contains "POSIX message queues are refused on the -R tier" \
     "denied mq_open: rc=-38 -> OK" "$out"
 rm -rf "$DR"
