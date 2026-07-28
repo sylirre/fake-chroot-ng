@@ -1,6 +1,8 @@
 #include "cng/path.h"
 #include "cng/procreg.h"
 #include "cng/rt.h"
+#include "cng/syscall.h"
+#include "cng/uapi.h"
 
 int cng_g_no_proc = 0;
 
@@ -127,9 +129,48 @@ static void normalize_root(char *dst, size_t dstsz, const char *src) {
         dst[0] = '\0'; /* "/" => "" */
 }
 
+/* Store a host prefix (the rootfs, a bind source) the way the kernel spells it:
+ * symlink-free. These prefixes are not only prepended to guest paths, they are
+ * matched against host paths the kernel *produced* — getcwd() after the guest
+ * fchdir()s, a /proc/self/fd readback — and the kernel always reports those
+ * fully resolved. An unresolved prefix therefore matches nothing coming back,
+ * and every reverse lookup falls out of the guest view.
+ *
+ * Android is where this bites: the app hands us the rootfs under
+ * /data/user/0/<pkg>, a symlink to /data/data/<pkg>. apk runs a package script
+ * by fchdir()ing to its root fd and exec'ing a *relative* path; getcwd() then
+ * answered /data/data/..., which cng_fs_untranslate could not reverse, so the
+ * virtual cwd stayed where it was and the script resolved under it — ENOENT.
+ *
+ * Resolved by opening the directory and reading back the kernel's own name for
+ * it. Anything that does not resolve (a nonexistent path — diagnosed by the
+ * caller — or the synthetic roots the self-tests use, which have no host inode)
+ * is kept verbatim, exactly as before. */
+static void canon_host_root(char *dst, size_t dstsz, const char *src) {
+    long fd = sys_openat(CNG_AT_FDCWD, src,
+                         CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
+    if (fd >= 0) {
+        char link[40], real[CNG_PATH_MAX];
+        cng_snprintf(link, sizeof link, "/proc/self/fd/%d", (int)fd);
+        long n = sys_readlinkat(CNG_AT_FDCWD, link, real, sizeof real - 1);
+        sys_close((int)fd);
+        /* A deleted or otherwise unnamed directory reads back as something
+         * that is not an absolute path ("... (deleted)", "pipe:[N]"); only a
+         * plain absolute name is a prefix we can match against. */
+        if (n > 0 && (size_t)n < sizeof real && real[0] == '/') {
+            real[n] = '\0';
+            if (!strchr(real, ' ')) {
+                normalize_root(dst, dstsz, real);
+                return;
+            }
+        }
+    }
+    normalize_root(dst, dstsz, src);
+}
+
 void cng_fs_init(struct cng_fs *fs, const char *rootfs) {
     memset(fs, 0, sizeof *fs);
-    normalize_root(fs->rootfs, sizeof fs->rootfs, rootfs ? rootfs : "/");
+    canon_host_root(fs->rootfs, sizeof fs->rootfs, rootfs ? rootfs : "/");
     fs->cwd[0] = '/';
     fs->cwd[1] = '\0';
 }
@@ -147,7 +188,7 @@ int cng_fs_add_bind(struct cng_fs *fs, const char *guest, const char *host,
         return -1; /* bind guest paths must be absolute */
     }
     cng_strlcpy(b->guest, canon, sizeof b->guest);
-    normalize_root(b->host, sizeof b->host, host);
+    canon_host_root(b->host, sizeof b->host, host);
     b->glen = (unsigned)strlen(b->guest);
     b->ro = ro ? 1u : 0u;
     fs->nbinds++;
