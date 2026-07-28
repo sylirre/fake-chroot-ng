@@ -266,6 +266,12 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
 #endif
             {"semget", __NR_semget},
             {"msgget", __NR_msgget},
+#ifdef __NR_mq_open
+            {"mq_open", __NR_mq_open},
+#endif
+#ifdef __NR_mq_timedsend
+            {"mq_timedsend", __NR_mq_timedsend},
+#endif
         };
         int fails = 0;
         for (unsigned i = 0; i < sizeof d / sizeof *d; i++) {
@@ -2856,6 +2862,21 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
          CNG_SECCOMP_RET_ERRNO | 38},
         {"msgget is refused ENOSYS", __NR_msgget, 0x1000, 0,
          CNG_SECCOMP_RET_ERRNO | 38},
+        /* POSIX mqueue: the same leak in the namespace next door. An mq name is
+         * not a path, so nothing translates it — left native the guest opened
+         * queues in the HOST's mqueue namespace. */
+#ifdef __NR_mq_open
+        {"mq_open is refused ENOSYS", __NR_mq_open, 0x1000, 0,
+         CNG_SECCOMP_RET_ERRNO | 38},
+#endif
+#ifdef __NR_mq_timedsend
+        {"mq_timedsend is refused ENOSYS", __NR_mq_timedsend, 0x1000, 0,
+         CNG_SECCOMP_RET_ERRNO | 38},
+#endif
+#ifdef __NR_mq_getsetattr
+        {"mq_getsetattr is refused ENOSYS", __NR_mq_getsetattr, 0x1000, 0,
+         CNG_SECCOMP_RET_ERRNO | 38},
+#endif
         /* ...while shm stays emulated, not refused. */
         {"shmget still traps for emulation", __NR_shmget, 0x1000, 0,
          CNG_SECCOMP_RET_TRAP},

@@ -236,6 +236,14 @@ check_contains "SysV semaphores no longer reach the host namespace" \
     "bpftest semget is refused ENOSYS: ERRNO -> OK" "$out"
 check_contains "SysV message queues no longer reach the host namespace" \
     "bpftest msgget is refused ENOSYS: ERRNO -> OK" "$out"
+# POSIX mqueue: the same leak one namespace over. An mq name is not a filesystem
+# path -- it names an entry in the per-IPC-namespace mqueue mount -- so no path
+# trap can translate it and the rootfs prefix cannot scope it. Left native, a
+# guest mq_open() created its queue in the HOST's namespace.
+check_contains "POSIX message queues no longer reach the host namespace" \
+    "bpftest mq_open is refused ENOSYS: ERRNO -> OK" "$out"
+check_contains "and the descriptor-taking mqueue calls are refused with them" \
+    "bpftest mq_timedsend is refused ENOSYS: ERRNO -> OK" "$out"
 check_contains "shm is still emulated rather than refused" \
     "bpftest shmget still traps for emulation: TRAP -> OK" "$out"
 check_contains "fchmodat2 is translated, not refused" \
@@ -260,4 +268,6 @@ check_contains "SysV semaphores are refused on the -R tier" \
     "denied semget: rc=-38 -> OK" "$out"
 check_contains "SysV message queues are refused on the -R tier" \
     "denied msgget: rc=-38 -> OK" "$out"
+check_contains "POSIX message queues are refused on the -R tier" \
+    "denied mq_open: rc=-38 -> OK" "$out"
 rm -rf "$DR"

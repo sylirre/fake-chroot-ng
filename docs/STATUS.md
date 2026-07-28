@@ -1674,6 +1674,30 @@ vfork/`posix_spawn` child-stack handling.
     against the real kernel (it reads `src_nl=0` without the fix). `-t faulttest`
     gained the bad-sockaddr case, which segfaults the run without the probe.
 
+- [x] **M20 — POSIX message queues: the last host IPC namespace the guest could
+  reach**
+  The sweep that closed the System V sem/msg leak stopped one namespace short.
+  `mq_open`/`mq_unlink`/`mq_timedsend`/`mq_timedreceive`/`mq_notify`/
+  `mq_getsetattr` were in no trapped and no refused list, so they ran natively
+  and a guest `mq_open("/x")` created its queue in the **host's** POSIX mqueue
+  namespace — visible to every process on the machine, listed by
+  `ls /dev/mqueue`, and charged against the host's `RLIMIT_MSGQUEUE`.
+  - **Nothing here can be translated.** An mq name is not a filesystem path: it
+    names an entry in the per-IPC-namespace mqueue mount, which an unprivileged
+    process cannot be given one of. So the path traps have nothing to rewrite and
+    the rootfs prefix nothing to scope — the same shape as abstract sockets,
+    without the option of splicing a tag in (the guest would still share the
+    host's queue limits and show up in its `/dev/mqueue`).
+  - **Refused** with `SECCOMP_RET_ERRNO(ENOSYS)`, which is the oracle's answer
+    (arm64chroot has no handler at all) and what the guest already sees on
+    Android, where all six are off the app allow-list. The four
+    descriptor-taking calls are refused with the two name-taking ones: with no
+    queue there is nothing to send on, and a bare `mq_getsetattr` on some other
+    fd must not half-work. `cng_denied_syscall` covers the `-R` trampoline tier,
+    which has no filter.
+  - Tests: three `-t bpftest` cases and one `-t dtest denied` case, mirroring how
+    the sem/msg refusal above is pinned.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

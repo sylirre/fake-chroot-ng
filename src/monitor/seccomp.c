@@ -225,6 +225,38 @@ static const int enosys_syscalls[] = {
      * the oracle's answer; a broker-backed emulation would be the richer one. */
     __NR_semget,      __NR_semop,       __NR_semctl,      __NR_semtimedop,
     __NR_msgget,      __NR_msgsnd,      __NR_msgrcv,      __NR_msgctl,
+    /* POSIX message queues — the same leak one namespace over, and the one the
+     * System V sweep above did not reach. An mq name is not a filesystem path:
+     * it names an entry in the per-IPC-namespace mqueue mount,
+     * which an unprivileged process cannot be given one of, so there is nothing
+     * for the path traps to translate and nothing the rootfs prefix can scope.
+     * Left native, a guest mq_open("/x") created the queue in the HOST's
+     * namespace, where it is visible to every process on the machine (and to
+     * `ls /dev/mqueue`) and charged against the host's RLIMIT_MSGQUEUE. Android
+     * denies all six outright — they predate the app allow-list and Bionic never
+     * issues them — so refusing is also what the guest already sees there, and it
+     * is the oracle's answer (arm64chroot has no handler at all). The
+     * descriptor-taking four are listed with the two name-taking ones: without a
+     * queue there is nothing to send on, and a bare mq_getsetattr on some other
+     * fd must not half-work. */
+#ifdef __NR_mq_open
+    __NR_mq_open,
+#endif
+#ifdef __NR_mq_unlink
+    __NR_mq_unlink,
+#endif
+#ifdef __NR_mq_timedsend
+    __NR_mq_timedsend,
+#endif
+#ifdef __NR_mq_timedreceive
+    __NR_mq_timedreceive,
+#endif
+#ifdef __NR_mq_notify
+    __NR_mq_notify,
+#endif
+#ifdef __NR_mq_getsetattr
+    __NR_mq_getsetattr,
+#endif
 };
 #define NENOSYS ((int)(sizeof(enosys_syscalls) / sizeof(enosys_syscalls[0])))
 
