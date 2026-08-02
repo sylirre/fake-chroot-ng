@@ -124,3 +124,20 @@ check_contains "the final component's symlink is kept under -n" \
 check_contains "...while the components before it still resolve under -n" \
     "/bin/../lib -> $XR/usr/lib" "$(run -t xlate -n -r "$XR" /bin/../lib)"
 rm -rf "$XR"
+
+# A formatted line longer than cng_dprintf's 1024-byte buffer must truncate.
+# The PUT macro used to evaluate its argument only when there was room to store
+# it, so `while (*s) PUT(*s++)` stopped advancing the moment the buffer filled
+# and spun forever — reachable from anything that prints a guest path, /proc
+# maps and the synthesized mount table included. A rootfs plus a ~600-byte path
+# overruns it, so this hangs rather than fails if the guard comes back.
+_lp=/
+_i=0
+while [ $_i -lt 12 ]; do
+    _lp="${_lp}aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    _i=$((_i + 1))
+done
+_out=$(run_t 20 -t xlate -r /root "$_lp" 2>&1)
+check "an over-long line truncates instead of spinning" 0 $?
+check "...to exactly the buffer's capacity" 1023 "$(printf %s "$_out" | wc -c | tr -d ' ')"
+check_contains "...keeping what it did fit" " -> /root/aaaaaaaaaa" "$_out"

@@ -136,10 +136,16 @@ void cng_puts(int fd, const char *s) { cng_write_all(fd, s, strlen(s)); }
  * cap > 0) and returns the byte count written, excluding the terminator. */
 size_t cng_vsnprintf(char *buf, size_t cap, const char *fmt, va_list ap) {
     size_t n = 0;
+/* `ch` is evaluated exactly once, and outside the room-to-store test — every
+ * caller below hands this an expression with a side effect (`*s++`, `t[--i]`,
+ * `va_arg(...)`), and guarding the evaluation stops the side effect the moment
+ * the buffer fills. `while (*s) PUT(*s++)` then never advances `s`: a format
+ * whose output overruns `cap` did not truncate, it spun forever. */
 #define PUT(ch)                                                                \
     do {                                                                       \
+        char c_ = (char)(ch);                                                  \
         if (n + 1 < cap)                                                       \
-            buf[n] = (char)(ch);                                               \
+            buf[n] = c_;                                                       \
         n++;                                                                   \
     } while (0)
 
