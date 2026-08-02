@@ -495,10 +495,14 @@ long cng_sysvipc_handle(long nr, long a0, long a1, long a2, long a3, long a4) {
     switch (nr) {
     case __NR_semget:
         return do_semget((s32)a0, (long)(s32)a1, (s32)a2);
+    /* nsops is `unsigned` in both kernel prototypes, so the top half of the
+     * register is discarded rather than folded into the count — a distinction
+     * only a caller passing a 64-bit value can see, and there the kernel takes
+     * the low word and proceeds where an unnarrowed one answers E2BIG. */
     case __NR_semop:
-        return do_semop((s32)a0, (const void *)a1, (u64)a2, -1);
+        return do_semop((s32)a0, (const void *)a1, (u32)a2, -1);
     case __NR_semtimedop:
-        return do_semtimedop((s32)a0, (const void *)a1, (u64)a2,
+        return do_semtimedop((s32)a0, (const void *)a1, (u32)a2,
                              (const void *)a3);
     case __NR_semctl:
         return do_semctl((s32)a0, (s32)a1, (int)a2, (u64)a3);

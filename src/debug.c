@@ -3817,6 +3817,18 @@ int cng_cmd_ipctest(int argc, char **argv, char **envp, unsigned long *auxv) {
         fails += !ok;
     }
 
+    /* 7c) nsops is `unsigned`: the kernel narrows it and acts on the low word,
+     *     so a 64-bit count with a set top half is one operation, not E2BIG. */
+    {
+        sem_ctl(sid, 0, CNG_SETVAL, 0);
+        struct cng_sembuf up = {0, +1, 0};
+        int ok = ipc_call(__NR_semop, sid, (long)&up, 0x100000001L, 0, 0) == 0 &&
+                 sem_ctl(sid, 0, CNG_GETVAL, 0) == 1;
+        sem_ctl(sid, 0, CNG_SETVAL, 0);
+        cng_dprintf(1, "ipctest semop nsops width -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
     /* 8) the error cases, in the kernel's order. */
     {
         struct cng_sembuf bad = {99, -1, 0};

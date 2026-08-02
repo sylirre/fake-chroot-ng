@@ -36,6 +36,8 @@ check_contains "a blocking semop parks in the daemon and is woken by another pro
     "ipctest blocking semop woken -> OK" "$out"
 check_contains "semtimedop's deadline expires in the daemon" \
     "ipctest semtimedop timeout -> OK" "$out"
+check_contains "nsops is narrowed to the width the kernel takes it at" \
+    "ipctest semop nsops width -> OK" "$out"
 check_contains "the semadj range, cumulative within a vector and at its ends" \
     "ipctest sem_undo range -> OK" "$out"
 check_contains "SEM_UNDO is applied at death, with no exit hook to do it" \
