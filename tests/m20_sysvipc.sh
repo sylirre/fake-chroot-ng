@@ -28,6 +28,8 @@ check_contains "a vector that cannot proceed rolls back entirely" \
     "ipctest semop atomic rollback -> OK" "$out"
 check_contains "GETALL/SETALL stream their vector over the connection" \
     "ipctest semctl getall+setall -> OK" "$out"
+check_contains "msgctl's enumeration commands and the msginfo constants" \
+    "ipctest msgctl enumeration -> OK" "$out"
 check_contains "IPC_STAT/IPC_SET and the ipcs enumeration commands" \
     "ipctest semctl stat+set+enumeration -> OK" "$out"
 check_contains "a blocking semop parks in the daemon and is woken by another process" \

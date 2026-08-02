@@ -458,6 +458,12 @@ static long do_msgctl(s32 msqid, int cmd, void *buf) {
         mi.msgmni = CNG_MSGMNI;
         mi.msgmax = CNG_MSGMAX;
         mi.msgmnb = CNG_MSGMNB;
+        /* msgssz/msgseg describe a segment allocator no kernel has used since
+         * 2.6, but msgctl_info fills them for MSG_INFO and IPC_INFO alike — only
+         * the pool/map/tql triple is repurposed by MSG_INFO — so they belong
+         * outside the branch. */
+        mi.msgssz = 16;     /* MSGSSZ */
+        mi.msgseg = 0xffff; /* MSGSEG, clamped as the uapi header clamps it */
         if (cmd == CNG_MSG_INFO) {
             mi.msgpool = r.info_used;    /* existing queues */
             mi.msgmap = (s32)r.info_tot; /* messages over all of them */
@@ -466,8 +472,6 @@ static long do_msgctl(s32 msqid, int cmd, void *buf) {
             mi.msgpool = CNG_MSGMNI * (CNG_MSGMNB / 1024); /* legacy constants */
             mi.msgmap = CNG_MSGMNB;
             mi.msgtql = CNG_MSGMNB;
-            mi.msgssz = 16;
-            mi.msgseg = 0xffff;
         }
         memcpy(buf, &mi, sizeof mi);
         return r.ret < 0 ? 0 : r.ret;

@@ -3803,6 +3803,29 @@ int cng_cmd_ipctest(int argc, char **argv, char **envp, unsigned long *auxv) {
         fails += !ok;
     }
 
+    /* 10b) the msg enumeration commands, the counterpart of the sem group in 4:
+     *      MSG_INFO for the highest index, MSG_STAT by that index, and IPC_INFO
+     *      for the limits. msgssz/msgseg are asserted for both info commands
+     *      because msgctl_info fills them for both — MSG_INFO repurposes only
+     *      the pool/map/tql triple. */
+    {
+        struct cng_msginfo mi;
+        memset(&mi, 0, sizeof mi);
+        long maxidx = ipc_call(__NR_msgctl, 0, CNG_MSG_INFO, (long)&mi, 0, 0);
+        int ok = maxidx >= 0 && mi.msgpool >= 1 && mi.msgmnb == CNG_MSGMNB &&
+                 mi.msgmax == CNG_MSGMAX && mi.msgssz == 16 &&
+                 mi.msgseg == 0xffff;
+        struct cng_msqid64_ds ds;
+        memset(&ds, 0, sizeof ds);
+        ok = ok && ipc_call(__NR_msgctl, maxidx, CNG_MSG_STAT | 0x100, (long)&ds,
+                            0, 0) == qid;
+        memset(&mi, 0, sizeof mi);
+        ok = ok && ipc_call(__NR_msgctl, 0, CNG_IPC_INFO, (long)&mi, 0, 0) >= 0 &&
+             mi.msgmni >= 1 && mi.msgssz == 16 && mi.msgseg == 0xffff;
+        cng_dprintf(1, "ipctest msgctl enumeration -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
     /* 11) a buffer too small is E2BIG and leaves the message queued; with
      *     MSG_NOERROR it is truncated instead. */
     {
