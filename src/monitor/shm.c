@@ -237,7 +237,12 @@ static long do_shmctl(s32 shmid, int cmd, void *buf) {
 
     /* The ipcs enumeration commands deliver a struct and return a max index or
      * a shmid; SHM_INFO/IPC_INFO return -1 (no segments) without that being an
-     * error, so they write their struct before the sign check below. */
+     * error, so they write their struct before the sign check below — and clamp
+     * that -1 to 0, which is what the kernel hands the user (`err < 0 ? 0 : err`
+     * over ipc_get_maxidx, in both shmctl_shm_info and shmctl_ipc_info). Passed
+     * through raw it reaches the guest as a failed syscall with errno EPERM, so
+     * `ipcs -m` on a namespace with no segments yet reported an error instead of
+     * an empty list. The sem/msg siblings clamp the same way. */
     if (cmd == CNG_SHM_INFO) {
         struct cng_shm_info si;
         if (!cng_user_writable(buf, sizeof si))
@@ -247,7 +252,7 @@ static long do_shmctl(s32 shmid, int cmd, void *buf) {
         si.shm_tot = r.info_tot;
         si.shm_rss = r.info_tot; /* no separate RSS accounting: report total */
         memcpy(buf, &si, sizeof si);
-        return r.ret;
+        return r.ret < 0 ? 0 : r.ret;
     }
     if (cmd == CNG_IPC_INFO) {
         struct cng_shminfo64 li;
@@ -259,7 +264,7 @@ static long do_shmctl(s32 shmid, int cmd, void *buf) {
         li.shmmni = li.shmseg = 1024;      /* the broker's segment table */
         li.shmall = 0x7fffffffffffffffULL >> 12;
         memcpy(buf, &li, sizeof li);
-        return r.ret;
+        return r.ret < 0 ? 0 : r.ret;
     }
 
     if (r.ret < 0)

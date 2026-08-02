@@ -32,6 +32,8 @@ check_contains "keyed lookup, IPC_EXCL and ENOENT" \
     "shmtest keyed lookup -> OK" "$out"
 check_contains "the ipcs enumeration path (SHM_INFO, SHM_STAT, IPC_INFO)" \
     "shmtest shm_info+shm_stat+ipc_info -> OK" "$out"
+check_contains "SHM_INFO/IPC_INFO succeed before any segment exists" \
+    "shmtest empty-namespace shm_info+ipc_info -> OK" "$out"
 check_contains "IPC_SET writes the permission triad back" \
     "shmtest ipc_set -> OK" "$out"
 check_contains "execve detaches every attachment" \

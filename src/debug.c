@@ -3366,6 +3366,23 @@ int cng_cmd_shmtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     int self = (int)sys_getpid();
     unsigned long pg = cng_page_size;
 
+    /* 0) the enumeration commands on a namespace that holds nothing yet — which
+     *    is what `ipcs -m` asks first, and the one state step 7 below cannot
+     *    reach because it creates a segment before looking. The kernel clamps
+     *    its "no ids" answer (-1) to 0, so both must succeed. */
+    {
+        struct cng_shm_info info;
+        struct cng_shminfo64 li;
+        memset(&info, 0, sizeof info);
+        memset(&li, 0, sizeof li);
+        long e1 = shm_call(__NR_shmctl, 0, CNG_SHM_INFO, (long)&info);
+        long e2 = shm_call(__NR_shmctl, 0, CNG_IPC_INFO, (long)&li);
+        int ok = e1 == 0 && e2 == 0 && info.used_ids == 0 && li.shmmni >= 1;
+        cng_dprintf(1, "shmtest empty-namespace shm_info+ipc_info -> %s\n",
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
     /* 1) create, attach, and see the memory. */
     long id = shm_call(__NR_shmget, 0 /*IPC_PRIVATE*/, SHMT_SZ,
                        CNG_IPC_CREAT | 0600);
