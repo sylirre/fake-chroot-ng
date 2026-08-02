@@ -125,12 +125,13 @@ check_contains "...while the components before it still resolve under -n" \
     "/bin/../lib -> $XR/usr/lib" "$(run -t xlate -n -r "$XR" /bin/../lib)"
 rm -rf "$XR"
 
-# A formatted line longer than cng_dprintf's 1024-byte buffer must truncate.
-# The PUT macro used to evaluate its argument only when there was room to store
-# it, so `while (*s) PUT(*s++)` stopped advancing the moment the buffer filled
-# and spun forever — reachable from anything that prints a guest path, /proc
-# maps and the synthesized mount table included. A rootfs plus a ~600-byte path
-# overruns it, so this hangs rather than fails if the guard comes back.
+# A formatted line longer than cng_dprintf's 1024-byte window. Two failures
+# have lived here: PUT evaluated its argument only when there was room to store
+# it, so `while (*s) PUT(*s++)` stopped advancing once the buffer filled and
+# spun forever; and cutting the line at the window's width took its trailing
+# newline with it, running two rows of a synthesized /proc file together. The
+# window is now refilled instead, so the line comes out whole however long it
+# is — 600 bytes of path against a rootfs prefix clears 1024 twice over.
 _lp=/
 _i=0
 while [ $_i -lt 12 ]; do
@@ -138,6 +139,9 @@ while [ $_i -lt 12 ]; do
     _i=$((_i + 1))
 done
 _out=$(run_t 20 -t xlate -r /root "$_lp" 2>&1)
-check "an over-long line truncates instead of spinning" 0 $?
-check "...to exactly the buffer's capacity" 1023 "$(printf %s "$_out" | wc -c | tr -d ' ')"
-check_contains "...keeping what it did fit" " -> /root/aaaaaaaaaa" "$_out"
+check "an over-long line does not spin" 0 $?
+# "<601> -> /root<601>" = 601 + 4 + 5 + 601; the trailing newline is stripped
+# by the command substitution, and its presence is what a cut line would lose.
+check "...and is emitted whole, newline included" 1211 \
+    "$(printf %s "$_out" | wc -c | tr -d ' ')"
+check "...as a single line" 1 "$(printf '%s\n' "$_out" | wc -l | tr -d ' ')"

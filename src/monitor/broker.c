@@ -87,6 +87,12 @@ static unsigned broker_addr(struct cng_sockaddr_un *a, u32 hash, u64 sess) {
     else
         n = cng_snprintf(a->path + 1, sizeof a->path - 1, "cng-ipc.v2.%u.%08x",
                          (unsigned)sys_getuid(), hash);
+    /* cng_snprintf reports what the format would have produced, so clamp to
+     * what it actually wrote before this becomes an addrlen. These names are
+     * ~40 bytes against sun_path's 108 and cannot overflow, but an addrlen past
+     * the buffer would be the kind of thing nobody notices until it is. */
+    if (n > sizeof a->path - 2)
+        n = sizeof a->path - 2;
     return (unsigned)(sizeof a->family + 1 + n);
 }
 

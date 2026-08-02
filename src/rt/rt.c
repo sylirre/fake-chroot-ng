@@ -132,22 +132,49 @@ void cng_puts(int fd, const char *s) { cng_write_all(fd, s, strlen(s)); }
 
 /* ---- minimal printf --------------------------------------------------- */
 
-/* The formatter. Writes at most `cap` bytes into `buf` (NUL-terminated when
- * cap > 0) and returns the byte count written, excluding the terminator. */
-size_t cng_vsnprintf(char *buf, size_t cap, const char *fmt, va_list ap) {
-    size_t n = 0;
-/* `ch` is evaluated exactly once, and outside the room-to-store test — every
- * caller below hands this an expression with a side effect (`*s++`, `t[--i]`,
- * `va_arg(...)`), and guarding the evaluation stops the side effect the moment
- * the buffer fills. `while (*s) PUT(*s++)` then never advances `s`: a format
- * whose output overruns `cap` did not truncate, it spun forever. */
-#define PUT(ch)                                                                \
-    do {                                                                       \
-        char c_ = (char)(ch);                                                  \
-        if (n + 1 < cap)                                                       \
-            buf[n] = c_;                                                       \
-        n++;                                                                   \
-    } while (0)
+/* One formatting run.
+ *
+ * `buf`/`cap` is where characters land, but when `fd` is >= 0 it is a *window*
+ * rather than the destination: it is written out and reused each time it fills,
+ * so a line longer than the buffer is delivered whole. That matters because the
+ * lines this formats are not log lines — put_maps copies a mapping's path
+ * through, put_mounts prints a bind's guest and host path on one row — and
+ * cutting one at the window's width takes its trailing newline with it, running
+ * two rows of a synthesized /proc file together.
+ *
+ * With `fd` < 0 nothing is flushed and the overflow is only counted, which is
+ * what gives cng_snprintf the C return value: the length the format would have
+ * produced, so a caller can tell that it did not fit. */
+struct cng_fmt {
+    char *buf;
+    size_t cap;   /* bytes in buf, one of them reserved for a NUL */
+    size_t len;   /* bytes held right now */
+    size_t total; /* bytes the whole format produces */
+    int fd;       /* >= 0: flush there when the window fills */
+};
+
+static void fmt_flush(struct cng_fmt *f) {
+    if (f->len) {
+        cng_write_all(f->fd, f->buf, f->len);
+        f->len = 0;
+    }
+}
+
+static void fmt_put(struct cng_fmt *f, char c) {
+    f->total++;
+    if (f->len + 1 >= f->cap) {
+        if (f->fd < 0)
+            return; /* snprintf: drop the byte, keep counting */
+        fmt_flush(f);
+    }
+    f->buf[f->len++] = c;
+}
+
+/* A function call, so the argument is evaluated exactly once whether or not
+ * there is room for it. Every caller below hands this an expression with a side
+ * effect (`*s++`, `t[--i]`, `va_arg(...)`). */
+static void fmt_run(struct cng_fmt *o, const char *fmt, va_list ap) {
+#define PUT(ch) fmt_put(o, (char)(ch))
 
     for (const char *f = fmt; *f; f++) {
         if (*f != '%') {
@@ -274,13 +301,17 @@ size_t cng_vsnprintf(char *buf, size_t cap, const char *fmt, va_list ap) {
         }
 #undef PAD
     }
-    if (cap) {
-        if (n >= cap)
-            n = cap - 1; /* truncated */
-        buf[n] = '\0';
-    }
-    return n;
 #undef PUT
+}
+
+/* Writes at most `cap - 1` bytes into `buf` plus a NUL, and returns the length
+ * the format would have produced — so `>= cap` means it did not all fit. */
+size_t cng_vsnprintf(char *buf, size_t cap, const char *fmt, va_list ap) {
+    struct cng_fmt f = {buf, cap, 0, 0, -1};
+    fmt_run(&f, fmt, ap);
+    if (cap)
+        buf[f.len] = '\0';
+    return f.total;
 }
 
 size_t cng_snprintf(char *buf, size_t cap, const char *fmt, ...) {
@@ -291,10 +322,12 @@ size_t cng_snprintf(char *buf, size_t cap, const char *fmt, ...) {
     return n;
 }
 
+/* No length limit: the window below is refilled as often as the format needs. */
 void cng_vdprintf(int fd, const char *fmt, va_list ap) {
     char buf[1024];
-    size_t n = cng_vsnprintf(buf, sizeof buf, fmt, ap);
-    cng_write_all(fd, buf, n);
+    struct cng_fmt f = {buf, sizeof buf, 0, 0, fd};
+    fmt_run(&f, fmt, ap);
+    fmt_flush(&f);
 }
 
 void cng_dprintf(int fd, const char *fmt, ...) {
