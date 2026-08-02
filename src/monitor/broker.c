@@ -204,8 +204,18 @@ int cng_broker_recv(int sock, void *data, unsigned len, int *fd_out) {
         *fd_out = cm.fd;
     while ((unsigned)r < len) { /* top up a short stream read (see broker_send) */
         long n = sys_read(sock, (char *)data + r, len - (unsigned)r);
-        if (n <= 0)
+        if (n <= 0) {
+            /* The ancillary fd arrived with the first byte, so a message that
+             * fails to complete has already installed one — and host fd ==
+             * guest fd here, so leaving it open hands the guest a descriptor
+             * onto whatever it named (a segment's backing memfd). The peer
+             * dying mid-message and the 2 s SO_RCVTIMEO both land here. */
+            if (fd_out && *fd_out >= 0) {
+                sys_close(*fd_out);
+                *fd_out = -1;
+            }
             return -1;
+        }
         r += n;
     }
     return 0;
