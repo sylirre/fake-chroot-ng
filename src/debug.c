@@ -2135,6 +2135,33 @@ int cng_cmd_nettest(int argc, char **argv, char **envp, unsigned long *auxv) {
                     (int)ret, sigsys_blocked, ok ? "OK" : "FAIL");
         fails += !ok;
     }
+    /* 2d) the same call with ONE variable for both masks — sigprocmask(how, &m,
+     * &m) is legal and common. The writability probe validates a range by
+     * zeroing it, so the new mask has to be read out before the old-mask pointer
+     * is probed, or SIG_UNBLOCK clears everything instead of the one signal
+     * named. */
+    {
+        struct cng_ucontext uc;
+        cng_siginfo_t si;
+        memset(&uc, 0, sizeof uc);
+        memset(&si, 0, sizeof si);
+        unsigned long usr1 = 1UL << (CNG_SIGUSR1 - 1);
+        unsigned long usr2 = 1UL << (12 /*SIGUSR2*/ - 1);
+        unsigned long m = usr1;
+        si.si_code = CNG_SYS_SECCOMP;
+        si._u._sigsys.call_addr = (void *)0x1000;
+        uc.uc_mcontext.regs[8] = __NR_rt_sigprocmask;
+        uc.uc_mcontext.regs[0] = 1; /* SIG_UNBLOCK */
+        uc.uc_mcontext.regs[1] = (unsigned long)&m;
+        uc.uc_mcontext.regs[2] = (unsigned long)&m; /* the same variable */
+        uc.uc_sigmask.sig[0] = usr1 | usr2;
+        cng_sigsys_body(&uc, &si);
+        int ok = (long)uc.uc_mcontext.regs[0] == 0 &&
+                 uc.uc_sigmask.sig[0] == usr2 && m == (usr1 | usr2);
+        cng_dprintf(1, "nettest sigprocmask aliased: mask=0x%lx old=0x%lx -> %s\n",
+                    uc.uc_sigmask.sig[0], m, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
     /* 3) guest-directed SIGSYS (si_code != SYS_SECCOMP) -> untouched. */
     {
         struct cng_ucontext uc;

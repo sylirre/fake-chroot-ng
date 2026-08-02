@@ -84,20 +84,31 @@ static int sigsys_syscall(struct cng_ucontext *uc, long nr) {
         unsigned long *pold = (unsigned long *)r[2];
         unsigned long cur = uc->uc_sigmask.sig[0];
         /* Both are guest pointers we dereference ourselves rather than handing
-         * to the kernel, so a bad one must come back -EFAULT (see uaccess.c). */
-        if ((pset && !cng_user_readable(pset, sizeof *pset)) ||
-            (pold && !cng_user_writable(pold, sizeof *pold))) {
-            r[0] = (unsigned long long)(long)-EFAULT;
-            return 1;
-        }
-        if (pold)
-            *pold = cur;
+         * to the kernel, so a bad one must come back -EFAULT (see uaccess.c).
+         * They are taken in the kernel's order — the new mask read and applied
+         * first, the old one written after — which is also what makes the two
+         * pointers safe to alias. `sigprocmask(how, &m, &m)` is a legal call,
+         * and the writability probe validates a range by ZEROING it: probing
+         * the old-mask pointer before reading the new mask out of the same
+         * address handed us a zeroed set, so SIG_UNBLOCK cleared the guest's
+         * whole mask and SIG_BLOCK became a silent no-op. */
         if (pset) {
+            if (!cng_user_readable(pset, sizeof *pset)) {
+                r[0] = (unsigned long long)(long)-EFAULT;
+                return 1;
+            }
             unsigned long set = *pset;
             unsigned long neu = (how == 0)   ? (cur | set)   /* SIG_BLOCK */
                                 : (how == 1) ? (cur & ~set)  /* SIG_UNBLOCK */
                                              : set;          /* SIG_SETMASK */
             uc->uc_sigmask.sig[0] = neu & ~(1UL << (CNG_SIGSYS - 1));
+        }
+        if (pold) {
+            if (!cng_user_writable(pold, sizeof *pold)) {
+                r[0] = (unsigned long long)(long)-EFAULT;
+                return 1;
+            }
+            *pold = cur;
         }
         r[0] = 0;
         return 1;
