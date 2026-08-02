@@ -146,8 +146,12 @@ static void l2s_dirname(const char *path, char *dir, size_t sz) {
     dir[dl] = '\0';
 }
 
-/* Append an unsigned decimal, zero-padded to at least `width`, at *pp (bounded
- * by end). Advances *pp. */
+/* Append an unsigned decimal, zero-padded to at least `width`, at *pp — storing
+ * only what fits before `end`, but advancing *pp by the whole width either way.
+ * That advance is what makes the caller's `p > end` test see an overflow: with
+ * *pp stopped at `end` instead, a name whose digits did not fit came back
+ * shortened and *valid*, so ".l2s.<ino>" silently became another group's
+ * backing file rather than -ENAMETOOLONG. */
 static void put_u64(char **pp, char *end, unsigned long long v, int width) {
     char tmp[24];
     int n = 0;
@@ -158,8 +162,12 @@ static void put_u64(char **pp, char *end, unsigned long long v, int width) {
     while (n < width)
         tmp[n++] = '0';
     char *p = *pp;
-    while (n > 0 && p < end)
-        *p++ = tmp[--n];
+    while (n > 0) {
+        if (p < end)
+            *p = tmp[n - 1];
+        n--;
+        p++;
+    }
     *pp = p;
 }
 

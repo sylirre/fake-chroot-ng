@@ -145,3 +145,26 @@ check "an over-long line does not spin" 0 $?
 check "...and is emitted whole, newline included" 1211 \
     "$(printf %s "$_out" | wc -c | tr -d ' ')"
 check "...as a single line" 1 "$(printf '%s\n' "$_out" | wc -l | tr -d ' ')"
+
+# A guest path that fits, whose translated host path does not. cng_fs_translate
+# used to cut it and report success, so the syscall ran against a DIFFERENT,
+# shorter name — an unlink deleting the wrong entry, an O_CREAT making the wrong
+# file. It must refuse instead, and the dispatcher must answer ENAMETOOLONG
+# rather than hand the kernel the guest's own untranslated spelling.
+_c=cccccccccc
+_c="$_c$_c$_c$_c$_c"   # 50
+_c="$_c$_c$_c$_c"      # 200
+XL=$(mktemp -d)/"$_c"  # a rootfs prefix long enough to matter
+mkdir -p "$XL"
+_g=""
+_i=0
+while [ $_i -lt 20 ]; do   # 20 * 201 = 4020 bytes: fits alone, not once prefixed
+    _g="$_g/$_c"
+    _i=$((_i + 1))
+done
+check_contains "a path the rootfs prefix pushes past PATH_MAX is refused" \
+    "<overflow>" "$(run_t 20 -t xlate -r "$XL" "$_g" 2>&1)"
+run_t 20 -t dtest -r "$XL" open "$_g" >"$CNG_TMP/toolong.out" 2>&1
+check_contains "...and the syscall answers ENAMETOOLONG, not the wrong file" \
+    "open: errno 36" "$(cat "$CNG_TMP/toolong.out")"
+rm -rf "$(dirname "$XL")"

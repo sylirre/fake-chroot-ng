@@ -45,7 +45,7 @@ const int cng_dev_nnodes =
     (int)(sizeof cng_dev_nodes / sizeof cng_dev_nodes[0]);
 
 /* Fill `out` for a guest path inside the /dev zone. Returns 1 when it did, 0 to
- * fall through to ordinary rootfs prefixing. */
+ * fall through to ordinary rootfs prefixing, -1 when the name did not fit. */
 static int dev_zone(const char *canon, char *out, size_t outsz) {
     if (cng_g_no_dev)
         return 0;
@@ -70,7 +70,9 @@ static int dev_zone(const char *canon, char *out, size_t outsz) {
             if (strcmp(h, "/dev/pts") == 0 || strcmp(h, "/dev/shm") == 0 ||
                 strcmp(h, "/proc/self/fd") == 0) {
                 size_t n = cng_strlcpy(out, h, outsz);
-                cng_strlcpy(out + n, leaf + nl, outsz > n ? outsz - n : 0);
+                if (n >= outsz ||
+                    cng_strlcpy(out + n, leaf + nl, outsz - n) >= outsz - n)
+                    return -1; /* truncated: the caller must not use `out` */
                 return 1;
             }
             return 0;
@@ -337,19 +339,30 @@ int cng_fs_translate(const struct cng_fs *fs, const char *path, char *out,
         }
     }
 
+    /* A prefix that does not fit is a failure, never a shorter path. cng_strlcpy
+     * reports what the source needed, so truncation is visible — and it has to
+     * be acted on: silently cut, "<rootfs>/very/long/name" becomes a different
+     * name that exists, so an unlink deletes the wrong entry and an O_CREAT
+     * makes the wrong file. The caller answers -ENAMETOOLONG, which is what a
+     * kernel whose PATH_MAX the name exceeded would have said. */
+    int dz = 0;
     if (best >= 0) {
         const char *suffix = canon + blen; /* "" or "/rest" */
         size_t n = cng_strlcpy(out, fs->binds[best].host, outsz);
-        cng_strlcpy(out + n, suffix, outsz > n ? outsz - n : 0);
+        if (n >= outsz || cng_strlcpy(out + n, suffix, outsz - n) >= outsz - n)
+            return -1;
     } else if (proc_zone(canon)) {
         /* A bind wins over the passthrough (checked first, above): an explicit
          * -b DIR:/proc is the user overriding the host view. */
-        cng_strlcpy(out, canon, outsz);
-    } else if (dev_zone(canon, out, outsz)) {
-        /* filled by the zone */
+        if (cng_strlcpy(out, canon, outsz) >= outsz)
+            return -1;
+    } else if ((dz = dev_zone(canon, out, outsz)) != 0) {
+        if (dz < 0)
+            return -1; /* filled by the zone, unless it did not fit */
     } else {
         size_t n = cng_strlcpy(out, fs->rootfs, outsz); /* "" or "/root" */
-        cng_strlcpy(out + n, canon, outsz > n ? outsz - n : 0);
+        if (n >= outsz || cng_strlcpy(out + n, canon, outsz - n) >= outsz - n)
+            return -1;
     }
     /* Applied to the result, so a bind onto the host /proc is covered too. */
     if (host_proc_hidden(out))
@@ -371,10 +384,16 @@ int cng_fs_untranslate(const struct cng_fs *fs, const char *host, char *out,
             blen = hl;
         }
     }
+    /* Truncation is a failure here too, and a bind can make the guest spelling
+     * the LONGER of the two — `-b /x:/a/very/long/mount/point` grows every path
+     * under it — so this direction is not safe by construction either. Callers
+     * read a non-zero return as "outside the guest view" and leave the host
+     * name alone, which is the right answer for a name that cannot be said. */
     if (best >= 0) {
         const char *suffix = host + blen;
         size_t n = cng_strlcpy(out, fs->binds[best].guest, outsz);
-        cng_strlcpy(out + n, suffix, outsz > n ? outsz - n : 0);
+        if (n >= outsz || cng_strlcpy(out + n, suffix, outsz - n) >= outsz - n)
+            return -1;
         if (out[0] == '\0')
             cng_strlcpy(out, "/", outsz);
         return 0;
@@ -382,14 +401,13 @@ int cng_fs_untranslate(const struct cng_fs *fs, const char *host, char *out,
 
     size_t rl = strlen(fs->rootfs);
     if (rl == 0) { /* identity rootfs */
-        cng_strlcpy(out, host, outsz);
-        return 0;
+        return cng_strlcpy(out, host, outsz) >= outsz ? -1 : 0;
     }
     if (strncmp(host, fs->rootfs, rl) == 0 &&
         (host[rl] == '/' || host[rl] == '\0')) {
         const char *suffix = host + rl;
-        cng_strlcpy(out, suffix[0] ? suffix : "/", outsz);
-        return 0;
+        return cng_strlcpy(out, suffix[0] ? suffix : "/", outsz) >= outsz ? -1
+                                                                         : 0;
     }
     return -1; /* outside the guest view */
 }

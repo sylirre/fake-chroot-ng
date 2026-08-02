@@ -281,6 +281,18 @@ static int dev_magic(char *cur, size_t sz) {
 
 static int dirfd_host(int dfd, char *hdir, size_t sz);
 
+/* A guest path the rootfs/bind map cannot express inside CNG_PATH_MAX. Not a
+ * path — never dereferenced — so that a caller which forgets to test for it
+ * faults on a null page rather than quietly operating on host storage. The
+ * syscall answers -ENAMETOOLONG, which is what a kernel whose own PATH_MAX the
+ * name exceeded would say, and what proot answers in the same spot.
+ *
+ * It matters because the alternative is not an error but the WRONG FILE: a
+ * silently cut "<rootfs>/very/long/name" names something else that exists, so
+ * an unlink deletes the wrong entry and an O_CREAT makes the wrong one. */
+#define XLATE_TOOLONG ((const char *)8)
+#define XLATE_AT_LONG (-2) /* xlate_at's spelling of the same verdict */
+
 /* The canonical GUEST directory an open fd names, for the getdents64 overlay
  * splicing below. Returns 0/-1. */
 static int dirfd_guest_dir(long dirfd, char *out, size_t sz) {
@@ -555,7 +567,11 @@ int cng_resolve(const char *path, int deref_final, char *out, size_t outsz) {
             return -ENAMETOOLONG;
         p = rest;
     }
-    return cng_fs_translate(cng_g_fs, canon, out, outsz);
+    /* cng_fs_translate fails only on length — the canonical form overflowing,
+     * or the rootfs prefix pushing the result past `outsz` — so its refusal is
+     * the same -ENAMETOOLONG the walk above answers. */
+    return cng_fs_translate(cng_g_fs, canon, out, outsz) == 0 ? 0
+                                                              : -ENAMETOOLONG;
 }
 
 /* "/proc/self/fd/<fd>" into out[40]. fd args are 32-bit: glibc passes ints in
@@ -608,12 +624,22 @@ static int xlate_at(int dfd, const char *path, char *out, size_t sz, int deref) 
     if (cng_fs_untranslate(cng_g_fs, hdir, gdir, sizeof gdir) != 0)
         return -1;
     size_t k = cng_strlcpy(gp, gdir, sizeof gp);
+    if (k >= sizeof gp)
+        return XLATE_AT_LONG;
     if (k && gp[k - 1] != '/' && k + 1 < sizeof gp) {
         gp[k++] = '/';
         gp[k] = '\0';
     }
-    cng_strlcpy(gp + k, path, sizeof gp > k ? sizeof gp - k : 0);
-    return cng_resolve(gp, deref, out, sz) == 0 ? 0 : -1;
+    if (cng_strlcpy(gp + k, path, sizeof gp - k) >= sizeof gp - k)
+        return XLATE_AT_LONG;
+    long r = cng_resolve(gp, deref, out, sz);
+    if (r == 0)
+        return 0;
+    /* A name that does not fit must not be passed through: the kernel would
+     * resolve it against the dirfd with no rootfs in the way, which is what
+     * the walk above exists to prevent. Every other failure (ELOOP) is one the
+     * kernel reproduces for itself on the guest's own name. */
+    return r == -ENAMETOOLONG ? XLATE_AT_LONG : -1;
 }
 
 /* Does a dirfd-relative name need the guest-side walk above, or can the kernel
@@ -655,20 +681,24 @@ int cng_resolve_at(long dirfd, const char *path, int deref, char *out,
     }
     if (dfd < 0)
         return -1;
-    if (xlate_at(dfd, path, out, sz, deref) == 0)
+    int r = xlate_at(dfd, path, out, sz, deref);
+    if (r == 0)
         return 0;
+    if (r == XLATE_AT_LONG)
+        return -1; /* fail closed rather than fall through to the host join */
     /* Outside the guest view (a /proc dirfd): the host directory joined with
      * the name is the only answer available, and the right one there. */
     char hdir[CNG_PATH_MAX];
     if (dirfd_host(dfd, hdir, sizeof hdir) != 0)
         return -1;
     size_t k = cng_strlcpy(out, hdir, sz);
+    if (k >= sz)
+        return -1;
     if (k && out[k - 1] != '/' && k + 1 < sz) {
         out[k++] = '/';
         out[k] = '\0';
     }
-    cng_strlcpy(out + k, path, sz > k ? sz - k : 0);
-    return 0;
+    return cng_strlcpy(out + k, path, sz - k) >= sz - k ? -1 : 0;
 }
 
 /* An open the host refused on a path naming one of *our own* fds. We hold that
@@ -752,16 +782,26 @@ static const char *xlate(long dirfd, const char *gp, char *buf, size_t bufsz,
             return buf;
         if (cng_fs_translate(cng_g_fs, gp, buf, bufsz) == 0)
             return buf;
-        return gp;
+        /* Both routes failing means the name does not fit — cng_fs_translate
+         * has no other way to fail — so there is nothing to hand back. Falling
+         * through to the guest's own spelling, which is what this used to do,
+         * would put an untranslated name in front of the kernel. */
+        return XLATE_TOOLONG;
     }
     /* Relative to a real dirfd. Handing this to the kernel unchanged — which is
      * what we used to do — lets a ".." run climb out of the rootfs and an
      * absolute symlink target resolve from the HOST root, since the kernel does
      * not know about the rootfs. Contain it like any other path, but only when
      * something in it could actually redirect (see at_needs_xlate). */
-    if (dfd >= 0 && at_needs_xlate(dfd, gp, deref_final) &&
-        xlate_at(dfd, gp, buf, bufsz, deref_final) == 0)
-        return buf;
+    if (dfd >= 0 && at_needs_xlate(dfd, gp, deref_final)) {
+        int r = xlate_at(dfd, gp, buf, bufsz, deref_final);
+        if (r == 0)
+            return buf;
+        if (r == XLATE_AT_LONG)
+            return XLATE_TOOLONG;
+    }
+    /* A plain name against a dirfd already inside the guest view: the kernel
+     * resolves it there, which is the containment. */
     return gp;
 }
 
@@ -1191,6 +1231,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 return pr;
         }
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
+        if (p == XLATE_TOOLONG)
+            return -ENAMETOOLONG;
         /* :ro bind — mkdirat/mknodat always create; an open only offends with
          * write intent (non-RDONLY, or O_CREAT/O_TRUNC). name_to_handle_at also
          * lands here and never writes, so its a2 (a handle pointer) is never
@@ -1239,6 +1281,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             deref = 0;
 #endif
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
+        if (p == XLATE_TOOLONG)
+            return -ENAMETOOLONG;
         long fl = a3;
         long dfd = a0;
 #ifdef __NR_faccessat2
@@ -1275,6 +1319,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * denies the mode change (a chmod on a file you own still applies for real). */
     case __NR_fchmodat: {
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, 1);
+        if (p == XLATE_TOOLONG)
+            return -ENAMETOOLONG;
         if (ro_denied(p))
             return -EROFS;
         return chattr_result(reissue(a0, (long)p, a2, a3, a4, a5, nr));
@@ -1286,6 +1332,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_fchmodat2: {
         int deref = !((int)a3 & CNG_AT_SYMLINK_NOFOLLOW);
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
+        if (p == XLATE_TOOLONG)
+            return -ENAMETOOLONG;
         if (ro_denied(p))
             return -EROFS;
         return chattr_result(reissue(a0, (long)p, a2, a3, a4, a5, nr));
@@ -1305,6 +1353,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 dec = 1;
         }
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, 0);
+        if (p == XLATE_TOOLONG)
+            return -ENAMETOOLONG;
         if (ro_denied(p))
             return -EROFS;
         long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_unlinkat);
@@ -1334,6 +1384,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         }
         int deref = !((int)a3 & CNG_AT_SYMLINK_NOFOLLOW);
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
+        if (p == XLATE_TOOLONG)
+            return -ENAMETOOLONG;
         if (ro_denied(p))
             return -EROFS;
         long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_utimensat);
@@ -1358,6 +1410,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         }
         int deref = !((int)a3 & CNG_AT_SYMLINK_NOFOLLOW);
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
+        if (p == XLATE_TOOLONG)
+            return -ENAMETOOLONG;
         long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_newfstatat);
         if (r == 0 && cng_g_l2s && a2 && ((int)a3 & CNG_AT_EMPTY_PATH)) {
             const char *gp = (const char *)a1; /* fstat-by-fd form */
@@ -1381,6 +1435,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         }
         int deref = !((int)a2 & CNG_AT_SYMLINK_NOFOLLOW);
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
+        if (p == XLATE_TOOLONG)
+            return -ENAMETOOLONG;
         long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_statx);
         if (r == 0 && cng_g_l2s && a4 && ((int)a2 & CNG_AT_EMPTY_PATH)) {
             const char *gp = (const char *)a1; /* fstat-by-fd form */
@@ -1407,6 +1463,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         }
         int deref = !((int)a4 & CNG_AT_SYMLINK_NOFOLLOW);
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
+        if (p == XLATE_TOOLONG)
+            return -ENAMETOOLONG;
         if (ro_denied(p))
             return -EROFS;
         return chattr_result(reissue(a0, (long)p, a2, a3, a4, a5, __NR_fchownat));
@@ -1425,6 +1483,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             }
         }
         const char *p = xlate(a0, gp, b1, sizeof b1, /*deref_final=*/0);
+        if (p == XLATE_TOOLONG)
+            return -ENAMETOOLONG;
         /* A link2symlink entry presents as a regular file: readlink must fail
          * with EINVAL rather than leak the backing path — including through a
          * real dirfd, which xlate passes through untranslated. */
@@ -1471,6 +1531,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     /* symlinkat(target, newdirfd, linkpath): translate only the linkpath. */
     case __NR_symlinkat: {
         const char *lp = xlate(a1, (const char *)a2, b2, sizeof b2, 0);
+        if (lp == XLATE_TOOLONG)
+            return -ENAMETOOLONG;
         if (ro_denied(lp))
             return -EROFS;
         return reissue(a0, a1, (long)lp, a3, a4, a5, __NR_symlinkat);
@@ -1703,7 +1765,11 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_renameat:
     case __NR_renameat2: {
         const char *op = xlate(a0, (const char *)a1, b1, sizeof b1, 0);
+        if (op == XLATE_TOOLONG)
+            return -ENAMETOOLONG;
         const char *np = xlate(a2, (const char *)a3, b2, sizeof b2, 0);
+        if (np == XLATE_TOOLONG)
+            return -ENAMETOOLONG;
         /* A rename unlinks the old name and creates the new one, so either end
          * under a :ro bind is EROFS. */
         if (ro_denied(op) || ro_denied(np))
@@ -2230,6 +2296,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                       nr == __NR_removexattr || nr == __NR_lremovexattr);
         const char *p =
             xlate(CNG_AT_FDCWD, (const char *)a0, b1, sizeof b1, deref);
+        if (p == XLATE_TOOLONG)
+            return -ENAMETOOLONG;
         if (writes && ro_denied(p))
             return -EROFS;
         return reissue((long)p, a1, a2, a3, a4, a5, nr);
@@ -2239,6 +2307,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_statfs: {
         const char *p =
             xlate(CNG_AT_FDCWD, (const char *)a0, b1, sizeof b1, 1);
+        if (p == XLATE_TOOLONG)
+            return -ENAMETOOLONG;
         if (nr == __NR_truncate && ro_denied(p)) /* statfs only reads */
             return -EROFS;
         return reissue((long)p, a1, a2, a3, a4, a5, nr);
@@ -2247,6 +2317,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_chdir: {
         const char *gp = (const char *)a0;
         const char *hp = xlate(CNG_AT_FDCWD, gp, b1, sizeof b1, 1);
+        if (hp == XLATE_TOOLONG)
+            return -ENAMETOOLONG;
         long r = reissue((long)hp, 0, 0, 0, 0, 0, __NR_chdir);
         if (r == 0) {
             char gc[CNG_PATH_MAX];
