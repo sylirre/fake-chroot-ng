@@ -3729,6 +3729,32 @@ int cng_cmd_ipctest(int argc, char **argv, char **envp, unsigned long *auxv) {
         fails += !(v == 2);
     }
 
+    /* 7b) the semadj range, at both ends. A vector naming one semaphore twice
+     *     accumulates its adjustment across the operations, so the middle
+     *     no-undo step below leaves the third asking for a semadj of -65534: the
+     *     kernel refuses the whole vector with ERANGE and changes nothing.
+     *     Applied one operation at a time the same total is legal, because the
+     *     bound is the s16 range and -32768 is inside it. */
+    {
+        sem_ctl(sid, 0, CNG_SETVAL, 0); /* also clears every pending semadj */
+        struct cng_sembuf over[3] = {
+            {0, +32767, CNG_SEM_UNDO}, {0, -32767, 0}, {0, +32767, CNG_SEM_UNDO}};
+        int ok = ipc_call(__NR_semop, sid, (long)over, 3, 0, 0) == -ERANGE &&
+                 sem_ctl(sid, 0, CNG_GETVAL, 0) == 0;
+
+        sem_ctl(sid, 0, CNG_SETVAL, 0);
+        struct cng_sembuf up = {0, +32767, CNG_SEM_UNDO};
+        struct cng_sembuf down = {0, -32767, 0};
+        struct cng_sembuf one = {0, +1, CNG_SEM_UNDO};
+        ok = ok && ipc_call(__NR_semop, sid, (long)&up, 1, 0, 0) == 0 &&
+             ipc_call(__NR_semop, sid, (long)&down, 1, 0, 0) == 0 &&
+             ipc_call(__NR_semop, sid, (long)&one, 1, 0, 0) == 0 &&
+             sem_ctl(sid, 0, CNG_GETVAL, 0) == 1;
+        sem_ctl(sid, 0, CNG_SETVAL, 0);
+        cng_dprintf(1, "ipctest sem_undo range -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
     /* 8) the error cases, in the kernel's order. */
     {
         struct cng_sembuf bad = {99, -1, 0};

@@ -435,17 +435,28 @@ static void msg_free_queue(struct msg_q *q) {
 /* ---- the semop core ------------------------------------------------------ */
 
 /* Attempt a whole operation vector atomically (the kernel's
- * perform_atomic_semop): apply in order against the live values, roll the
- * applied prefix back if one cannot proceed. Returns 0 (applied — values,
+ * perform_atomic_semop_slow — the general form, which is what handles a vector
+ * naming the same semaphore twice): apply in order against the live values, roll
+ * the applied prefix back if one cannot proceed. Returns 0 (applied — values,
  * sempids, otime and undo adjustments all updated), 1 (would block, *blk = the
  * index that blocked), or a hard -errno (-EAGAIN when the blocking operation
- * carried IPC_NOWAIT). */
+ * carried IPC_NOWAIT).
+ *
+ * The undo adjustment is applied inside the loop, not tallied afterwards, for
+ * the same reason the value is: a later operation on a semaphore an earlier one
+ * already touched has to see that. Deferring it left every op in a vector
+ * checking its adjustment against the value the vector *started* with, so a
+ * cumulative overflow — [+32767 UNDO, -32767, +32767 UNDO], which the kernel
+ * refuses with ERANGE — passed all three checks and then wrapped the s16 at
+ * commit, leaving a semadj of +2 where the process owed -65534. Rollback mirrors
+ * the kernel's `un->semadj[n] += sem_op`. */
 static s32 sem_try_op(struct sem_set *s, const struct cng_sembuf *sops, u32 nsops,
                       s32 pid, int *blk) {
     for (u32 i = 0; i < nsops; i++)
         if (sops[i].sem_num >= s->nsems)
             return -EFBIG;
 
+    struct sem_undo *u = 0; /* this process's row, created by the first UNDO op */
     s32 result = 0;
     u32 i;
     for (i = 0; i < nsops; i++) {
@@ -466,37 +477,37 @@ static s32 sem_try_op(struct sem_set *s, const struct cng_sembuf *sops, u32 nsop
             break;
         }
         if (op->sem_flg & CNG_SEM_UNDO) {
-            struct sem_undo *u = sem_undo_find(pid, s, 1);
+            if (!u)
+                u = sem_undo_find(pid, s, 1);
             if (!u) {
                 result = -ENOMEM; /* the undo table is full */
                 break;
             }
             int adj = (int)u->adj[op->sem_num] - op->sem_op;
-            if (adj < -CNG_SEMAEM || adj > CNG_SEMAEM) {
+            /* The kernel's bound is the s16 range itself: -SEMAEM-1 is a
+             * reachable semadj, not an overflow. */
+            if (adj < -CNG_SEMAEM - 1 || adj > CNG_SEMAEM) {
                 result = -ERANGE;
                 break;
             }
+            u->adj[op->sem_num] = (s16)adj;
         }
         s->val[op->sem_num] = (u16)v;
     }
-    if (result != 0) { /* roll the applied prefix back */
-        while (i--)
+    if (result != 0) { /* roll the applied prefix back, values and undo alike */
+        while (i--) {
             s->val[sops[i].sem_num] =
                 (u16)((int)s->val[sops[i].sem_num] - sops[i].sem_op);
+            if (u && (sops[i].sem_flg & CNG_SEM_UNDO))
+                u->adj[sops[i].sem_num] =
+                    (s16)((int)u->adj[sops[i].sem_num] + sops[i].sem_op);
+        }
         return result;
     }
-    /* Committed. Record the undo adjustments and stamp sempid on every
-     * semaphore the vector referenced — zero-operations included, as the kernel
-     * does — and otime on the set. */
-    for (i = 0; i < nsops; i++) {
-        if (sops[i].sem_flg & CNG_SEM_UNDO) {
-            struct sem_undo *u = sem_undo_find(pid, s, 0);
-            if (u)
-                u->adj[sops[i].sem_num] =
-                    (s16)(u->adj[sops[i].sem_num] - sops[i].sem_op);
-        }
+    /* Committed. Stamp sempid on every semaphore the vector referenced — zero
+     * operations included, as the kernel does — and otime on the set. */
+    for (i = 0; i < nsops; i++)
         s->lpid[sops[i].sem_num] = pid;
-    }
     s->otime = now_sec();
     s->tpid = pid;
     return 0;
