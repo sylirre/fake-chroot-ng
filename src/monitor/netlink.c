@@ -917,30 +917,38 @@ int cng_nl_recv(int fd, void *buf, long len, long flags, long *out) {
  * message and wait for an NLMSG_DONE it would never accept. getsockname, by
  * contrast, must report our own port id, which is what the client then matches
  * each reply's nlmsg_pid against (see fix_pid). */
-static int write_nladdr(void *addr, unsigned *alen, unsigned pid) {
-    if (!addr || !alen || *alen < sizeof(struct sockaddr_nl_))
-        return 1;
+/* Both pointers are the guest's, and this address is synthesized rather than
+ * fetched — so the kernel never validates either, and a bad one has to answer
+ * -EFAULT instead of faulting inside the handler, where SIGSEGV is masked and
+ * fatal. The caller's length is read out before anything is probed for
+ * writing, since the write probe validates a range by zeroing it. */
+static long write_nladdr(void *addr, unsigned *alen, unsigned pid) {
+    if (!addr || !alen)
+        return 0;
+    if (!cng_user_readable(alen, sizeof *alen))
+        return -EFAULT;
+    if (*alen < sizeof(struct sockaddr_nl_))
+        return 0;
+    if (!cng_user_writable(addr, sizeof(struct sockaddr_nl_)) ||
+        !cng_user_writable(alen, sizeof *alen))
+        return -EFAULT;
     struct sockaddr_nl_ sa;
     memset(&sa, 0, sizeof sa);
     sa.family = AF_NETLINK_;
     sa.pid = pid;
     memcpy(addr, &sa, sizeof sa);
     *alen = (unsigned)sizeof sa;
-    return 1;
+    return 0;
 }
 
-int cng_nl_getname(int fd, void *addr, unsigned *alen) {
+long cng_nl_getname(int fd, void *addr, unsigned *alen) {
     /* The real AF_UNIX answer is an unnamed 2-byte sockaddr, and iproute2
      * rejects that with "Wrong address length 2". Report the sockaddr_nl it
      * expects, carrying our own port id. */
-    if (!slot_of(fd))
-        return 0;
     return write_nladdr(addr, alen, (unsigned)sys_getpid());
 }
 
-int cng_nl_srcaddr(int fd, void *addr, unsigned *alen) {
-    if (!slot_of(fd))
-        return 0;
+long cng_nl_srcaddr(int fd, void *addr, unsigned *alen) {
     return write_nladdr(addr, alen, 0); /* 0 == from the kernel */
 }
 

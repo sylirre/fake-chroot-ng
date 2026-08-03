@@ -2136,14 +2136,12 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             if (is_recv) {
                 long out = 0;
                 cng_nl_recv((int)a0, (void *)a1, a2, a3, &out);
-                if (aa && alp)
-                    cng_nl_srcaddr((int)a0, (void *)aa, (unsigned *)alp);
-                return out;
+                long e = cng_nl_srcaddr((int)a0, (void *)aa, (unsigned *)alp);
+                return e ? e : out;
             }
             /* getsockname/getpeername must report a sockaddr_nl: the real
              * AF_UNIX answer is 2 bytes and iproute2 refuses it. */
-            if (cng_nl_getname((int)a0, (void *)aa, (unsigned *)alp))
-                return 0;
+            return cng_nl_getname((int)a0, (void *)aa, (unsigned *)alp);
         }
         if (!aa || !alp) /* no address wanted: nothing to translate */
             return reissue(a0, a1, a2, a3, a4, a5, nr);
@@ -2180,9 +2178,9 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                     cng_nl_recv((int)a0, iov[0].base, (long)iov[0].len, a2,
                                 &out);
                 void *name = *(void **)m;
-                unsigned *nlp = (unsigned *)(m + 8);
-                if (name && nlp)
-                    cng_nl_srcaddr((int)a0, name, nlp);
+                long e = cng_nl_srcaddr((int)a0, name, (unsigned *)(m + 8));
+                if (e)
+                    return e;
             }
             return out;
         }
@@ -2266,8 +2264,11 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                     break;
                 }
                 m->len = (unsigned)out;
-                if (m->hdr.name)
-                    cng_nl_srcaddr((int)a0, m->hdr.name, &m->hdr.namelen);
+                long e = cng_nl_srcaddr((int)a0, m->hdr.name, &m->hdr.namelen);
+                if (e) {
+                    r = e;
+                    break;
+                }
             }
             return got ? (long)got : r;
         }
