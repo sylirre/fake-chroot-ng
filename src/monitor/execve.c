@@ -449,7 +449,13 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
             nv[k++] = sheb_arg[depth];
         }
         nv[k++] = (char *)cur; /* the script path, as the guest named it */
-        if (eff_argv)
+        /* The caller's argv from [1] on, since [0] is what the interpreter
+         * name replaces. An *empty* argv is a legal exec — the kernel's
+         * remove_arg_zero simply has nothing to remove — and there [1] is one
+         * past the terminator: the snapshot lays envp out directly behind
+         * argv, so the walk ran on into the environment and handed the
+         * interpreter every variable as an argument. */
+        if (eff_argv && eff_argv[0])
             for (int j = 1; eff_argv[j] && k < SHEB_ARGV - 2; j++)
                 nv[k++] = eff_argv[j];
         nv[k] = 0;

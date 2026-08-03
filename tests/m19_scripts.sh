@@ -42,7 +42,12 @@ ln -s real "$M19/link"
 # ENOEXEC on the kernel and has to be here too.
 printf '#!/scriptprobe shortok\n' >"$M19/real/short.sh"
 : >"$M19/real/empty.bin"
-chmod 755 "$M19/real/short.sh" "$M19/real/empty.bin"
+# A script to exec with an EMPTY argv: the kernel splices in the interpreter,
+# the `#!` argument and the script path, and stops there. "argv[1] onwards" is
+# then one past the vector's own terminator, and the snapshot lays envp
+# directly behind argv -- so the walk ran into the environment.
+printf '#!/scriptprobe argok\n' >"$M19/real/noargv.sh"
+chmod 755 "$M19/real/short.sh" "$M19/real/empty.bin" "$M19/real/noargv.sh"
 
 if ! guest_xlate_ready "M19 script legs"; then
     :
@@ -79,6 +84,12 @@ elif guest_cc_report "$GDIR/scriptprobe" tests/guests/scriptprobe.c; then
     check_contains "and exits 0" "shortscript-rc=0" "$out"
     check_contains "an empty file is ENOEXEC, as it is on the kernel" \
         "emptyfile=ENOEXEC" "$out"
+
+    out=$(m19_run -w /root "$M19/real" /scriptprobe lib/apk/exec/scriptprobe \
+        /short.sh /empty.bin /noargv.sh 2>/dev/null)
+    check_contains "a script exec'd with an empty argv gets the three the kernel splices" \
+        "shebargv=[argok][/noargv.sh]" "$out"
+    check_absent "and not the environment behind it" "SHEBENV" "$out"
 
     # And it says so with the errno alone. A failed exec used to narrate itself
     # onto the guest's own stderr naming the resolved host path -- the one

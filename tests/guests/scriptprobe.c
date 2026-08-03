@@ -63,6 +63,19 @@ int main(int argc, char **argv) {
         fflush(stdout);
         return 0;
     }
+    /* Reached as the interpreter of a script whose `#!` line carries the
+     * argument "argok". Print the whole argv the interpreter was handed: what
+     * the kernel splices in is {interpreter, argument, script path} and
+     * nothing else, so anything extra — or an argument that kept the line's
+     * trailing blanks — shows up here. */
+    if (argc > 1 && strncmp(argv[1], "argok", 5) == 0) {
+        printf("shebargv=");
+        for (int i = 1; i < argc; i++)
+            printf("[%s]", argv[i]);
+        printf("\n");
+        fflush(stdout);
+        return 0;
+    }
 
     struct stat st;
     printf("empty-access=%s\n", how(access("", X_OK)));
@@ -117,6 +130,28 @@ int main(int argc, char **argv) {
         waitpid(pid, &status, 0);
         printf("%s-rc=%d\n", label,
                WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        fflush(stdout);
+    }
+
+    /* argv[4]: a `#!` script exec'd with an EMPTY argv. Legal — the kernel's
+     * remove_arg_zero has nothing to remove and simply splices the three
+     * entries in — and the one case where "the caller's argv from [1] on"
+     * reads past the vector's own terminator. The environment is deliberately
+     * not empty: it is laid out directly behind argv, so it is what an
+     * over-running walk picks up. */
+    if (argc > 4) {
+        fflush(stdout);
+        pid = fork();
+        if (pid == 0) {
+            char *av[] = {NULL};
+            char *ev[] = {(char *)"SHEBENV=x", NULL};
+            execve(argv[4], av, ev);
+            printf("noargv=%s\n", how(-1));
+            fflush(stdout);
+            _exit(125);
+        }
+        status = 0;
+        waitpid(pid, &status, 0);
         fflush(stdout);
     }
     return 0;
