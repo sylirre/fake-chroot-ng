@@ -288,10 +288,17 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
      * Listed once for either. */
     if (cng_g_l2s || cng_g_fake_id)
         nr[nsys++] = __NR_fstat;
-    /* getdents64: hides the l2s backing files, and — the reason it is trapped
-     * by default — filters host processes out of a /proc listing, which is
-     * what `ls /proc` and `ps` actually read. Listed once for either. */
-    if (cng_g_l2s || !cng_g_no_proc)
+    /* getdents64 does three jobs, and it has to be trapped for any one of them:
+     * it hides the l2s backing files, it filters host processes out of a /proc
+     * listing (what `ls /proc` and `ps` actually read), and it splices in the
+     * entries that exist only as resolution overlays — the -b mount points and
+     * the /dev nodes, which have no dirent of their own. Gating on the first two
+     * alone meant `--no-proc` silently took the third away with it: `ls /` no
+     * longer showed a bind destination and `ls /dev` came back empty, on a real
+     * device, while both still opened by name. Listed once for whichever
+     * applies. */
+    if (cng_g_l2s || !cng_g_no_proc || !cng_g_no_dev ||
+        (cng_g_fs && cng_g_fs->nbinds > 0))
         nr[nsys++] = __NR_getdents64;
 
     if (cap < CNG_SECCOMP_MAX_INSNS)
