@@ -100,3 +100,33 @@ else
         'grep -c " /dev devtmpfs " /proc/mounts' 2>/dev/null)
     check "m14 --no-dev drops the /dev mount rows" 0 "$got"
 fi
+
+# --- reaching an overlay entry through a dirfd ------------------------------
+# The listing half above makes these names visible; this is the other half of
+# the same question. An overlay has no dirent, so a *relative* name against the
+# directory's own fd cannot be resolved by the kernel — it has to take the
+# guest-side walk, even though a single plain component looks like nothing that
+# could redirect. `ls -l` asks exactly this (fstatat against the fd it is
+# listing), so without it an entry ls had just shown came back ENOENT.
+M14D=$(mktemp -d)
+M14DB=$(mktemp -d)
+mkdir -p "$M14D/dev" # the zone overlays entries INTO it; the directory is real
+printf x >"$M14DB/marker"
+if ! guest_xlate_ready "dirfd-relative overlay legs"; then
+    :
+elif guest_cc_report "$M14D/atoverlay" tests/guests/atoverlay.c; then
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+    out=$(run -R $GUEST_BINDS -b "$M14DB":/hostdir "$M14D" /atoverlay \
+        2>/dev/null)
+    check_contains "m14 openat(dirfd(/dev), \"zero\") resolves" "dev-openat=ok" \
+        "$out"
+    check_contains "m14 fstatat(dirfd(/dev), \"urandom\") resolves" \
+        "dev-fstatat=ok" "$out"
+    check_contains "m14 faccessat(dirfd(/dev), \"null\") resolves" \
+        "dev-faccessat=ok" "$out"
+    check_contains "m14 fstatat(dirfd(/), \"<bind>\") resolves" \
+        "bind-fstatat=ok" "$out"
+    check_contains "m14 openat(dirfd(/), \"<bind>\") resolves" \
+        "bind-openat=ok" "$out"
+fi
+rm -rf "$M14D" "$M14DB"

@@ -642,13 +642,40 @@ static int xlate_at(int dfd, const char *path, char *out, size_t sz, int deref) 
     return r == -ENAMETOOLONG ? XLATE_AT_LONG : -1;
 }
 
+/* Could this single component name an entry that exists only as a resolution
+ * overlay? The /dev whitelist, a -b destination and the /proc passthrough have
+ * no directory entry behind them — cng_fs_translate conjures them out of the
+ * path alone — so the kernel cannot find one relative to a dirfd however plain
+ * the name looks. Nothing but the name matters, so this is a string test and
+ * costs no syscall on the hot path. */
+static int name_may_overlay(const char *name) {
+    if (!cng_g_no_proc && strcmp(name, "proc") == 0)
+        return 1;
+    if (!cng_g_no_dev)
+        for (int i = 0; i < cng_dev_nnodes; i++)
+            if (strcmp(name, cng_dev_nodes[i].name) == 0)
+                return 1;
+    for (int i = 0; cng_g_fs && i < cng_g_fs->nbinds; i++) {
+        const char *g = cng_g_fs->binds[i].guest;
+        const char *s = strrchr(g, '/');
+        if (s && s[1] && strcmp(s + 1, name) == 0)
+            return 1;
+    }
+    return 0;
+}
+
 /* Does a dirfd-relative name need the guest-side walk above, or can the kernel
  * be trusted with it? The dirfd itself already points inside the guest view, so
- * only two things can redirect out of it: a ".." component, and a symlink. This
- * is the hot path (every relative openat), so the cheap cases stay cheap.
+ * only three things can redirect out of it: a ".." component, a symlink, and a
+ * name the kernel cannot resolve at all because it is ours. This is the hot
+ * path (every relative openat), so the cheap cases stay cheap.
  *
  *  - any '/' => some intermediate component is followed as a symlink => walk;
  *  - a ".." component => walk;
+ *  - a name that could be a resolution overlay => walk, since the kernel has no
+ *    dirent to find it by: without this `fstatat(dirfd("/dev"), "zero")` and
+ *    `fstatat(dirfd("/"), "<bind>")` answered ENOENT for entries the same
+ *    absolute path opens fine — which is exactly what `ls -l` asks;
  *  - otherwise a single component, and only its own symlink can escape: one
  *    readlinkat settles it. EINVAL (not a symlink) and ENOENT (nothing there)
  *    are safe for the kernel to finish; a real link needs the walk. */
@@ -657,6 +684,8 @@ static int at_needs_xlate(int dfd, const char *path, int deref) {
         if (*p == '/')
             return 1;
     if (path[0] == '.' && path[1] == '.' && !path[2])
+        return 1;
+    if (name_may_overlay(path))
         return 1;
     if (!deref)
         return 0;
