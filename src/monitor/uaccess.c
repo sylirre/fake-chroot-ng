@@ -10,10 +10,21 @@
  *
  * So ask the kernel whether a range is accessible instead of finding out by
  * faulting — the same move dbg_str makes for the debug log, generalized from a
- * C string to a byte range. The probe is a copy through a scratch memfd:
+ * C string to a byte range. Two ways to ask, and the first one that works wins:
  *
- *   readable  pwrite64(fd, p, n, SCRATCH)  — copy_from_user of exactly [p,p+n)
- *   writable  pread64 (fd, p, n, ZERO)     — copy_to_user of exactly [p,p+n)
+ *   process_vm_readv/writev against our own pid. One syscall, no descriptor,
+ *   and nothing that can go stale — the kernel copies exactly [p,p+n) and
+ *   reports what it managed. Self-access needs no ptrace permission (the mm is
+ *   already ours, so mm_access never reaches the check).
+ *
+ *   a copy through a scratch memfd, for a kernel — or an emulator — without the
+ *   pair:
+ *     readable  pwrite64(fd, p, n, SCRATCH)  — copy_from_user of exactly [p,p+n)
+ *     writable  pread64 (fd, p, n, ZERO)     — copy_to_user of exactly [p,p+n)
+ *   This one holds a descriptor, and we do not trap close(2), so the guest can
+ *   close ours and have the number handed straight back for a file of its own —
+ *   after which a probe would write into a guest file. Hence the inode check on
+ *   every use, which is the second syscall the pair above does not need.
  *
  * Both report -EFAULT (or a short count, where the fault is partway in) for an
  * inaccessible range and touch nothing else. The write probe's source region is
@@ -22,9 +33,10 @@
  * scratch region is written and never read back, so concurrent probes on
  * different threads cannot disturb each other and no lock is needed.
  *
- * When the memfd cannot be had at all the probes answer "accessible" and the
- * caller dereferences as it did before: no regression, just no protection.
+ * When neither can be had the probes answer "accessible" and the caller
+ * dereferences as it did before: no regression, just no protection.
  */
+#include "cng/broker.h"
 #include "cng/monitor.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
@@ -93,15 +105,71 @@ static int probe_faulted(long r, unsigned long n) {
     return r == -EFAULT || (r >= 0 && (unsigned long)r < n);
 }
 
-static int probe(const void *p, unsigned long n, int nr, long off) {
+/* Our end of a process_vm_* probe. The read probe's landing area is written and
+ * never read back; the write probe's source is read and never written, so it
+ * stays the zeros the guest's buffer is filled with. Neither needs a lock for
+ * the same reason the memfd regions do not. */
+static char g_land[UA_CHUNK];
+static char g_zero[UA_CHUNK];
+
+/* One process_vm_readv/writev of [user, user+n) against our own address space.
+ * `write` picks the direction: readv copies the guest's bytes into g_land,
+ * writev copies our zeros over them. */
+static long pvm(const void *user, unsigned long n, int write) {
+    struct cng_iovec local = {write ? (void *)g_zero : (void *)g_land, n};
+    struct cng_iovec remote = {(void *)user, n};
+    return CNG_SYS(write ? __NR_process_vm_writev : __NR_process_vm_readv,
+                   sys_getpid(), &local, 1, &remote, 1, 0);
+}
+
+/* -1 undecided, 1 the pair works here, 0 it does not. */
+static int g_pvm = -1;
+
+int cng_uaccess_probe_setup(void) {
+    int v = __atomic_load_n(&g_pvm, __ATOMIC_ACQUIRE);
+    if (v >= 0)
+        return v;
+    /* CNG_UACCESS_MEMFD=1 forces the fallback, so the descriptor path can be
+     * exercised on a host that does have the pair — otherwise it would only
+     * ever run under an emulator, which is where it is least worth trusting. */
+    if (cng_broker_env("CNG_UACCESS_MEMFD")) {
+        __atomic_store_n(&g_pvm, 0, __ATOMIC_RELEASE);
+        return 0;
+    }
+    /* Android denies plenty; the block-list has measured which syscalls before
+     * any filter of ours exists, so asking it here cannot trap — which matters,
+     * because deciding this from inside the SIGSYS handler would need nested
+     * delivery, the one thing the design refuses to depend on. */
+    if (cng_blocked[__NR_process_vm_readv] ||
+        cng_blocked[__NR_process_vm_writev]) {
+        v = 0;
+    } else {
+        char here;
+        v = pvm(&here, sizeof here, 0) == (long)sizeof here;
+    }
+    __atomic_store_n(&g_pvm, v, __ATOMIC_RELEASE);
+    return v;
+}
+
+static int probe(const void *p, unsigned long n, int nr, long off, int write) {
     if (!p)
         return 0;
     if (!n)
         return 1;
+    const char *q = (const char *)p;
+    if (cng_uaccess_probe_setup()) {
+        while (n) {
+            unsigned long k = n > UA_CHUNK ? UA_CHUNK : n;
+            if (probe_faulted(pvm(q, k, write), k))
+                return 0;
+            q += k;
+            n -= k;
+        }
+        return 1;
+    }
     int fd = scratch_fd();
     if (fd < 0)
         return 1; /* cannot ask: dereference as we did before */
-    const char *q = (const char *)p;
     while (n) {
         unsigned long k = n > UA_CHUNK ? UA_CHUNK : n;
         if (probe_faulted(CNG_SYS(nr, fd, q, k, off, 0, 0), k))
@@ -113,11 +181,11 @@ static int probe(const void *p, unsigned long n, int nr, long off) {
 }
 
 int cng_user_readable(const void *p, unsigned long n) {
-    return probe(p, n, __NR_pwrite64, UA_SCRATCH_OFF);
+    return probe(p, n, __NR_pwrite64, UA_SCRATCH_OFF, 0);
 }
 
 int cng_user_writable(void *p, unsigned long n) {
-    return probe(p, n, __NR_pread64, UA_ZERO_OFF);
+    return probe(p, n, __NR_pread64, UA_ZERO_OFF, 1);
 }
 
 /* A string and a pointer vector are read a piece at a time, so they cannot be

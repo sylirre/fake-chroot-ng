@@ -41,6 +41,11 @@ static const int probe_set[] = {
     __NR_setxattr,   __NR_lsetxattr,  __NR_getxattr,   __NR_lgetxattr,
     __NR_listxattr,  __NR_llistxattr, __NR_removexattr, __NR_lremovexattr,
     __NR_inotify_add_watch,
+    /* Not re-issued on a guest's behalf: this pair is how the guest-pointer
+     * probe asks whether a range is accessible (uaccess.c). Measuring it here
+     * is what keeps that question out of the SIGSYS handler, where a refused
+     * syscall would need nested delivery to survive. */
+    __NR_process_vm_readv, __NR_process_vm_writev,
 #ifdef __NR_fchmodat2
     __NR_fchmodat2,
 #endif

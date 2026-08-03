@@ -423,6 +423,10 @@ int cng_install_monitor(struct cng_fs *fs) {
     /* Measure which syscalls Android blocks (before our own filter is active)
      * so dispatch emulates them rather than trapping on a re-issue. */
     cng_probe_blocked();
+    /* ...and settle which guest-pointer probe this host supports, here rather
+     * than on the first trapped syscall: the question is itself a syscall, and
+     * asking it from inside the handler would need nested SIGSYS delivery. */
+    cng_uaccess_probe_setup();
     int r = cng_install_seccomp();
     /* NO_NEW_PRIVS is now set; on Android that can revoke anon executable memory,
      * so switch the loader to file-backed mapping if so (before the guest execs). */

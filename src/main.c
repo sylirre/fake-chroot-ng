@@ -433,6 +433,9 @@ static void help(char **envp) {
         {"CNG_L2S_FORCE", "With -l: route every linkat through the emulation "
                       "without trying the real hardlink first. Test aid for "
                       "hosts whose filesystem allows link(2)."},
+        {"CNG_UACCESS_MEMFD", "Validate guest pointers through a scratch memfd "
+                      "instead of process_vm_readv/writev. Test aid: it is the "
+                      "fallback a host without that pair already uses."},
     };
     static const char *const examples[] = {
         "chroot-ng --probe",

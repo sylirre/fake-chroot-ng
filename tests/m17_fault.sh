@@ -19,6 +19,18 @@ case "$out" in
     ;;
 *)
     check "faulttest rc" 0 $rc
+    # Two mechanisms answer the same question: process_vm_readv/writev against
+    # our own pid where the kernel has them (one syscall, no descriptor), and a
+    # copy through a scratch memfd where it does not (qemu-user, and an Android
+    # policy that denies the pair). Whichever is live, every leg below must give
+    # the same answer — so the forced-fallback run repeats the whole set.
+    check_contains "the probe names the mechanism it used" "faulttest probe " \
+        "$out"
+    memfd_out=$(CNG_UACCESS_MEMFD=1 run_t 30 -t faulttest 2>&1)
+    check "faulttest rc with the memfd fallback forced" 0 $?
+    check_contains "the knob really forces the fallback" \
+        "mech=memfd" "$memfd_out"
+    check_absent "no case faulted on the fallback" "FAIL" "$memfd_out"
     check_absent "no case faulted" "FAIL" "$out"
     for _c in rt_sigaction rt_sigprocmask getcwd getresuid getresgid \
         setgroups getgroups capget shmctl sendmsg readlinkat "execve path" \

@@ -948,7 +948,8 @@ int cng_cmd_faulttest(int argc, char **argv, char **envp, unsigned long *auxv) {
     }
     int okg = cng_user_readable(good, sizeof good) &&
               cng_user_writable(good, sizeof good);
-    cng_dprintf(1, "faulttest probe good=%d bad=0 -> %s\n", okg,
+    cng_dprintf(1, "faulttest probe good=%d bad=0 mech=%s -> %s\n", okg,
+                cng_uaccess_probe_setup() ? "process_vm" : "memfd",
                 okg ? "OK" : "FAIL");
     fails += !okg;
 

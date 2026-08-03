@@ -227,6 +227,12 @@ long cng_fd_reopen(const char *host, long flags, long mode, long err);
 int cng_user_readable(const void *p, unsigned long n);
 int cng_user_writable(void *p, unsigned long n);
 
+/* Settle which probe mechanism this host supports, returning 1 for the
+ * process_vm_* pair and 0 for the memfd fallback. Called once at monitor
+ * install so the question is never asked from inside the SIGSYS handler, where
+ * a refused syscall would need nested delivery to be survivable. */
+int cng_uaccess_probe_setup(void);
+
 /* Length of a guest string / entry count of a guest pointer vector, measured
  * without ever reading past accessible memory. Returns the count, -EFAULT when
  * it runs off readable memory, or -E2BIG when `max` passes with no terminator —
