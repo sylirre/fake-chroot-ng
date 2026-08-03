@@ -430,6 +430,15 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
         while (*p && *p != '\n' && *p != '\r')
             p++;
         size_t alen = (size_t)(p - a0);
+        /* The argument runs to the end of the line, embedded blanks and all
+         * ("#!/usr/bin/env python3 -u" is one argument) — but not the line's
+         * *trailing* blanks, which fs/binfmt_script.c walks back over before it
+         * parses anything. Keeping them handed the interpreter "-e   " where
+         * the kernel hands it "-e", and a shell rejects that as an illegal
+         * option: a shebang line with a stray space at the end, which editors
+         * leave behind routinely, ran everywhere but here. */
+        while (alen > 0 && (a0[alen - 1] == ' ' || a0[alen - 1] == '\t'))
+            alen--;
         if (ilen == 0 || ilen >= SHEB_WORD) {
             if (cng_g_debug)
                 cng_dprintf(2, "[cng] execve %s -> bad shebang\n", cur);

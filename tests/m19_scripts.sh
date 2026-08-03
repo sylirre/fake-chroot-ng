@@ -47,7 +47,23 @@ printf '#!/scriptprobe shortok\n' >"$M19/real/short.sh"
 # then one past the vector's own terminator, and the snapshot lays envp
 # directly behind argv -- so the walk ran into the environment.
 printf '#!/scriptprobe argok\n' >"$M19/real/noargv.sh"
-chmod 755 "$M19/real/short.sh" "$M19/real/empty.bin" "$M19/real/noargv.sh"
+# ...and one whose `#!` line ends in a blank, which editors leave behind all the
+# time. The kernel walks back over the line's trailing spaces and tabs before it
+# parses anything, so the interpreter never sees them on its argument.
+printf '#!/scriptprobe argok \n' >"$M19/real/trail.sh"
+chmod 755 "$M19/real/short.sh" "$M19/real/empty.bin" "$M19/real/noargv.sh" \
+    "$M19/real/trail.sh"
+
+# That rule is the host kernel's own, so establish it here rather than claim it:
+# a script whose interpreter is itself a script prints the argument it was
+# handed, and the same trailing blank goes in.
+KREF=$(mktemp -d)
+printf '#!/bin/sh\nprintf "[%%s]" "$1"\n' >"$KREF/showarg"
+printf '#!%s/showarg argok \n' "$KREF" >"$KREF/t.sh"
+chmod 755 "$KREF/showarg" "$KREF/t.sh"
+M19_KERN=$("$KREF/t.sh" 2>/dev/null)
+rm -rf "$KREF"
+check "the host kernel strips a #! line's trailing blanks" "[argok]" "$M19_KERN"
 
 if ! guest_xlate_ready "M19 script legs"; then
     :
@@ -90,6 +106,11 @@ elif guest_cc_report "$GDIR/scriptprobe" tests/guests/scriptprobe.c; then
     check_contains "a script exec'd with an empty argv gets the three the kernel splices" \
         "shebargv=[argok][/noargv.sh]" "$out"
     check_absent "and not the environment behind it" "SHEBENV" "$out"
+
+    out=$(m19_run -w /root "$M19/real" /scriptprobe lib/apk/exec/scriptprobe \
+        /trail.sh 2>/dev/null)
+    check_contains "the #! argument loses the line's trailing blanks, as it just did on the kernel" \
+        "shebargv=$M19_KERN[/trail.sh]" "$out"
 
     # And it says so with the errno alone. A failed exec used to narrate itself
     # onto the guest's own stderr naming the resolved host path -- the one
