@@ -250,23 +250,68 @@ struct cap_data {
     unsigned effective, permitted, inheritable;
 };
 
-static long do_capget(const struct cap_header *hdr, struct cap_data *data) {
+#define CAP_VER_1 0x19980330u /* one 32-bit data block */
+#define CAP_VER_2 0x20071026u /* two */
+#define CAP_VER_3 0x20080522u /* two; what a current kernel prefers */
+
+/* cap_validate_magic(): how many data blocks the header asks for. An
+ * unrecognised version is not a success — the kernel writes back the version it
+ * does speak and fails, which is precisely how libcap and everyone else
+ * discovers what to ask for. Answering 0 to it instead left the caller
+ * believing its own version was supported, and then took the two-block branch
+ * for it: a capget writing 24 bytes into the 12-byte buffer a v1 caller
+ * allocated. */
+static long cap_magic(struct cap_header *hdr, int *nblocks) {
     if (!cng_user_readable(hdr, sizeof *hdr))
         return -EFAULT;
-    if (data) {
-        unsigned all = cng_fake_root() ? 0xffffffffu : 0u;
-        int n = (hdr->version == 0x19980330u) ? 1 : 2; /* v1 vs v2/v3 */
-        if (!cng_user_writable(data, (unsigned long)n * sizeof *data))
-            return -EFAULT;
-        for (int i = 0; i < n; i++) {
-            data[i].effective = all;
-            data[i].permitted = all;
-            data[i].inheritable = 0;
-        }
+    switch (hdr->version) {
+    case CAP_VER_1:
+        *nblocks = 1;
+        return 0;
+    case CAP_VER_2:
+    case CAP_VER_3:
+        *nblocks = 2;
+        return 0;
+    }
+    if (!cng_user_writable(&hdr->version, sizeof hdr->version))
+        return -EFAULT;
+    hdr->version = CAP_VER_3;
+    return -EINVAL;
+}
+
+static long do_capget(struct cap_header *hdr, struct cap_data *data) {
+    int n = 0;
+    long r = cap_magic(hdr, &n);
+    /* A probe with no data buffer is the negotiation itself, and the kernel
+     * calls it a success once the version has been written back. */
+    if (r != 0 || !data)
+        return (!data && r == -EINVAL) ? 0 : r;
+    if (hdr->pid < 0)
+        return -EINVAL;
+    unsigned all = cng_fake_root() ? 0xffffffffu : 0u;
+    if (!cng_user_writable(data, (unsigned long)n * sizeof *data))
+        return -EFAULT;
+    for (int i = 0; i < n; i++) {
+        data[i].effective = all;
+        data[i].permitted = all;
+        data[i].inheritable = 0;
     }
     return 0;
 }
-static long do_capset(void) { return cng_fake_root() ? 0 : -EPERM; }
+
+static long do_capset(struct cap_header *hdr, const struct cap_data *data) {
+    int n = 0;
+    long r = cap_magic(hdr, &n);
+    if (r != 0)
+        return r;
+    if (hdr->pid != 0 && hdr->pid != (int)sys_getpid())
+        return -EPERM; /* "may only affect current", as the kernel puts it */
+    /* The payload is copied in before any decision is taken, so a bad one is
+     * -EFAULT whatever the caller's privilege would have been. */
+    if (!cng_user_readable(data, (unsigned long)n * sizeof *data))
+        return -EFAULT;
+    return cng_fake_root() ? 0 : -EPERM;
+}
 
 /* Non-faking re-issue for the -R trampoline path: consult the Android block-list
  * so a re-issue can never trap and die (see blocklist.c). */
@@ -351,9 +396,9 @@ long cng_cred_handle(long nr, long a0, long a1, long a2, long a3, long a4,
     case __NR_getgroups:
         return do_getgroups(c, (int)a0, (unsigned *)a1);
     case __NR_capget:
-        return do_capget((const struct cap_header *)a0, (struct cap_data *)a1);
+        return do_capget((struct cap_header *)a0, (struct cap_data *)a1);
     case __NR_capset:
-        return do_capset();
+        return do_capset((struct cap_header *)a0, (const struct cap_data *)a1);
     default:
         return -ENOSYS;
     }

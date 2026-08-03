@@ -21,6 +21,11 @@ check_contains "a refused reopen is served from the fd we hold, rewound" \
     "fd_reopen: dup=1 content=1 -> OK" "$out"
 check_contains "supplementary groups empty" "ngroups=0"           "$out"
 check_contains "capget reports full set under fake-root" "cap_eff=ffffffff" "$out"
+# The header version is negotiated. An unknown one gets the kernel's own written
+# back and fails — except for the data-less probe that IS the negotiation — and
+# a v1 header buys one data block, never the two a v2/v3 caller sized for.
+check_contains "capget negotiates the capability header version" \
+    "cap_ver probe=0 got=20080522 bad=-22 v1=0 v1_spill=0" "$out"
 check_contains "privilege drop is real and irreversible" \
     "setuid_drop rc=0 uid=1000 regain=-1" "$out"
 check_contains "setuid-root shows setuid exec as root:root" \

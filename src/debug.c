@@ -662,6 +662,24 @@ int cng_cmd_faketest(int argc, char **argv, char **envp, unsigned long *auxv) {
     unsigned capdata[6] = { 0 };               /* two {eff,perm,inh} blocks */
     cng_dispatch(__NR_capget, (long)caphdr, (long)capdata, 0, 0, 0, 0, 1);
     cng_dprintf(1, "cap_eff=%x\n", capdata[0]);
+    /* The header version is negotiated, not assumed: an unrecognised one is
+     * answered with the version the kernel does speak, and only a data-less
+     * probe of it counts as a success. Calling it supported instead handed a v1
+     * caller two blocks of data for its one-block buffer. */
+    unsigned probe[2] = { 0, 0 };
+    long cpn = cng_dispatch(__NR_capget, (long)probe, 0, 0, 0, 0, 0, 1);
+    unsigned negotiated = probe[0];
+    probe[0] = 0;
+    long cbad = cng_dispatch(__NR_capget, (long)probe, (long)capdata, 0, 0, 0, 0,
+                             1);
+    unsigned v1hdr[2] = { 0x19980330u, 0 };    /* v1: one block, and only one */
+    unsigned v1data[6];
+    memset(v1data, 0xee, sizeof v1data);
+    long cv1 = cng_dispatch(__NR_capget, (long)v1hdr, (long)v1data, 0, 0, 0, 0,
+                            1);
+    cng_dprintf(1, "cap_ver probe=%d got=%x bad=%d v1=%d v1_spill=%d\n",
+                (int)cpn, negotiated, (int)cbad, (int)cv1,
+                v1data[3] != 0xeeeeeeeeu);
 
     /* A privilege drop is real and, for the resulting non-root id, irreversible:
      * setuid(1000) succeeds, getuid then reports 1000, and setuid(0) is EPERM. */
