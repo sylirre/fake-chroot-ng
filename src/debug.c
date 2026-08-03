@@ -181,6 +181,46 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
         cng_dprintf(1, "read: %s\n", buf);
         return 0;
     }
+    /* _dtest -r ROOT [-b SRC:DST] dents GUESTDIR BUFSZ — read a directory to
+     * the end through the dispatcher, one getdents64 of BUFSZ bytes at a time,
+     * and print every name. The entries that exist only as resolution overlays
+     * (a -b mount point, the /dev nodes) have no dirent of their own and are
+     * spliced in by the dispatcher, so a small BUFSZ is what asks whether they
+     * survive a directory whose real entries fill the guest's buffer — musl's
+     * readdir reads 2 KiB at a time where glibc's reads 32 KiB. */
+    if (!strcmp(op, "dents") && relpath) {
+        long bufsz = 0;
+        for (const char *q = relpath; *q >= '0' && *q <= '9'; q++)
+            bufsz = bufsz * 10 + (*q - '0');
+        if (bufsz < 32 || bufsz > 65536)
+            bufsz = 256;
+        long fd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
+                               CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+        if (fd < 0) {
+            cng_dprintf(1, "dents: open errno %d\n", (int)-fd);
+            return 1;
+        }
+        char buf[65536];
+        int batches = 0;
+        cng_dprintf(1, "dents:");
+        for (;;) {
+            long n = cng_dispatch(__NR_getdents64, fd, (long)buf, bufsz, 0, 0, 0,
+                                  0);
+            if (n <= 0 || ++batches > 4096)
+                break;
+            for (long o = 0; o + 19 <= n;) {
+                unsigned short rl;
+                memcpy(&rl, buf + o + 16, 2);
+                if (rl == 0 || o + rl > n)
+                    break;
+                cng_dprintf(1, " %s", buf + o + 19);
+                o += rl;
+            }
+        }
+        cng_dprintf(1, "\ndents: batches=%d\n", batches);
+        sys_close((int)fd);
+        return 0;
+    }
     /* CNG_DEBUG error logging must never dereference a syscall arg that is a
      * scalar rather than a path: truncate's length here is large enough to look
      * like a pointer, and reading it killed the guest (SIGSEGV in the handler,

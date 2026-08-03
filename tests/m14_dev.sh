@@ -122,6 +122,33 @@ fi
 # guest-side walk, even though a single plain component looks like nothing that
 # could redirect. `ls -l` asks exactly this (fstatat against the fd it is
 # listing), so without it an entry ls had just shown came back ENOENT.
+# An overlay entry has to survive a directory whose real entries fill the
+# guest's buffer. Spliced in after the kernel's own it had nowhere to fit, and
+# since injection happens only on the first read of the stream, "did not fit"
+# meant the guest never saw it at all -- decided by the guest libc's readdir
+# buffer, which is 2 KiB in musl and 32 KiB in glibc. Read the same directory
+# to the end at three buffer sizes: the set of names must not depend on it.
+M14S=$(mktemp -d)
+M14SB=$(mktemp -d)
+i=0
+while [ $i -lt 60 ]; do : >"$M14S/file_with_a_longish_name_$i"; i=$((i + 1)); done
+m14_names() { # bufsz
+    run -t dtest -r "$M14S" -b "$M14SB":/zzbind dents / "$1" 2>&1 |
+        head -1 | tr ' ' '\n' | sort | tr '\n' ' '
+}
+m14_count() { echo "$1" | tr ' ' '\n' | grep -c .; }
+m14_big=$(m14_names 65536)
+m14_bign=$(m14_count "$m14_big")
+check_contains "m14 an overlay entry is listed with a large read buffer" \
+    " zzbind " "$m14_big"
+for bufsz in 256 128; do
+    m14_got=$(m14_names $bufsz)
+    check_contains "m14 ...and with a $bufsz-byte one" " zzbind " "$m14_got"
+    check "m14 ...listing the same names either way ($bufsz)" "$m14_bign" \
+        "$(m14_count "$m14_got")"
+done
+rm -rf "$M14S" "$M14SB"
+
 M14D=$(mktemp -d)
 M14DB=$(mktemp -d)
 mkdir -p "$M14D/dev" # the zone overlays entries INTO it; the directory is real

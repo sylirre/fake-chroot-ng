@@ -349,6 +349,13 @@ static long put_dent(char *buf, long at, long cap, const char *name,
     if (at < 0 || cap < 0 || at + reclen > cap)
         return 0;
     char *rec = buf + at;
+    /* These records go in ahead of the kernel's, so nothing has established
+     * that the guest's buffer is writable this far — only that it said so.
+     * A fault here is inside the handler, where SIGSEGV is masked and fatal;
+     * refusing the record instead just makes the batch a short one, which is
+     * legal, and leaves the kernel to answer the bad pointer with -EFAULT. */
+    if (!cng_user_writable(rec, (unsigned long)reclen))
+        return 0;
     memset(rec, 0, (size_t)reclen);
     memcpy(rec, &ino, 8);
     memcpy(rec + 8, &cookie, 8);
@@ -1774,30 +1781,40 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         /* Injection belongs at the start of the stream and only there, so the
          * decision is taken before the read: lseek(SEEK_CUR) == 0 means nothing
          * has been read from this fd yet. Deciding it up front also means an
-         * empty directory (n == 0 below) still gets its overlay entries. */
+         * empty directory still gets its overlay entries.
+         *
+         * They go in *ahead* of the kernel's own, which is what guarantees they
+         * go in at all. Appended to a batch the kernel had already filled, they
+         * had nowhere to fit and were simply dropped — and since injection
+         * happens only on the first read of the stream, dropped meant the guest
+         * never saw them. Whether that happened came down to the guest libc's
+         * readdir buffer: musl reads 2 KiB at a time where glibc reads 32 KiB,
+         * so a bind mount point in a directory of any size was listed on a
+         * Debian rootfs and invisible on an Alpine one. */
         char injdir[CNG_PATH_MAX];
         int inject = a1 && sys_lseek((int)a0, 0, CNG_SEEK_CUR) == 0 &&
                      dirfd_guest_dir(a0, injdir, sizeof injdir) == 0;
-
-        long n = reissue(a0, a1, a2, a3, a4, a5, __NR_getdents64);
-        if (n < 0 || !a1)
-            return n;
-        if (n == 0)
-            return inject ? inject_dents(a0, injdir, (char *)a1, 0, (long)a2)
+        long pre = inject ? inject_dents(a0, injdir, (char *)a1, 0, (long)a2)
                           : 0;
+        char *buf = (char *)a1 + pre;
+        long cap = (long)a2 - pre;
+
+        long n = reissue(a0, (long)buf, cap, a3, a4, a5, __NR_getdents64);
+        /* Whatever was spliced in has been handed over; the kernel's answer —
+         * including an end-of-directory, or the EINVAL a buffer we filled
+         * draws — is the next read's to give. */
+        if (n <= 0 || !a1)
+            return pre ? pre : n;
         /* Hidden-process view, listing side: the path layer makes a host
          * process's /proc entry unreachable, but `ls /proc` and `ps` read the
          * directory, so the numeric entries have to go as well. Deciding that
          * costs a readlink of the fd, so it is asked only when this batch
          * actually holds a numeric name — outside /proc almost nothing does. */
-        int at_proc = !cng_g_no_proc && dents_have_pid((const char *)a1, n) &&
+        int at_proc = !cng_g_no_proc && dents_have_pid(buf, n) &&
                       fd_is_host_proc(a0);
         if (!cng_g_l2s && !at_proc)
-            return inject ? n + inject_dents(a0, injdir, (char *)a1, n,
-                                             (long)a2)
-                          : n;
+            return pre + n;
         int at_root = cng_g_l2s && fd_is_rootfs_root(a0);
-        char *buf = (char *)a1;
         for (;;) {
             /* linux_dirent64: d_reclen u16 @16, d_name @19. d_off cookies are
              * directory-stream positions, so compaction is seek-safe. */
@@ -1819,14 +1836,12 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 o += reclen;
             }
             if (w > 0)
-                return inject ? w + inject_dents(a0, injdir, buf, w, (long)a2)
-                              : w;
-            n = reissue(a0, a1, a2, a3, a4, a5, __NR_getdents64);
-            /* A real end-of-directory (0) still owes the overlay entries. */
+                return pre + w;
+            /* A whole batch of ours: re-read, so a filtered 0 is not mistaken
+             * for end-of-directory. */
+            n = reissue(a0, (long)buf, cap, a3, a4, a5, __NR_getdents64);
             if (n <= 0)
-                return (n == 0 && inject)
-                           ? inject_dents(a0, injdir, buf, 0, (long)a2)
-                           : n;
+                return pre ? pre : n;
         }
     }
 
