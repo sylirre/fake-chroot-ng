@@ -35,6 +35,19 @@ check_contains "...and for an ordinary file both forms agree" \
     "accessnf: nofollow=0 follow=0" \
     "$(run -t dtest -r "$ROOT" accessnf /etc/greeting 2>&1)"
 
+# faccessat(2) is a three-argument syscall -- dirfd, path, mode -- and has no
+# flags word; only faccessat2 has one. Read as flags, a stray AT_SYMLINK_NOFOLLOW
+# in the caller's x3 made fake-root's X_OK recovery stat the /proc fd link
+# (mode 0700: executable whatever it points at) instead of the file behind it,
+# so a non-executable file answered "yes" depending on register leftovers.
+printf x > "$ROOT/etc/noexec"
+chmod 0644 "$ROOT/etc/noexec"
+exec 7< "$ROOT/etc/noexec"
+check_contains "faccessat has no flags word, so x3 cannot change its answer" \
+    "accessgb: clean=-13 dirty=-13" \
+    "$(run -t dtest -r "$ROOT" accessgb /proc/self/fd/7 2>&1)"
+exec 7<&-
+
 # Plant a file OUTSIDE the rootfs; guest /../ must not reach it.
 printf SECRET > "$ROOT/../esc_$$"
 check_contains "dispatch blocks .. escape" \

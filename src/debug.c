@@ -436,6 +436,31 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
         return 0;
     }
 #endif
+    /* faccessat(2) takes three arguments — dirfd, path, mode — and has no flags
+     * word at all; only faccessat2 does. x3 is therefore whatever the caller
+     * happened to leave there, and no part of the answer may depend on it. The
+     * same call is made twice, with a clean x3 and with one carrying
+     * AT_SYMLINK_NOFOLLOW, and the two must agree.
+     *
+     * GUESTPATH names a non-executable file through a /proc fd link, which the
+     * resolver hands over as the magic link itself rather than dereferencing it.
+     * That is what makes the difference observable: under fake-root a denied
+     * X_OK is recovered from a stat, and a stray NOFOLLOW made that stat
+     * describe the link (mode 0700 — so X_OK is granted whatever the file is)
+     * instead of the file behind it. */
+    if (!strcmp(op, "accessgb")) {
+        cng_g_fake_id = 1;
+        cng_g_fake_uid = cng_g_fake_gid = 0;
+        cng_cred_seed();
+        long clean = cng_dispatch(__NR_faccessat, CNG_AT_FDCWD, (long)gpath,
+                                  1 /*X_OK*/, 0, 0, 0, /*trapped=*/0);
+        long dirty = cng_dispatch(__NR_faccessat, CNG_AT_FDCWD, (long)gpath,
+                                  1 /*X_OK*/, CNG_AT_SYMLINK_NOFOLLOW, 0, 0,
+                                  /*trapped=*/0);
+        cng_g_fake_id = 0;
+        cng_dprintf(1, "accessgb: clean=%d dirty=%d\n", (int)clean, (int)dirty);
+        return 0;
+    }
     /* A ":ro" bind must answer -EROFS for every mutating path syscall while
      * still serving reads, the way a real read-only mount does. GUESTPATH names
      * an existing file inside the bind. Without ":ro" on the -b spec the same

@@ -1439,7 +1439,16 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
         if (p == XLATE_TOOLONG)
             return -ENAMETOOLONG;
-        long fl = a3;
+        /* faccessat(2) takes three arguments and has no flags word at all —
+         * only faccessat2 does. a3 is therefore whatever the guest happened to
+         * leave in x3, and reading it as flags made the fake-root stat below
+         * AT_SYMLINK_NOFOLLOW at random: on a symlink that answers about the
+         * link (mode 0777, so X_OK is always granted) rather than the target. */
+        long fl = 0;
+#ifdef __NR_faccessat2
+        if (nr == __NR_faccessat2)
+            fl = a3;
+#endif
         long dfd = a0;
 #ifdef __NR_faccessat2
         /* faccessat2 with AT_SYMLINK_NOFOLLOW on an l2s name must report on
