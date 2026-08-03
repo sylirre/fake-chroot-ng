@@ -1505,13 +1505,29 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     /* readlinkat: /proc/self magic-link fixups, else translate + reissue. */
     case __NR_readlinkat: {
         const char *gp = (const char *)a1;
+        /* bufsiz is an int, and the kernel refuses a non-positive one before it
+         * looks at anything else. It has to be read at that width here rather
+         * than as the raw register: the magic-link answers below are written by
+         * us, not by the kernel, so a negative bufsiz became a buffer of ~2^64
+         * bytes to clamp the answer against — no clamp at all. */
+        int bufsiz = (int)a3;
+        if (bufsiz <= 0)
+            return -EINVAL;
         if (gp && (gp[0] == '/' || (int)a0 == CNG_AT_FDCWD)) {
-            char canon[CNG_PATH_MAX];
+            char canon[CNG_PATH_MAX], val[CNG_PATH_MAX];
             if (cng_fs_abscanon(cng_g_fs, gp, canon, sizeof canon) == 0) {
-                long fx = proc_self_fixup(canon, (char *)a2,
-                                          (unsigned long)a3);
-                if (fx >= 0)
+                long fx = proc_self_fixup(canon, val, sizeof val);
+                if (fx >= 0) {
+                    if (fx > bufsiz)
+                        fx = bufsiz;
+                    /* Our own copy_to_user. The kernel never sees this buffer,
+                     * so a bad one has to come back -EFAULT rather than fault
+                     * in the handler, where SIGSEGV is masked and fatal. */
+                    if (!cng_user_writable((void *)a2, (unsigned long)fx))
+                        return -EFAULT;
+                    memcpy((void *)a2, val, (size_t)fx);
                     return fx;
+                }
             }
         }
         const char *p = xlate(a0, gp, b1, sizeof b1, /*deref_final=*/0);
@@ -1534,7 +1550,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * lsof's map_files walk all land here. Targets outside the view
          * (memfd:, pipe:[..], a host-only file) are left exactly as the kernel
          * wrote them. */
-        if (r > 0 && r < (long)a3 && *(char *)a2 == '/' &&
+        if (r > 0 && r < bufsiz && *(char *)a2 == '/' &&
             rl_may_fdlink(a0, gp)) {
             char canon[CNG_PATH_MAX];
             if (at_canon(a0, gp, canon, sizeof canon) == 0) {
@@ -1548,8 +1564,14 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                         if (cng_fs_untranslate(cng_g_fs, tgt, guest,
                                                sizeof guest) == 0) {
                             size_t gl = strlen(guest);
-                            if (gl > (size_t)a3)
-                                gl = (size_t)a3;
+                            if (gl > (size_t)bufsiz)
+                                gl = (size_t)bufsiz;
+                            /* A bind can make the guest spelling longer than
+                             * the host one, so this may write past what the
+                             * kernel validated — ask before it does. */
+                            if (gl > (size_t)r &&
+                                !cng_user_writable((char *)a2, gl))
+                                return -EFAULT;
                             memcpy((char *)a2, guest, gl);
                             r = (long)gl;
                         }

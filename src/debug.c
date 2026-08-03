@@ -850,6 +850,11 @@ int cng_cmd_faulttest(int argc, char **argv, char **envp, unsigned long *auxv) {
         {"shmctl",
          cng_dispatch(__NR_shmctl, 0, CNG_IPC_SET, (long)bad, 0, 0, 0, 1)},
         {"sendmsg", cng_dispatch(__NR_sendmsg, 0, (long)bad, 0, 0, 0, 0, 1)},
+        /* A /proc magic link is answered from our own bookkeeping, so this
+         * buffer is one the kernel never validates either. */
+        {"readlinkat",
+         cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD, (long)"/proc/self/cwd",
+                      (long)bad, 4096, 0, 0, 1)},
         /* execve walks argv/envp itself — the kernel never sees them — so both
          * the vector and the strings it points at have to be validated. */
         {"execve path",
@@ -900,6 +905,20 @@ int cng_cmd_faulttest(int argc, char **argv, char **envp, unsigned long *auxv) {
     cng_dprintf(1, "faulttest valid getresuid=%d getcwd=%d -> %s\n", (int)rr,
                 (int)rc, okv ? "OK" : "FAIL");
     fails += !okv;
+
+    /* readlinkat's bufsiz is an int, and the kernel refuses a non-positive one
+     * outright. The magic links are answered from our bookkeeping, so the clamp
+     * is ours to apply — and applying it to the raw register instead made a
+     * negative bufsiz a buffer of ~2^64 bytes, i.e. no clamp at all. */
+    long rn = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD,
+                           (long)"/proc/self/cwd", (long)good, -1, 0, 0, 1);
+    memset(good, '#', sizeof good);
+    long rs = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD,
+                           (long)"/proc/self/cwd", (long)good, 1, 0, 0, 1);
+    int okrl = (rn == -EINVAL && rs == 1 && good[1] == '#');
+    cng_dprintf(1, "faulttest readlink-bufsiz neg=%d short=%d -> %s\n", (int)rn,
+                (int)rs, okrl ? "OK" : "FAIL");
+    fails += !okrl;
 
     cng_g_fake_id = 0;
     return fails ? 1 : 0;

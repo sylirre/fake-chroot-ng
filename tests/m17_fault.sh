@@ -21,11 +21,15 @@ case "$out" in
     check "faulttest rc" 0 $rc
     check_absent "no case faulted" "FAIL" "$out"
     for _c in rt_sigaction rt_sigprocmask getcwd getresuid getresgid \
-        setgroups getgroups capget shmctl sendmsg "execve path" \
+        setgroups getgroups capget shmctl sendmsg readlinkat "execve path" \
         "execve argv" "execve argv string"; do
         check_contains "$_c answers EFAULT" "faulttest $_c=-14 want=-14 -> OK" \
             "$out"
     done
+    # readlinkat's bufsiz is the other half of that buffer being ours to write:
+    # a non-positive one is EINVAL, and the answer is clamped at the int width.
+    check_contains "readlinkat's bufsiz is taken as an int and clamps" \
+        "faulttest readlink-bufsiz neg=-22 short=1 -> OK" "$out"
     # A sockaddr, and a whole mmsg vector of them, are read before the kernel
     # would have validated either. The errno is the host's to choose here (the
     # test fd is not a socket, so its refusal comes first) — what is asserted is
