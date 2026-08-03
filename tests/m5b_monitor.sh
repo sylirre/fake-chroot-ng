@@ -205,6 +205,18 @@ check "stackswtest exit 0" 0 "$rc"
 check_contains "handler stack switch runs on scratch and preserves caller" \
     "stacksw: ran_on_scratch=1 ret=0xc0de caller_ok=1 -> OK" "$out"
 
+# ...and what runs there must not itself scale with the guest's argv. The
+# emulated execve accepts a quarter of RLIMIT_STACK of arguments (megabytes),
+# and the guest-stack builder used to collect one address per entry in a VLA of
+# the caller's stack -- so an exec the kernel takes happily, `rm *` in a
+# directory of fifty thousand files, overflowed the 256 KiB scratch stack. With
+# every signal but SIGSYS masked there, that kills the guest outright: before
+# the fix this leg does not fail, it segfaults.
+out=$(run -t argvtest 2>&1); rc=$?
+check "argvtest exit 0" 0 "$rc"
+check_contains "a 50k-entry argv builds on a handler-sized stack" \
+    "argv: n=50000 shape=1 strings=1 env=1 caller_ok=1 -> OK" "$out"
+
 # A vfork-style clone (CLONE_VFORK|CLONE_VM, as Go's os/exec and posix_spawn use)
 # must be converted to a real COW fork, or the in-process emulated execve would
 # load the new program over the shared parent's memory.

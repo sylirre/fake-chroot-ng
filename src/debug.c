@@ -2208,6 +2208,70 @@ int cng_cmd_stackswtest(int argc, char **argv, char **envp, unsigned long *auxv)
     return ok ? 0 : 1;
 }
 
+/* _argvtest — building a guest stack must not cost the *caller's* stack in
+ * proportion to argc.
+ *
+ * The emulated execve runs on the SIGSYS handler's 256 KiB scratch stack, while
+ * accepting a quarter of RLIMIT_STACK worth of arguments — megabytes. The
+ * address of each pushed argv string used to be collected in a VLA, so an exec
+ * the kernel takes without complaint (`rm *` in a directory of fifty thousand
+ * files) overflowed the handler's stack; inside the handler, where every signal
+ * but SIGSYS is masked, that is the death of the guest rather than a fault.
+ *
+ * So build one on a stack of exactly that size and check the vector that comes
+ * back. Before the fix this does not print at all: it dies on the switch. */
+#define ARGVTEST_N 50000
+
+static struct cng_loaded argvtest_prog;
+static char **argvtest_argv;
+static char *argvtest_env[2] = {(char *)"ARGVTEST=1", 0};
+
+static long argvtest_body(void *a0, void *a1) {
+    (void)a0;
+    (void)a1;
+    return (long)cng_build_stack(ARGVTEST_N, argvtest_argv, argvtest_env, 0,
+                                 &argvtest_prog, 0, "argvtest");
+}
+
+int cng_cmd_argvtest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    unsigned long vsz = cng_page_up((ARGVTEST_N + 1) * sizeof(char *));
+    argvtest_argv = sys_mmap(0, vsz, CNG_PROT_READ | CNG_PROT_WRITE,
+                             CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    void *base = sys_mmap(0, 256 * 1024, CNG_PROT_READ | CNG_PROT_WRITE,
+                          CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (cng_is_err((long)argvtest_argv) || cng_is_err((long)base)) {
+        cng_dprintf(1, "argv: mmap failed -> FAIL\n");
+        return 1;
+    }
+    for (int i = 0; i < ARGVTEST_N; i++)
+        argvtest_argv[i] = (char *)"arg";
+    argvtest_argv[ARGVTEST_N] = 0;
+
+    unsigned long top = ((unsigned long)base + 256 * 1024) & ~15UL;
+    unsigned long marker = 0xA5A5A5A5;
+    long sp = cng_run_on_stack((void *)top, (void *)argvtest_body, 0, 0);
+
+    unsigned long *w = (unsigned long *)sp;
+    int shape = sp > 0 && (sp & 15) == 0 && w[0] == ARGVTEST_N &&
+                w[ARGVTEST_N + 1] == 0;
+    /* Every slot really points at its own copy of the string, so a vector that
+     * was written short (or over its own end) does not read as intact. */
+    int strings = shape;
+    for (int i = 1; strings && i <= ARGVTEST_N; i++)
+        strings = w[i] && !strcmp((const char *)w[i], "arg");
+    int env_ok = shape && w[ARGVTEST_N + 2] &&
+                 !strcmp((const char *)w[ARGVTEST_N + 2], "ARGVTEST=1");
+    int ok = shape && strings && env_ok && marker == 0xA5A5A5A5;
+    cng_dprintf(1, "argv: n=%d shape=%d strings=%d env=%d caller_ok=%d -> %s\n",
+                ARGVTEST_N, shape, strings, env_ok, marker == 0xA5A5A5A5,
+                ok ? "OK" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 /* _clonetest — a CLONE_VFORK|CLONE_VM clone must be converted to a real (COW)
  * fork by the dispatcher, so the child gets a private address space (our
  * emulated execve would otherwise corrupt the shared parent). Verify the child

@@ -43,6 +43,39 @@ unsigned long cng_build_stack(int argc, char **argv, char **envp,
         cng_die("guest stack mmap", (long)stk);
     unsigned long top = (unsigned long)stk + GUEST_STACK_SIZE;
 
+    /* Where the address of each pushed string is collected until the vector
+     * region's base is known. These were VLAs, so they were argc*8 bytes of the
+     * *caller's* stack — and the caller here is the emulated execve, which the
+     * SIGSYS handler runs on a 256 KiB scratch stack (sigsys.c) while accepting
+     * a quarter of RLIMIT_STACK worth of arguments: megabytes. `rm *` in a
+     * directory of fifty thousand files is an exec the kernel takes and this
+     * overflowed the handler's stack on, which inside the handler (every signal
+     * but SIGSYS masked) is the death of the guest rather than a fault.
+     *
+     * They live at the bottom of the region just mapped instead — 64 MiB below
+     * where the stack is built, and further below than any guest reaches. */
+    unsigned long *argv_addr = (unsigned long *)stk;
+    unsigned long *env_addr = argv_addr + argc;
+
+    const char *execfn_str = execfn ? execfn : (argc > 0 ? argv[0] : "");
+
+    /* ...and with them inside the mapping, whether all of this fits is a
+     * question with an answer. The caller bounds argv+envp to a quarter of this
+     * size (exec_arg_max), so exceeding it means a caller that did not — the
+     * pushes below would run off the end of the mapping. Answering 0 lets the
+     * caller report -E2BIG, which is what the kernel says to the same input. */
+    unsigned long strbytes = strlen(execfn_str) + 1 + sizeof "aarch64" + 16;
+    for (int i = 0; i < argc; i++)
+        strbytes += strlen(argv[i]) + 1;
+    for (int i = 0; i < envc; i++)
+        strbytes += strlen(envp[i]) + 1;
+    unsigned long need = 2 * ((unsigned long)argc + (unsigned long)envc) * 8 +
+                         strbytes + (3 + 64 * 2) * 8 + 64 /* auxv + alignment */;
+    if (need > GUEST_STACK_SIZE) {
+        sys_munmap(stk, GUEST_STACK_SIZE);
+        return 0;
+    }
+
     /* String pool grows down from the top of the stack region. */
     unsigned long sp_str = top;
 #define PUSH_STR(s)                                                            \
@@ -54,15 +87,12 @@ unsigned long cng_build_stack(int argc, char **argv, char **envp,
         (unsigned long)sp_str;                                                 \
     })
 
-    unsigned long argv_addr[argc > 0 ? argc : 1];
     for (int i = 0; i < argc; i++)
         argv_addr[i] = PUSH_STR(argv[i]);
-    unsigned long env_addr[envc > 0 ? envc : 1];
     for (int i = 0; i < envc; i++)
         env_addr[i] = PUSH_STR(envp[i]);
 
-    unsigned long execfn_addr =
-        PUSH_STR(execfn ? execfn : (argc > 0 ? argv[0] : ""));
+    unsigned long execfn_addr = PUSH_STR(execfn_str);
     unsigned long platform_addr = PUSH_STR("aarch64");
 
     /* AT_RANDOM: 16 bytes, 16-aligned. glibc and musl take the stack canary and

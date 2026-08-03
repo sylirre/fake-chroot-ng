@@ -330,6 +330,10 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
         sp = cng_build_stack(gargc, gargv, genv, auxv, &prog, 0, prog_guest);
         entry = prog.entry;
     }
+    if (!sp) {
+        cng_dprintf(2, "chroot-ng: argument list too long\n");
+        return 1;
+    }
     /* (svc rewriting + its pool are handled inside the loader, per object.) */
 
     /* /proc emulation: bring up the PID registry and reserve the synthesized fd

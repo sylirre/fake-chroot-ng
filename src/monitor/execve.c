@@ -512,6 +512,8 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
     unsigned long sp = cng_build_stack(argc, eff_argv, envp, cng_host_auxv,
                                        &prog, have_interp ? &interp : 0,
                                        eff_argv ? eff_argv[0] : path);
+    if (!sp)
+        return -E2BIG; /* argv/envp outgrew the guest stack region */
     unsigned long entry = have_interp ? interp.entry : prog.entry;
     if (cng_g_debug)
         cng_dprintf(2, "[cng]   argc=%d sp=%lx entry=%lx -> enter\n", argc, sp,
