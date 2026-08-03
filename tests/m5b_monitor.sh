@@ -303,4 +303,16 @@ check_contains "an ordinary syscall still runs on the -R tier" \
     "denied control getpid: rc=" "$out"
 check_contains "POSIX message queues are refused on the -R tier" \
     "denied mq_open: rc=-38 -> OK" "$out"
+# The mount family took paths and was neither trapped nor refused, so the
+# guest's own untranslated spelling went to the host kernel to be judged. A
+# mount cannot be carried out here in any case — the path layer would not know
+# about it and the synthesized /proc/self/mounts is built from the rootfs and
+# its binds — so ENOSYS is the honest answer, where EPERM implied it might have
+# worked with privilege.
+check_contains "mount is refused rather than judged by the host" \
+    "denied mount: rc=-38 -> OK" "$out"
+check_contains "umount2 likewise" "denied umount2: rc=-38 -> OK" "$out"
+check_contains "pivot_root likewise" "denied pivot_root: rc=-38 -> OK" "$out"
+check_contains "quotactl likewise" "denied quotactl: rc=-38 -> OK" "$out"
+check_contains "swapon likewise" "denied swapon: rc=-38 -> OK" "$out"
 rm -rf "$DR"

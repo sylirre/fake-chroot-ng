@@ -177,6 +177,33 @@ static const int enosys_syscalls[] = {
 #ifdef __NR_clone3
     __NR_clone3,
 #endif
+    /* The mount family. Each takes one or two paths, and none of them was
+     * trapped or refused, so the guest's own untranslated spelling went to the
+     * host kernel to be judged. In the target environment that judgement is
+     * EPERM and nothing happens — but it is EPERM for the wrong reason, and on
+     * a host where chroot-ng does hold the privilege (running as root, or an
+     * identity rootfs) the path would have been acted on where it named.
+     *
+     * Refusing rather than translating, because a mount is not something this
+     * design can carry out even in principle: the path layer would not know
+     * about the new mount, and the synthesized /proc/self/mounts — which is
+     * what the guest reads back — is built from the rootfs and its binds. A
+     * mount that succeeded would be invisible to everything that had to see
+     * it. ENOSYS says so; EPERM implies it might have worked with privilege.
+     * `mount --bind` inside a guest is what -b exists for. */
+    __NR_mount,
+    __NR_umount2,
+    __NR_pivot_root,
+#ifdef __NR_mount_setattr
+    __NR_mount_setattr,
+#endif
+    /* Quotas and swap name a block device by path and are the same story. */
+    __NR_quotactl,
+#ifdef __NR_quotactl_fd
+    __NR_quotactl_fd,
+#endif
+    __NR_swapon,
+    __NR_swapoff,
     /* Path-bearing syscalls we do not model. Each takes a path or names a mount
      * and would otherwise reach the host filesystem untranslated; all are
      * privileged in practice, so an unprivileged guest saw EPERM rather than an

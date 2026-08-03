@@ -350,6 +350,11 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
 #ifdef __NR_mq_timedsend
             {"mq_timedsend", __NR_mq_timedsend},
 #endif
+            {"mount", __NR_mount},
+            {"umount2", __NR_umount2},
+            {"pivot_root", __NR_pivot_root},
+            {"quotactl", __NR_quotactl},
+            {"swapon", __NR_swapon},
         };
         int fails = 0;
         for (unsigned i = 0; i < sizeof d / sizeof *d; i++) {
