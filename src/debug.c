@@ -268,6 +268,21 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
                                   0, 0);
         long r_self = cng_dispatch(__NR_openat, d, (long)"self/status",
                                    CNG_O_RDONLY, 0, 0, 0, 0);
+        /* The fd links are the sharp end: they are answered as HOST paths, so
+         * the kernel takes one straight to the open file description it names.
+         * A hidden process's must be ENOENT — not EACCES, which would mean we
+         * reached it and only DAC turned us away. pid 1 is never a guest
+         * process and always exists, so it is the honest thing to ask about. */
+        char lb[CNG_PATH_MAX];
+        long fd_for = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD,
+                                   (long)"/proc/1/fd/0", (long)lb, sizeof lb, 0,
+                                   0, 0);
+        long fd_open = cng_dispatch(__NR_openat, CNG_AT_FDCWD,
+                                    (long)"/proc/1/fd/0", CNG_O_RDONLY, 0, 0, 0,
+                                    0);
+        long fd_own = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD,
+                                   (long)"/proc/self/fd/1", (long)lb, sizeof lb,
+                                   0, 0, 0);
         if (a_for >= 0)
             sys_close((int)a_for);
         if (r_for >= 0)
@@ -276,13 +291,18 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
             sys_close((int)r_own);
         if (r_self >= 0)
             sys_close((int)r_self);
+        if (fd_open >= 0)
+            sys_close((int)fd_open);
         sys_close((int)d);
         int ok = a_for < 0 && r_for < 0 && r_bare < 0 && r_own >= 0 &&
-                 r_self >= 0;
+                 r_self >= 0 && fd_for == -ENOENT && fd_open == -ENOENT &&
+                 fd_own > 0;
         cng_dprintf(1,
-                    "prochide: abs=%d rel=%d bare=%d own=%d self=%d -> %s\n",
+                    "prochide: abs=%d rel=%d bare=%d own=%d self=%d "
+                    "fdlink=%d fdopen=%d ownfd=%d -> %s\n",
                     (int)a_for, (int)r_for, (int)r_bare, r_own >= 0,
-                    r_self >= 0, ok ? "OK" : "FAIL");
+                    r_self >= 0, (int)fd_for, (int)fd_open, fd_own > 0,
+                    ok ? "OK" : "FAIL");
         return ok ? 0 : 1;
     }
     if (!strcmp(op, "inotify")) {

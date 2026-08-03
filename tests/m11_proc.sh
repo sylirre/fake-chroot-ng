@@ -29,8 +29,14 @@ check_contains "a /proc listing drops host pids, keeps guest ones" \
 # path to resolve against — so a relative name under one went to the kernel
 # untouched and read the process the absolute spelling had just refused. Our own
 # entry must still be reachable both ways, or the fix would hide everything.
-check_contains "a host pid stays hidden through a /proc dirfd too" \
-    "prochide: abs=-2 rel=-2 bare=-2 own=1 self=1 -> OK" \
+# ...and the fd links, which are the sharp end of the same thing: they are
+# answered as HOST paths, so the kernel takes one straight to the open file
+# description it names. A hidden process's descriptors were readable by pid and
+# number — the host file itself, wherever on the filesystem it lived. ENOENT is
+# the required answer, not EACCES: that would mean we reached it and only DAC
+# turned us away.
+check_contains "a host pid stays hidden through a /proc dirfd and its fd links" \
+    "prochide: abs=-2 rel=-2 bare=-2 own=1 self=1 fdlink=-2 fdopen=-2 ownfd=1 -> OK" \
     "$(run -t dtest -r "$PT" prochide / 2>&1)"
 check_contains "cmdline is the guest argv, not the chroot-ng invocation" \
     "proctest cmdline: 24 bytes argv0=/bin/busybox -> OK" "$out"

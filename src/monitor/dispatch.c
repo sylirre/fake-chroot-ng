@@ -174,9 +174,33 @@ static size_t proc_pid_prefix(const char *p, int self_only) {
 
 /* Classify (and for the guest-visible links rewrite in place) a canonical
  * guest path that starts with a /proc magic link. See PROC_MAGIC_*. */
+/* May the guest see the process a "/proc/<pid|self|thread-self>/" prefix names?
+ * Its own two spellings always; another pid only where the registry knows it as
+ * a guest process of this session. */
+static int proc_pid_visible(const char *canon) {
+    if (proc_pid_prefix(canon, 1))
+        return 1; /* self / thread-self */
+    long pid = 0;
+    for (const char *q = canon + 6; *q >= '0' && *q <= '9'; q++) {
+        pid = pid * 10 + (*q - '0');
+        if (pid > 0x7fffffff)
+            return 0;
+    }
+    return cng_procreg_has((int)pid);
+}
+
 static int proc_magic(char *cur, size_t sz) {
     size_t pl = proc_pid_prefix(cur, 0);
     if (!pl)
+        return PROC_MAGIC_NONE;
+    /* A process the guest may not see has no magic links either. The hidden
+     * view is applied by cng_fs_translate, and PROC_MAGIC_HOST is precisely the
+     * verdict that skips it — so without this the fd branch below handed back
+     * "/proc/<hostpid>/fd/<n>" as a host path and the kernel took it straight
+     * to that process's open file description. A hidden process's open files
+     * were readable by pid and descriptor number, anywhere on the host
+     * filesystem and whatever the rootfs was. */
+    if (!proc_pid_visible(cur))
         return PROC_MAGIC_NONE;
     const char *rest = cur + pl;
 
