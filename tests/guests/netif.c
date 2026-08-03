@@ -68,6 +68,15 @@ int main(void) {
         printf("getsockname: len=%d family=%d\n", (int)glen,
                (int)got.nl_family);
 
+    /* accept(2) does not apply to a datagram socket, and netlink is one. The
+     * stand-in is a socketpair end the kernel would refuse for the same reason,
+     * but the kernel never sees the call — so the refusal has to be ours. */
+    socklen_t alen = sizeof got;
+    int ac = accept(fd, (struct sockaddr *)&got, &alen);
+    printf("accept: rc=%d errno=%d\n", ac, ac < 0 ? errno : 0);
+    if (ac >= 0)
+        close(ac);
+
     struct {
         struct nlmsghdr nlh;
         struct rtgenmsg g;

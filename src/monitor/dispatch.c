@@ -2257,6 +2257,13 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 long e = cng_nl_srcaddr((int)a0, (void *)aa, (unsigned *)alp);
                 return e ? e : out;
             }
+            /* accept(2) does not apply to a datagram socket, and netlink is
+             * one. The stand-in is a socketpair end, so the kernel would have
+             * refused it for us — but it never sees the call, and answering
+             * with a sockaddr_nl and success would hand back fd 0 as if it were
+             * a connection. EOPNOTSUPP is what the family answers. */
+            if (nr == __NR_accept || nr == __NR_accept4)
+                return -EOPNOTSUPP;
             /* getsockname/getpeername must report a sockaddr_nl: the real
              * AF_UNIX answer is 2 bytes and iproute2 refuses it. */
             return cng_nl_getname((int)a0, (void *)aa, (unsigned *)alp);

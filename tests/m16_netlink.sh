@@ -66,6 +66,11 @@ else
         # the underlying AF_UNIX socket would report 2 bytes.
         check_contains "m16 getsockname reports a 12-byte sockaddr_nl" \
             "getsockname: len=12 family=16" "$em"
+        # accept(2) does not apply to a datagram socket, and netlink is one.
+        # The stand-in shares the getsockname branch, so it used to answer
+        # success with a sockaddr_nl — handing back fd 0 as a connection.
+        check_contains "m16 accept on a netlink socket is EOPNOTSUPP" \
+            "accept: rc=-1 errno=95" "$em"
         # A dump the guest can parse: messages present, its own sequence number
         # echoed, and real RTM_NEWLINK records in it.
         check_contains "m16 an RTM_GETLINK dump is relayed and parseable" \
