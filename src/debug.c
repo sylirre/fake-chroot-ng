@@ -983,6 +983,14 @@ int cng_cmd_faulttest(int argc, char **argv, char **envp, unsigned long *auxv) {
         {"readlinkat",
          cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD, (long)"/proc/self/cwd",
                       (long)bad, 4096, 0, 0, 1)},
+        /* And the path argument of an ordinary path syscall: the resolver
+         * copies up to 4 KiB out of it long before the kernel sees it. */
+        {"openat path",
+         cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)bad, CNG_O_RDONLY, 0, 0,
+                      0, 1)},
+        {"renameat path2",
+         cng_dispatch(__NR_renameat, CNG_AT_FDCWD, (long)"/tmp",
+                      CNG_AT_FDCWD, (long)bad, 0, 0, 1)},
         /* execve walks argv/envp itself — the kernel never sees them — so both
          * the vector and the strings it points at have to be validated. */
         {"execve path",

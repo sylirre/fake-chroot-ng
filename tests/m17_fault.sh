@@ -33,8 +33,8 @@ case "$out" in
     check_absent "no case faulted on the fallback" "FAIL" "$memfd_out"
     check_absent "no case faulted" "FAIL" "$out"
     for _c in rt_sigaction rt_sigprocmask getcwd getresuid getresgid \
-        setgroups getgroups capget shmctl sendmsg readlinkat "execve path" \
-        "execve argv" "execve argv string"; do
+        setgroups getgroups capget shmctl sendmsg readlinkat "openat path" \
+        "renameat path2" "execve path" "execve argv" "execve argv string"; do
         check_contains "$_c answers EFAULT" "faulttest $_c=-14 want=-14 -> OK" \
             "$out"
     done

@@ -1245,6 +1245,23 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     struct path_args pa;
     path_args_of(nr, a0, a1, a2, a3, &pa);
 
+    /* The path itself is guest memory, and everything below reads it — the
+     * empty test right here, the l2s check, the resolver's 4 KiB copy — before
+     * the kernel has been given a chance to validate anything. A pointer into
+     * nothing, or a string with no terminator before the end of its mapping,
+     * is what the kernel answers -EFAULT and -ENAMETOOLONG for; here it faulted
+     * inside the handler, where SIGSEGV is masked and the fault is the death of
+     * the guest. So measure it first, without ever reading past accessible
+     * memory (cng_user_strlen), and give the two answers the kernel gives. */
+    if (pa.p1 || pa.p2) {
+        long n1 = pa.p1 ? cng_user_strlen(pa.p1, CNG_PATH_MAX) : 0;
+        long n2 = pa.p2 ? cng_user_strlen(pa.p2, CNG_PATH_MAX) : 0;
+        if (n1 < 0 || n2 < 0) {
+            long e = n1 < 0 ? n1 : n2;
+            return e == -E2BIG ? -ENAMETOOLONG : e;
+        }
+    }
+
     /* An empty pathname is ENOENT to the kernel — the one answer every
      * path-bearing syscall agrees on — except where AT_EMPTY_PATH (or
      * readlinkat) makes the dirfd the subject. Without this the resolver made
