@@ -197,6 +197,13 @@ static const int enosys_syscalls[] = {
 #ifdef __NR_mount_setattr
     __NR_mount_setattr,
 #endif
+    /* Process accounting names a file by path and is the same story — the last
+     * path-bearing syscall in the table that was neither trapped nor refused.
+     * It is also the one that cannot be translated even in principle: what it
+     * turns on is a machine-wide kernel setting with one file behind it, not
+     * something a rootfs can hold a private copy of, so re-rooting the name
+     * would merely put the *host's* accounting records inside the guest. */
+    __NR_acct,
     /* Quotas and swap name a block device by path and are the same story. */
     __NR_quotactl,
 #ifdef __NR_quotactl_fd

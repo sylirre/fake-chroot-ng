@@ -395,6 +395,7 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
             {"pivot_root", __NR_pivot_root},
             {"quotactl", __NR_quotactl},
             {"swapon", __NR_swapon},
+            {"acct", __NR_acct},
         };
         int fails = 0;
         for (unsigned i = 0; i < sizeof d / sizeof *d; i++) {
@@ -3273,6 +3274,12 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
         {"in-gate io_uring is refused too", __NR_io_uring_setup, gate, 0,
          CNG_SECCOMP_RET_ERRNO | 38},
 #endif
+        /* acct(2) carries a path and reached the host with the guest's own
+         * spelling: unprivileged that is EPERM, but chroot-ng run as root would
+         * have turned on the machine's process accounting to whatever the guest
+         * named. */
+        {"acct is refused ENOSYS", __NR_acct, 0x1000, 0,
+         CNG_SECCOMP_RET_ERRNO | 38},
         /* clone3 carries its flags behind a pointer, so BPF cannot tell a
          * thread from a vfork. Refusing it puts glibc's posix_spawn and
          * pthread_create back on __NR_clone, which the conversion below

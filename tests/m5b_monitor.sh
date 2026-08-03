@@ -269,6 +269,13 @@ check_contains "io_uring is refused even from inside the gate" \
 # reach the emulated execve and load the new program over its parent.
 check_contains "clone3 is refused so spawns use the converted clone path" \
     "bpftest clone3 is refused ENOSYS: ERRNO -> OK" "$out"
+# acct(2) names a file, and was the last path-bearing syscall in the table that
+# was neither trapped nor refused: unprivileged it is EPERM, but chroot-ng run
+# as root would have pointed the machine's process accounting at whatever the
+# guest named. It cannot be translated either -- there is one such file per
+# machine, so re-rooting the name only files the host's records in the guest.
+check_contains "acct is refused ENOSYS by the filter" \
+    "bpftest acct is refused ENOSYS: ERRNO -> OK" "$out"
 # A guest-installed filter also governs the syscalls the SIGSYS handler
 # re-issues through the gate, which that filter knows nothing about -- so
 # seccomp(2) is refused outright. prctl carries the same capability under an op
@@ -340,4 +347,5 @@ check_contains "umount2 likewise" "denied umount2: rc=-38 -> OK" "$out"
 check_contains "pivot_root likewise" "denied pivot_root: rc=-38 -> OK" "$out"
 check_contains "quotactl likewise" "denied quotactl: rc=-38 -> OK" "$out"
 check_contains "swapon likewise" "denied swapon: rc=-38 -> OK" "$out"
+check_contains "acct likewise" "denied acct: rc=-38 -> OK" "$out"
 rm -rf "$DR"
