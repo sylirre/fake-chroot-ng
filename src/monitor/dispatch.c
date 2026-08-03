@@ -665,6 +665,23 @@ static int name_may_overlay(const char *name) {
     return 0;
 }
 
+/* Is any bind in the view read-only? The :ro refusal is keyed on the resolved
+ * HOST path, and a dirfd-relative name that needs no walk never acquires one —
+ * so every mutating *at call made against a directory fd inside the bind went
+ * straight through to the host, and the mount was read-only only to whoever
+ * spelled the name out in full. That is not a corner: `rm -rf`, `find -delete`,
+ * tar, rsync and git all open a directory once and work relative to it.
+ *
+ * A resolution is the only thing that produces a host path, so a session that
+ * asked for :ro pays for one per relative name. Sessions without one, which is
+ * the default, are untouched. */
+static int fs_has_ro(void) {
+    for (int i = 0; cng_g_fs && i < cng_g_fs->nbinds; i++)
+        if (cng_g_fs->binds[i].ro)
+            return 1;
+    return 0;
+}
+
 /* Does a dirfd-relative name need the guest-side walk above, or can the kernel
  * be trusted with it? The dirfd itself already points inside the guest view, so
  * only three things can redirect out of it: a ".." component, a symlink, and a
@@ -677,6 +694,8 @@ static int name_may_overlay(const char *name) {
  *    dirent to find it by: without this `fstatat(dirfd("/dev"), "zero")` and
  *    `fstatat(dirfd("/"), "<bind>")` answered ENOENT for entries the same
  *    absolute path opens fine — which is exactly what `ls -l` asks;
+ *  - a :ro bind anywhere in the view => walk, since the refusal needs a host
+ *    path to key on (see fs_has_ro);
  *  - otherwise a single component, and only its own symlink can escape: one
  *    readlinkat settles it. EINVAL (not a symlink) and ENOENT (nothing there)
  *    are safe for the kernel to finish; a real link needs the walk. */
@@ -687,6 +706,8 @@ static int at_needs_xlate(int dfd, const char *path, int deref) {
     if (path[0] == '.' && path[1] == '.' && !path[2])
         return 1;
     if (name_may_overlay(path))
+        return 1;
+    if (fs_has_ro())
         return 1;
     if (!deref)
         return 0;

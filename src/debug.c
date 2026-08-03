@@ -379,6 +379,52 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
         char sib[CNG_PATH_MAX];
         size_t gl = cng_strlcpy(sib, gpath, sizeof sib);
         cng_strlcpy(sib + gl, ".x", sizeof sib - gl);
+        int fails = 0;
+
+        /* First, the same calls made *relative to a directory fd* inside the
+         * bind, which is how rm -rf, find -delete, tar and git all work. The
+         * refusal keys on the resolved HOST path, and a plain relative name used
+         * to be handed to the kernel without ever acquiring one — so these went
+         * straight through and the unlink really removed the file. Run before
+         * the absolute set below, which in the rw control leg deletes it. */
+        long rofd = cng_dispatch(__NR_openat, CNG_AT_FDCWD,
+                                 (long)(fs.nbinds > 0 ? fs.binds[0].guest : "/"),
+                                 CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+        const char *base = strrchr(gpath, '/');
+        base = base ? base + 1 : gpath;
+        /* The unlink leg gets a name of its own: in the rw control run it really
+         * removes what it names, and the absolute set below still needs the
+         * original. Creating it is itself one of the calls under test. */
+        char atsib[128];
+        size_t bl = cng_strlcpy(atsib, base, sizeof atsib);
+        cng_strlcpy(atsib + bl, ".at", sizeof atsib - bl);
+        struct {
+            const char *name;
+            long r;
+        } at[] = {
+            {"at-read", cng_dispatch(__NR_openat, rofd, (long)base,
+                                     CNG_O_RDONLY, 0, 0, 0, 0)},
+            {"at-open-w", cng_dispatch(__NR_openat, rofd, (long)base,
+                                       CNG_O_WRONLY, 0, 0, 0, 0)},
+            {"at-creat", cng_dispatch(__NR_openat, rofd, (long)atsib,
+                                      CNG_O_WRONLY | CNG_O_CREAT, 0644, 0, 0,
+                                      0)},
+            {"at-unlink", cng_dispatch(__NR_unlinkat, rofd, (long)atsib, 0, 0, 0,
+                                       0, 0)},
+        };
+        if (rofd >= 0)
+            sys_close((int)rofd);
+        for (unsigned i = 0; i < sizeof at / sizeof *at; i++) {
+            int is_read = !strcmp(at[i].name, "at-read");
+            int ok = is_read ? at[i].r >= 0
+                             : (ro ? at[i].r == -EROFS : at[i].r != -EROFS);
+            if (at[i].r >= 0 && strcmp(at[i].name, "at-unlink"))
+                sys_close((int)at[i].r);
+            cng_dprintf(1, "robind %s %s: rc=%d -> %s\n", ro ? "ro" : "rw",
+                        at[i].name, (int)at[i].r, ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+
         struct {
             const char *name;
             long r;
@@ -414,7 +460,6 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
             {"fchownat", cng_dispatch(__NR_fchownat, CNG_AT_FDCWD, (long)gpath, 0,
                                       0, 0, 0, 0)},
         };
-        int fails = 0;
         for (unsigned i = 0; i < sizeof t / sizeof *t; i++) {
             int is_read = !strcmp(t[i].name, "read") ||
                           !strcmp(t[i].name, "access-r");

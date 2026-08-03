@@ -146,6 +146,18 @@ check_contains ":ro bind reports itself to access(W_OK)" \
     "robind ro access-w: rc=-30 -> OK" "$out"
 check_contains ":ro bind still answers access(R_OK)" \
     "robind ro access-r: rc=0 -> OK" "$out"
+# The refusal keys on the resolved HOST path, and a plain name against a
+# directory fd inside the bind never used to acquire one — so it went straight
+# to the kernel and the mount was read-only only to whoever spelled the name out
+# in full. rm -rf, find -delete, tar and git all work through a dirfd.
+check_contains ":ro bind refuses a write open through a dirfd" \
+    "robind ro at-open-w: rc=-30 -> OK" "$out"
+check_contains ":ro bind refuses a create through a dirfd" \
+    "robind ro at-creat: rc=-30 -> OK" "$out"
+check_contains ":ro bind refuses an unlink through a dirfd" \
+    "robind ro at-unlink: rc=-30 -> OK" "$out"
+check_contains ":ro bind still reads through a dirfd" \
+    "robind ro at-read: rc=" "$out"
 out=$(run -t dtest -r "$ROOT" -b "$RB":/rw robind /rw/f 2>&1); rc=$?
 check "a plain (rw) bind reports no EROFS" 0 "$rc"
 rm -rf "$RB"
