@@ -1,10 +1,18 @@
-# Make clangd resolve headers/types the way the cross build does.
+# The compile flags live in compile_flags.txt, not here — see below.
+#
+# clangd resolves a relative -I against the compile command's working
+# directory, and with no compilation database that directory is the *source
+# file's own*. So `-Iinclude` here resolved to src/monitor/include for every
+# file under src/monitor, each "cng/*.h" came back not-found, and with the
+# types gone nothing else in the translation unit could be checked either — so
+# the whole file lit up. compile_flags.txt does not have that problem: the
+# directory holding it is the working directory, so `-Iinclude` names the
+# include/ it sits next to, whatever the depth of the file being opened.
+#
+# What stays here is what that file cannot express. A compile_commands.json
+# generated from the real build (`bear -- make`) takes precedence over
+# compile_flags.txt, and would carry the gcc-only flag the Makefile probes for
+# — which clang does not ignore but rejects, taking the whole command with it.
 CompileFlags:
-  Add:
-    - -xc
-    - -Iinclude
-    - --target=aarch64-linux-gnu
-    - -ffreestanding
-    - -nostdlib
-    - -std=gnu11
-    - -D__aarch64__
+  Remove:
+    - -fno-tree-loop-distribute-patterns

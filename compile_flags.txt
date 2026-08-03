@@ -1,0 +1,8 @@
+--target=aarch64-linux-gnu
+-std=gnu11
+-ffreestanding
+-fno-builtin
+-Iinclude
+-Wall
+-Wextra
+-Wno-unused-parameter
