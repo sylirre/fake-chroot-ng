@@ -2313,6 +2313,98 @@ int cng_cmd_argvtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     return ok ? 0 : 1;
 }
 
+/* _elfspan — the span the loader reserves has to cover every byte it then
+ * writes into that reserve.
+ *
+ * The kernel maps each PT_LOAD on its own, so a p_filesz reaching past p_memsz
+ * costs it nothing; here there is one reservation and everything is pread into
+ * it, so a span sized from p_memsz alone left the file part writing past the
+ * end. Build exactly that object — one PT_LOAD, 128 KiB of file behind a 4 KiB
+ * memory image — load it, and check the last file byte arrived. Before the fix
+ * the reserve was a single page and the pread ran off it: -EFAULT partway
+ * through and a short read (CNG_LOAD_EIO), or, with something mapped after, no
+ * error at all and that mapping quietly overwritten.
+ *
+ * A memfd rather than a path: the object never has to exist in a rootfs, and
+ * the fd form is the one the emulated execve uses for /proc/self/fd targets. */
+#define ELFSPAN_FILESZ 0x20000u
+#define ELFSPAN_MEMSZ  0x1000u
+#define ELFSPAN_MARK   0x5Au
+
+int cng_cmd_elfspan(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    long fd = sys_memfd_create("cng-elfspan", 0);
+    if (fd < 0) {
+        cng_dprintf(1, "elfspan: memfd_create errno=%d -> SKIP\n", (int)-fd);
+        return 0;
+    }
+
+    unsigned char hdr[0x78];
+    memset(hdr, 0, sizeof hdr);
+    hdr[0] = 0x7f;
+    hdr[1] = 'E';
+    hdr[2] = 'L';
+    hdr[3] = 'F';
+    hdr[4] = 2; /* ELFCLASS64 */
+    hdr[5] = 1; /* ELFDATA2LSB */
+    hdr[6] = 1; /* EV_CURRENT */
+    *(unsigned short *)(hdr + 16) = 3;   /* e_type = ET_DYN */
+    *(unsigned short *)(hdr + 18) = 183; /* e_machine = EM_AARCH64 */
+    *(unsigned *)(hdr + 20) = 1;         /* e_version */
+    *(unsigned long *)(hdr + 32) = 0x40; /* e_phoff */
+    *(unsigned short *)(hdr + 52) = 64;  /* e_ehsize */
+    *(unsigned short *)(hdr + 54) = 56;  /* e_phentsize */
+    *(unsigned short *)(hdr + 56) = 1;   /* e_phnum */
+    unsigned char *p = hdr + 0x40;
+    *(unsigned *)(p + 0) = 1; /* p_type = PT_LOAD */
+    *(unsigned *)(p + 4) = 6; /* p_flags = PF_R|PF_W (never PF_X: an executable
+                               * segment would draw the -R trampoline pool in
+                               * after the span and hide the overrun) */
+    *(unsigned long *)(p + 8) = 0;                /* p_offset */
+    *(unsigned long *)(p + 16) = 0;               /* p_vaddr */
+    *(unsigned long *)(p + 24) = 0;               /* p_paddr */
+    *(unsigned long *)(p + 32) = ELFSPAN_FILESZ;  /* p_filesz */
+    *(unsigned long *)(p + 40) = ELFSPAN_MEMSZ;   /* p_memsz  < p_filesz */
+    *(unsigned long *)(p + 48) = 0x1000;          /* p_align */
+
+    if (cng_write_all((int)fd, hdr, sizeof hdr) != (long)sizeof hdr) {
+        cng_dprintf(1, "elfspan: short header write -> FAIL\n");
+        sys_close((int)fd);
+        return 1;
+    }
+    /* Pad out to p_filesz, ending in a byte we can look for in memory. */
+    static unsigned char pad[4096];
+    memset(pad, 0, sizeof pad);
+    unsigned long left = ELFSPAN_FILESZ - sizeof hdr;
+    while (left) {
+        unsigned long k = left > sizeof pad ? sizeof pad : left;
+        if (k == left)
+            pad[k - 1] = ELFSPAN_MARK;
+        if (cng_write_all((int)fd, pad, k) != (long)k) {
+            cng_dprintf(1, "elfspan: short pad write -> FAIL\n");
+            sys_close((int)fd);
+            return 1;
+        }
+        left -= k;
+    }
+
+    struct cng_loaded prog;
+    int rc = cng_load_elf_fd((int)fd, 0, &prog);
+    sys_close((int)fd);
+
+    int tail = 0;
+    if (rc == CNG_LOAD_OK)
+        tail = *(unsigned char *)(prog.base + ELFSPAN_FILESZ - 1) ==
+               ELFSPAN_MARK;
+    int ok = rc == CNG_LOAD_OK && tail;
+    cng_dprintf(1, "elfspan: rc=%d tail=%d -> %s\n", rc, tail,
+                ok ? "OK" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 /* _clonetest — a CLONE_VFORK|CLONE_VM clone must be converted to a real (COW)
  * fork by the dispatcher, so the child gets a private address space (our
  * emulated execve would otherwise corrupt the shared parent). Verify the child

@@ -229,8 +229,32 @@ int cng_load_elf_fd(int fd, unsigned long base_hint, struct cng_loaded *out) {
         if (ph[i].p_type != PT_LOAD)
             continue;
         nload++;
+        /* The span has to cover every byte that gets written into it, and what
+         * is written is p_filesz — the kernel maps each segment on its own, so
+         * a p_filesz past p_memsz costs it nothing, while here it is the one
+         * reserve everything lands in. Sized from p_memsz alone, a header
+         * claiming filesz=2 MiB and memsz=4 KiB reserved a page and then had
+         * read_exact pread 2 MiB of file into it, straight through whatever the
+         * kernel had placed after. Take the larger of the two: no real object
+         * has filesz above memsz (0 of 16515 in a Debian + Alpine tree), so
+         * this refuses nothing that ever loaded, and a malformed one is now
+         * merely wrong rather than out of bounds.
+         *
+         * Overflow is the same question one step out: p_vaddr and the sizes are
+         * attacker-chosen 64-bit values, and a sum that wraps yields an `e`
+         * below `lo` and a span that is not the range we then write into. */
+        unsigned long fill = ph[i].p_filesz > ph[i].p_memsz ? ph[i].p_filesz
+                                                            : ph[i].p_memsz;
+        if (ph[i].p_vaddr + fill < ph[i].p_vaddr) {
+            rc = CNG_LOAD_EFORMAT;
+            goto out;
+        }
         unsigned long s = cng_page_down(ph[i].p_vaddr);
-        unsigned long e = cng_page_up(ph[i].p_vaddr + ph[i].p_memsz);
+        unsigned long e = cng_page_up(ph[i].p_vaddr + fill);
+        if (e < s) { /* cng_page_up wrapped at the top of the address space */
+            rc = CNG_LOAD_EFORMAT;
+            goto out;
+        }
         if (s < lo)
             lo = s;
         if (e > hi)

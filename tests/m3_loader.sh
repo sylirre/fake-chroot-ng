@@ -57,3 +57,16 @@ if [ -n "$GUESTCC" ] &&
 else
     skip "ET_EXEC leg: no -static -no-pie AArch64 toolchain"
 fi
+
+# The reserved span has to cover every byte the loader then writes into it.
+# A PT_LOAD may name more file bytes than memory bytes; the kernel maps each
+# segment separately so that costs it nothing, but here one reservation is sized
+# from the segment list and everything is pread into it — sized from p_memsz
+# alone, the file part ran off the end, into whatever the kernel had placed
+# after. Answered by the loader directly (`-t elfspan` builds the object in a
+# memfd), since no toolchain emits one and no rootfs need hold it.
+run -t elfspan >/dev/null 2>&1
+check "a PT_LOAD whose file part exceeds its memory part stays in its reserve" \
+    0 $?
+check_contains "...and every byte of it arrived" "rc=0 tail=1" \
+    "$(run -t elfspan 2>&1)"
