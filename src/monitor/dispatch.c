@@ -1459,9 +1459,14 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
 #endif
         long r = reissue(dfd, (long)p, a2, fl, a4, a5, nr);
         if (r < 0 && cng_fake_root()) {
+            /* Root's DAC bypass, applied to the file the check asked about:
+             * under AT_SYMLINK_NOFOLLOW that is the symlink itself, so the
+             * stat has to carry the flag too or the mode it reads — and the
+             * X_OK verdict drawn from it — belongs to the target instead. */
             char sb[128]; /* AArch64 struct stat is 128 bytes */
-            if (reissue(dfd, (long)p, (long)sb, 0, 0, 0, __NR_newfstatat) ==
-                0) {
+            if (reissue(dfd, (long)p, (long)sb,
+                        fl & CNG_AT_SYMLINK_NOFOLLOW, 0, 0,
+                        __NR_newfstatat) == 0) {
                 unsigned mode = *(unsigned *)(sb + STAT_MODE_OFF);
                 if (((int)a2 & CNG_X_OK) && !(mode & 0111))
                     return -EACCES;
