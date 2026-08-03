@@ -1146,6 +1146,11 @@ int cng_cmd_prctltest(int argc, char **argv, char **envp, unsigned long *auxv) {
          cng_dispatch(__NR_prctl, CNG_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0, 0, 1), 0},
         {"GET_NO_NEW_PRIVS after the guest set it",
          cng_dispatch(__NR_prctl, CNG_PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0, 0, 1), 1},
+        /* The getter takes no arguments, and the kernel refuses a call that
+         * supplies any — the same check the setter beside it already made. */
+        {"GET_NO_NEW_PRIVS with a stray argument is EINVAL",
+         cng_dispatch(__NR_prctl, CNG_PR_GET_NO_NEW_PRIVS, 0, 1, 0, 0, 0, 1),
+         -EINVAL},
         {"seccomp(2) refused",
          cng_dispatch(__NR_seccomp, CNG_SECCOMP_SET_MODE_FILTER, 0, 0, 0, 0, 0,
                       1),

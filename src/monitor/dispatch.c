@@ -2799,6 +2799,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             guest_nnp = 1;
             return 0; /* already set for real, at install */
         case CNG_PR_GET_NO_NEW_PRIVS:
+            if (a1 || a2 || a3 || a4)
+                return -EINVAL; /* the kernel's own check, as for the setter */
             return guest_nnp;
         }
         return reissue(a0, a1, a2, a3, a4, a5, nr);

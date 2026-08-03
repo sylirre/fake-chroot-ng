@@ -20,6 +20,8 @@ check_contains "a guest filter is refused" \
 check_contains "seccomp(2) is ENOSYS" "prctltest seccomp(2) refused=-38" "$out"
 check_contains "the guest's own no_new_privs is remembered" \
     "prctltest GET_NO_NEW_PRIVS after the guest set it=1" "$out"
+check_contains "the getter refuses a stray argument, as the setter does" \
+    "prctltest GET_NO_NEW_PRIVS with a stray argument is EINVAL=-22" "$out"
 check_contains "an op we do not own still reaches the kernel" \
     "prctltest SET_NAME passthrough rc=0 comm=cngprctl" "$out"
 # (the filter side — which prctl ops trap at all — is asserted with the rest of
