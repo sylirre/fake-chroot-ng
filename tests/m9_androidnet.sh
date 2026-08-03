@@ -9,5 +9,11 @@ check_contains "gate-trapped reissue -> ENOSYS" "gate-net: regs0=-38" "$nettest_
 # requested set to the writability probe, which validates by zeroing.
 check_contains "an aliased sigprocmask unblocks only what it named" \
     "nettest sigprocmask aliased: mask=0x800 old=0xa00 -> OK" "$nettest_out"
+# ...and the argument checks the kernel makes before it changes anything. The
+# call never reaches it, so a wrong sigsetsize passed silently and an out-of-
+# range `how` was taken as SIG_SETMASK — replacing the mask, not adding to it.
+check_contains "sigprocmask refuses a bad sigsetsize and a bad how" \
+    "nettest sigprocmask args: size=-22 kept=1 how=-22 kept=1 -> OK" \
+    "$nettest_out"
 run -t blocktest >/dev/null 2>&1
 check "blocklist gates reissue -> ENOSYS" 0 $?

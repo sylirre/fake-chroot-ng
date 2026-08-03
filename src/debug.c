@@ -2194,6 +2194,7 @@ int cng_cmd_nettest(int argc, char **argv, char **envp, unsigned long *auxv) {
         uc.uc_mcontext.regs[8] = __NR_rt_sigprocmask;
         uc.uc_mcontext.regs[0] = 2; /* SIG_SETMASK */
         uc.uc_mcontext.regs[1] = (unsigned long)&block_all;
+        uc.uc_mcontext.regs[3] = sizeof(cng_sigset_t);
         uc.uc_sigmask.sig[0] = 0;
         cng_sigsys_body(&uc, &si);
         int sigsys_blocked = (uc.uc_sigmask.sig[0] >> (CNG_SIGSYS - 1)) & 1;
@@ -2222,12 +2223,59 @@ int cng_cmd_nettest(int argc, char **argv, char **envp, unsigned long *auxv) {
         uc.uc_mcontext.regs[0] = 1; /* SIG_UNBLOCK */
         uc.uc_mcontext.regs[1] = (unsigned long)&m;
         uc.uc_mcontext.regs[2] = (unsigned long)&m; /* the same variable */
+        uc.uc_mcontext.regs[3] = sizeof(cng_sigset_t);
         uc.uc_sigmask.sig[0] = usr1 | usr2;
         cng_sigsys_body(&uc, &si);
         int ok = (long)uc.uc_mcontext.regs[0] == 0 &&
                  uc.uc_sigmask.sig[0] == usr2 && m == (usr1 | usr2);
         cng_dprintf(1, "nettest sigprocmask aliased: mask=0x%lx old=0x%lx -> %s\n",
                     uc.uc_sigmask.sig[0], m, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+    /* 2e) the two argument checks the kernel makes before it changes anything:
+     * a sigsetsize that is not its own, and a `how` outside the three it
+     * defines. This call is answered entirely in the handler, so nothing else
+     * was going to make them — a bad size passed silently, and any other `how`
+     * was taken as SIG_SETMASK, which REPLACES the mask a miscalled SIG_BLOCK
+     * meant to add to. Both must leave the mask exactly as it was. */
+    {
+        struct cng_ucontext uc;
+        cng_siginfo_t si;
+        unsigned long usr1 = 1UL << (CNG_SIGUSR1 - 1);
+        unsigned long set = 0;
+        long bad_size, bad_how;
+        int kept_size, kept_how;
+        memset(&si, 0, sizeof si);
+        si.si_code = CNG_SYS_SECCOMP;
+        si._u._sigsys.call_addr = (void *)0x1000;
+
+        memset(&uc, 0, sizeof uc);
+        uc.uc_mcontext.regs[8] = __NR_rt_sigprocmask;
+        uc.uc_mcontext.regs[0] = 2; /* SIG_SETMASK */
+        uc.uc_mcontext.regs[1] = (unsigned long)&set;
+        uc.uc_mcontext.regs[3] = 4; /* not the kernel's sigset_t */
+        uc.uc_sigmask.sig[0] = usr1;
+        cng_sigsys_body(&uc, &si);
+        bad_size = (long)uc.uc_mcontext.regs[0];
+        kept_size = uc.uc_sigmask.sig[0] == usr1;
+
+        memset(&uc, 0, sizeof uc);
+        uc.uc_mcontext.regs[8] = __NR_rt_sigprocmask;
+        uc.uc_mcontext.regs[0] = 7; /* no such `how` */
+        uc.uc_mcontext.regs[1] = (unsigned long)&set;
+        uc.uc_mcontext.regs[3] = sizeof(cng_sigset_t);
+        uc.uc_sigmask.sig[0] = usr1;
+        cng_sigsys_body(&uc, &si);
+        bad_how = (long)uc.uc_mcontext.regs[0];
+        kept_how = uc.uc_sigmask.sig[0] == usr1;
+
+        int ok = bad_size == -EINVAL && kept_size && bad_how == -EINVAL &&
+                 kept_how;
+        cng_dprintf(1,
+                    "nettest sigprocmask args: size=%d kept=%d how=%d kept=%d "
+                    "-> %s\n",
+                    (int)bad_size, kept_size, (int)bad_how, kept_how,
+                    ok ? "OK" : "FAIL");
         fails += !ok;
     }
     /* 3) guest-directed SIGSYS (si_code != SYS_SECCOMP) -> untouched. */

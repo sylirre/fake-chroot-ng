@@ -2577,7 +2577,12 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * uc_sigmask): apply the mask but never block SIGSYS. */
     case __NR_rt_sigprocmask: {
         int how = (int)a0;
-        if ((how == 0 /*BLOCK*/ || how == 2 /*SETMASK*/) && a1) {
+        /* Only a sigsetsize the kernel accepts gets the copy: for any other the
+         * mask is not eight bytes wide, and reading it as if it were turns the
+         * kernel's -EINVAL into an -EFAULT of ours whenever those bytes happen
+         * to end a mapping. Handed straight over, the kernel refuses it. */
+        if ((how == 0 /*BLOCK*/ || how == 2 /*SETMASK*/) && a1 &&
+            (unsigned long)a3 == sizeof(unsigned long)) {
             if (!cng_user_readable((void *)a1, sizeof(unsigned long)))
                 return -EFAULT;
             unsigned long set = *(unsigned long *)a1 & ~(1UL << (CNG_SIGSYS - 1));

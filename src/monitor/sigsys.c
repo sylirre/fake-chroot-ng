@@ -83,6 +83,14 @@ static int sigsys_syscall(struct cng_ucontext *uc, long nr) {
         unsigned long *pset = (unsigned long *)r[1];
         unsigned long *pold = (unsigned long *)r[2];
         unsigned long cur = uc->uc_sigmask.sig[0];
+        /* The kernel refuses a sigsetsize that is not its own before it looks at
+         * anything else — the check that stops a caller assuming some other
+         * width from half-working — and this call is answered entirely here, so
+         * nothing else was going to make it. */
+        if (r[3] != sizeof(cng_sigset_t)) {
+            r[0] = (unsigned long long)(long)-EINVAL;
+            return 1;
+        }
         /* Both are guest pointers we dereference ourselves rather than handing
          * to the kernel, so a bad one must come back -EFAULT (see uaccess.c).
          * They are taken in the kernel's order — the new mask read and applied
@@ -95,6 +103,14 @@ static int sigsys_syscall(struct cng_ucontext *uc, long nr) {
         if (pset) {
             if (!cng_user_readable(pset, sizeof *pset)) {
                 r[0] = (unsigned long long)(long)-EFAULT;
+                return 1;
+            }
+            /* ...and only then `how`, which the kernel validates inside
+             * sigprocmask() and only when a new mask was supplied. Anything but
+             * the three it defines was silently taken as SIG_SETMASK here, so a
+             * miscalled SIG_BLOCK REPLACED the mask it meant to add to. */
+            if (how != 0 && how != 1 && how != 2) {
+                r[0] = (unsigned long long)(long)-EINVAL;
                 return 1;
             }
             unsigned long set = *pset;
