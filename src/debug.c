@@ -773,6 +773,27 @@ int cng_cmd_faketest(int argc, char **argv, char **envp, unsigned long *auxv) {
      * the full set while fake-root (euid still 0 at this point). */
     cng_dprintf(1, "ngroups=%d\n",
                 (int)cng_dispatch(__NR_getgroups, 0, 0, 0, 0, 0, 0, 1));
+    /* ...and the set holds a realistic list, not a token one. initgroups(3) in
+     * a directory-service environment hands over more than a handful, and a
+     * limit it trips is an EINVAL that takes `su` and `login` with it. Round
+     * trip a list past the old ceiling, then put the set back. */
+    {
+        static unsigned gsend[200], gback[200];
+        for (unsigned i = 0; i < 200; i++)
+            gsend[i] = 3000 + i;
+        long sg = cng_dispatch(__NR_setgroups, 200, (long)gsend, 0, 0, 0, 0, 1);
+        long gg = cng_dispatch(__NR_getgroups, 200, (long)gback, 0, 0, 0, 0, 1);
+        int same = (gg == 200);
+        for (int i = 0; same && i < 200; i++)
+            same = gback[i] == gsend[i];
+        /* One past the ceiling is still EINVAL, as it is in the kernel past
+         * its own. */
+        long over = cng_dispatch(__NR_setgroups, CNG_NGROUPS_MAX + 1,
+                                 (long)gsend, 0, 0, 0, 0, 1);
+        cng_dispatch(__NR_setgroups, 0, 0, 0, 0, 0, 0, 1);
+        cng_dprintf(1, "groups set=%d got=%d same=%d over=%d\n", (int)sg,
+                    (int)gg, same, (int)over);
+    }
     unsigned caphdr[2] = { 0x20080522u, 0 };   /* _LINUX_CAPABILITY_VERSION_3 */
     unsigned capdata[6] = { 0 };               /* two {eff,perm,inh} blocks */
     cng_dispatch(__NR_capget, (long)caphdr, (long)capdata, 0, 0, 0, 0, 1);

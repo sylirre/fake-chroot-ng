@@ -20,6 +20,11 @@ check_contains "fake-root reopens a file it may execute but not read" \
 check_contains "a refused reopen is served from the fd we hold, rewound" \
     "fd_reopen: dup=1 content=1 -> OK" "$out"
 check_contains "supplementary groups empty" "ngroups=0"           "$out"
+# The set has to hold a realistic list. initgroups(3) against a directory
+# service hands over more than a handful, and a ceiling it trips is an EINVAL
+# that takes `su` and `login` with it; 64 was low enough to be reachable.
+check_contains "a 200-group list round-trips through the credential set" \
+    "groups set=0 got=200 same=1 over=-22" "$out"
 check_contains "capget reports full set under fake-root" "cap_eff=ffffffff" "$out"
 # The header version is negotiated. An unknown one gets the kernel's own written
 # back and fails — except for the data-less probe that IS the negotiation — and

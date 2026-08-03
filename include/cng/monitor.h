@@ -48,7 +48,15 @@ extern unsigned long *cng_host_auxv;
  * owned by the fake id. The set is process-wide and, because the guest forks for
  * real, is inherited across fork() exactly as the kernel would. cng_g_exe_guest
  * is what /proc/self/exe reports. */
-#define CNG_NGROUPS_MAX 64
+/* How many supplementary groups the synthetic set holds. The kernel's own
+ * NGROUPS_MAX is 65536, and setgroups(2) beyond this answers -EINVAL, which is
+ * the right kind of answer but at the wrong number: 64 was low enough that
+ * initgroups(3) for a user in a directory-service environment could trip it,
+ * and take `su` and `login` down with it. Not the kernel's figure, though —
+ * struct cng_cred is copied by value in the setreuid and setregid paths, on
+ * the SIGSYS handler's 256 KiB scratch stack, so 65536 entries would be a
+ * 256 KiB copy there. 1024 is past anything real and costs 4 KiB. */
+#define CNG_NGROUPS_MAX 1024
 
 struct cng_cred {
     unsigned ruid, euid, suid, fsuid;    /* real, effective, saved-set, fs uid */
