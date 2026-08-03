@@ -316,9 +316,23 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
         memset(guest, 0, sizeof guest);
         sys_uname(host);
         long r = cng_dispatch(__NR_uname, (long)guest, 0, 0, 0, 0, 0, 0);
-        cng_dprintf(1, "uname: rc=%d sys=%s rel=%s ver=%s mach=%s node_kept=%d\n",
+        /* A faked field is 65 bytes, and the kernel NUL-pads its own. Writing a
+         * shorter identity over a longer one left the host's tail readable past
+         * the terminator — which for release and version is the vendor string
+         * the fake exists to withhold. Every byte after it must be zero. */
+        int dirty = 0;
+        for (int f = 0; f < 5; f++) {
+            if (f == 1)
+                continue; /* nodename is deliberately the host's */
+            const char *p = guest + f * 65;
+            for (unsigned k = strlen(p) + 1; k < 65; k++)
+                dirty += p[k] != '\0';
+        }
+        cng_dprintf(1,
+                    "uname: rc=%d sys=%s rel=%s ver=%s mach=%s node_kept=%d "
+                    "tail_dirty=%d\n",
                     (int)r, guest, guest + 2 * 65, guest + 3 * 65, guest + 4 * 65,
-                    !strcmp(host + 65, guest + 65));
+                    !strcmp(host + 65, guest + 65), dirty);
         return r == 0 ? 0 : 1;
     }
     /* chroot(2) is privileged: without CAP_SYS_CHROOT — for us, a fake identity

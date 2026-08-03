@@ -22,6 +22,12 @@ check_contains "nodename stays the host's" "node_kept=1" "$out"
 # The host release must not appear anywhere in what the guest was told.
 check_absent "the host release does not leak through uname" \
     "$(uname -r 2>/dev/null || echo IMPOSSIBLE)" "$out"
+# ...including past the terminator. Each field is 65 bytes and the kernel
+# NUL-pads its own, so writing a shorter identity over a longer one leaves the
+# host's tail sitting there, readable by anything that walks the whole array
+# rather than stopping at the NUL. That tail is the device fingerprint.
+check_contains "no host bytes survive past a faked field's terminator" \
+    "tail_dirty=0" "$out"
 
 vout=$(run -t dtest -r "$UR" open /proc/version 2>&1)
 check_contains "/proc/version repeats the same release" \

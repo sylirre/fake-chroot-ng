@@ -1114,6 +1114,16 @@ static int empty_path_ok(long nr, long a0, long a2, long a3, long a4) {
     }
 }
 
+/* Write one 65-byte utsname field. The whole field is cleared first, the way
+ * the kernel NUL-pads its own: copying a shorter identity over a longer one
+ * leaves the host's tail readable past the terminator, and for release and
+ * version that tail is the vendor string the fake exists to withhold —
+ * "-android14-11-g<sha>" on a phone, the build date and distro elsewhere. */
+static void uts_set(char *field, const char *val) {
+    memset(field, 0, 65);
+    cng_strlcpy(field, val, 65);
+}
+
 /* Deliver a translated sockaddr to the guest exactly as move_addr_to_user()
  * would: copy at most what the caller's buffer holds, then report the
  * UNtruncated length ("fromlen shall refer to the value before truncation",
@@ -2605,10 +2615,10 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         if (r != 0 || !a0)
             return r;
         char *u = (char *)a0;
-        cng_strlcpy(u + 0 * 65, "Linux", 65);
-        cng_strlcpy(u + 2 * 65, CNG_KREL, 65);
-        cng_strlcpy(u + 3 * 65, CNG_KVER, 65);
-        cng_strlcpy(u + 4 * 65, "aarch64", 65);
+        uts_set(u + 0 * 65, "Linux");
+        uts_set(u + 2 * 65, CNG_KREL);
+        uts_set(u + 3 * 65, CNG_KVER);
+        uts_set(u + 4 * 65, "aarch64");
         return 0;
     }
 
