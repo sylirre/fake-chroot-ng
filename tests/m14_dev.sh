@@ -74,6 +74,20 @@ else
     *) pass=$((pass + 1)); echo "  ok   m14 --no-dev injects nothing" ;;
     esac
 
+    # The zone is governed by --no-dev, not by --no-proc: `fd` and the std*
+    # aliases name the host fd table, which is a host object whatever /proc the
+    # guest has, and /dev/fd/N already resolved under --no-proc. The directory
+    # itself did not — it fell through to the /proc zone and vanished with it,
+    # taking its listing entry along (busybox lstats each name it prints).
+    got=$(run -R --no-proc "$M14_ALPINE" /bin/busybox sh -c \
+        '[ -d /dev/fd ] && echo have-dir; [ -e /dev/fd/1 ] && echo have-n' \
+        2>/dev/null)
+    check_contains "m14 --no-proc keeps /dev/fd a directory" "have-dir" "$got"
+    check_contains "m14 --no-proc keeps /dev/fd/N" "have-n" "$got"
+    got=$(run -R --no-proc "$M14_ALPINE" /bin/busybox sh -c \
+        'ls /dev | grep -c "^fd$"' 2>/dev/null)
+    check "m14 --no-proc still lists fd" 1 "$got"
+
     # A -b mount point is a resolution overlay with no dirent in the rootfs, so
     # it was reachable by name but invisible to anything that enumerates first
     # (shell globbing, find, a package manager's tree walk).

@@ -204,11 +204,20 @@ static int proc_magic(char *cur, size_t sz) {
         return PROC_MAGIC_NONE;
     const char *rest = cur + pl;
 
-    /* "fd/<n>": the magic path *is* the host path — the kernel takes it
+    /* "fd[/<n>]": the magic path *is* the host path — the kernel takes it
      * straight to the open file description, including the anonymous and
      * deleted files no re-rooted target could ever name. Any trailing
-     * components (a directory fd) ride along, as they do for a real dirfd. */
-    if (strncmp(rest, "fd/", 3) == 0) {
+     * components (a directory fd) ride along, as they do for a real dirfd.
+     *
+     * The directory itself counts, and not only for symmetry: it used to fall
+     * through to cng_fs_translate, which answered it out of the /proc zone —
+     * and --no-proc switches that zone off, so `/dev/fd` was re-rooted into the
+     * rootfs and came back ENOENT while `/dev/fd/1` next to it kept working.
+     * (`ls /dev` lost the entry to the same thing: busybox lstats each name.)
+     * The fd table is a host object under every flag, so name it as one. */
+    if (strncmp(rest, "fd", 2) == 0 && (rest[2] == '\0' || rest[2] == '/')) {
+        if (rest[2] == '\0')
+            return PROC_MAGIC_HOST;
         const char *d = rest + 3;
         while (*d >= '0' && *d <= '9')
             d++;
