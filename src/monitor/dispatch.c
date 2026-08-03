@@ -36,6 +36,7 @@ const char *cng_g_exe_guest = "/";
 #define STATX_GID_OFF  24
 #define STATX_MODE_OFF 28   /* stx_mode is a u16 at offset 28 */
 #define CNG_X_OK        1   /* access(2) X_OK */
+#define CNG_W_OK        2   /* access(2) W_OK */
 
 /* Rewrite a struct stat / statx buffer's ownership under a fake identity: files
  * owned by the real invoking user appear owned by the fake id, and a setuid/
@@ -1351,9 +1352,17 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 unsigned mode = *(unsigned *)(sb + STAT_MODE_OFF);
                 if (((int)a2 & CNG_X_OK) && !(mode & 0111))
                     return -EACCES;
-                return 0;
+                r = 0;
             }
         }
+        /* "SuS v2 requires we report a read only fs too", as fs/open.c puts it:
+         * a W_OK that the inode itself grants is still EROFS on a read-only
+         * mount, and a :ro bind is one. Without it `test -w` answered yes about
+         * a file whose host copy is perfectly writable, and the write that
+         * followed got the EROFS the check existed to avoid. Applied after the
+         * access check, where the kernel applies it. */
+        if (r == 0 && ((int)a2 & CNG_W_OK) && ro_denied(p))
+            return -EROFS;
         return r;
     }
 

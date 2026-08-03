@@ -385,6 +385,13 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
         } t[] = {
             {"read", cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
                                   CNG_O_RDONLY, 0, 0, 0, 0)},
+            /* access(W_OK) reports a read-only mount, so `test -w` agrees with
+             * what the write would actually do rather than with the host
+             * file's own mode. R_OK on the same name must still succeed. */
+            {"access-r", cng_dispatch(__NR_faccessat, CNG_AT_FDCWD, (long)gpath,
+                                      4 /*R_OK*/, 0, 0, 0, 0)},
+            {"access-w", cng_dispatch(__NR_faccessat, CNG_AT_FDCWD, (long)gpath,
+                                      2 /*W_OK*/, 0, 0, 0, 0)},
             {"open-w", cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
                                     CNG_O_WRONLY, 0, 0, 0, 0)},
             {"open-creat", cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)sib,
@@ -409,11 +416,12 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
         };
         int fails = 0;
         for (unsigned i = 0; i < sizeof t / sizeof *t; i++) {
-            int is_read = !strcmp(t[i].name, "read");
+            int is_read = !strcmp(t[i].name, "read") ||
+                          !strcmp(t[i].name, "access-r");
             /* reads always succeed; mutators are EROFS exactly when ro */
             int ok = is_read ? t[i].r >= 0
                              : (ro ? t[i].r == -EROFS : t[i].r != -EROFS);
-            if (is_read && t[i].r >= 0)
+            if (!strcmp(t[i].name, "read") && t[i].r >= 0)
                 sys_close((int)t[i].r);
             cng_dprintf(1, "robind %s %s: rc=%d -> %s\n", ro ? "ro" : "rw",
                         t[i].name, (int)t[i].r, ok ? "OK" : "FAIL");

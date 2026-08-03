@@ -139,6 +139,13 @@ check_contains ":ro bind refuses unlinkat" \
     "robind ro unlinkat: rc=-30 -> OK" "$out"
 check_contains ":ro bind refuses rename" \
     "robind ro renameat: rc=-30 -> OK" "$out"
+# access(W_OK) reports a read-only filesystem — SuS requires it and the kernel
+# does it — so `test -w` inside a :ro bind agrees with what the write would do
+# rather than with the host file's own mode. R_OK on the same name still passes.
+check_contains ":ro bind reports itself to access(W_OK)" \
+    "robind ro access-w: rc=-30 -> OK" "$out"
+check_contains ":ro bind still answers access(R_OK)" \
+    "robind ro access-r: rc=0 -> OK" "$out"
 out=$(run -t dtest -r "$ROOT" -b "$RB":/rw robind /rw/f 2>&1); rc=$?
 check "a plain (rw) bind reports no EROFS" 0 "$rc"
 rm -rf "$RB"
