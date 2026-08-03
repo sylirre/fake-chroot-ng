@@ -34,6 +34,9 @@
 #define CNG_RENAME_NOREPLACE 1
 #define CNG_RENAME_EXCHANGE  2
 
+/* inotify_add_watch: the one mask bit that changes path resolution. */
+#define CNG_IN_DONT_FOLLOW 0x02000000
+
 /* mmap prot */
 #define CNG_PROT_NONE   0x0
 #define CNG_PROT_READ   0x1

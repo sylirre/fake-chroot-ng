@@ -238,6 +238,23 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
         cng_dprintf(1, "getxa: errno %d\n", r < 0 ? (int)-r : 0);
         return 0;
     }
+    /* inotify_add_watch was never trapped either, and its a0 is the inotify
+     * instance rather than a dirfd, so the guest's absolute path went to the
+     * HOST — the containment exactly inverted: a name inside the rootfs
+     * answered ENOENT while a host-only one armed the watch. The errno says
+     * which file the kernel found. */
+    if (!strcmp(op, "inotify")) {
+        long ifd = CNG_SYS(__NR_inotify_init1, 0, 0, 0, 0, 0, 0);
+        if (ifd < 0) {
+            cng_dprintf(1, "inotify: init errno %d\n", (int)-ifd);
+            return 1;
+        }
+        long w = cng_dispatch(__NR_inotify_add_watch, ifd, (long)gpath,
+                              2 /*IN_MODIFY*/, 0, 0, 0, /*trapped=*/0);
+        cng_dprintf(1, "inotify: errno %d\n", w < 0 ? (int)-w : 0);
+        sys_close((int)ifd);
+        return 0;
+    }
     /* The -R trampoline tier runs with no seccomp filter at all, so the
      * designed-ENOSYS refusals cannot come from the kernel there: the dispatcher
      * has to answer them itself. bpftest covers the filter; this covers the

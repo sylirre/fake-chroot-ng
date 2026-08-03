@@ -112,6 +112,20 @@ else
 fi
 rm -f "$XAH"
 
+# inotify_add_watch is the last path-bearing syscall with no dirfd form, and the
+# only one whose a0 is not one — which is how it was missed. Untranslated it was
+# the containment exactly inverted: a watch on a name present only on the HOST
+# armed, while the rootfs's own file answered ENOENT. Both directions are
+# asserted, so a blanket refusal cannot pass either.
+INOH=$(mktemp); printf x >"$INOH"
+check_contains "inotify on a host-only path is contained" \
+    "inotify: errno 2" \
+    "$(run -t dtest -r "$ROOT" inotify "$INOH" 2>&1)"
+check_contains "inotify reaches the rootfs file, so it is translated not blocked" \
+    "inotify: errno 0" \
+    "$(run -t dtest -r "$ROOT" inotify /etc/greeting 2>&1)"
+rm -f "$INOH"
+
 # A ":ro" bind must answer EROFS for every mutating path syscall while still
 # serving reads. The rw run is the negative control: the same calls must NOT
 # report EROFS there, so a blanket refusal cannot pass both legs.

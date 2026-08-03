@@ -40,6 +40,7 @@ static const int probe_set[] = {
 #endif
     __NR_setxattr,   __NR_lsetxattr,  __NR_getxattr,   __NR_lgetxattr,
     __NR_listxattr,  __NR_llistxattr, __NR_removexattr, __NR_lremovexattr,
+    __NR_inotify_add_watch,
 #ifdef __NR_fchmodat2
     __NR_fchmodat2,
 #endif

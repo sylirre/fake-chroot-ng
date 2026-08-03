@@ -1057,6 +1057,9 @@ static void path_args_of(long nr, long a0, long a1, long a2, long a3,
         pa->d1 = a1;
         pa->p1 = (const char *)a2;
         break;
+    case __NR_inotify_add_watch: /* a0 is the instance, not a dirfd */
+        pa->p1 = (const char *)a1;
+        break;
     case __NR_renameat:
     case __NR_renameat2:
     case __NR_linkat:
@@ -2330,6 +2333,22 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         if (writes && ro_denied(p))
             return -EROFS;
         return reissue((long)p, a1, a2, a3, a4, a5, nr);
+    }
+
+    /* inotify_add_watch(fd, path, mask): a path-bearing syscall whose a0 is the
+     * inotify instance rather than a dirfd, so the name is always absolute or
+     * cwd-relative. Untranslated it was exactly inverted — a watch on
+     * "/etc/passwd" armed on the HOST's file while the rootfs's own answered
+     * ENOENT — which is what every file-watching runtime asks for
+     * (inotifywait, glib's GFileMonitor, systemd's path units, bundlers). The
+     * mask's IN_DONT_FOLLOW is this call's spelling of AT_SYMLINK_NOFOLLOW. */
+    case __NR_inotify_add_watch: {
+        int deref = !((unsigned)a2 & CNG_IN_DONT_FOLLOW);
+        const char *p =
+            xlate(CNG_AT_FDCWD, (const char *)a1, b1, sizeof b1, deref);
+        if (p == XLATE_TOOLONG)
+            return -ENAMETOOLONG;
+        return reissue(a0, (long)p, a2, a3, a4, a5, nr);
     }
 
     case __NR_truncate:

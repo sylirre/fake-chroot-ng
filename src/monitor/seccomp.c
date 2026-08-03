@@ -45,6 +45,11 @@ static const int path_syscalls[] = {
      * setters and removers *write* the host filesystem. */
     __NR_setxattr,    __NR_lsetxattr,    __NR_getxattr,    __NR_lgetxattr,
     __NR_listxattr,   __NR_llistxattr,   __NR_removexattr, __NR_lremovexattr,
+    /* inotify_add_watch: the last path-bearing syscall with no dirfd form, and
+     * the only one whose a0 is not one. Left native it armed the watch on the
+     * HOST's copy of the name while the rootfs's own answered ENOENT — the
+     * whole containment inverted, for every file-watching runtime there is. */
+    __NR_inotify_add_watch,
     /* AF_UNIX addresses. A pathname socket carries a filesystem path in
      * sun_path, so it needs the same containment as any other path: without
      * these a guest bind("/run/foo.sock") created the inode on the HOST and
