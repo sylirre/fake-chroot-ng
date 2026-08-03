@@ -682,6 +682,19 @@ static int fs_has_ro(void) {
     return 0;
 }
 
+/* Is the first component of `path` all digits — the only shape that can name a
+ * process against a /proc directory fd, and so the only one the hidden-process
+ * view has anything to say about? A string test, so the hot path pays nothing
+ * for it. */
+static int name_may_be_pid(const char *p) {
+    if (*p < '0' || *p > '9')
+        return 0;
+    for (; *p && *p != '/'; p++)
+        if (*p < '0' || *p > '9')
+            return 0;
+    return 1;
+}
+
 /* Does a dirfd-relative name need the guest-side walk above, or can the kernel
  * be trusted with it? The dirfd itself already points inside the guest view, so
  * only three things can redirect out of it: a ".." component, a symlink, and a
@@ -708,6 +721,11 @@ static int at_needs_xlate(int dfd, const char *path, int deref) {
     if (name_may_overlay(path))
         return 1;
     if (fs_has_ro())
+        return 1;
+    /* A pid-shaped name may be a host process seen through a /proc dirfd, which
+     * only the join in xlate() can hide (that dirfd has no guest path, so the
+     * walk itself fails — the point is to reach the branch after it). */
+    if (!cng_g_no_proc && name_may_be_pid(path))
         return 1;
     if (!deref)
         return 0;
@@ -850,6 +868,30 @@ static const char *xlate(long dirfd, const char *gp, char *buf, size_t bufsz,
             return buf;
         if (r == XLATE_AT_LONG)
             return XLATE_TOOLONG;
+        /* The dirfd names no guest path — the /proc zone, which passes through
+         * to the host on purpose. That is the right namespace, but the
+         * hidden-process view has to hold inside it, and it is keyed on the
+         * host path, which a relative name only acquires once it is joined onto
+         * the directory's own. Without the join, `openat(dirfd("/proc"),
+         * "1/status")` read the host's init while "/proc/1/status" answered
+         * ENOENT — the whole host process list, one directory fd away. */
+        if (name_may_be_pid(gp)) {
+            char hdir[CNG_PATH_MAX], hp[CNG_PATH_MAX];
+            if (dirfd_host(dfd, hdir, sizeof hdir) == 0) {
+                size_t k = cng_strlcpy(hp, hdir, sizeof hp);
+                if (k && k + 1 < sizeof hp && hp[k - 1] != '/') {
+                    hp[k++] = '/';
+                    hp[k] = '\0';
+                }
+                /* Only inside /proc: anywhere else this is a host path with no
+                 * guest spelling, and re-rooting it would be the wrong answer. */
+                if (k < sizeof hp &&
+                    cng_strlcpy(hp + k, gp, sizeof hp - k) < sizeof hp - k &&
+                    !strncmp(hp, "/proc/", 6) &&
+                    cng_fs_translate(cng_g_fs, hp, buf, bufsz) == 0)
+                    return buf;
+            }
+        }
     }
     /* A plain name against a dirfd already inside the guest view: the kernel
      * resolves it there, which is the containment. */

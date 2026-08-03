@@ -243,6 +243,48 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
      * HOST — the containment exactly inverted: a name inside the rootfs
      * answered ENOENT while a host-only one armed the watch. The errno says
      * which file the kernel found. */
+    /* The hidden-process view keys on the resolved HOST path, and a /proc dirfd
+     * has no guest path to resolve against — so a relative name under it went
+     * to the kernel untouched and `openat(dirfd("/proc"), "1/status")` read the
+     * host's init while "/proc/1/status" answered ENOENT. Both spellings of a
+     * foreign pid must be hidden, and both spellings of our own must not be. */
+    if (!strcmp(op, "prochide")) {
+        long d = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/proc",
+                              CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+        if (d < 0) {
+            cng_dprintf(1, "prochide: /proc errno %d\n", (int)-d);
+            return 1;
+        }
+        char own[64];
+        cng_snprintf(own, sizeof own, "%ld/status", sys_getpid());
+        long a_for = cng_dispatch(__NR_openat, CNG_AT_FDCWD,
+                                  (long)"/proc/1/status", CNG_O_RDONLY, 0, 0, 0,
+                                  0);
+        long r_for = cng_dispatch(__NR_openat, d, (long)"1/status",
+                                  CNG_O_RDONLY, 0, 0, 0, 0);
+        long r_bare = cng_dispatch(__NR_newfstatat, d, (long)"1",
+                                   (long)(char[144]){0}, 0, 0, 0, 0);
+        long r_own = cng_dispatch(__NR_openat, d, (long)own, CNG_O_RDONLY, 0, 0,
+                                  0, 0);
+        long r_self = cng_dispatch(__NR_openat, d, (long)"self/status",
+                                   CNG_O_RDONLY, 0, 0, 0, 0);
+        if (a_for >= 0)
+            sys_close((int)a_for);
+        if (r_for >= 0)
+            sys_close((int)r_for);
+        if (r_own >= 0)
+            sys_close((int)r_own);
+        if (r_self >= 0)
+            sys_close((int)r_self);
+        sys_close((int)d);
+        int ok = a_for < 0 && r_for < 0 && r_bare < 0 && r_own >= 0 &&
+                 r_self >= 0;
+        cng_dprintf(1,
+                    "prochide: abs=%d rel=%d bare=%d own=%d self=%d -> %s\n",
+                    (int)a_for, (int)r_for, (int)r_bare, r_own >= 0,
+                    r_self >= 0, ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
     if (!strcmp(op, "inotify")) {
         long ifd = CNG_SYS(__NR_inotify_init1, 0, 0, 0, 0, 0, 0);
         if (ifd < 0) {

@@ -25,6 +25,13 @@ check_contains "a -b /proc:/proc bind does not reopen the host process list" \
     "proctest bound-proc hidden -> OK" "$out"
 check_contains "a /proc listing drops host pids, keeps guest ones" \
     "proctest listing: self=1 own_pid=1 host_pids=0 -> OK" "$out"
+# The hidden view keys on the resolved HOST path, and a /proc dirfd has no guest
+# path to resolve against — so a relative name under one went to the kernel
+# untouched and read the process the absolute spelling had just refused. Our own
+# entry must still be reachable both ways, or the fix would hide everything.
+check_contains "a host pid stays hidden through a /proc dirfd too" \
+    "prochide: abs=-2 rel=-2 bare=-2 own=1 self=1 -> OK" \
+    "$(run -t dtest -r "$PT" prochide / 2>&1)"
 check_contains "cmdline is the guest argv, not the chroot-ng invocation" \
     "proctest cmdline: 24 bytes argv0=/bin/busybox -> OK" "$out"
 
