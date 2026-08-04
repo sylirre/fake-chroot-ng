@@ -139,6 +139,15 @@ else
     pt_case step
     # PTRACE_ATTACH to a process that is already running, and DETACH.
     pt_case attach
+    # process_vm_readv against a stopped tracee — strace's fast path, served
+    # from the mailbox because the host may refuse it. The iovec counts are a
+    # tracer's to choose and the emulation walks the arrays by them, so this
+    # asks the kernel what each count means: import_iovec narrows nr_segs to an
+    # `unsigned` before refusing it above UIO_MAXIOV, which makes 1<<60 read as
+    # zero segments rather than an error. Taking that count at face value both
+    # wrapped the length validation to nothing (1<<60 entries of 16 bytes is
+    # exactly 2^64) and then walked the array off the end of guest memory.
+    pt_case vmrw
 
     # ...and the same, with a rootfs actually in the way: the guest binary is
     # bound in so it can be loaded, and the trace must still read the guest's

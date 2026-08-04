@@ -1727,14 +1727,36 @@ int cng_pt_vm_rw(long nr, long pid, u64 lvec, u64 lcnt, u64 rvec, u64 rcnt,
     }
     int write = (nr == __NR_process_vm_writev);
     u64 *lv = (u64 *)lvec, *rv = (u64 *)rvec;
-    if (!cng_user_readable(lv, (unsigned long)lcnt * 16) ||
-        !cng_user_readable(rv, (unsigned long)rcnt * 16)) {
+    /* Narrow the counts the way the kernel does before anything else looks at
+     * them: import_iovec takes nr_segs as an `unsigned`, so the top half of a
+     * 64-bit count is simply dropped, and only then is what is left refused
+     * above UIO_MAXIOV. Both halves of that matter here.
+     *
+     * The bound is what keeps `count * 16` from being a 64-bit multiply that
+     * wraps. A count whose low 60 bits are small wrapped the product to almost
+     * nothing — 1<<60 gives exactly 0, and cng_user_readable answers 1 for a
+     * zero-length range — so the validation passed having probed nothing, and
+     * the walk below then indexed lv[]/rv[] for as many entries as the count
+     * claimed, off the end of whatever the guest had mapped. In the handler
+     * that is an unblockable SIGSEGV.
+     *
+     * The truncation is what keeps the answer the kernel's: a guest passing
+     * 1<<60 is not refused there, it is read as *zero* segments and gets back
+     * 0, and (1<<60)+1 transfers one. Rejecting those with -EINVAL would have
+     * been a divergence of its own. */
+    unsigned lc = (unsigned)lcnt, rc = (unsigned)rcnt;
+    if (lc > CNG_UIO_MAXIOV || rc > CNG_UIO_MAXIOV) {
+        *out = -EINVAL;
+        return 1;
+    }
+    if (!cng_user_readable(lv, (unsigned long)lc * 16) ||
+        !cng_user_readable(rv, (unsigned long)rc * 16)) {
         *out = -EFAULT;
         return 1;
     }
     /* Walk the two iovec lists in lockstep, as the kernel does. */
     unsigned long li = 0, ri = 0, loff = 0, roff = 0, total = 0;
-    while (li < lcnt && ri < rcnt) {
+    while (li < lc && ri < rc) {
         u64 lbase = lv[li * 2] + loff, llen = lv[li * 2 + 1] - loff;
         u64 rbase = rv[ri * 2] + roff, rlen = rv[ri * 2 + 1] - roff;
         if (!llen) { li++, loff = 0; continue; }

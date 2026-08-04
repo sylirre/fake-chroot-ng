@@ -711,6 +711,66 @@ static int sc_attach(void) {
     return 0;
 }
 
+/* process_vm_readv against a stopped tracee: the fast path strace takes before
+ * falling back to PEEKDATA, and the one the emulation has to serve itself
+ * because the host has no reason to believe we are attached.
+ *
+ * What is asserted is what it does with the iovec counts, which a tracer passes
+ * through from its caller and the emulation walks the arrays by. The kernel's
+ * import_iovec takes nr_segs as an `unsigned`, so a 64-bit count is truncated
+ * first and only then refused above UIO_MAXIOV — which makes 1<<60 read as zero
+ * segments and succeed, not fail. Protocol only, so the host build is the
+ * oracle for all of it. */
+static const char *vmres(ssize_t n) {
+    if (n >= 0)
+        return n == 0 ? "zero" : "bytes";
+    switch (errno) {
+    case EINVAL: return "EINVAL";
+    case EFAULT: return "EFAULT";
+    case ESRCH:  return "ESRCH";
+    case EPERM:  return "EPERM";
+    default:     return "other";
+    }
+}
+
+static int sc_vmrw(void) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        child_start();
+        _exit(9);
+    }
+    expect_first_stop(pid);
+
+    char buf[64];
+    struct iovec liov = {buf, sizeof buf};
+    struct iovec riov = {(void *)&g_magic, sizeof g_magic};
+    ssize_t n;
+
+    errno = 0;
+    n = process_vm_readv(pid, &liov, 1, &riov, 1, 0);
+    printf("vmrw plain %s\n", vmres(n));
+
+    /* 1<<60 entries of 16 bytes is exactly 2^64: the count that wraps a
+     * length check to zero, and the one the kernel truncates to no segments. */
+    errno = 0;
+    n = process_vm_readv(pid, &liov, 1UL << 60, &riov, 1, 0);
+    printf("vmrw wrapcnt %s\n", vmres(n));
+
+    errno = 0;
+    n = process_vm_readv(pid, &liov, (1UL << 60) + 1, &riov, 1, 0);
+    printf("vmrw wrapcnt1 %s\n", vmres(n));
+
+    errno = 0;
+    n = process_vm_readv(pid, &liov, 2048, &riov, 1, 0);
+    printf("vmrw overmax %s\n", vmres(n));
+
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    int st;
+    wait_for(pid, &st);
+    show(st);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, 0, _IOLBF, 0);
     if (argc > 1 && !strcmp(argv[1], "hello")) {
@@ -752,6 +812,8 @@ int main(int argc, char **argv) {
         return sc_step();
     if (!strcmp(s, "attach"))
         return sc_attach();
+    if (!strcmp(s, "vmrw"))
+        return sc_vmrw();
     fprintf(stderr, "unknown scenario %s\n", s);
     return 2;
 }
