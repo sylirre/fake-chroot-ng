@@ -193,7 +193,25 @@ static struct pt_link *pt_find(s32 tid) {
 
 /* Reserves a slot while its body is cleared, so no scan ever sees a link that
  * is about to be wiped. Never a valid tid, which is always > 0. */
-#define PT_CLAIMING ((s32)-1)
+/* A slot reserved but not yet filled in, keyed by the tid it is being claimed
+ * for: negative, so no scan that looks for a tid can match it. */
+#define PT_CLAIMING(tid) (-(tid))
+
+/* Wait out a claim in progress at `i` for `tid`; 1 if it resolved to that tid.
+ * The claimant only has a memset between the reservation and the publish, so
+ * this is a handful of yields — bounded anyway, since a claimant killed inside
+ * that window would never publish. */
+static int pt_claim_settled(int i, s32 tid) {
+    for (int spin = 0; spin < 4096; spin++) {
+        s32 v = __atomic_load_n(&g_tab->links[i].tracee, __ATOMIC_SEQ_CST);
+        if (v == tid)
+            return 1;
+        if (v != PT_CLAIMING(tid))
+            return 0;
+        __asm__ volatile("yield");
+    }
+    return 0;
+}
 
 /* Find or create the link for `tid`.
  *
@@ -210,22 +228,35 @@ static struct pt_link *pt_find(s32 tid) {
  * Two links for one tid is not merely untidy. pt_find takes the lowest index,
  * and the ghost the parent made has state PT_ST_RUNNING, so every
  * PTRACE_CONT/SYSCALL/GETREGS against the real stop answers -ESRCH and the
- * tracee is never resumed.
+ * tracee is never resumed — the tracer then waits for an exit that cannot come.
  *
  * So publish, then look below: whoever holds the lower index keeps it, and the
  * other releases and adopts it. Each racer scans only strictly below itself, so
  * exactly one can conclude it lost — and the SEQ_CST publish is what guarantees
- * the loser sees the winner. */
+ * the loser sees the winner.
+ *
+ * That is not enough on its own, and the hang above is what is left when it is
+ * missed: a racer that has taken a lower slot but published only the
+ * reservation is invisible to the one above, which keeps its own link, while
+ * the lower one scans below itself and sees nothing. Both survive. The
+ * reservation therefore carries the tid it is for — as its negative, which no
+ * tid scan can match — so a claim in progress can be recognised and waited
+ * out, both here and in the loser test. */
 static struct pt_link *pt_claim(s32 tid, s32 tgid) {
-    if (!g_tab)
+    if (!g_tab || tid <= 0)
         return 0;
-    struct pt_link *e = pt_find(tid);
-    if (e)
-        return e;
+    for (int i = 0; i < PT_MAX; i++) {
+        s32 v = __atomic_load_n(&g_tab->links[i].tracee, __ATOMIC_SEQ_CST);
+        if (v == tid)
+            return &g_tab->links[i];
+        if (v == PT_CLAIMING(tid) && pt_claim_settled(i, tid))
+            return &g_tab->links[i];
+    }
+    struct pt_link *e;
     for (int i = 0; i < PT_MAX; i++) {
         s32 expect = 0;
         if (!__atomic_compare_exchange_n(&g_tab->links[i].tracee, &expect,
-                                         PT_CLAIMING, 0, __ATOMIC_ACQ_REL,
+                                         PT_CLAIMING(tid), 0, __ATOMIC_ACQ_REL,
                                          __ATOMIC_RELAXED))
             continue;
         e = &g_tab->links[i];
@@ -236,12 +267,15 @@ static struct pt_link *pt_claim(s32 tid, s32 tgid) {
         memset((char *)e + sizeof(s32), 0, sizeof *e - sizeof(s32));
         e->tgid = tgid;
         __atomic_store_n(&e->tracee, tid, __ATOMIC_SEQ_CST);
-        for (int j = 0; j < i; j++)
-            if (__atomic_load_n(&g_tab->links[j].tracee, __ATOMIC_SEQ_CST) ==
-                tid) {
-                __atomic_store_n(&e->tracee, 0, __ATOMIC_RELEASE);
-                return &g_tab->links[j];
-            }
+        for (int j = 0; j < i; j++) {
+            s32 v = __atomic_load_n(&g_tab->links[j].tracee, __ATOMIC_SEQ_CST);
+            if (v == PT_CLAIMING(tid))
+                v = pt_claim_settled(j, tid) ? tid : 0;
+            if (v != tid)
+                continue;
+            __atomic_store_n(&e->tracee, 0, __ATOMIC_RELEASE);
+            return &g_tab->links[j];
+        }
         return e;
     }
     return 0; /* registry full: the caller degrades to untraced */
