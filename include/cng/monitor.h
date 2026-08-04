@@ -258,6 +258,14 @@ void cng_probe_blocked(void);
 /* Install a signal handler with our own rt_sigreturn restorer. Returns 0/-errno. */
 int cng_sig_install(int signo, cng_sighandler_t h);
 
+/* Run `fn(arg)` on this thread's per-thread scratch stack, returning 1 when it
+ * switched and 0 when the caller must run it in place (no slot, or already on
+ * the stack). The path dispatcher needs far more stack than a guest thread is
+ * likely to have — see sigsys.c — so both tiers enter it through this.
+ * cng_scratch_leave gives the stack back for a call that never returns. */
+int cng_run_scratch(void (*fn)(void *), void *arg);
+void cng_scratch_leave(void);
+
 /* Core SIGSYS logic (exposed for testing): given the trapped signal context and
  * info, either translate+dispatch the guest syscall, or — when the trap is
  * Android's seccomp filter blocking a syscall WE re-issued from the gate —

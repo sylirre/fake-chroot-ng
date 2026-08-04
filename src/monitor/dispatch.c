@@ -2900,8 +2900,16 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
  * read and write, and the same single-step report. `trapped` is 0 here — an
  * unhandled syscall on this path is an ordinary one to re-issue, not one
  * Android blocked. */
-void cng_tramp_dispatch(struct cng_uregs *r) {
+static void tramp_body(void *p) {
+    struct cng_uregs *r = (struct cng_uregs *)p;
     long nr = (long)r->x[8];
+    /* An untraced exit does not come back, so the slot it holds would stay
+     * claimed and busy — and a thread that later inherits the tid would find it
+     * so and run in place. Give it back while still on it: nothing nests below
+     * an exit. Traced is left alone, since there a tracer can cancel the call
+     * and make it return after all. */
+    if ((nr == __NR_exit || nr == __NR_exit_group) && !cng_pt_active())
+        cng_scratch_leave();
     cng_pt_set_frame(r, 0);
     if (!cng_pt_active()) {
         r->x[0] = (u64)cng_dispatch(nr, (long)r->x[0], (long)r->x[1],
@@ -2917,4 +2925,13 @@ void cng_tramp_dispatch(struct cng_uregs *r) {
                                 (long)r->x[3], (long)r->x[4], (long)r->x[5], 0);
     cng_pt_syscall_exit(r);
     cng_pt_step_report(r);
+}
+
+void cng_tramp_dispatch(struct cng_uregs *r) {
+    /* On the guest's own stack this is the same overflow the SIGSYS tier has a
+     * 256 KiB scratch stack to avoid, and here it is not even a fault: the
+     * dispatcher's frame is larger than a guard page, so it steps over the
+     * guard and writes into ordinary guest memory below, silently. */
+    if (!cng_run_scratch(tramp_body, r))
+        tramp_body(r);
 }

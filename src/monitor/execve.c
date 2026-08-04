@@ -695,5 +695,10 @@ long cng_execve_tramp(int dirfd, const char *path, char **argv, char **envp,
         entry = regs.pc;
         cng_pt_set_frame(0, 0);
     }
+    /* This is the one path out of the trampoline dispatcher that does not
+     * return: we enter the new program instead. Hand the scratch stack back
+     * first, or the flag stays set and every syscall the new program makes on
+     * this thread runs the dispatcher on the guest's own stack again. */
+    cng_scratch_leave();
     cng_enter(sp, entry);
 }

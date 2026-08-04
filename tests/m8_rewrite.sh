@@ -84,3 +84,26 @@ else
     skip "fixed-vaddr exec-collision leg: no -static -no-pie AArch64 toolchain"
 fi
 rm -rf "$XR"
+
+# A translated syscall must stay inside the stack the guest was running on.
+# The dispatcher is deep — ~24 KiB for cng_dispatch's frame alone, ~66 KiB for
+# a whole openat translation — which is why the SIGSYS tier switches to a
+# dedicated scratch stack before entering it. The trampoline tier calls the very
+# same code from an ordinary context and did not, so a guest that runs syscalls
+# on a small stack (musl's 128 KiB threads, Go's ~8 KiB goroutines, any
+# sigaltstack) had the monitor write off the end of it. Not a crash, either: the
+# frame is bigger than a guard page, so it stepped over the guard into ordinary
+# guest memory. The guest sets SP into a small region itself and counts how many
+# bytes of a canary below it moved.
+SSR=$(mktemp -d)
+mkdir -p "$SSR/etc"
+printf 'guest\n' > "$SSR/etc/hostname"
+if guest_xlate_ready "small-stack syscall leg" &&
+    guest_cc_report "$SSR/smallstack" tests/guests/smallstack.c; then
+    for _k in 8 16 64; do
+        out=$(run_t 60 -R "$SSR" /smallstack $_k 2>/dev/null)
+        check "a syscall on a ${_k} KiB guest stack writes nothing below it" \
+            "clobbered=0" "$out"
+    done
+fi
+rm -rf "$SSR"

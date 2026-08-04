@@ -348,6 +348,49 @@ static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {
     cng_scr[i].busy = 0;
 }
 
+/* Run `fn(arg)` on this thread's scratch stack; 0 when there was none to switch
+ * to and the caller has to run it where it stands.
+ *
+ * The SIGSYS handler is not the only way into the path dispatcher. The -R
+ * trampoline tier reaches the very same code from an ordinary call, on whatever
+ * stack the rewritten `svc` site happened to be executing on — which is the
+ * stack the handler above refuses to use, for reasons that do not change with
+ * the tier: `cng_dispatch`'s own frame is ~24 KiB and a translated openat runs
+ * ~66 KiB deep, against musl's 128 KiB thread stacks, Go's ~8 KiB goroutine
+ * stacks, and whatever size a guest hands sigaltstack.
+ *
+ * Nesting is detected by the same busy flag the handler uses, and for the same
+ * reason an SP range test will not do it: the re-entry need not be on the
+ * scratch stack. A guest that registers a sigaltstack takes its own signals on
+ * that alt-stack, and one delivered while we are mid-dispatch — the kernel
+ * delivers it on the way out of a syscall we issued ourselves — reaches a
+ * rewritten `svc` from there. SP is then the guest's alt-stack, nowhere near
+ * the scratch stack an outer invocation is still using, and switching onto it
+ * again overwrites those frames. The SP test is kept alongside for the direct
+ * re-entry it does catch. */
+int cng_run_scratch(void (*fn)(void *), void *arg) {
+    int i = cng_scratch_slot(sys_gettid());
+    if (i < 0)
+        return 0;
+    unsigned long sp = (unsigned long)&i;
+    if (cng_scr[i].busy || (sp >= cng_scr[i].lo && sp < cng_scr[i].hi))
+        return 0; /* already in use: run in place, as a nested trap does */
+    cng_scr[i].busy = 1;
+    cng_run_on_stack((void *)cng_scr[i].hi, (void *)fn, arg, 0);
+    cng_scr[i].busy = 0;
+    return 1;
+}
+
+/* Give the stack back for a call that will not return through cng_run_scratch:
+ * the -R tier's emulated execve enters the new program directly. Left set, the
+ * flag would send every later SIGSYS on this thread back onto the guest's own
+ * stack — the thing this all exists to avoid. */
+void cng_scratch_leave(void) {
+    int i = cng_scratch_slot(sys_gettid());
+    if (i >= 0)
+        cng_scr[i].busy = 0;
+}
+
 /* Is a signal pending that the guest would take delivery of?
  *
  * A blocking System V IPC wait has to end in EINTR exactly when a real one
