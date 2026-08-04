@@ -82,18 +82,51 @@ cng_svc_tramp_ret:
 cng_svc_tramp_tpl_end:
     .size cng_svc_tramp_tpl, . - cng_svc_tramp_tpl
 
-/* Self-test function (M8 _rwtest): set sentinels in x1..x7, do a getpid via
- * `svc #0` (the site to rewrite), then verify the sentinels survived (the
- * kernel — and our trampoline — must preserve them). Returns the pid if all
- * preserved, else -1. Self-contained (local branches, no literals) so it can be
- * copied to an anonymous buffer and rewritten.
+/* Self-test function (M8 _rwtest): set sentinels in x1..x7, the FP registers and
+ * FPCR, run two `svc #0` sites, then check that they survived. A syscall
+ * preserves every register but x0 — the kernel saves the lot into pt_regs and
+ * never touches the FP state — so a rewritten site owes the guest exactly the
+ * same.
+ *
+ * Two sites, because what the dispatcher does behind them differs: getpid is
+ * answered almost immediately, while the openat runs the path translator and
+ * whatever synthesis the path selects, which is where the C code that might
+ * spend a register the guest still owns actually lives.
+ *
+ * x1..x7 are answered here (return -1); the rest are written to the caller's
+ * buffer in x0 so the failure can be named. Returns the pid when the register
+ * file is intact, else -1. Self-contained (local branches, no literals) so it
+ * can be copied to an anonymous buffer and rewritten.
+ *
+ * Buffer layout, 8 bytes each: d0, d1, d8, d16, d31, fpcr, then the openat
+ * result.
  */
     .global cng_rwtest_fn
     .global cng_rwtest_fn_end
     .balign 4
-cng_rwtest_fn:
-    mov     x1, #0x101
-    mov     x2, #0x202
+cng_rwtest_fn:                      /* (void *results, const char *path) */
+    mov     x10, x0                 /* result buffer; x0 is about to be a fd */
+    mov     x12, x1                 /* path, likewise for x1 */
+    movz    x11, #0xfd00            /* an FP value live across a syscall is */
+    fmov    d0, x11                 /* ordinary code: gcc -O2 keeps doubles in */
+    movz    x11, #0xfd01            /* d0..d7 across an inline svc, since the */
+    fmov    d1, x11                 /* asm clobbers only "memory" and "cc" */
+    movz    x11, #0xfd08
+    fmov    d8, x11
+    movz    x11, #0xfd10
+    fmov    d16, x11
+    movz    x11, #0xfd1f
+    fmov    d31, x11
+    mov     x11, #0x400000          /* FPCR.RMode = 01 (toward +inf) */
+    msr     fpcr, x11
+    mov     x0, #-100               /* AT_FDCWD */
+    mov     x1, x12
+    mov     x2, #0                  /* O_RDONLY */
+    mov     x8, #56                 /* __NR_openat */
+    svc     #0                      /* <-- rewritten by the test */
+    mov     x13, x0                 /* fd, or -errno */
+    mov     x1, #0x101              /* the x1..x7 sentinels: after the openat, */
+    mov     x2, #0x202              /* whose arguments live in x0..x2 */
     mov     x3, #0x303
     mov     x4, #0x404
     mov     x5, #0x505
@@ -102,6 +135,20 @@ cng_rwtest_fn:
     mov     x8, #172                /* __NR_getpid */
     svc     #0                      /* <-- rewritten by the test */
     mov     x9, x0                  /* save pid */
+    fmov    x11, d0
+    str     x11, [x10, #0]
+    fmov    x11, d1
+    str     x11, [x10, #8]
+    fmov    x11, d8
+    str     x11, [x10, #16]
+    fmov    x11, d16
+    str     x11, [x10, #24]
+    fmov    x11, d31
+    str     x11, [x10, #32]
+    mrs     x11, fpcr
+    str     x11, [x10, #40]
+    str     x13, [x10, #48]
+    msr     fpcr, xzr               /* leave the caller's rounding mode alone */
     cmp     x1, #0x101
     b.ne    1f
     cmp     x2, #0x202

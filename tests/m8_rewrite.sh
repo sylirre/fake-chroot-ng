@@ -6,7 +6,15 @@ echo "== M8: svc rewriting =="
 
 run -t rwtest >/dev/null 2>&1
 check "trampoline preserves regs + correct syscall" 0 $?
-check_contains "rewrote the svc site" "rewrote 1 site" "$(run -t rwtest 2>&1)"
+check_contains "rewrote the svc sites" "rewrote 2 site" "$(run -t rwtest 2>&1)"
+# The FP register file is part of "preserves regs": the kernel leaves it alone
+# across a syscall, so a rewritten site owes it back, and the C dispatcher the
+# site branches into is under no such discipline. Measured: gcc spends d0/d1/d16
+# on an openat of a synthesized /proc/stat — `cnt v0.8b` for the CPU popcount,
+# and `fmov d1, x0` as a cheap spill slot for a pointer. Nothing puts them back;
+# the monitor is built -mgeneral-regs-only so the instructions never exist.
+check_contains "no FP register is spent behind a rewritten syscall" \
+    "openat=4 -> OK" "$(run -t rwtest 2>&1)"
 
 ROOT=$(mktemp -d)
 mkdir -p "$ROOT/bin" "$ROOT/etc"

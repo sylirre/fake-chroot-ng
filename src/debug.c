@@ -1133,12 +1133,38 @@ int cng_cmd_rwtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     cng_flush_icache((void *)pool, (void *)(pool + used));
 
     long real = sys_getpid();
-    long (*fn)(void) = (long (*)(void))buf;
-    long got = fn();
+    unsigned long res[7];
+    memset(res, 0, sizeof res);
+    /* The openat below goes to a synthesized /proc/stat, forced here the way the
+     * --proc-stat-synth flag forces it: that path counts the CPUs in the
+     * affinity mask with __builtin_popcountl, which gcc compiles to `cnt v0.8b`.
+     * The dispatcher reaching for a vector register is not hypothetical. */
+    cng_g_procstat_synth = 1;
+    long (*fn)(void *, const char *) = (long (*)(void *, const char *))buf;
+    long got = fn(res, "/proc/stat");
+    if ((long)res[6] >= 0)
+        sys_close((int)res[6]);
 
-    int ok = (n >= 1 && got == real);
-    cng_dprintf(1, "rwtest: rewrote %d site(s); real_pid=%d fn_pid=%d -> %s\n",
-                n, (int)real, (int)got, ok ? "OK" : "FAIL");
+    /* The FP register file is the guest's across a syscall — the kernel does
+     * not touch it — so the C dispatcher a rewritten site calls must not spend
+     * any of it. Nothing puts it back; the monitor is built to never generate an
+     * FP instruction in the first place (-mgeneral-regs-only). */
+    static const unsigned long want[6] = {0xfd00UL, 0xfd01UL, 0xfd08UL,
+                                          0xfd10UL, 0xfd1fUL, 0x400000UL};
+    static const char *const nm[6] = {"d0", "d1", "d8", "d16", "d31", "fpcr"};
+    int regs_ok = 1;
+    for (int i = 0; i < 6; i++)
+        if (res[i] != want[i]) {
+            regs_ok = 0;
+            cng_dprintf(1, "rwtest: %s clobbered: %lx want %lx\n", nm[i], res[i],
+                        want[i]);
+        }
+
+    int ok = (n >= 2 && got == real && (long)res[6] >= 0 && regs_ok);
+    cng_dprintf(1,
+                "rwtest: rewrote %d site(s); real_pid=%d fn_pid=%d openat=%ld "
+                "-> %s\n",
+                n, (int)real, (int)got, (long)res[6], ok ? "OK" : "FAIL");
     return ok ? 0 : 1;
 }
 

@@ -52,6 +52,18 @@ endif
 # LL/SC form works on every ARMv8. Probed, since not every compiler has it.
 CFLAGS  += $(shell $(CC) -mno-outline-atomics -E -x c /dev/null >/dev/null 2>&1 \
              && echo -mno-outline-atomics)
+# No floating point or SIMD anywhere in the monitor. This is not a size or a
+# purity argument: on the -R tier the trampoline calls straight into this C code
+# on the guest's own register file, and the kernel preserves the FP registers
+# across a syscall, so anything we spend there is taken from the guest. gcc does
+# spend it — `cnt v0.8b` for a popcount, and `fmov d1, x0` as a cheap spill slot
+# for a pointer — which cost a guest d0/d1/d16 across an openat (measured; see
+# the sentinels in cng_rwtest_fn). Saving all 32 q registers per rewritten
+# syscall would cost 512 bytes of stack traffic on the hot path and still leave
+# the live registers wrong at a ptrace stop; not generating the instructions in
+# the first place costs nothing and is enforced at build time. Deliberately not
+# probed: silently dropping it would put the clobber back.
+CFLAGS  += -mgeneral-regs-only
 # Link chroot-ng far above the guest ET_EXEC range via an explicit linker script
 # (scripts/chroot-ng.ld). A non-PIE guest (notably gcc's cc1) loads at the fixed
 # address 0x400000 — where a -no-pie executable also defaults to — so if

@@ -252,8 +252,15 @@ static unsigned long stat_ncpu(void) {
     if (r <= 0)
         return 1;
     unsigned long n = 0;
-    for (unsigned long i = 0; i < (unsigned long)r / sizeof mask[0]; i++)
-        n += (unsigned long)__builtin_popcountl(mask[i]);
+    for (unsigned long i = 0; i < (unsigned long)r / sizeof mask[0]; i++) {
+        /* Kernighan's, not __builtin_popcountl: the builtin compiles either to
+         * `cnt v0.8b` — a vector register the guest still owns on the -R tier,
+         * see -mgeneral-regs-only in the Makefile — or to a libgcc helper a
+         * -nostdlib link cannot resolve. One iteration per set bit, and the bits
+         * here are CPUs. */
+        for (unsigned long m = mask[i]; m; m &= m - 1)
+            n++;
+    }
     return n ? n : 1;
 }
 
