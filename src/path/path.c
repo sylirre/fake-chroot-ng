@@ -122,13 +122,26 @@ static void hide_proc_pid(char *out, size_t outsz) {
     cng_strlcpy(out, tmp, outsz);
 }
 
-/* Strip a trailing '/'; treat "/" as "" (root of host). */
-static void normalize_root(char *dst, size_t dstsz, const char *src) {
+/* Strip a trailing '/'; treat "/" as "" (root of host). Returns 0, or -1 when
+ * `src` did not fit — a truncation is not something to tolerate here: this is a
+ * prefix every guest path is joined to, so a short one silently roots the guest
+ * at some ancestor of the tree that was asked for, or
+ * — since the cut lands wherever 512 bytes happen to end — at a path that is
+ * not a directory at all. The caller refuses instead. */
+static int normalize_root(char *dst, size_t dstsz, const char *src) {
     size_t n = cng_strlcpy(dst, src, dstsz);
+    if (n >= dstsz) {
+        /* cng_strlcpy reports the length of the SOURCE, so n is past the end of
+         * dst: the trim below would read there, and write there for a byte that
+         * happened to be '/'. */
+        dst[0] = '\0';
+        return -1;
+    }
     while (n > 1 && dst[n - 1] == '/')
         dst[--n] = '\0';
     if (n == 1 && dst[0] == '/')
         dst[0] = '\0'; /* "/" => "" */
+    return 0;
 }
 
 /* Store a host prefix (the rootfs, a bind source) the way the kernel spells it:
@@ -148,7 +161,7 @@ static void normalize_root(char *dst, size_t dstsz, const char *src) {
  * it. Anything that does not resolve (a nonexistent path — diagnosed by the
  * caller — or the synthetic roots the self-tests use, which have no host inode)
  * is kept verbatim, exactly as before. */
-static void canon_host_root(char *dst, size_t dstsz, const char *src) {
+static int canon_host_root(char *dst, size_t dstsz, const char *src) {
     long fd = sys_openat(CNG_AT_FDCWD, src,
                          CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
     if (fd >= 0) {
@@ -161,20 +174,19 @@ static void canon_host_root(char *dst, size_t dstsz, const char *src) {
          * plain absolute name is a prefix we can match against. */
         if (n > 0 && (size_t)n < sizeof real && real[0] == '/') {
             real[n] = '\0';
-            if (!strchr(real, ' ')) {
-                normalize_root(dst, dstsz, real);
-                return;
-            }
+            if (!strchr(real, ' '))
+                return normalize_root(dst, dstsz, real);
         }
     }
-    normalize_root(dst, dstsz, src);
+    return normalize_root(dst, dstsz, src);
 }
 
-void cng_fs_init(struct cng_fs *fs, const char *rootfs) {
+int cng_fs_init(struct cng_fs *fs, const char *rootfs) {
     memset(fs, 0, sizeof *fs);
-    canon_host_root(fs->rootfs, sizeof fs->rootfs, rootfs ? rootfs : "/");
+    int r = canon_host_root(fs->rootfs, sizeof fs->rootfs, rootfs ? rootfs : "/");
     fs->cwd[0] = '/';
     fs->cwd[1] = '\0';
+    return r;
 }
 
 int cng_fs_add_bind(struct cng_fs *fs, const char *guest, const char *host,
@@ -189,8 +201,13 @@ int cng_fs_add_bind(struct cng_fs *fs, const char *guest, const char *host,
     } else {
         return -1; /* bind guest paths must be absolute */
     }
-    cng_strlcpy(b->guest, canon, sizeof b->guest);
-    canon_host_root(b->host, sizeof b->host, host);
+    /* Same reasoning as the rootfs: a bind prefix that does not fit would be
+     * cut to some shorter guest path, and then the host directory is exposed
+     * at a name nobody asked for. */
+    if (cng_strlcpy(b->guest, canon, sizeof b->guest) >= sizeof b->guest)
+        return -1;
+    if (canon_host_root(b->host, sizeof b->host, host) != 0)
+        return -1;
     b->glen = (unsigned)strlen(b->guest);
     b->ro = ro ? 1u : 0u;
     fs->nbinds++;

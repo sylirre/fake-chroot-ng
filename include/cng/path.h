@@ -45,7 +45,9 @@ struct cng_dev_node {
 extern const struct cng_dev_node cng_dev_nodes[];
 extern const int cng_dev_nnodes;
 
-void cng_fs_init(struct cng_fs *fs, const char *rootfs);
+/* 0, or -1 when the rootfs path does not fit fs->rootfs: it is refused rather
+ * than truncated, since a short prefix roots the guest somewhere else. */
+int cng_fs_init(struct cng_fs *fs, const char *rootfs);
 int cng_fs_add_bind(struct cng_fs *fs, const char *guest, const char *host,
                     int ro);
 void cng_fs_set_cwd(struct cng_fs *fs, const char *guest_cwd);

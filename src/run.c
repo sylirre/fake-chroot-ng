@@ -231,10 +231,21 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
     if (cng_g_fake_id)
         cng_cred_setup((unsigned)sys_getuid(), (unsigned)sys_getgid());
 
-    /* Filesystem view. */
-    cng_fs_init(&g_fs, rootfs);
+    /* Filesystem view. A prefix that does not fit is refused, not shortened:
+     * every guest path is joined to it, so a truncated one would silently root
+     * the guest at an ancestor of the tree that was named — or, since the cut
+     * lands mid-component, at a path that is not a directory at all. */
+    if (cng_fs_init(&g_fs, rootfs) != 0) {
+        cng_dprintf(2, "chroot-ng: rootfs '%s': path too long (max %d)\n",
+                    rootfs, (int)sizeof g_fs.rootfs - 1);
+        return 2;
+    }
     for (int j = 0; j < nb; j++)
-        cng_fs_add_bind(&g_fs, bind_g[j], bind_h[j], bind_ro[j]);
+        if (cng_fs_add_bind(&g_fs, bind_g[j], bind_h[j], bind_ro[j]) != 0) {
+            cng_dprintf(2, "chroot-ng: --bind '%s:%s': path too long\n",
+                        bind_h[j], bind_g[j]);
+            return 2;
+        }
     /* The dispatcher (used by both the SIGSYS handler and M8 trampolines) needs
      * the fs view even if the seccomp monitor never installs (e.g. -R only) —
      * and so does cng_resolve, which -w/--work-dir and the program lookup below

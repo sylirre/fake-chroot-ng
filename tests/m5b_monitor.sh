@@ -11,6 +11,31 @@ check_contains "dispatch openat translated into rootfs" \
     "read: HELLO-FROM-ROOTFS" \
     "$(run -t dtest -r "$ROOT" open /etc/greeting 2>&1)"
 
+# --- the rootfs argument itself ---------------------------------------------
+# It is a prefix, and every guest path is joined to it, so the two ways of
+# getting one that is not what the user typed both end somewhere they did not
+# ask for. An empty one is the identity — `chroot-ng "$ROOTFS" rm -rf /` with the
+# variable unset ran against the host root, silently. And one that did not fit
+# the 512-byte field was truncated, which lands mid-component: the guest was
+# rooted at a shorter path, or at one that is not a directory at all. (The
+# truncation also read one byte past the buffer while trimming trailing slashes,
+# since cng_strlcpy reports the length of the source.)
+run "" /bin/true >/dev/null 2>&1
+check "an empty rootfs argument is refused" 2 $?
+check_contains "the empty rootfs is diagnosed, with the deliberate spelling" \
+    "chroot-ng: <rootfs> is empty (use '/' for the host root)" \
+    "$(run "" /bin/true 2>&1)"
+M5B_DEEP="$ROOT"
+while [ ${#M5B_DEEP} -lt 512 ]; do M5B_DEEP="$M5B_DEEP/dddddddddddddddddddd"; done
+mkdir -p "$M5B_DEEP"
+run "$M5B_DEEP" /bin/true >/dev/null 2>&1
+check "a rootfs path too long to hold is refused, not truncated" 2 $?
+check_contains "the over-long rootfs is diagnosed with the limit" \
+    "path too long (max 511)" "$(run "$M5B_DEEP" /bin/true 2>&1)"
+check_contains "a bind destination too long to hold is refused too" \
+    "--bind '$ROOT:/$(printf 'b%.0s' $(seq 1 300))': path too long" \
+    "$(run -b "$ROOT:/$(printf 'b%.0s' $(seq 1 300))" "$ROOT" /bin/true 2>&1)"
+
 # The runtime's own formatter, which everything here reports through and the
 # SIGSYS handler runs with every signal but SIGSYS masked — so an out-of-bounds
 # read in it is an unblockable kill, not a wrong string. A format ending in a

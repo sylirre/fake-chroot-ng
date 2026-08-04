@@ -855,6 +855,15 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
         return 2;
     }
     rootfs = argv[i];
+    /* An empty one is almost always an unset variable — `chroot-ng "$ROOTFS"
+     * rm -rf /` — and it used to mean the host root, silently: the rootfs is a
+     * prefix, and the empty prefix is the identity. "/" is how that is asked
+     * for on purpose. */
+    if (!*rootfs) {
+        cng_dprintf(2, "chroot-ng: <rootfs> is empty (use '/' for the host "
+                       "root)\n");
+        return 2;
+    }
     char **gargv = argv + i + 1;
     int gargc = argc - i - 1;
 
