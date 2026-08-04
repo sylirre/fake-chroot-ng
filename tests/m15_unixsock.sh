@@ -212,6 +212,39 @@ else
             "recvmsg: n=2 namelen=0 controllen=0 flags=0 poison=1" "$out"
     fi
 
+    # --- a name the containment cannot express ----------------------------
+    # sun_path holds 108 bytes, so a long enough rootfs pushes the translated
+    # name out of it. The fallback binds relative to the parent directory's fd
+    # so only the basename has to fit — but when even that cannot be had (here
+    # the parent simply does not exist in the rootfs), there is no contained
+    # form of the address at all.
+    #
+    # That case has to be refused. Passing it through meant re-issuing the
+    # guest's OWN sun_path, which the host kernel resolves against the host
+    # filesystem: the bind reported success and created the socket at the guest's
+    # literal name, outside the rootfs, in exactly the configuration where the
+    # prefix is longest. A guest daemon would then be serving on a host-visible
+    # name. /tmp is used because it is writable on every host we target, so the
+    # escaped bind really does succeed and the check is not passing for free.
+    R3=$(mktemp -d)
+    R3="$R3/$(printf 'd%.0s' $(seq 1 60))/$(printf 'e%.0s' $(seq 1 30))"
+    mkdir -p "$R3/bin"          # deliberately no "tmp" directory inside
+    cp "$M15D/uxsock" "$R3/bin/uxsock"
+    M15ESC=/tmp/cng-m15-escape.sock
+    rm -f "$M15ESC"
+    out=$(m15run -R "$R3" /bin/uxsock "$M15ESC" 2>&1)
+    check_absent "m15 a name too long to contain is not bound at all" \
+        "bind: ok" "$out"
+    if [ -e "$M15ESC" ]; then
+        fail=$((fail + 1))
+        echo "  FAIL m15 the guest's socket escaped to the host at $M15ESC"
+        rm -f "$M15ESC"
+    else
+        pass=$((pass + 1))
+        echo "  ok   m15 ...and nothing of it reaches the host filesystem"
+    fi
+    rm -rf "$R3"
+
     rm -rf "$R1" "$R2"
 fi
 rm -rf "$M15D"

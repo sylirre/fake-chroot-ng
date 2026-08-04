@@ -161,7 +161,7 @@ int cng_sun_in(struct cng_sun_xlate *x, const void *addr, long alen,
     char host[CNG_PATH_MAX];
     if (cng_resolve(guest, follow, host, sizeof host) != 0 &&
         cng_fs_translate(cng_g_fs, guest, host, sizeof host) != 0)
-        return 0; /* unresolvable: let the kernel answer on the raw name */
+        return -ENAMETOOLONG; /* the contained name cannot be spelled */
 
     size_t hl = strlen(host);
     char *out = x->buf;
@@ -176,12 +176,19 @@ int cng_sun_in(struct cng_sun_xlate *x, const void *addr, long alen,
     /* The rootfs prefix pushed the translated name past sun_path. Open the
      * parent directory and name the socket relative to that fd, so only the
      * basename has to fit: /proc/self/fd/<n>/<basename>. The fd is closed by
-     * cng_sun_done once the syscall has run. */
+     * cng_sun_done once the syscall has run.
+     *
+     * Every way out of here below is an error, never a 0. A 0 means "nothing to
+     * translate" and sends the caller's own address to the kernel — which for a
+     * pathname socket is the guest's untranslated name, resolved against the
+     * host filesystem. That is the containment gone: a bind creates the inode
+     * outside the rootfs and a connect reaches a host daemon, in exactly the
+     * case the rootfs prefix is longest. */
     size_t cut = hl;
     while (cut > 0 && host[cut - 1] != '/')
         cut--;
     if (cut == 0)
-        return 0;
+        return -ENAMETOOLONG;
     char parent[CNG_PATH_MAX];
     memcpy(parent, host, cut - 1); /* drop the '/' itself */
     parent[cut - 1] = '\0';
@@ -189,13 +196,13 @@ int cng_sun_in(struct cng_sun_xlate *x, const void *addr, long alen,
     long fd = sys_openat(CNG_AT_FDCWD, parent[0] ? parent : "/",
                          CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
     if (fd < 0)
-        return 0;
+        return (int)fd; /* the parent's own errno: ENOENT, EACCES, ... */
     char pfx[64];
     size_t pl = fd_dir_prefix((int)fd, pfx, sizeof pfx);
     size_t bl = strlen(base);
     if (pl + bl + 1 > SUN_PATH_MAX) {
         sys_close((int)fd);
-        return 0;
+        return -ENAMETOOLONG;
     }
     memcpy(out + SUN_HDR, pfx, pl);
     memcpy(out + SUN_HDR + pl, base, bl + 1);

@@ -2130,11 +2130,14 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         long al = is_send ? a5 : a2;   /* addrlen */
         struct cng_sun_xlate x;
         long r;
-        if (cng_sun_in(&x, (const void *)aa, al, nr != __NR_bind)) {
+        int sx = cng_sun_in(&x, (const void *)aa, al, nr != __NR_bind);
+        if (sx > 0) {
             if (is_send)
                 r = reissue(a0, a1, a2, a3, (long)x.buf, x.len, nr);
             else
                 r = reissue(a0, (long)x.buf, x.len, a3, a4, a5, nr);
+        } else if (sx < 0) {
+            r = sx; /* a name we could not contain is refused, not passed on */
         } else {
             r = reissue(a0, a1, a2, a3, a4, a5, nr);
         }
@@ -2170,12 +2173,16 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         long r;
         x.dirfd = -1; /* a NULL msghdr never reaches cng_sun_in, and cng_sun_done
                        * must not then close whatever the stack held */
-        if (a1 && cng_sun_in(&x, *(void **)(char *)a1,
-                             (long)*(unsigned *)((char *)a1 + 8), 1)) {
+        int sx = a1 ? cng_sun_in(&x, *(void **)(char *)a1,
+                                 (long)*(unsigned *)((char *)a1 + 8), 1)
+                    : 0;
+        if (sx > 0) {
             memcpy(mh, (const void *)a1, sizeof mh);
             *(void **)mh = x.buf;
             *(unsigned *)(mh + 8) = (unsigned)x.len;
             r = reissue(a0, (long)mh, a2, a3, a4, a5, nr);
+        } else if (sx < 0) {
+            r = sx;
         } else {
             r = reissue(a0, a1, a2, a3, a4, a5, nr);
         }
@@ -2240,11 +2247,15 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             }
             struct cng_msghdr mh = v[i].hdr;
             struct cng_sun_xlate x;
-            if (cng_sun_in(&x, mh.name, (long)mh.namelen, 1)) {
+            int sx = cng_sun_in(&x, mh.name, (long)mh.namelen, 1);
+            if (sx > 0) {
                 mh.name = x.buf;
                 mh.namelen = (unsigned)x.len;
             }
-            r = reissue(a0, (long)&mh, a3, 0, 0, 0, __NR_sendmsg);
+            if (sx < 0)
+                r = sx;
+            else
+                r = reissue(a0, (long)&mh, a3, 0, 0, 0, __NR_sendmsg);
             cng_sun_done(&x);
             if (r < 0)
                 break;

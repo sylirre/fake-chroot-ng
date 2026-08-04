@@ -29,8 +29,11 @@ struct cng_sun_xlate {
  * last component literal, since it is the name being created. Returns 1 when
  * x->buf/x->len should be used, 0 to pass the guest's address through untouched
  * — which is also the answer for an address that cannot be read, so the kernel
- * gets to fault on the guest's own pointer rather than the handler dying on it.
- * Always pair with cng_sun_done(). */
+ * gets to fault on the guest's own pointer rather than the handler dying on it
+ * — and a negative errno when the address is a pathname that needed containing
+ * and could not be expressed. That last case must be answered, never passed
+ * through: the guest's own sun_path names a host location. Always pair with
+ * cng_sun_done(). */
 int cng_sun_in(struct cng_sun_xlate *x, const void *addr, long alen, int follow);
 
 /* Would cng_sun_in() rewrite this address? Lets the mmsg array forms re-issue a
