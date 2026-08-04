@@ -455,14 +455,20 @@ static int addr_dump_indices(int *idx, unsigned *v4, unsigned char *plen,
             break;
         for (long p = 0; p + (long)sizeof(struct nlmsghdr_) <= r;) {
             struct nlmsghdr_ *m = (struct nlmsghdr_ *)(scratch + p);
-            if (m->len < sizeof *m || p + (long)m->len > r)
+            /* Read the length once and bound everything below by the copy. The
+             * walk stores through idx/v4/plen, which the compiler must assume
+             * may alias this buffer, so re-reading m->len would let a value
+             * written after the check decide how far the attribute loop goes —
+             * and this buffer is the caller's, not ours. */
+            long mlen = (long)m->len;
+            if (mlen < (long)sizeof *m || p + mlen > r)
                 break;
             if (m->type == NLMSG_DONE_ || m->type == NLMSG_ERROR_) {
                 done = 1;
                 break;
             }
             /* ifaddrmsg: family, prefixlen, flags, scope, then u32 index. */
-            if (m->type == RTM_NEWADDR_ && m->len >= sizeof *m + 8) {
+            if (m->type == RTM_NEWADDR_ && mlen >= (long)sizeof *m + 8) {
                 unsigned char *ifa = (unsigned char *)m + sizeof *m;
                 int ifi = *(int *)(ifa + 4);
                 int slot = -1;
@@ -481,10 +487,10 @@ static int addr_dump_indices(int *idx, unsigned *v4, unsigned char *plen,
                  * family — which has no way to express anything else, and which
                  * must describe the same interfaces this dump defines. */
                 if (slot >= 0 && v4 && !v4[slot] && ifa[0] == AF_INET_) {
-                    for (long q = (long)sizeof *m + 8; q + 4 <= (long)m->len;) {
+                    for (long q = (long)sizeof *m + 8; q + 4 <= mlen;) {
                         unsigned short al = *(unsigned short *)((char *)m + q);
                         unsigned short at = *(unsigned short *)((char *)m + q + 2);
-                        if (al < 4 || q + al > (long)m->len)
+                        if (al < 4 || q + al > mlen)
                             break;
                         if ((at == IFA_LOCAL_ || at == IFA_ADDRESS_) &&
                             al >= 8 && !v4[slot]) {
@@ -496,7 +502,7 @@ static int addr_dump_indices(int *idx, unsigned *v4, unsigned char *plen,
                     }
                 }
             }
-            p += (long)((m->len + 3) & ~3u);
+            p += (mlen + 3) & ~3L;
         }
     }
 out:
@@ -1001,7 +1007,16 @@ struct ifview {
 };
 
 static int enum_ifviews(struct ifview *out, int cap) {
-    static unsigned char scratch[NL_REPLY_MAX];
+    /* Not static: cng_nl_ioctl reaches this from the SIGSYS handler, on any
+     * thread, with no lock anywhere on the path. A process-wide parse buffer
+     * would have two threads' recvfrom writing into it while the other walks
+     * it — two guest threads in getifaddrs(3) is all that takes — and the
+     * damage is not confined to a wrong answer: addr_dump_indices derives every
+     * bound from a length it reads back out of this buffer, so a value landing
+     * there mid-walk sends the attribute loop past the end of it, and a fault
+     * in the handler is unblockable. 8 KiB on the 256 KiB scratch stack. Every
+     * other receive area in this file is already per-slot or automatic. */
+    unsigned char scratch[NL_REPLY_MAX];
     int idx[32];
     unsigned v4[32];
     unsigned char pl[32];
