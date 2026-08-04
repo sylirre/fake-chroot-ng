@@ -98,6 +98,16 @@ else
         # it never takes away an answer the host is willing to give.
         check_contains "m16 an interface nobody has is ENODEV" \
             "ifget: nodev=1" "$em"
+        # A non-dump RTM_GET* is a different request from the dump of the same
+        # type: its payload *is* the request, and the kernel parses it with a
+        # header length of its own before the handler runs. Relaying every
+        # RTM_GET* in the minimal dump form — the shape that gets past Android's
+        # refusal of the attribute-bearing dump — hands the kernel a message
+        # four bytes short of that and it answers EINVAL, so `ip link show dev
+        # eth0` and `ip route get 8.8.8.8` printed "Invalid argument" for
+        # requests the host would have answered.
+        check_contains "m16 a non-dump RTM_GETLINK is answered, not refused" \
+            "getlink1: msgs>0=1 newlink=1 err=0" "$em"
 
         # --- 2. against the kernel, where there is a kernel to compare to ---
         if [ "$m16_raw" = 1 ]; then

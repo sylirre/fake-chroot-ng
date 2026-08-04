@@ -115,6 +115,57 @@ int main(void) {
            seq_ok, newlink > 0);
     close(fd);
 
+    /* --- a NON-dump RTM_GETLINK, which is a different request entirely ---
+     *
+     * `ip link show dev NAME` and `ip route get ADDR` ask about one thing, and
+     * for those the payload IS the request: the kernel parses it with a header
+     * length of its own (sizeof ifinfomsg for GETLINK, sizeof rtmsg for
+     * GETROUTE) before the handler runs. An emulation that relays every
+     * RTM_GET* in the minimal dump form — header plus a family byte, which is
+     * what gets past Android's refusal of the attribute-bearing dump — hands
+     * the kernel a message four bytes short of either, and it answers EINVAL.
+     *
+     * Asked about interface index 1, which every host has, so the answer is a
+     * property both sides must share rather than a name that differs. */
+    int gfd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+    int gone = 0, gerr = 0, gnew = 0;
+    if (gfd >= 0) {
+        struct timeval gtv = {2, 0};
+        setsockopt(gfd, SOL_SOCKET, SO_RCVTIMEO, &gtv, sizeof gtv);
+        struct {
+            struct nlmsghdr nlh;
+            struct ifinfomsg ifi;
+        } g1;
+        memset(&g1, 0, sizeof g1);
+        g1.nlh.nlmsg_len = sizeof g1;
+        g1.nlh.nlmsg_type = RTM_GETLINK;
+        g1.nlh.nlmsg_flags = NLM_F_REQUEST; /* no NLM_F_DUMP: one interface */
+        g1.nlh.nlmsg_seq = 4243;
+        g1.ifi.ifi_family = AF_UNSPEC;
+        g1.ifi.ifi_index = 1;
+        if (sendto(gfd, &g1, sizeof g1, 0, (struct sockaddr *)&sa, sizeof sa) >=
+            0) {
+            char gbuf[8192];
+            long gn = recv(gfd, gbuf, sizeof gbuf, 0);
+            if (gn > 0) {
+                struct nlmsghdr *h = (struct nlmsghdr *)gbuf;
+                size_t len = (size_t)gn;
+                for (; NLMSG_OK(h, len); h = NLMSG_NEXT(h, len)) {
+                    gone++;
+                    if (h->nlmsg_type == RTM_NEWLINK)
+                        gnew++;
+                    if (h->nlmsg_type == NLMSG_ERROR) {
+                        struct nlmsgerr *e = (struct nlmsgerr *)NLMSG_DATA(h);
+                        if (e->error)
+                            gerr = -e->error;
+                    }
+                }
+            }
+        }
+        close(gfd);
+    }
+    printf("getlink1: msgs>0=%d newlink=%d err=%d\n", gone > 0, gnew, gerr);
+
     /* --- the same dump read back with recvmmsg --------------------------- */
     /* The array form fills one source address per message, and what a netlink
      * client does with that address is decide whether the reply came from the

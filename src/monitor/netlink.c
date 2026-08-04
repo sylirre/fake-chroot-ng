@@ -277,22 +277,50 @@ static long open_hostfd(void) {
  * The family byte sits at offset 16 in all three dump payloads we relay —
  * ifinfomsg.ifi_family, ifaddrmsg.ifa_family, rtmsg.rtm_family — so it is
  * carried across without knowing which one this is. */
-static long relay_dump(int hostfd, const unsigned char *req, long rlen) {
-    unsigned char out[20];
-    memset(out, 0, sizeof out);
-    struct nlmsghdr_ *h = (struct nlmsghdr_ *)out;
+/* The most a non-dump get needs bounced: `ip route get ADDR` is 36 bytes,
+ * `ip link show dev NAME` about 42. */
+#define NL_RELAY_MAX 256
+
+static long relay_request(int hostfd, const unsigned char *req, long rlen,
+                          int is_dump) {
+    unsigned char out[NL_RELAY_MAX];
+    long n;
     const struct nlmsghdr_ *rh = (const struct nlmsghdr_ *)req;
-    h->len = (unsigned)sizeof out;
-    h->type = rh->type;
-    h->flags = rh->flags;
-    h->seq = rh->seq;
+    struct nlmsghdr_ *h = (struct nlmsghdr_ *)out;
+    if (is_dump) {
+        /* A dump goes in the minimal form — header plus a one-byte family,
+         * with the request's filter attributes dropped. That is what gets past
+         * Android's refusal of the attribute-bearing form, and it is safe
+         * because netlink filtering is advisory: the kernel may return more
+         * than the guest asked for, and every client filters the replies
+         * itself. */
+        n = 20;
+        memset(out, 0, (size_t)n);
+        h->len = (unsigned)n;
+        h->type = rh->type;
+        h->flags = rh->flags;
+        h->seq = rh->seq;
+        out[16] = (rlen > 16) ? req[16] : 0;
+    } else {
+        /* A non-dump get cannot be expressed that way: its payload *is* the
+         * request, and the kernel validates that payload's length before the
+         * handler ever sees it. rtnl_getlink() parses with hdrlen
+         * sizeof(struct ifinfomsg) == 16 and rtnl_getroute() with
+         * sizeof(struct rtmsg) == 12, while the minimal form's nlmsg_len() is
+         * 4 — so nlmsg_parse refuses it and `ip route get 8.8.8.8` was told
+         * "Invalid argument" for a request the host would have answered.
+         * Forward it as it stands instead. */
+        if (rlen < (long)sizeof *rh || rlen > (long)sizeof out)
+            return -EINVAL; /* too big to bounce: fall back to synthesis */
+        memcpy(out, req, (size_t)rlen);
+        n = rlen;
+        h->len = (unsigned)n; /* consistent with what we actually send */
+    }
     h->pid = 0; /* the kernel fills in the source port id */
-    out[16] = (rlen > 16) ? req[16] : 0;
     struct sockaddr_nl_ sa;
     memset(&sa, 0, sizeof sa);
     sa.family = AF_NETLINK_;
-    return CNG_SYS(__NR_sendto, hostfd, (long)out, sizeof out, 0, (long)&sa,
-                   sizeof sa);
+    return CNG_SYS(__NR_sendto, hostfd, (long)out, n, 0, (long)&sa, sizeof sa);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -723,7 +751,7 @@ static void process_request(struct nl_slot *s, const unsigned char *req,
         if (s->hostfd >= 0)
             sr = (cng_nl_deny_getlink && type == RTM_GETLINK_)
                      ? -EACCES /* test aid: Android's nlmsg_readpriv refusal */
-                     : relay_dump(s->hostfd, req, rl);
+                     : relay_request(s->hostfd, req, rl, is_dump);
         if (sr >= 0) {
             if (cng_g_debug)
                 cng_dprintf(2, "[cng] nl send fd=%d type=%u -> relayed\n",
