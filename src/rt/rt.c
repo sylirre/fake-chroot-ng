@@ -208,6 +208,22 @@ static void fmt_run(struct cng_fmt *o, const char *fmt, va_list ap) {
         for (int p_ = (have); p_ < width; p_++)                                \
             PUT(zero ? '0' : ' ');                                             \
     } while (0)
+        /* The conversion specifier can be the terminator: stepping past the '%'
+         * is unconditional and every scan above stops at '\0'. Falling into the
+         * default arm below put that NUL in the output as a character and then
+         * let the loop's own f++ walk past the end of the string, after which
+         * this went on formatting whatever followed the literal in memory,
+         * consuming a va_arg for every '%' it found there — an out-of-bounds
+         * read in the one formatter every path shares, the SIGSYS handler's
+         * included, where a fault is an unblockable kill.
+         *
+         * glibc calls an incomplete conversion an error and returns -1; this
+         * returns a length and has nowhere to say that, so it keeps the stray
+         * '%' (dropping nothing) and stops. */
+        if (!*f) {
+            PUT('%');
+            break;
+        }
         switch (*f) {
         case 's': {
             const char *s = va_arg(ap, const char *);

@@ -11,6 +11,20 @@ check_contains "dispatch openat translated into rootfs" \
     "read: HELLO-FROM-ROOTFS" \
     "$(run -t dtest -r "$ROOT" open /etc/greeting 2>&1)"
 
+# The runtime's own formatter, which everything here reports through and the
+# SIGSYS handler runs with every signal but SIGSYS masked — so an out-of-bounds
+# read in it is an unblockable kill, not a wrong string. A format ending in a
+# bare '%' had one: stepping past the '%' is unconditional and the flag, width
+# and length scans all stop at the terminator, so the conversion dispatch landed
+# on '\0', emitted it, and let the loop walk off the end of the literal and keep
+# formatting the bytes after it — consuming a va_arg for every '%' it found.
+# Latent (every format in the tree is a literal, none ending in '%'), so the
+# probe builds its formats at runtime and puts known bytes past the terminator:
+# the walk shows as a reported length of 9 rather than 2.
+check_contains "a format ending in a bare % stops at the terminator" \
+    "fmt: bare=1,2 wide=1,2 normal=1,6 [x007%y]" \
+    "$(run -t dtest fmt / 2>&1)"
+
 run -t dtest -r "$ROOT" access /etc/greeting >/dev/null 2>&1
 check "dispatch faccessat: present file" 0 $?
 run -t dtest -r "$ROOT" access /etc/nope >/dev/null 2>&1

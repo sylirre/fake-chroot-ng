@@ -527,6 +527,38 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
                     (int)rd, (int)bad, (int)miss);
         return 0;
     }
+    /* The one formatter the whole freestanding runtime shares, asked about the
+     * inputs it cannot get from a literal. A format ending in a bare '%' is the
+     * sharp one: stepping past the '%' is unconditional and every scan for
+     * flags, width and length stops at the terminator, so the conversion
+     * dispatch used to land on '\0' — emit it as a character, and let the
+     * loop's own increment walk off the end of the string and go on formatting
+     * whatever followed it in memory, consuming a va_arg per '%' found there.
+     * In .rodata that is an out-of-bounds read in code the SIGSYS handler runs,
+     * where a fault is an unblockable kill. Built here rather than written as a
+     * literal, so a compiler's own -Wformat cannot object and so the bytes
+     * after the terminator are known: the walk shows up as a length of 9 rather
+     * than 2, having appended "Z4242Z" from past the end. */
+    if (!strcmp(op, "fmt")) {
+        static char pct[8] = {'a', '%', 0, 'Z', '%', 'd', 'Z', 0};
+        static char pctw[12] = {'b', '%', '0', '8', 'l', 0, 'Z', '%', 'd', 0};
+        char out[64];
+        memset(out, 'Q', sizeof out);
+        size_t n = cng_snprintf(out, sizeof out, pct, 4242);
+        int clean = n == 2 && out[0] == 'a' && out[1] == '%' && out[2] == 0;
+        char out2[64];
+        memset(out2, 'Q', sizeof out2);
+        size_t n2 = cng_snprintf(out2, sizeof out2, pctw, 4242);
+        int clean2 = n2 == 2 && out2[0] == 'b' && out2[1] == '%' && out2[2] == 0;
+        /* ...and an ordinary format still works, so the guard is not a stop. */
+        char out3[64];
+        size_t n3 = cng_snprintf(out3, sizeof out3, "x%03d%%y", 7);
+        int ok3 = n3 == 6 && !strcmp(out3, "x007%y");
+        cng_dprintf(1, "fmt: bare=%d,%lu wide=%d,%lu normal=%d,%lu [%s]\n",
+                    clean, (unsigned long)n, clean2, (unsigned long)n2, ok3,
+                    (unsigned long)n3, out3);
+        return 0;
+    }
     /* A ":ro" bind must answer -EROFS for every mutating path syscall while
      * still serving reads, the way a real read-only mount does. GUESTPATH names
      * an existing file inside the bind. Without ":ro" on the -b spec the same
