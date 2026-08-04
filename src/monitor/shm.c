@@ -324,11 +324,19 @@ void cng_shm_detach_all(void) {
         u64 va = __atomic_load_n(&g_att[i].va, __ATOMIC_ACQUIRE);
         if (!va || va == ATT_CLAIMING)
             continue;
+        /* Copied out before the CAS, as do_shmdt does and for the same reason:
+         * zeroing `va` releases the slot, and from that instant a concurrent
+         * shmat on another thread may claim it and write its own segment in.
+         * Read afterwards, the length belonged to that segment and this
+         * unmapped the old address for the new one's size, then charged the
+         * detach against the wrong shmid. */
+        s32 shmid = g_att[i].shmid;
+        u64 len = g_att[i].size;
         u64 expect = va;
         if (!__atomic_compare_exchange_n(&g_att[i].va, &expect, 0, 0,
                                          __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
             continue;
-        sys_munmap((void *)va, g_att[i].size);
-        shm_dt(g_att[i].shmid);
+        sys_munmap((void *)va, len);
+        shm_dt(shmid);
     }
 }
