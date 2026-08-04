@@ -111,6 +111,39 @@ check_contains "dirfd-relative absolute symlink re-roots into the rootfs" \
     "atrel: HELLO-FROM-ROOTFS" \
     "$(run -t dtest -r "$ROOT" atrel /sub lnk 2>&1)"
 
+# AT_EMPTY_PATH names the descriptor, not a name to resolve. The empty name was
+# walked like any other relative one -- the probe deciding that ends in a
+# readlinkat, which for an empty name reports on the dirfd, so a symlink fd said
+# "this is a link, walk it" -- and the walk then resolved the fd's own guest path
+# dereferencing its final component. fstatat described the TARGET where the
+# kernel describes the link, and a dangling link answered ENOENT where the kernel
+# answers fine. That is the race-free lstat-by-fd idiom systemd and util-linux
+# use everywhere. Byte-for-byte against the host build, which is the kernel.
+EPD=$(mktemp -d)
+printf hi > "$EPD/f"; ln -s f "$EPD/l"; ln -s nowhere "$EPD/dang"
+if ! guest_xlate_ready "AT_EMPTY_PATH legs"; then
+    :
+elif guest_cc_report "$EPD/emptypath" tests/guests/emptypath.c; then
+    ep_k=""
+    if have cc && cc -O1 -o "$EPD/ep_host" tests/guests/emptypath.c 2>/dev/null; then
+        ep_k=$("$EPD/ep_host" "$EPD" 2>/dev/null)
+    fi
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+    ep_g=$(run_t 60 -R $GUEST_BINDS "$EPD" /emptypath 2>/dev/null)
+    if [ -z "$ep_k" ]; then
+        skip "AT_EMPTY_PATH differential: no host compiler for the oracle"
+    elif [ "$ep_k" = "$ep_g" ]; then
+        pass=$((pass + 1))
+        echo "  ok   AT_EMPTY_PATH matches the kernel byte-for-byte"
+    else
+        fail=$((fail + 1))
+        echo "  FAIL AT_EMPTY_PATH diverges from the kernel"
+        printf '    kernel: %s\n' "$(echo "$ep_k" | tr '\n' '|')"
+        printf '    cng   : %s\n' "$(echo "$ep_g" | tr '\n' '|')"
+    fi
+fi
+rm -rf "$EPD"
+
 # The xattr family was never trapped, so a guest's absolute path reached the HOST
 # filesystem: getxattr answered existence questions about it and setxattr wrote
 # it. Translation shows up in the errno: a name that resolves inside the rootfs

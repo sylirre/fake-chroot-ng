@@ -902,7 +902,23 @@ static const char *xlate(long dirfd, const char *gp, char *buf, size_t bufsz,
      * absolute symlink target resolve from the HOST root, since the kernel does
      * not know about the rootfs. Contain it like any other path, but only when
      * something in it could actually redirect (see at_needs_xlate). */
-    if (dfd >= 0 && at_needs_xlate(dfd, gp, deref_final)) {
+    /* An empty name against a real dirfd is AT_EMPTY_PATH: the descriptor IS
+     * the file and there is no name to resolve. It must not be walked. The
+     * probe at_needs_xlate ends on is a readlinkat, which for an empty name
+     * reports on the *dirfd* — so an fd opened O_PATH|O_NOFOLLOW on a symlink
+     * answered "this is a link, walk it", and the walk then joined the empty
+     * name onto the fd's own guest path and resolved it with deref_final=1.
+     * The reissued call named the symlink's TARGET and ignored the dirfd
+     * entirely: fstatat described the target where the kernel describes the
+     * link, fchownat changed the target's owner and left the link alone, and on
+     * a dangling link a call the kernel answers came back -ENOENT. That is the
+     * standard race-free lstat-by-fd idiom (O_PATH|O_NOFOLLOW then *at(fd, "",
+     * AT_EMPTY_PATH)), which systemd and util-linux use everywhere.
+     *
+     * Nothing is given up by passing it through: the dirfd is already inside
+     * the guest view, which is what contains it. AT_FDCWD is handled above and
+     * still resolves through the virtual cwd. */
+    if (dfd >= 0 && gp[0] && at_needs_xlate(dfd, gp, deref_final)) {
         int r = xlate_at(dfd, gp, buf, bufsz, deref_final);
         if (r == 0)
             return buf;
