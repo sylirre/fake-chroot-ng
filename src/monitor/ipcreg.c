@@ -1341,15 +1341,27 @@ void cng_ipc_reclaim(void) {
         if (start != w->start || zombie)
             waiter_free(w); /* no reply: there is nobody left to read it */
     }
+    int applied = 0;
     for (int i = 0; i < SEM_UNDO_MAX; i++) {
         struct sem_undo *u = &g_undo[i];
         if (!u->used)
             continue;
         int zombie = 0;
         u64 start = cng_proc_starttime(u->pid, &zombie);
-        if (start != u->start || zombie)
+        if (start != u->start || zombie) {
             sem_undo_apply(u); /* the kernel's exit-time undo */
+            applied = 1;
+        }
     }
+    /* An undo raises semaphore values, which is exactly the state change a
+     * parked semop is waiting for — and the daemon only rescans after serving a
+     * request, so a reclaim that fires with nothing else going on woke nobody.
+     * A holder that took a semaphore with SEM_UNDO and then died left every
+     * sleeper on that semaphore parked forever, even though the resource it was
+     * waiting for had just been released on its behalf. That is the whole point
+     * of SEM_UNDO: the kernel's exit-time undo does wake them. */
+    if (applied)
+        cng_ipc_rescan();
 }
 
 int cng_ipc_any_live(void) {
