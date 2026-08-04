@@ -901,6 +901,15 @@ static void sem_fill_stat(struct cng_bresp *r, const struct sem_set *s) {
 /* Everything but GETALL/SETALL, which stream their vector and are handled by
  * the caller. `r` carries the stat payload out. */
 static s32 sem_do_ctl(const struct cng_breq *q, struct cng_bresp *r) {
+    /* SETVAL's value range is the kernel's first test of all. ksys_semctl
+     * dispatches SETVAL straight into semctl_setval(), whose opening statement
+     * is the range test — before the set is looked up, before semnum is bounded
+     * and before ipcperms(). Checked last, as it was, every one of those
+     * reported something else first. Measured: SETVAL of 99999 answers ERANGE
+     * on a nonexistent id, on a bad semnum and on a set with no permissions,
+     * where this answered EINVAL, EINVAL and EACCES. */
+    if (q->arg == CNG_SETVAL && (q->val < 0 || q->val > CNG_SEMVMX))
+        return -ERANGE;
     switch (q->arg) {
     case CNG_IPC_INFO:
     case CNG_SEM_INFO: {
@@ -962,14 +971,27 @@ static s32 sem_do_ctl(const struct cng_breq *q, struct cng_bresp *r) {
         return 0;
     }
 
-    /* The per-semaphore commands. */
-    if (q->semnum < 0 || (u32)q->semnum >= s->nsems)
-        return -EINVAL;
-    u32 n = (u32)q->semnum;
+    /* The per-semaphore commands. The two families order the remaining two
+     * checks the other way round from each other, and the kernel is explicit
+     * about it: semctl_setval() bounds semnum and calls ipcperms() after, while
+     * semctl_main() calls ipcperms() first and bounds semnum after. Measured:
+     * GETVAL with a bad semnum on a set with no permissions is EACCES, not the
+     * EINVAL a single shared order gave it. */
     int alter = (q->arg == CNG_SETVAL);
-    if (!ipc_access(s->mode, s->uid, s->cuid, s->gid, s->cgid, q->uid, q->gid,
-                    alter ? 02 : 04))
-        return -EACCES;
+    if (alter) {
+        if (q->semnum < 0 || (u32)q->semnum >= s->nsems)
+            return -EINVAL;
+        if (!ipc_access(s->mode, s->uid, s->cuid, s->gid, s->cgid, q->uid,
+                        q->gid, 02))
+            return -EACCES;
+    } else {
+        if (!ipc_access(s->mode, s->uid, s->cuid, s->gid, s->cgid, q->uid,
+                        q->gid, 04))
+            return -EACCES;
+        if (q->semnum < 0 || (u32)q->semnum >= s->nsems)
+            return -EINVAL;
+    }
+    u32 n = (u32)q->semnum;
     switch (q->arg) {
     case CNG_GETVAL:
         return (s32)s->val[n];
@@ -979,9 +1001,7 @@ static s32 sem_do_ctl(const struct cng_breq *q, struct cng_bresp *r) {
         return sem_count_waiters(s->semid, n, 0);
     case CNG_GETZCNT:
         return sem_count_waiters(s->semid, n, 1);
-    case CNG_SETVAL:
-        if (q->val < 0 || q->val > CNG_SEMVMX)
-            return -ERANGE;
+    case CNG_SETVAL: /* the range was settled at the top, ahead of everything */
         s->val[n] = (u16)q->val;
         s->lpid[n] = q->pid;
         sem_undo_clear(s->semid, (s32)n);

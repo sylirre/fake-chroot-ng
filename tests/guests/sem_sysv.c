@@ -115,6 +115,34 @@ int main(void) {
     u.val = 99999;
     rc = semctl(sid, 0, SETVAL, u);
     printf("setval out of range: rc=%d %s\n", rc, rc < 0 ? e() : "-");
+
+    /* Which of semctl's refusals wins, which is not one order but two.
+     * ksys_semctl sends SETVAL straight into semctl_setval(), whose opening
+     * statement is the value-range test — ahead of the id lookup, the semnum
+     * bound and the permission check alike — and which then bounds semnum
+     * BEFORE calling ipcperms(). semctl_main(), serving the read commands, does
+     * the opposite: ipcperms() first and the semnum bound after. A single
+     * shared order cannot produce both. */
+    {
+        int shut = semget(IPC_PRIVATE, 2, IPC_CREAT | 0000); /* no access */
+        u.val = 99999;
+        printf("setval range beats bad id: %s\n",
+               semctl(999999, 0, SETVAL, u) < 0 ? e() : "-");
+        printf("setval range beats bad semnum: %s\n",
+               semctl(sid, 99, SETVAL, u) < 0 ? e() : "-");
+        printf("setval range beats no access: %s\n",
+               semctl(shut, 0, SETVAL, u) < 0 ? e() : "-");
+        u.val = 1;
+        printf("setval semnum beats access: %s\n",
+               semctl(shut, 99, SETVAL, u) < 0 ? e() : "-");
+        printf("getval access beats semnum: %s\n",
+               semctl(shut, 99, GETVAL) < 0 ? e() : "-");
+        printf("getncnt access beats semnum: %s\n",
+               semctl(shut, 99, GETNCNT) < 0 ? e() : "-");
+        printf("getval semnum when readable: %s\n",
+               semctl(sid, 99, GETVAL) < 0 ? e() : "-");
+        semctl(shut, 0, IPC_RMID);
+    }
     printf("rmid: %d\n", semctl(sid, 0, IPC_RMID));
     printf("op after rmid: %d %s\n", semop(sid, ops, 1),
            semop(sid, ops, 1) < 0 ? e() : "-");
