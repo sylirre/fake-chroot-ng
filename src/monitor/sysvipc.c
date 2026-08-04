@@ -356,14 +356,29 @@ static long do_msgget(s32 key, s32 msgflg) {
 
 /* msgp is `struct msgbuf { long mtype; char mtext[]; }`. */
 static long do_msgsnd(s32 msqid, const void *msgp, u64 msgsz, s32 msgflg) {
-    if ((s64)msgsz < 0 || msgsz > CNG_MSGMAX)
-        return -EINVAL;
-    if (!cng_user_readable(msgp, sizeof(s64) + msgsz))
+    /* In the kernel's order, which splits the work differently than validating
+     * the whole buffer up front does. SYSCALL_DEFINE4(msgsnd) reads mtype with
+     * get_user() before anything else, so a bad msgp is EFAULT even when msgsz
+     * is also out of range; the real do_msgsnd() then bounds msgsz, then rejects
+     * mtype < 1, and only load_msg() afterwards touches mtext. Validating msgp
+     * and mtext together, after the size check, swapped the answer in both
+     * directions — measured on this kernel:
+     *
+     *   unmapped msgp, msgsz 1<<40           EFAULT, was EINVAL
+     *   mtype 0 with mtext off the mapping   EINVAL, was EFAULT
+     *
+     * (and the two that already agreed: a valid mtype with mtext off the mapping
+     * is EFAULT, and the same with an oversize msgsz is EINVAL.) */
+    if (!cng_user_readable(msgp, sizeof(s64)))
         return -EFAULT;
     s64 mtype;
     memcpy(&mtype, msgp, sizeof mtype);
+    if ((s64)msgsz < 0 || msgsz > CNG_MSGMAX)
+        return -EINVAL;
     if (mtype < 1)
         return -EINVAL;
+    if (msgsz && !cng_user_readable((const char *)msgp + sizeof(s64), msgsz))
+        return -EFAULT;
     char data[CNG_MSGMAX];
     if (msgsz)
         memcpy(data, (const char *)msgp + sizeof(s64), (size_t)msgsz);

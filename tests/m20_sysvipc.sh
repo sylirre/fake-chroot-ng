@@ -106,6 +106,57 @@ if [ "$m22_ready" = 1 ]; then
     # incarnation, and it has to be visible immediately after the reap.
     ipc_diff "m22 sem_undo matches it, SIGKILL included" sem_undo
 
+    # --- msgsnd's refusal order, against a HOST-native reference -----------
+    # The errno depends on where in the work the kernel stops: it reads mtype
+    # with get_user() before it looks at anything else, then bounds msgsz, then
+    # rejects mtype < 1, and only afterwards copies mtext. So a bad msgp beats
+    # an out-of-range msgsz, and a bad mtype beats an unreadable mtext.
+    # Validating the whole buffer in one go, after the size check, got both
+    # backwards.
+    #
+    # This is the one leg here that qemu-aarch64 cannot referee: its own msgsnd
+    # copies the guest's buffer in with a single lock_user() over
+    # sizeof(long) + msgsz, so it reproduces the exact ordering under test.
+    # Measured -- a type-0 message whose mtext runs off the mapping is EINVAL on
+    # the real kernel and EFAULT under qemu-user. Hence a host build for the
+    # reference side, as M18 does for ptrace.
+    MO_ORACLE=$IG/msg_order
+    mo_ready=1
+    if ! guest_cc "$IG/msg_order" tests/guests/msg_order.c; then
+        mo_ready=0
+        skip "m22 msgsnd refusal order: the guest program does not build here"
+    elif [ -n "$QEMU" ]; then
+        mo_ready=0
+        for _c in ${HOSTCC:-} cc gcc clang; do
+            have "$_c" || continue
+            if "$_c" -O2 -o "$IG/mo_host" tests/guests/msg_order.c 2>/dev/null
+            then
+                MO_ORACLE=$IG/mo_host
+                mo_ready=1
+                break
+            fi
+        done
+        [ "$mo_ready" = 1 ] ||
+            skip "m22 msgsnd refusal order: no host compiler for the differential oracle"
+    fi
+    if [ "$mo_ready" = 1 ]; then
+        if [ -n "$TIMEOUT" ]; then
+            mo_k=$("$TIMEOUT" 60 "$MO_ORACLE" 2>/dev/null)
+        else
+            mo_k=$("$MO_ORACLE" 2>/dev/null)
+        fi
+        mo_e=$(run_t 90 -R "$IG" /msg_order 2>/dev/null)
+        if [ "$mo_k" = "$mo_e" ]; then
+            pass=$((pass + 1))
+            printf '  ok   m22 msgsnd refuses in the kernel'\''s order\n'
+        else
+            fail=$((fail + 1))
+            printf '  FAIL m22 msgsnd refuses in a different order than the kernel\n'
+            printf '    kernel: %s\n' "$(echo "$mo_k" | tr '\n' '|')"
+            printf '    cng   : %s\n' "$(echo "$mo_e" | tr '\n' '|')"
+        fi
+    fi
+
     # --- namespace scope (nothing to diff: the host has one namespace) -----
     # By default the namespace is per invocation, so a keyed set one launch
     # creates must be invisible to the next.
