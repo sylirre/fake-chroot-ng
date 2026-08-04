@@ -1011,6 +1011,19 @@ int cng_pt_clone_event(unsigned long flags) {
 }
 
 void cng_pt_fork_child(struct cng_uregs *r, int event) {
+    /* A single-step breakpoint planted in the parent came across the fork in
+     * our copy-on-write text, and the bookkeeping that would take it out again
+     * (g_step_addr/g_step_orig, plain BSS) came with it. The parent unplants
+     * its own copy when the step lands; nothing unplants ours. An unfollowed
+     * child never reaches a stop that would, so it runs into a `brk` nobody is
+     * expecting — a SIGTRAP with no tracer to report it to, at an instruction
+     * that re-executes, forever.
+     *
+     * Cleared here, before the table wipe below, while the inherited addresses
+     * still describe this process's own text. Ahead of the `!g_tab` return too:
+     * an untraced child of a traced parent is exactly the case that has nobody
+     * left to fix it up later. */
+    cng_pt_step_clear();
     if (!g_tab)
         return;
     /* The per-task table came across the fork describing the *parent's*
