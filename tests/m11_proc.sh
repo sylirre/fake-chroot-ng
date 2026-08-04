@@ -74,6 +74,11 @@ check_contains "a held loadavg fd refreshes on rewind (top's pattern)" \
     "proctest loadavg refresh:" "$out"
 check_contains "the readv path takes the same refresh hook" \
     "proctest loadavg readv refresh:" "$out"
+# The p-variants take it too, and there the offset is the caller's argument, not
+# the description's — which pread(2) is defined never to move. Measured: the
+# kernel leaves a held /proc/uptime fd at 8 across a pread of the whole file.
+check_contains "a pread that triggers the refresh leaves the offset alone" \
+    "proctest pread keeps the offset: 8 then 8 -> OK" "$out"
 check_contains "uptime is synthesized" "proctest uptime:" "$out"
 check_contains "stat falls back to synthesis where the host denies it" \
     "proctest stat:" "$out"

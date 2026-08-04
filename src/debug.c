@@ -3180,6 +3180,21 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
             cng_dprintf(1, "proctest loadavg readv refresh: %ld bytes -> %s\n",
                         m, fresh ? "OK" : "FAIL");
             fails += !fresh;
+            /* ...and the same hook off the p-variants, where the offset is the
+             * caller's argument rather than the description's. pread(2) is
+             * defined never to move that description, but the regeneration
+             * rewinds the file it rewrites, so a sequential reader that pread's
+             * its own held fd at 0 had its position reset under it. */
+            sys_lseek((int)fd, 0, CNG_SEEK_SET);
+            m = cng_dispatch(__NR_read, fd, (long)again, 8, 0, 0, 0, 0);
+            long before = sys_lseek((int)fd, 0, CNG_SEEK_CUR);
+            cng_dispatch(__NR_pread64, fd, (long)again, sizeof again - 1, 0, 0,
+                         0, 0);
+            long after = sys_lseek((int)fd, 0, CNG_SEEK_CUR);
+            int kept = m == 8 && before == 8 && after == 8;
+            cng_dprintf(1, "proctest pread keeps the offset: %ld then %ld -> %s\n",
+                        before, after, kept ? "OK" : "FAIL");
+            fails += !kept;
             sys_close((int)fd);
         }
 

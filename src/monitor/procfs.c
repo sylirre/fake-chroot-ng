@@ -551,11 +551,22 @@ void cng_procfs_pre_read(int fd, long off) {
             __atomic_store_n(&g_pf[i].fd1, 0, __ATOMIC_RELEASE);
             return;
         }
+        long cur = sys_lseek(fd, 0, CNG_SEEK_CUR);
         if (off < 0)
-            off = sys_lseek(fd, 0, CNG_SEEK_CUR);
+            off = cur;
         if (off != 0)
             return; /* mid-file: keep the current snapshot */
         regen(fd, g_pf[i].kind);
+        /* pread(2) is defined never to move the file offset, and regen()
+         * rewinds the description it rewrote. Put the position back: reached
+         * only for the p-variants, since read()/readv() arrive here with an
+         * offset that already is 0. Without this a sequential reader that
+         * pread's its own held fd at offset 0 — one refresh idiom among
+         * several — silently starts over from the top on its next read.
+         * (Measured: the kernel leaves /proc/uptime's offset at 8 across a
+         * pread of the whole file.) */
+        if (cur > 0)
+            sys_lseek(fd, cur, CNG_SEEK_SET);
         return;
     }
 }
