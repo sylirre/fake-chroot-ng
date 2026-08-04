@@ -119,6 +119,52 @@ if [ "$m12_ready" = 1 ]; then
     # SHM_EXEC's permission check, SHM_LOCK, SHM_RND's rounding. See shm_edge.c.
     shm_diff "m12 shmat/shmctl corner cases match the real kernel" shm_edge
 
+    # SHM_REMAP has its own program because qemu-aarch64 cannot referee it: it
+    # tracks attachments in a table of its own keyed by start address and
+    # detaches the whole recorded region, which is the very mistake under test.
+    # Measured with no chroot-ng in the picture — one page remapped over the
+    # front of a 16-page attachment, then shmdt: the kernel keeps the covered
+    # segment's nattch at 1 and leaves the tail mapped, qemu-user reports 0 and
+    # unmaps all 64 KiB. So the reference side is a host build, as M18 does for
+    # ptrace and M22 for msgsnd.
+    RM_ORACLE=$SG/shm_remap
+    rm_ready=1
+    if ! guest_cc "$SG/shm_remap" tests/guests/shm_remap.c; then
+        rm_ready=0
+        skip "m12 SHM_REMAP: the guest program does not build here"
+    elif [ -n "$QEMU" ]; then
+        rm_ready=0
+        for _c in ${HOSTCC:-} cc gcc clang; do
+            have "$_c" || continue
+            if "$_c" -O2 -o "$SG/rm_host" tests/guests/shm_remap.c 2>/dev/null
+            then
+                RM_ORACLE=$SG/rm_host
+                rm_ready=1
+                break
+            fi
+        done
+        [ "$rm_ready" = 1 ] ||
+            skip "m12 SHM_REMAP: no host compiler for the differential oracle"
+    fi
+    if [ "$rm_ready" = 1 ]; then
+        if [ -n "$TIMEOUT" ]; then
+            rm_k=$("$TIMEOUT" 60 "$RM_ORACLE" 2>/dev/null)
+        else
+            rm_k=$("$RM_ORACLE" 2>/dev/null)
+        fi
+        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
+        rm_e=$(run_t 60 $GUEST_BINDS -R "$SG" /shm_remap 2>/dev/null)
+        if [ "$rm_k" = "$rm_e" ]; then
+            pass=$((pass + 1))
+            printf '  ok   m12 SHM_REMAP retires what it replaced\n'
+        else
+            fail=$((fail + 1))
+            printf '  FAIL m12 SHM_REMAP bookkeeping diverges from the kernel\n'
+            printf '    kernel: %s\n' "$(echo "$rm_k" | tr '\n' '|')"
+            printf '    cng   : %s\n' "$(echo "$rm_e" | tr '\n' '|')"
+        fi
+    fi
+
     # ...and again over the file-backed tier, which must be indistinguishable
     # from the memfd one (only the broker's backing differs).
     out_k=$m12_kbase

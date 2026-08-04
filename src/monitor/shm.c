@@ -108,6 +108,43 @@ static int att_add(s32 shmid, u64 va, u64 size) {
     return 0;
 }
 
+/* A MAP_FIXED attach replaces whatever was mapped at its address, so an
+ * attachment it covered is simply gone and the table has to say so. Left in,
+ * the stale entry is what shmdt() resolves the address to: it unmaps that
+ * entry's length instead of the new mapping's — punching a hole in a live
+ * attachment — and detaches the wrong segment, whose nattch then never reaches
+ * zero and whose backing is held until the daemon's death reclaim.
+ *
+ * The kernel takes this from the VMA it destroys, and the two cases are not the
+ * same event. Measured: remapping a 64 KiB segment over a 4 KiB attachment
+ * closes the old VMA, so the old segment's nattch drops to 0 at remap time and
+ * the later shmdt detaches the new one. Remapping one page over the front of a
+ * 16-page attachment *splits* the VMA instead — the old segment keeps its
+ * nattch, the address now resolves to the new mapping, and the orphaned tail
+ * can never be detached again. So a fully covered entry is retired and
+ * detached; one whose start alone is covered is retired without the detach,
+ * which says exactly that. No munmap either way: the new mapping already
+ * replaced those pages.
+ *
+ * An entry the range covers only at its *tail* is left alone, as the kernel
+ * leaves its nattch and its address: the split it models is not one this table
+ * can express. */
+static void att_retire_covered(u64 p, u64 len) {
+    for (int i = 0; i < ATT_MAX; i++) {
+        u64 va = __atomic_load_n(&g_att[i].va, __ATOMIC_ACQUIRE);
+        if (!va || va == ATT_CLAIMING || va < p || va >= p + len)
+            continue;
+        s32 shmid = g_att[i].shmid; /* before the CAS: see do_shmdt */
+        u64 size = g_att[i].size;
+        u64 expect = va;
+        if (!__atomic_compare_exchange_n(&g_att[i].va, &expect, 0, 0,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            continue;
+        if (va + size <= p + len)
+            shm_dt(shmid);
+    }
+}
+
 /* ---- the syscalls ------------------------------------------------------- */
 
 static long do_shmget(s32 key, u64 size, s32 shmflg) {
@@ -172,6 +209,8 @@ static long do_shmat(s32 shmid, u64 shmaddr, s32 shmflg) {
         shm_dt(shmid); /* undo the attach the broker already counted */
         return err;
     }
+    if (addr && (shmflg & CNG_SHM_REMAP))
+        att_retire_covered((u64)p, len); /* the only path that maps FIXED */
     att_add(shmid, (u64)p, len);
     return (long)p;
 }
