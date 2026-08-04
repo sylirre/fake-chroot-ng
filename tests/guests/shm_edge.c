@@ -57,6 +57,21 @@ int main(void) {
     if (r != (void *)-1) shmdt(r);
     shmctl(x, IPC_RMID, NULL);
 
+    /* Sizes no mapping could represent. The page round-up wraps to 0 for
+     * anything within a page of 2^64; substituting one page for it (which is
+     * what the emulation used to do) hands the guest a mapping far shorter than
+     * the segment it asked for, and every later shmdt then computes a length
+     * from a record that never matched. The kernel refuses the size outright,
+     * so the answer is an errno on both sides. */
+    for (size_t i = 0; i < 3; i++) {
+        static const size_t szs[3] = {(size_t)-1, (size_t)-4096, 0};
+        static const char *const nm[3] = {"max", "nearmax", "zero"};
+        int h = shmget(IPC_PRIVATE, szs[i], IPC_CREAT | 0600);
+        printf("shmget_%s=%s\n", nm[i], h < 0 ? strerror(errno) : "ok");
+        if (h >= 0)
+            shmctl(h, IPC_RMID, NULL);
+    }
+
     shmctl(id, IPC_RMID, NULL);
     printf("done\n");
     return 0;

@@ -124,17 +124,21 @@ static long do_shmat(s32 shmid, u64 shmaddr, s32 shmflg) {
     if (fd < 0)
         return fd;
 
+    /* A size whose page round-up wraps has no mapping that can represent it.
+     * Quietly substituting one page — which is what this did — handed the guest
+     * a mapping far shorter than the segment it asked for, and left every later
+     * shmdt and detach-on-exec computing a length from a record that never
+     * matched. The broker refuses such a size at shmget now; this is the belt,
+     * and it answers rather than guesses. */
     u64 len = cng_page_up(size);
-    if (!len)
-        len = cng_page_size;
     int prot = CNG_PROT_READ | (readonly ? 0 : CNG_PROT_WRITE) |
                ((shmflg & CNG_SHM_EXEC) ? CNG_PROT_EXEC : 0);
 
     /* SHMLBA is the page size on arm64, and the guest runs on our pages, so
      * SHM_RND rounds to cng_page_size. */
     u64 addr = shmaddr;
-    long err = 0;
-    if (addr) {
+    long err = len ? 0 : -EINVAL;
+    if (!err && addr) {
         if (shmflg & CNG_SHM_RND)
             addr = cng_page_down(addr);
         if (addr & (cng_page_size - 1))

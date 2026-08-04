@@ -454,7 +454,13 @@ static s32 shm_do_get(const struct cng_breq *q) {
         if (!(q->arg & CNG_IPC_CREAT))
             return -ENOENT;
     }
-    if (q->size == 0)
+    /* Zero is EINVAL, and so is a size no mapping could represent: the page
+     * round-up on the attach side wraps to 0 for anything within a page of
+     * 2^64, and the emulation's own IPC_INFO advertises shmmax as
+     * 0x7fffffffffffffff. The kernel answers EINVAL for an over-large size
+     * too, so this is its answer as well as the only safe one. */
+    if (q->size == 0 ||
+        q->size > (u64)0x7fffffffffffffffULL - (cng_page_size - 1))
         return -EINVAL;
     int slot = -1;
     for (int i = 0; i < SHM_SEG_MAX; i++)
