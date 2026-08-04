@@ -822,6 +822,91 @@ static int sc_sigact(void) {
     return 0;
 }
 
+/* SIGCHLD's SIG_IGN and SA_NOCLDWAIT are not delivery behaviour: they are what
+ * asks the kernel to reap children itself. An emulator that routes signals
+ * through its own handler while the task is traced has to keep them working
+ * anyway, because substituting any catching handler for SIG_IGN turns the
+ * reaping off — and because the flags say so, not the handler. So each leg
+ * below forks a child, lets it exit, and asks whether the kernel kept it for
+ * wait() or discarded it. Protocol only: no pids, no timings.
+ *
+ * The dispositions are installed *while traced*, which is the case a decision
+ * taken once at attach time cannot see. */
+static volatile sig_atomic_t g_chld_ran;
+static void on_chld(int s) {
+    (void)s;
+    g_chld_ran = 1;
+}
+
+/* Fork a child that exits at once, then report whether wait() found it. */
+static void chld_leg(const char *tag) {
+    g_chld_ran = 0;
+    pid_t c = fork();
+    if (c == 0)
+        _exit(3);
+    int st = 0;
+    errno = 0;
+    pid_t w = waitpid(c, &st, 0);
+    while (w < 0 && errno == EINTR) {
+        errno = 0;
+        w = waitpid(c, &st, 0);
+    }
+    if (w > 0)
+        printf("%s reaped_by_wait status=%d\n", tag, WEXITSTATUS(st));
+    else
+        printf("%s wait=%s\n", tag, errno == ECHILD ? "ECHILD" : "other");
+}
+
+static void chld_set(void *h, unsigned long extra) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = (void (*)(int))h;
+    sa.sa_flags = extra;
+    sigaction(SIGCHLD, &sa, 0);
+}
+
+static int sc_sigchld(int nocldwait) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        child_start();
+        if (nocldwait) {
+            /* SA_NOCLDWAIT asks for the same discarding *with* a handler, so it
+             * cannot be answered by declining to intercept: the flag has to
+             * survive onto the handler the emulator substitutes. Its own
+             * scenario because qemu-user cannot host it — see m18. */
+            chld_set((void *)on_chld, SA_NOCLDWAIT);
+            chld_leg("nocldwait");
+            printf("nocldwait_handler_ran=%d\n", (int)g_chld_ran);
+            _exit(6);
+        }
+        /* A plain handler: the kernel keeps the child for wait(). */
+        chld_set((void *)on_chld, 0);
+        chld_leg("handler");
+        /* SIG_IGN, arrived at from a disposition the emulator had taken over —
+         * the kernel must still discard the child. */
+        chld_set((void *)SIG_IGN, 0);
+        chld_leg("ignored");
+        /* ...and back again: the signal returns to the emulator's hands. */
+        chld_set((void *)on_chld, 0);
+        chld_leg("rehooked");
+        printf("rehooked_handler_ran=%d\n", (int)g_chld_ran);
+        _exit(6);
+    }
+    expect_first_stop(pid);
+    /* Forward every signal the tracee stops for; the stop counts themselves are
+     * not printed, only the reaping outcomes the tracee reports. */
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    int st;
+    for (;;) {
+        wait_for(pid, &st);
+        if (!WIFSTOPPED(st))
+            break;
+        ptrace(PTRACE_CONT, pid, 0, (void *)(long)WSTOPSIG(st));
+    }
+    show(st);
+    return 0;
+}
+
 /* waitid names the states it will accept, and the kernel honours each one
  * separately: a WSTOPPED-only wait must not be handed an exit, and a
  * WEXITED-only wait must still see one. The emulation gated its whole registry
@@ -894,6 +979,10 @@ int main(int argc, char **argv) {
         return sc_vmrw();
     if (!strcmp(s, "sigact"))
         return sc_sigact();
+    if (!strcmp(s, "sigchld"))
+        return sc_sigchld(0);
+    if (!strcmp(s, "sigchldw"))
+        return sc_sigchld(1);
     if (!strcmp(s, "waitid"))
         return sc_waitid();
     fprintf(stderr, "unknown scenario %s\n", s);

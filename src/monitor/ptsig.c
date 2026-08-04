@@ -183,6 +183,18 @@ static void pt_kick_handler(int sig, cng_siginfo_t *si, void *ucv) {
     pt_deliver_to_guest(sig, si, ucv);
 }
 
+/* Can our handler stand in for this disposition at all? SIGCHLD's SIG_IGN is
+ * not delivery behaviour, it is the instruction that asks the kernel to reap
+ * children itself, and any catching handler — ours included — silently turns
+ * that off. So that one signal is left to the kernel for as long as the guest
+ * wants its children reaped, and the cost is that its delivery stops are not
+ * reported. SA_NOCLDWAIT means the same thing and does not cost the hook: it
+ * survives pt_install's flag mask, so the kernel keeps reaping while our
+ * handler still routes the delivery through the stop machinery. */
+static int pt_sig_hookable(int sig, const struct pt_ksigaction *d, int set) {
+    return !(sig == SIG_CHLD_ && set && d->handler == (void *)1);
+}
+
 /* Install `h` for `sig` with flags mirroring what the guest asked for, so
  * restart semantics, SA_ONSTACK delivery and the blocked-signal set during the
  * handler all behave as the guest expects. SIGSYS is never blocked (a masked
@@ -193,8 +205,15 @@ static void pt_install(int sig, cng_sighandler_t h) {
     sa.handler = (void *)h;
     unsigned long gf = g_disp_set[sig] ? g_disp[sig].flags : 0;
     void *gh = g_disp_set[sig] ? g_disp[sig].handler : 0;
+    /* SA_NOCLDWAIT and SA_NOCLDSTOP are instructions to the kernel's child
+     * reaper rather than delivery behaviour, so substituting our handler must
+     * not drop them: without SA_NOCLDWAIT the kernel stops reaping and the
+     * guest's wait() starts finding children it had asked to be rid of
+     * (measured — the flag flips waitpid between ECHILD and a reaped child even
+     * with a handler installed). */
     sa.flags = CNG_SA_SIGINFO | CNG_SA_RESTORER | CNG_SA_ONSTACK |
-               (gf & (CNG_SA_RESTART | CNG_SA_NODEFER));
+               (gf & (CNG_SA_RESTART | CNG_SA_NODEFER | CNG_SA_NOCLDSTOP |
+                      CNG_SA_NOCLDWAIT));
     /* A disposition of ignore (explicit or by default) never interrupts a
      * syscall; our handler would, so ask the kernel to restart instead. */
     if (!gh || gh == (void *)1)
@@ -261,11 +280,7 @@ void cng_pt_sig_trace_enter(void) {
     for (int s = 1; s <= PT_NSIG; s++) {
         if (sig_reserved(s) || s == cng_g_kicksig)
             continue;
-        /* SIG_IGN on SIGCHLD is not a disposition we can emulate: it is what
-         * tells the kernel to reap children automatically, and a handler of
-         * ours would silently turn that off and leave zombies. Left alone; the
-         * cost is that its delivery stops are not reported. */
-        if (s == SIG_CHLD_ && g_disp_set[s] && g_disp[s].handler == (void *)1)
+        if (!pt_sig_hookable(s, &g_disp[s], g_disp_set[s]))
             continue;
         pt_install(s, pt_trace_handler);
         g_hooked[s] = 1;
@@ -302,6 +317,24 @@ int cng_pt_sigaction(int sig, u64 act, u64 oact, u64 sz, long *out) {
     if (sig < 1 || sig > PT_NSIG || sz != sizeof(cng_sigset_t))
         return 0; /* not ours to model: let the kernel answer */
     int mine = g_hooked[sig] || sig == cng_g_kicksig;
+
+    struct pt_ksigaction nd;
+    if (act) {
+        if (!cng_user_readable((void *)act, sizeof nd)) {
+            if (!mine)
+                return 0; /* let the re-issue produce the EFAULT */
+            *out = -EFAULT;
+            return 1;
+        }
+        memcpy(&nd, (void *)act, sizeof nd);
+        /* SIGCHLD changes hands with its own disposition, so the decision
+         * trace_enter made once is remade on every sigaction: take the signal
+         * back the moment the guest asks for something we can mirror. */
+        if (!mine && cng_pt_active() && !sig_reserved(sig) &&
+            pt_sig_hookable(sig, &nd, 1))
+            mine = 1;
+    }
+
     if (!mine) {
         /* Not intercepting this one, but keep the mirror current: it is what a
          * later trace_enter installs from, and what the kick handler forwards
@@ -317,11 +350,11 @@ int cng_pt_sigaction(int sig, u64 act, u64 oact, u64 sz, long *out) {
          * answers EINVAL (measured), and a guest that had been auto-reaping its
          * children and then installed a real SIGCHLD handler never got one:
          * the kernel went on discarding the children and its wait() answered
-         * ECHILD. */
+         * ECHILD. SIGKILL and SIGSTOP still belong here — the kernel's refusal
+         * is the right answer and only it can give it — while SIGCHLD is taken
+         * back above as soon as it is hookable again. */
         if (act) {
-            if (!cng_user_readable((void *)act, sizeof(struct pt_ksigaction)))
-                return 0; /* let the re-issue produce the EFAULT */
-            memcpy(&g_disp[sig], (void *)act, sizeof(struct pt_ksigaction));
+            g_disp[sig] = nd;
             g_disp_set[sig] = 1;
         }
         return 0;
@@ -332,14 +365,27 @@ int cng_pt_sigaction(int sig, u64 act, u64 oact, u64 sz, long *out) {
     struct pt_ksigaction old = g_disp[sig];
     int had = g_disp_set[sig];
     if (act) {
-        if (!cng_user_readable((void *)act, sizeof(struct pt_ksigaction))) {
-            *out = -EFAULT;
-            return 1;
-        }
-        memcpy(&g_disp[sig], (void *)act, sizeof(struct pt_ksigaction));
+        g_disp[sig] = nd;
         g_disp_set[sig] = 1;
-        if (g_hooked[sig])
+        if (!pt_sig_hookable(sig, &nd, 1)) {
+            /* The guest just asked for the kernel's own child reaper. Hand the
+             * signal back rather than installing over it: pt_install would put
+             * a catching handler where SIG_IGN was, the reaping would stop, and
+             * the guest's wait() would start finding children it had asked the
+             * kernel to discard. trace_enter already declines to hook this
+             * case; nothing repeated the decision when the guest arrived at it
+             * later, from a disposition we had hooked. */
+            if (g_hooked[sig]) {
+                g_hooked[sig] = 0;
+                pt_restore_guest(sig);
+            }
+        } else if (sig != cng_g_kicksig) {
+            /* The kick signal is ours by number, not by hook: its own handler
+             * stays installed and must not be replaced. Everything else here we
+             * either already hooked, or just took back above. */
+            g_hooked[sig] = 1;
             pt_install(sig, pt_trace_handler); /* re-mirror flags/mask */
+        }
     }
     if (oact) {
         if (!cng_user_writable((void *)oact, sizeof(struct pt_ksigaction))) {

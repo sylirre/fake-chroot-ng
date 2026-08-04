@@ -156,6 +156,26 @@ else
     # the kernel says EINVAL. Query-only stays allowed on both, which is the
     # half a blanket refusal would get wrong.
     pt_case sigact
+    # SIGCHLD's SIG_IGN and SA_NOCLDWAIT are instructions to the kernel's child
+    # reaper, not delivery behaviour, so a handler of ours cannot stand in for
+    # them. The emulation knew that for the disposition a task already had when
+    # it was attached to, and only for that one: arriving at SIG_IGN later, from
+    # a disposition it had hooked, installed a catching handler over it and
+    # turned the reaping off, and SA_NOCLDWAIT was dropped from the flags it
+    # mirrors. Both leave a guest waiting on children the kernel was supposed to
+    # have discarded.
+    pt_case sigchld
+    # The SA_NOCLDWAIT half is split off because qemu-user cannot host it:
+    # measured, with no chroot-ng in the picture, a plain qemu-aarch64 run of a
+    # bare SA_NOCLDWAIT program reaps the child by wait() where the host kernel
+    # answers ECHILD. qemu installs its own handler for every caught signal with
+    # sa_flags = SA_SIGINFO and nothing else, so the flag never reaches the host
+    # kernel and neither side of the comparison would mean anything.
+    if [ -z "$QEMU" ]; then
+        pt_case sigchldw
+    else
+        skip "ptrace sigchld SA_NOCLDWAIT: qemu-user drops the flag before the kernel sees it"
+    fi
     # waitid names the states it will accept and the kernel honours each one
     # separately. The emulation gated its whole registry on WSTOPPED, so a wait
     # asking only for stops could be handed an exit, and one asking only for
