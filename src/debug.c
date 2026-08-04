@@ -4104,6 +4104,40 @@ int cng_cmd_shmtest(int argc, char **argv, char **envp, unsigned long *auxv) {
         fails += !ok;
     }
 
+    /* 0c) ...and a message that completes normally, received by a caller that
+     *     asked for no fd at all. The control buffer rides on the recvmsg
+     *     either way, so the kernel installs whatever the peer attached before
+     *     the call returns: fd_out == NULL declines to look at the descriptor,
+     *     not to receive it. That caller is the daemon's request read — its one
+     *     and only path for a request, in a process that outlives every client
+     *     — so an fd attached to each request is a descriptor burned per
+     *     request until accept4 and memfd_create start failing with EMFILE. */
+    {
+        int sv[2] = {-1, -1};
+        int ok = CNG_SYS(__NR_socketpair, CNG_AF_UNIX, CNG_SOCK_STREAM, 0,
+                         (long)sv, 0, 0) == 0;
+        long pass = ok ? sys_memfd_create("cng-req", CNG_MFD_CLOEXEC) : -1;
+        ok = ok && pass >= 0 &&
+             cng_broker_send(sv[1], "abcd", 4, (int)pass) == 0;
+        if (pass >= 0)
+            sys_close((int)pass);
+        if (sv[1] >= 0)
+            sys_close(sv[1]);
+        long probe = CNG_SYS(__NR_fcntl, 0, 0 /*F_DUPFD*/, 0, 0, 0, 0);
+        int expect = (int)probe;
+        if (probe >= 0)
+            sys_close(expect);
+        char rb[4];
+        ok = ok && probe >= 0 &&
+             cng_broker_recv(sv[0], rb, sizeof rb, 0) == 0 &&
+             CNG_SYS(__NR_fcntl, expect, 1 /*F_GETFD*/, 0, 0, 0, 0) < 0;
+        if (sv[0] >= 0)
+            sys_close(sv[0]);
+        cng_dprintf(1, "shmtest an unwanted fd is not left installed -> %s\n",
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
     /* 1) create, attach, and see the memory. */
     long id = shm_call(__NR_shmget, 0 /*IPC_PRIVATE*/, SHMT_SZ,
                        CNG_IPC_CREAT | 0600);

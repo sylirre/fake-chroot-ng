@@ -205,9 +205,21 @@ int cng_broker_recv(int sock, void *data, unsigned len, int *fd_out) {
     } while (r == -EINTR);
     if (r <= 0)
         return -1;
-    if (fd_out && cm.h.level == CNG_SOL_SOCKET && cm.h.type == CNG_SCM_RIGHTS &&
+    /* The control buffer is supplied whatever the caller asked for, so the
+     * kernel's scm_detach_fds installs any attached descriptor into this
+     * process before recvmsg returns — asking for none does not decline one. A
+     * caller that did not want it must still close it, or a peer that attaches
+     * an fd to every message burns one descriptor per message in a process that
+     * outlives them all. The daemon's request read is exactly that caller; the
+     * reply direction was already fixed for the same reason. */
+    int got = -1;
+    if (cm.h.level == CNG_SOL_SOCKET && cm.h.type == CNG_SCM_RIGHTS &&
         cm.h.len == sizeof(struct cng_cmsghdr) + sizeof(int))
-        *fd_out = cm.fd;
+        got = cm.fd;
+    if (fd_out)
+        *fd_out = got;
+    else if (got >= 0)
+        sys_close(got);
     while ((unsigned)r < len) { /* top up a short stream read (see broker_send) */
         long n = sys_read(sock, (char *)data + r, len - (unsigned)r);
         if (n <= 0) {

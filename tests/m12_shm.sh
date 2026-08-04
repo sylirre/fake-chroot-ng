@@ -36,6 +36,11 @@ check_contains "SHM_INFO/IPC_INFO succeed before any segment exists" \
     "shmtest empty-namespace shm_info+ipc_info -> OK" "$out"
 check_contains "a truncated broker reply leaves no descriptor behind" \
     "shmtest short reply leaks no fd -> OK" "$out"
+# The other direction, and the one the daemon actually reads on: an fd a peer
+# attaches to a *request* is installed by the kernel whether or not the receiver
+# asked for one, because the control buffer goes on the recvmsg regardless.
+check_contains "a fd attached to a request is not left installed" \
+    "shmtest an unwanted fd is not left installed -> OK" "$out"
 check_contains "IPC_SET writes the permission triad back" \
     "shmtest ipc_set -> OK" "$out"
 check_contains "execve detaches every attachment" \
