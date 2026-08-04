@@ -80,6 +80,37 @@ static int ro_denied(const char *host) {
     return host && cng_g_fs && cng_fs_host_ro(cng_g_fs, host);
 }
 
+/* ...but a real read-only mount refuses at the point the kernel reaches it, and
+ * the calls that have to operate on an *existing* name reach it only after the
+ * path has resolved. So a name that is not there is ENOENT, exactly as it would
+ * be on a writable mount, and only a name that is there is EROFS. Measured on a
+ * squashfs mount, and uniform across the family: open(missing, O_WRONLY),
+ * truncate, chmod, utimensat, chown and setxattr all answer ENOENT for a name
+ * that is not there and EROFS for one that is. `[ -e f ] || : >f` is the shape
+ * that notices — a configure-style probe for an optional file read "read-only"
+ * as "present" and took the wrong branch.
+ *
+ * The create-and-remove family orders it the other way, taking write access on
+ * the parent before it looks at the final component: unlink, rmdir, mkdir,
+ * mknod, symlink, rename and an O_CREAT open are all EROFS even for a name that
+ * is not there (measured too). Those keep the plain ro_denied() pre-check.
+ *
+ * Answers with the lookup's own error rather than falling through to the
+ * reissue, so the refusal stays absolute — a :ro bind's host directory is
+ * genuinely writable, and letting a "not there" pass through to the real call
+ * would put the containment behind a race. newfstatat resolves the same path
+ * the same way, so its errno is what the real call would have reported from the
+ * same lookup: ENOENT, ENOTDIR, EACCES, ELOOP. `atflags` must carry the caller's
+ * own AT_SYMLINK_NOFOLLOW, or an lchown of a dangling link reads as absent. */
+static long ro_refusal(const char *host, int atflags) {
+    if (!ro_denied(host))
+        return 0;
+    char st[144];
+    long r = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, (long)host, (long)st,
+                     atflags, 0, 0);
+    return r < 0 ? r : -EROFS;
+}
+
 /* One-shot-per-number diagnostic that a syscall was emulated away (blocked by
  * Android's seccomp filter, or a credential change we can't perform). Shared
  * with the SIGSYS gate-net. Async-signal-safe. */
@@ -1435,8 +1466,18 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             if (nr == __NR_mkdirat || nr == __NR_mknodat)
                 return -EROFS;
             if (is_open && ((oflags & 3) != CNG_O_RDONLY ||
-                            (oflags & (CNG_O_CREAT | CNG_O_TRUNC))))
-                return -EROFS;
+                            (oflags & (CNG_O_CREAT | CNG_O_TRUNC)))) {
+                /* O_CREAT puts the open in the create family, where the kernel
+                 * takes write access on the parent before it looks at the final
+                 * component: a name that is not there is EROFS too. Without it
+                 * the open must find an existing name first, so one that is not
+                 * there is ENOENT. Both measured. */
+                if (oflags & CNG_O_CREAT)
+                    return -EROFS;
+                long ro = ro_refusal(p, deref ? 0 : CNG_AT_SYMLINK_NOFOLLOW);
+                if (ro)
+                    return ro;
+            }
         }
         long r = reissue(a0, (long)p, a2, a3, a4, a5, nr);
         /* O_NOFOLLOW through a real dirfd lands on the l2s symlink and draws
@@ -1553,8 +1594,9 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, 1);
         if (p == XLATE_TOOLONG)
             return -ENAMETOOLONG;
-        if (ro_denied(p))
-            return -EROFS;
+        long ro = ro_refusal(p, 0);
+        if (ro)
+            return ro;
         return chattr_result(reissue(a0, (long)p, a2, a3, a4, a5, nr));
     }
 
@@ -1566,8 +1608,9 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
         if (p == XLATE_TOOLONG)
             return -ENAMETOOLONG;
-        if (ro_denied(p))
-            return -EROFS;
+        long ro = ro_refusal(p, deref ? 0 : CNG_AT_SYMLINK_NOFOLLOW);
+        if (ro)
+            return ro;
         return chattr_result(reissue(a0, (long)p, a2, a3, a4, a5, nr));
     }
 #endif
@@ -1618,8 +1661,9 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
         if (p == XLATE_TOOLONG)
             return -ENAMETOOLONG;
-        if (ro_denied(p))
-            return -EROFS;
+        long ro = ro_refusal(p, deref ? 0 : CNG_AT_SYMLINK_NOFOLLOW);
+        if (ro)
+            return ro;
         long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_utimensat);
         if (cng_fake_root() && (r == -EPERM || r == -EACCES))
             return 0;
@@ -1697,8 +1741,9 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
         if (p == XLATE_TOOLONG)
             return -ENAMETOOLONG;
-        if (ro_denied(p))
-            return -EROFS;
+        long ro = ro_refusal(p, deref ? 0 : CNG_AT_SYMLINK_NOFOLLOW);
+        if (ro)
+            return ro;
         return chattr_result(reissue(a0, (long)p, a2, a3, a4, a5, __NR_fchownat));
     }
 
@@ -2627,8 +2672,11 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             xlate(CNG_AT_FDCWD, (const char *)a0, b1, sizeof b1, deref);
         if (p == XLATE_TOOLONG)
             return -ENAMETOOLONG;
-        if (writes && ro_denied(p))
-            return -EROFS;
+        if (writes) {
+            long ro = ro_refusal(p, deref ? 0 : CNG_AT_SYMLINK_NOFOLLOW);
+            if (ro)
+                return ro;
+        }
         return reissue((long)p, a1, a2, a3, a4, a5, nr);
     }
 
@@ -2654,8 +2702,11 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             xlate(CNG_AT_FDCWD, (const char *)a0, b1, sizeof b1, 1);
         if (p == XLATE_TOOLONG)
             return -ENAMETOOLONG;
-        if (nr == __NR_truncate && ro_denied(p)) /* statfs only reads */
-            return -EROFS;
+        if (nr == __NR_truncate) { /* statfs only reads */
+            long ro = ro_refusal(p, 0);
+            if (ro)
+                return ro;
+        }
         return reissue((long)p, a1, a2, a3, a4, a5, nr);
     }
 

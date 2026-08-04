@@ -287,6 +287,25 @@ check_contains ":ro bind refuses an unlink through a dirfd" \
     "robind ro at-unlink: rc=-30 -> OK" "$out"
 check_contains ":ro bind still reads through a dirfd" \
     "robind ro at-read: rc=" "$out"
+# A read-only mount refuses where the kernel reaches it, and for the calls that
+# must operate on an existing name that is *after* the path has resolved -- so a
+# name that is not there is ENOENT, the same answer a writable mount gives. The
+# refusal used to be returned before the syscall was issued and so did not
+# depend on the file existing, which told `[ -e f ] || : >f` that an absent file
+# was present and sent it down the wrong branch. Measured on a squashfs mount:
+# open(missing, O_WRONLY), O_TRUNC, truncate, chmod, chown and utimensat all
+# answer ENOENT there, and EROFS only on a name that is there.
+for _leg in open-w open-trunc truncate chmod chown utimensat; do
+    check_contains ":ro bind answers ENOENT for a $_leg on a name that is not there" \
+        "robind ro miss-$_leg: rc=-2 -> OK" "$out"
+done
+# ...and the other half, which the kernel orders the other way round: the
+# create-and-remove family takes write access on the parent before it looks at
+# the final component, so those are EROFS even for a name that is not there.
+for _leg in open-creat mkdir unlink; do
+    check_contains ":ro bind answers EROFS for a $_leg on a name that is not there" \
+        "robind ro miss-$_leg: rc=-30 -> OK" "$out"
+done
 out=$(run -t dtest -r "$ROOT" -b "$RB":/rw robind /rw/f 2>&1); rc=$?
 check "a plain (rw) bind reports no EROFS" 0 "$rc"
 rm -rf "$RB"

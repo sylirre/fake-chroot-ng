@@ -539,6 +539,66 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
         cng_strlcpy(sib + gl, ".x", sizeof sib - gl);
         int fails = 0;
 
+        /* Names that are NOT there. A real read-only mount refuses at the point
+         * the kernel reaches it, and for the calls that must operate on an
+         * existing name that is *after* the path has resolved — so a missing
+         * name is ENOENT, the same answer a writable mount gives, and the one
+         * `[ -e f ] || : >f` needs to take the right branch. The create-and-
+         * remove family orders it the other way, taking write access on the
+         * parent first, and is EROFS even for a name that is not there. Both
+         * halves measured against a squashfs mount. Each leg gets a name of its
+         * own so no leg's answer depends on another having created something in
+         * the rw control run. */
+        char miss[CNG_PATH_MAX];
+        size_t ml = cng_strlcpy(miss, gpath, sizeof miss);
+        cng_strlcpy(miss + ml, ".absent", sizeof miss - ml);
+        char missc[CNG_PATH_MAX], missd[CNG_PATH_MAX];
+        cng_strlcpy(missc, miss, sizeof missc);
+        cng_strlcpy(missc + ml + 7, "c", sizeof missc - ml - 7);
+        cng_strlcpy(missd, miss, sizeof missd);
+        cng_strlcpy(missd + ml + 7, "d", sizeof missd - ml - 7);
+        struct {
+            const char *name;
+            long want;
+            long r;
+        } m[] = {
+            {"miss-open-w", -ENOENT,
+             cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)miss, CNG_O_WRONLY, 0,
+                          0, 0, 0)},
+            {"miss-open-trunc", -ENOENT,
+             cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)miss,
+                          CNG_O_RDONLY | CNG_O_TRUNC, 0, 0, 0, 0)},
+            {"miss-truncate", -ENOENT,
+             cng_dispatch(__NR_truncate, (long)miss, 0, 0, 0, 0, 0, 0)},
+            {"miss-chmod", -ENOENT,
+             cng_dispatch(__NR_fchmodat, CNG_AT_FDCWD, (long)miss, 0600, 0, 0, 0,
+                          0)},
+            {"miss-chown", -ENOENT,
+             cng_dispatch(__NR_fchownat, CNG_AT_FDCWD, (long)miss, 0, 0, 0, 0,
+                          0)},
+            {"miss-utimensat", -ENOENT,
+             cng_dispatch(__NR_utimensat, CNG_AT_FDCWD, (long)miss, 0, 0, 0, 0,
+                          0)},
+            /* ...and the family the kernel refuses before it looks. */
+            {"miss-open-creat", -EROFS,
+             cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)missc,
+                          CNG_O_WRONLY | CNG_O_CREAT, 0644, 0, 0, 0)},
+            {"miss-mkdir", -EROFS,
+             cng_dispatch(__NR_mkdirat, CNG_AT_FDCWD, (long)missd, 0755, 0, 0, 0,
+                          0)},
+            {"miss-unlink", -EROFS,
+             cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)miss, 0, 0, 0, 0,
+                          0)},
+        };
+        for (unsigned i = 0; i < sizeof m / sizeof *m; i++) {
+            int ok = ro ? m[i].r == m[i].want : m[i].r != -EROFS;
+            if (m[i].r >= 0)
+                sys_close((int)m[i].r);
+            cng_dprintf(1, "robind %s %s: rc=%d -> %s\n", ro ? "ro" : "rw",
+                        m[i].name, (int)m[i].r, ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+
         /* First, the same calls made *relative to a directory fd* inside the
          * bind, which is how rm -rf, find -delete, tar and git all work. The
          * refusal keys on the resolved HOST path, and a plain relative name used
