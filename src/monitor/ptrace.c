@@ -712,8 +712,11 @@ static void pt_self_detach(struct pt_self *s) {
 }
 
 /* Is task `tid` gone (reaped) or a zombie? A tracer that died leaves its
- * tracees parked forever otherwise. */
-static int pt_task_dead(s32 tid) {
+ * tracees parked forever otherwise. `ppid_out`, when asked for, gets the task's
+ * parent — 0 if there was no /proc entry to read it from. */
+static int pt_task_dead(s32 tid, s32 *ppid_out) {
+    if (ppid_out)
+        *ppid_out = 0;
     char path[64];
     cng_snprintf(path, sizeof path, "/proc/%d/stat", (int)tid);
     long fd = sys_openat(CNG_AT_FDCWD, path, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
@@ -728,7 +731,18 @@ static int pt_task_dead(s32 tid) {
     char *rp = strrchr(buf, ')'); /* comm can hold spaces and parens */
     if (!rp || !rp[1])
         return 0;
-    char st = (rp[1] == ' ') ? rp[2] : rp[1];
+    const char *p = rp + 1;
+    while (*p == ' ')
+        p++;
+    char st = *p++;
+    if (ppid_out) { /* the field after the state is the parent's pid */
+        while (*p == ' ')
+            p++;
+        s32 par = 0;
+        while (*p >= '0' && *p <= '9')
+            par = par * 10 + (*p++ - '0');
+        *ppid_out = par;
+    }
     return st == 'Z' || st == 'X' || st == 'x';
 }
 
@@ -747,7 +761,7 @@ static int pt_service_loop(struct pt_self *s, struct cng_uregs *r,
             if (__atomic_load_n(&e->cmd_seq, __ATOMIC_ACQUIRE) != seen)
                 break;
             s32 tr = __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE);
-            if (tr <= 0 || pt_task_dead(tr)) {
+            if (tr <= 0 || pt_task_dead(tr, 0)) {
                 /* The tracer died. The kernel detaches its tracees (killing
                  * them first under PTRACE_O_EXITKILL); do the same rather than
                  * park here forever. */
@@ -1626,7 +1640,29 @@ static s32 pt_reap_dead(s32 wpid, int *status) {
             continue;
         if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) != PT_ST_RUNNING)
             continue;
-        if (!pt_task_dead(t))
+        s32 par = 0;
+        if (!pt_task_dead(t, &par))
+            continue;
+        /* "Dead" here includes a zombie, and a zombie child of ours is not ours
+         * to invent a death for: the host wait4 this call sits behind reports
+         * the real one, this turn or the next. Under qemu-user that takes a few
+         * more turns — /proc says Z long before its wait4 will hand the child
+         * over, in 89% of zombie sightings (measured; a real kernel never
+         * disagrees with itself that way) — and inventing one in the gap
+         * reported an ordinary exit(12) to the tracer as killed by SIGKILL.
+         * What this exists for is a tracee that is NOT our child: PTRACE_ATTACH'd
+         * or auto-attached through a fork, whose death nothing else tells us
+         * about. A task with no /proc entry left has no parent to read, and if
+         * it were ours the host wait would have freed this link already. */
+        if (par == me)
+            continue;
+        /* It may also have published an exit of its own while /proc was being
+         * read — every check above is on state sampled before that. Claim the
+         * transition rather than assume it: losing the CAS means a real status
+         * is in the link now, and the next pt_collect hands that over. */
+        u32 expect = PT_ST_RUNNING;
+        if (!__atomic_compare_exchange_n(&e->state, &expect, PT_ST_EXITED, 0,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
             continue;
         *status = 9; /* WIFSIGNALED(SIGKILL) */
         pt_free(e);
