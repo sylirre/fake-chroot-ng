@@ -375,14 +375,28 @@ static int sc_fork(void) {
     ptrace(PTRACE_CONT, pid, 0, 0);
     /* Both deaths reach the tracer: one through its own child, one through the
      * ptrace relationship. They can arrive in either order, so report the pair
-     * of exit codes sorted. */
+     * of exit codes sorted.
+     *
+     * A stop can arrive first, and it is not an error. If the grandchild dies
+     * before the middle process does, its death raises SIGCHLD there — and a
+     * traced process stops for a signal it is about to be handed even when the
+     * disposition is to ignore it, so the tracer is shown a signal-delivery
+     * stop before the two exits. Whether that happens is a pure race with the
+     * middle process's own exit, and the kernel loses it about a quarter of the
+     * time (measured: 150 of 640 runs on the host, and far more often under an
+     * emulator, whose exit path is longer). Resuming it is what any tracer does;
+     * the signal is suppressed because nothing here wants it delivered. */
     int codes[2] = {-1, -1};
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0, guard = 0; i < 2 && guard < 8; guard++) {
         int s2;
         pid_t w = wait(&s2);
         if (w < 0)
             break;
-        codes[i] = WIFEXITED(s2) ? WEXITSTATUS(s2) : -WTERMSIG(s2);
+        if (WIFSTOPPED(s2)) {
+            ptrace(PTRACE_CONT, w, 0, 0);
+            continue;
+        }
+        codes[i++] = WIFEXITED(s2) ? WEXITSTATUS(s2) : -WTERMSIG(s2);
     }
     if (codes[0] > codes[1]) {
         int t = codes[0];
