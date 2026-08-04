@@ -195,7 +195,13 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
      * CNG_L2S_FORCE=1 routes every linkat through the -l emulation (test aid
      * for hosts whose filesystem allows real hardlinks). */
     for (char **e = envp; e && *e; e++) {
-        if (!strncmp(*e, "CNG_DEBUG=", 10) && (*e)[10] != '0')
+        /* An empty value is off, as it is for the two knobs below and for
+         * cng_broker_env, which every other CNG_* switch goes through. Without
+         * the test, `CNG_DEBUG= chroot-ng ...` — how a shell clears a variable
+         * for one command — turned verbose logging ON, onto the guest's own
+         * stderr, which is a stream package managers capture and log. */
+        if (!strncmp(*e, "CNG_DEBUG=", 10) && (*e)[10] != '\0' &&
+            (*e)[10] != '0')
             cng_g_debug = 1;
         if (!strncmp(*e, "CNG_L2S_FORCE=", 14) && (*e)[14] != '\0' &&
             (*e)[14] != '0')

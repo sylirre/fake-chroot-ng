@@ -72,8 +72,23 @@ check_contains "dispatch openat through /proc/self/cwd" \
 # wild read inside the handler (SIGSEGV masked there => the guest is killed).
 out=$(run -t dtest -r "$ROOT" dbgpath /etc 2>&1); rc=$?
 check "debug logging survives a scalar syscall arg" 0 "$rc"
+
 check_contains "debug logging still reports the real error" \
     "dbgpath: survived rc=-21 -> OK" "$out"
+
+# ...and an EMPTY CNG_DEBUG is off, as it is for every other CNG_* switch (the
+# two beside it in the same loop, and cng_broker_env, all require a non-empty
+# value). `CNG_DEBUG= chroot-ng ...` is how a shell clears a variable for one
+# command; it used to turn verbose logging on instead, onto the guest's own
+# stderr -- a stream package managers capture.
+# The knob is read by cng_run, so a real (here: failing) guest launch is what
+# drives it; the banner it stamps is the cheapest thing to look for.
+check_contains "CNG_DEBUG=1 does log" "[cng] chroot-ng" \
+    "$(CNG_DEBUG=1 run "$ROOT" /nosuchprogram 2>&1)"
+check_absent "an empty CNG_DEBUG does not" "[cng] chroot-ng" \
+    "$(CNG_DEBUG= run "$ROOT" /nosuchprogram 2>&1)"
+check_absent "and CNG_DEBUG=0 does not" "[cng] chroot-ng" \
+    "$(CNG_DEBUG=0 run "$ROOT" /nosuchprogram 2>&1)"
 
 # A name resolved relative to a real dirfd must be contained exactly like an
 # absolute one. It used to be passed to the kernel untouched, and the kernel has
