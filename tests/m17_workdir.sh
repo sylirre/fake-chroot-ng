@@ -60,6 +60,26 @@ out=$(run -w "$M17W/a/b/marker" / /no-such-program 2>&1)
 check_contains "the non-directory -w path is diagnosed" \
     "not a directory" "$out"
 
+# ...and a directory that stats fine but cannot be entered. The real cwd moves
+# with the guest's, because a relative path the monitor never sees — anything
+# untrapped, and everything when no monitor installs at all — resolves against
+# it; that chdir's failure used to be dropped, so the guest was told it was in
+# one place while its untranslated names resolved from the launch directory,
+# outside the view entirely. Reachable: no search permission is EACCES, and
+# under --fake-id the guest believes it is root where the kernel does not.
+if [ "$(id -u)" = 0 ]; then
+    skip "a -w path that cannot be entered is refused: running as root, mode 0000 is still enterable"
+else
+    mkdir -p "$M17W/sealed"
+    chmod 0000 "$M17W/sealed"
+    run -u 0:0 -w /sealed "$M17W" /no-such-program >/dev/null 2>&1
+    check "a -w path that cannot be entered is refused" 1 $?
+    out=$(run -u 0:0 -w /sealed "$M17W" /no-such-program 2>&1)
+    check_contains "the unenterable -w path is diagnosed with its errno" \
+        "chroot-ng: --work-dir '/sealed': cannot enter (errno 13)" "$out"
+    chmod 0755 "$M17W/sealed"
+fi
+
 # --- the identity rootfs ----------------------------------------------------
 # Guest paths are host paths here, so these legs need no translation tier and
 # run on every host — including the cross host, where getcwd is answered by the

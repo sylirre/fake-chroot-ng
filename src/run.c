@@ -155,11 +155,20 @@ static int set_workdir(struct cng_fs *fs, const char *wd) {
         cng_dprintf(2, "chroot-ng: --work-dir '%s': path too long\n", wd);
         return -1;
     }
+    /* The real cwd first, and its failure is the whole answer: a relative path
+     * the monitor never sees — anything untrapped, and everything when no
+     * monitor installs at all — resolves against this one, so leaving it at the
+     * launch directory while telling the guest it is somewhere else resolves
+     * those names outside the guest view entirely. It can genuinely fail after
+     * the stat above: a directory with no search permission is EACCES, and
+     * under --fake-id the guest believes it is root while the kernel does not. */
+    long r2 = sys_chdir(host);
+    if (r2 != 0) {
+        cng_dprintf(2, "chroot-ng: --work-dir '%s': cannot enter (errno %d)\n",
+                    wd, (int)-r2);
+        return -1;
+    }
     cng_fs_set_cwd(fs, guest);
-    /* And the real cwd with it, as the default does: a relative path that the
-     * monitor never sees — anything untrapped, and everything when no monitor
-     * installs at all — resolves against this one. */
-    sys_chdir(host);
     return 0;
 }
 
