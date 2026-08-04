@@ -237,40 +237,6 @@ void cng_procreg_init(const char *shared_key) {
     cng_g_procreg_backing = CNG_PROCREG_B_ANON;
 }
 
-/* Our slot: the one already holding `pid`, else a free one, else one whose
- * process is gone (a slot is released when cng_procreg_has catches a reused
- * pid, or reclaimed here — there is no exit hook, since exit_group is not a
- * syscall we trap and a SIGKILL never could be). The old starttime is zeroed
- * before the pid CAS publishes the claim, so a reader that races the claim
- * sees "not stamped yet" rather than judging the new pid against the previous
- * occupant's starttime. */
-static struct proc_ent *slot_for(int pid) {
-    if (!g_tab || pid <= 0)
-        return 0;
-    for (int i = 0; i < g_tab_n; i++)
-        if (__atomic_load_n(&g_tab->pid[i], __ATOMIC_ACQUIRE) == pid)
-            return &g_tab->ent[i];
-    for (int i = 0; i < g_tab_n; i++) {
-        if (__atomic_load_n(&g_tab->pid[i], __ATOMIC_ACQUIRE) != 0)
-            continue;
-        __atomic_store_n(&g_tab->ent[i].start, 0, __ATOMIC_RELEASE);
-        s32 expect = 0;
-        if (__atomic_compare_exchange_n(&g_tab->pid[i], &expect, (s32)pid, 0,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
-            return &g_tab->ent[i];
-    }
-    for (int i = 0; i < g_tab_n; i++) {
-        s32 dead = __atomic_load_n(&g_tab->pid[i], __ATOMIC_ACQUIRE);
-        if (dead <= 0 || cng_proc_starttime(dead, 0) != 0)
-            continue;
-        __atomic_store_n(&g_tab->ent[i].start, 0, __ATOMIC_RELEASE);
-        if (__atomic_compare_exchange_n(&g_tab->pid[i], &dead, (s32)pid, 0,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
-            return &g_tab->ent[i];
-    }
-    return 0; /* full: this process stays invisible (host passthrough) */
-}
-
 /* Begin a seqlock write: CAS the count even -> odd. A child's slot can see two
  * writers — the parent publishing the fork while the child already publishes
  * its own exec — and interleaved plain stores could leave a torn payload
@@ -291,6 +257,74 @@ static u32 seq_acquire(struct proc_ent *e, int spins) {
 static void seq_release(struct proc_ent *e, u32 odd) {
     __atomic_thread_fence(__ATOMIC_RELEASE);
     __atomic_store_n(&e->seq, odd + 1, __ATOMIC_RELAXED); /* even: write done */
+}
+
+/* Take slot `i` from `want` for `pid`, clearing the previous occupant's
+ * starttime, under the entry's own seqlock.
+ *
+ * Neither half of that can be dropped. Zeroing before the CAS — which is what
+ * this used to do — writes a slot we may not get: the winner of the race has by
+ * then published its own starttime, and the loser's zero lands on top of it,
+ * leaving a live process stamped "never registered" and so invisible in /proc
+ * until its next exec. Zeroing after winning instead leaves a window where the
+ * new pid is already visible against the OLD occupant's starttime, and
+ * starttimes are jiffies since boot, so two processes really can share one — a
+ * reader hitting that coincidence accepts the slot and reports the previous
+ * occupant's cmdline as this pid's.
+ *
+ * The seqlock closes that window: cng_procreg_get reads the starttime and the
+ * payload inside it, so a reader that races the claim retries and finds the
+ * zero. The pid itself is still published by one CAS, which is what keeps a
+ * forking parent and an exec'ing child converging on the same slot.
+ *
+ * A slot whose owner was killed mid-write has an odd count nobody will clear;
+ * taking it without the lock is what the publish path's own recovery does, and
+ * leaves that (already degenerate) case no worse than before. Returns the entry,
+ * or 0 if the CAS was lost. */
+static struct proc_ent *slot_take(int i, s32 want, int pid) {
+    struct proc_ent *e = &g_tab->ent[i];
+    u32 s = seq_acquire(e, 1024);
+    s32 exp = want;
+    if (!__atomic_compare_exchange_n(&g_tab->pid[i], &exp, (s32)pid, 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+        if (s)
+            seq_release(e, s);
+        return 0;
+    }
+    __atomic_store_n(&e->start, 0, __ATOMIC_RELEASE);
+    if (s)
+        seq_release(e, s);
+    return e;
+}
+
+/* Our slot: the one already holding `pid`, else a free one, else one whose
+ * process is gone (a slot is released when cng_procreg_has catches a reused
+ * pid, or reclaimed here — there is no exit hook, since exit_group is not a
+ * syscall we trap and a SIGKILL never could be). A reader that races a claim
+ * sees "not stamped yet" rather than judging the new pid against the previous
+ * occupant's starttime — see slot_take. */
+static struct proc_ent *slot_for(int pid) {
+    if (!g_tab || pid <= 0)
+        return 0;
+    for (int i = 0; i < g_tab_n; i++)
+        if (__atomic_load_n(&g_tab->pid[i], __ATOMIC_ACQUIRE) == pid)
+            return &g_tab->ent[i];
+    for (int i = 0; i < g_tab_n; i++) {
+        if (__atomic_load_n(&g_tab->pid[i], __ATOMIC_ACQUIRE) != 0)
+            continue;
+        struct proc_ent *e = slot_take(i, 0, pid);
+        if (e)
+            return e;
+    }
+    for (int i = 0; i < g_tab_n; i++) {
+        s32 dead = __atomic_load_n(&g_tab->pid[i], __ATOMIC_ACQUIRE);
+        if (dead <= 0 || cng_proc_starttime(dead, 0) != 0)
+            continue;
+        struct proc_ent *e = slot_take(i, dead, pid);
+        if (e)
+            return e;
+    }
+    return 0; /* full: this process stays invisible (host passthrough) */
 }
 
 /* Flatten a NULL-terminated string vector into NUL-joined bytes, as the kernel
