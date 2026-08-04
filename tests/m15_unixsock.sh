@@ -69,6 +69,17 @@ else
     out=$(m15run -R "$DEEP" /bin/uxsock /run/s.sock 2>&1)
     check_contains "m15 an over-long translated path still binds" "bind: ok" \
         "$out"
+    # ...and reads back as the name the guest bound. The kernel stores sun_path
+    # exactly as it was handed in -- measured: bind through
+    # "/proc/self/fd/3/s.sock" and getsockname returns that same string, before
+    # and after fd 3 is closed -- so the fallback's own spelling came straight
+    # back to the guest. It names nothing by then (the dirfd is closed once the
+    # syscall has run) and it is the one address here that cng_fs_untranslate
+    # cannot map, matching neither a bind's host prefix nor the rootfs.
+    check_contains "m15 ...and reads back as the name the guest bound" \
+        "getsockname: /run/s.sock" "$out"
+    check_absent "m15 ...with none of our own /proc/self/fd spelling in it" \
+        "/proc/self/fd/" "$out"
 
     # --- abstract namespace ----------------------------------------------
     out=$(m15run -R "$R1" /bin/uxsock myabs abstract 2>&1)

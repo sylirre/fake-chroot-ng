@@ -100,6 +100,55 @@ int cng_sun_needed(const void *addr, long alen) {
     return fam == CNG_AF_UNIX;
 }
 
+/* What a socket bound through the over-long-path fallback reads back as.
+ *
+ * The kernel stores sun_path exactly as it was handed in — measured: bind
+ * through "/proc/self/fd/3/s.sock" and getsockname returns that same string,
+ * before and after fd 3 is closed. So a socket bound through the fallback read
+ * back as our own internal spelling: not the name the guest asked for, naming
+ * nothing by the time the guest can look (cng_sun_done closed the fd), and the
+ * one thing in this module that cng_fs_untranslate cannot map, since it matches
+ * neither a bind's host prefix nor the rootfs. That breaks what this module is
+ * for and what README.md promises of it — "a program comparing the readback
+ * against what it bound still agrees".
+ *
+ * The guest's own name always fits in sun_path, having arrived in one, so the
+ * answer is simply to remember it. Recorded as the fallback is applied, and
+ * consulted on the way back out.
+ *
+ * Keyed on the stored spelling, which is all the readback carries. Two sockets
+ * bound through the fallback with the same basename, in different directories,
+ * landing on the same fd number would collide — and the fd is closed right after
+ * the bind, so consecutive fallbacks do tend to reuse the number, which leaves
+ * the basename doing the work. The answer is then one plausible guest path
+ * instead of another, where before it was our /proc/self/fd spelling either way.
+ *
+ * Written guest-first and stored-last: a reader either fails to match a
+ * half-written key or matches one whose guest name is already there. Every
+ * buffer is one byte longer than the most that is copied into it, so a
+ * concurrent read is always NUL-terminated. */
+#define SUN_FB_MAX 8
+static struct {
+    char stored[SUN_PATH_MAX + 1];
+    char guest[SUN_PATH_MAX + 1];
+} g_sun_fb[SUN_FB_MAX];
+static unsigned g_sun_fb_next;
+
+static void sun_fb_note(const char *stored, const char *guest) {
+    unsigned i = __atomic_fetch_add(&g_sun_fb_next, 1, __ATOMIC_RELAXED) %
+                 SUN_FB_MAX;
+    memset(&g_sun_fb[i], 0, sizeof g_sun_fb[i]);
+    cng_strlcpy(g_sun_fb[i].guest, guest, sizeof g_sun_fb[i].guest);
+    cng_strlcpy(g_sun_fb[i].stored, stored, sizeof g_sun_fb[i].stored);
+}
+
+static const char *sun_fb_lookup(const char *stored) {
+    for (int i = 0; i < SUN_FB_MAX; i++)
+        if (g_sun_fb[i].stored[0] && !strcmp(g_sun_fb[i].stored, stored))
+            return g_sun_fb[i].guest;
+    return 0;
+}
+
 int cng_sun_in(struct cng_sun_xlate *x, const void *addr, long alen,
                int follow) {
     x->applied = 0;
@@ -148,6 +197,7 @@ int cng_sun_in(struct cng_sun_xlate *x, const void *addr, long alen,
      * passes an exact addrlen, so copy out at most the bytes it gave us. */
     char guest[SUN_PATH_MAX + 1];
     long n = plen;
+    /* (the fallback below records the pair for the readback; see sun_fb_note) */
     if (n > SUN_PATH_MAX)
         n = SUN_PATH_MAX;
     memcpy(guest, gp, (size_t)n);
@@ -209,6 +259,12 @@ int cng_sun_in(struct cng_sun_xlate *x, const void *addr, long alen,
     x->len = (long)(SUN_HDR + pl + bl + 1);
     x->dirfd = (int)fd;
     x->applied = 1;
+    /* Only where the name is being created — !follow is exactly bind, the one
+     * call that establishes what a later getsockname has to report. A connect
+     * or a sendto names something someone else bound, and its readback is that
+     * binding's to answer. */
+    if (!follow)
+        sun_fb_note(out + SUN_HDR, guest);
     return 1;
 }
 
@@ -244,8 +300,14 @@ void cng_sun_out(void *addr, long *alen) {
         n = SUN_PATH_MAX;
     memcpy(hostp, p, (size_t)n);
     hostp[n] = '\0';
-    if (cng_fs_untranslate(cng_g_fs, hostp, guest, sizeof guest) != 0)
-        return; /* outside the guest view: leave it alone */
+    if (cng_fs_untranslate(cng_g_fs, hostp, guest, sizeof guest) != 0) {
+        /* ...unless it is one of our own fallback spellings, which no prefix
+         * matches and which the guest must never be shown (see sun_fb_note). */
+        const char *g = sun_fb_lookup(hostp);
+        if (!g)
+            return; /* outside the guest view: leave it alone */
+        cng_strlcpy(guest, g, sizeof guest);
+    }
     size_t gl = strlen(guest);
     if (gl + 1 > SUN_PATH_MAX)
         return;
