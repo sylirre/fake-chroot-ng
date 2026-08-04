@@ -55,6 +55,7 @@ typedef struct {
 typedef void (*cng_sighandler_t)(int, cng_siginfo_t *, void *);
 
 #define CNG_SIGUSR1 10
+#define CNG_SIGSEGV 11
 #define CNG_SIGSYS  31
 
 /* sa_flags */

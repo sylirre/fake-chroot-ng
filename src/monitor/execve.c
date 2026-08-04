@@ -255,11 +255,13 @@ static long exec_args_take(struct exec_args *a, const char *path, char **argv,
     return 0;
 }
 
-/* Emulation body: resolve the target (shebang-aware), load it, build its stack,
- * and pass the commit point (close FD_CLOEXEC fds, reset signal dispositions,
- * retarget /proc/self/exe). Returns -errno on failure (all of which occur before
- * the commit point), or 0 with *out_sp and *out_entry set for the caller to
- * transfer control into the new program.
+/* Emulation body: resolve the target (shebang-aware), plan the program and its
+ * ELF interpreter, map them, build the stack, and pass the commit point (close
+ * FD_CLOEXEC fds, reset signal dispositions, retarget /proc/self/exe). Returns
+ * -errno on failure — every one of which is raised before the first mapping, so
+ * the caller is still there to receive it — or 0 with *out_sp and *out_entry set
+ * for the caller to transfer control into the new program. Past that first
+ * mapping the caller no longer exists and a failure is fatal (exec_fatal).
  *
  * path/argv/envp are the snapshot taken by execve_core, not the guest's own
  * pointers: everything from cng_load_elf onwards would otherwise be reading
@@ -320,6 +322,36 @@ static void cng_exec_reset(void) {
         if (cur > 0 && (unsigned long)cur > cng_g_brk0)
             CNG_SYS(__NR_brk, cng_g_brk0, 0, 0, 0, 0, 0);
     }
+}
+
+/* A failure after the point of no return.
+ *
+ * The kernel draws exactly this line around begin_new_exec(): everything that
+ * can be refused is refused before it, and a failure after it force_sigsegv()s
+ * the process — there is no caller left to hand an errno to. Ours is the same
+ * situation for the same reason: an ET_EXEC image goes down MAP_FIXED at its
+ * link-time vaddr, which is the calling program's own text, so `return -Esomething`
+ * would resume a program whose code has just been replaced.
+ *
+ * Die by the signal rather than by exit(), so a wait() sees WIFSIGNALED with
+ * SIGSEGV — what the shell prints as "Segmentation fault", and what a real
+ * kernel would have reported. Name only the guest path: `host` spells out where
+ * the rootfs lives on the device (see the load-failure trace below). */
+static _Noreturn void exec_fatal(const char *path, const char *what, long err) {
+    cng_dprintf(2,
+                "chroot-ng: exec %s: %s failed (code %d) with the new image "
+                "already mapped over the old one; nothing left to return to\n",
+                path, what, (int)err);
+    unsigned long dfl[4] = {0, 0, 0, 0};
+    CNG_SYS(__NR_rt_sigaction, CNG_SIGSEGV, dfl, 0, sizeof(cng_sigset_t), 0, 0);
+    unsigned long unblock = 1UL << (CNG_SIGSEGV - 1);
+    CNG_SYS(__NR_rt_sigprocmask, 1 /*SIG_UNBLOCK*/, &unblock, 0,
+            sizeof(cng_sigset_t), 0, 0);
+    CNG_SYS(__NR_tgkill, sys_getpid(), sys_gettid(), CNG_SIGSEGV, 0, 0, 0);
+    /* A blocked-or-ignored corner: leave no doubt about the outcome. */
+    CNG_SYS(__NR_exit_group, 0x80 | CNG_SIGSEGV, 0, 0, 0, 0, 0);
+    for (;;)
+        ;
 }
 
 static long execve_load(int dirfd, const char *path, char **argv, char **envp,
@@ -472,8 +504,13 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
         cng_dprintf(2, "[cng] exec %s host=%s file_backed=%d\n", path, host,
                     cng_g_loader_file);
 
+    /* Header pass, program and ELF interpreter both: read, validate, map
+     * nothing. Every refusal an execve can produce has to be produced here,
+     * because the map pass below is what replaces the calling program. */
+    struct cng_elf_plan pplan, iplan;
     struct cng_loaded prog;
-    int rc = gfd >= 0 ? cng_load_elf_fd(gfd, 0, &prog) : cng_load_elf(host, 0, &prog);
+    int rc = gfd >= 0 ? cng_elf_plan_fd(gfd, &pplan, &prog)
+                      : cng_elf_plan(host, &pplan, &prog);
     if (rc != CNG_LOAD_OK) {
         /* A failed exec tells the guest what the kernel would: the errno, and
          * nothing else. This was an unconditional line on the guest's own
@@ -488,24 +525,50 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
         return rc == CNG_LOAD_EOPEN ? -ENOENT : -ENOEXEC;
     }
     if (cng_g_debug)
-        cng_dprintf(2,
-                    "[cng]   prog dyn=%d base=%lx entry=%lx phdr=%lx "
-                    "lo=%lx hi=%lx interp=%d\n",
-                    prog.is_dyn, prog.base, prog.entry, prog.phdr, prog.load_lo,
-                    prog.load_hi, prog.has_interp);
+        cng_dprintf(2, "[cng]   prog dyn=%d lo=%lx hi=%lx interp=%d\n",
+                    pplan.is_dyn, pplan.lo, pplan.hi, prog.has_interp);
 
+    /* The interpreter is planned here rather than loaded after the program,
+     * which is the whole point of the split: a rootfs without the loader the
+     * binary names is an ordinary, common failure — a partially populated tree,
+     * a musl binary under glibc — and the kernel answers it with ENOENT while
+     * the caller keeps running. Loading it *after* the program answered the same
+     * ENOENT into a program that had already been overwritten. */
     struct cng_loaded interp;
     int have_interp = 0;
     if (prog.has_interp) {
         char ip[CNG_PATH_MAX];
         if (cng_resolve(prog.interp, 1, ip, sizeof ip) != 0 ||
-            cng_load_elf(ip, 0, &interp) != CNG_LOAD_OK) {
+            cng_elf_plan(ip, &iplan, &interp) != CNG_LOAD_OK) {
             if (cng_g_debug) /* guest-visible stderr: see the load failure above */
                 cng_dprintf(2, "[cng] exec %s: interp %s load failed\n", path,
                             prog.interp);
+            cng_elf_plan_release(&pplan);
             return -ENOENT;
         }
         have_interp = 1;
+    }
+
+    /* --- point of no return ------------------------------------------------
+     * Both images are known good; from here the address space is being taken
+     * apart and a failure can only be fatal (see exec_fatal). The program goes
+     * down first and the interpreter second, which is also the only safe order:
+     * the program is MAP_FIXED at a fixed vaddr while the interpreter is
+     * kernel-placed, so mapping the interpreter first risks the kernel putting
+     * it inside the span the program is about to claim. */
+    rc = cng_elf_map(&pplan, 0, &prog);
+    cng_elf_plan_release(&pplan);
+    if (rc != CNG_LOAD_OK)
+        exec_fatal(path, "mapping the program", rc);
+    if (cng_g_debug)
+        cng_dprintf(2, "[cng]   prog base=%lx entry=%lx phdr=%lx lo=%lx hi=%lx\n",
+                    prog.base, prog.entry, prog.phdr, prog.load_lo,
+                    prog.load_hi);
+    if (have_interp) {
+        rc = cng_elf_map(&iplan, 0, &interp);
+        cng_elf_plan_release(&iplan);
+        if (rc != CNG_LOAD_OK)
+            exec_fatal(path, "mapping the ELF interpreter", rc);
         if (cng_g_debug)
             cng_dprintf(2, "[cng]   interp %s base=%lx entry=%lx lo=%lx hi=%lx\n",
                         prog.interp, interp.base, interp.entry, interp.load_lo,
@@ -548,11 +611,21 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
         argc = np + (argc >= 1 ? argc - 1 : 0);
     }
 
+    /* The stack has to be built after the images, since AT_PHDR/AT_BASE/AT_ENTRY
+     * are only known once they are placed — so this is the one remaining thing
+     * that can fail past the commit, and it is fatal rather than -E2BIG.
+     *
+     * It should not be reachable: exec_args_take already refused anything above
+     * exec_arg_max(), which is clamped to a quarter of CNG_GUEST_STACK_SIZE,
+     * and the stack needs at most twice the vector plus once the strings — half
+     * the region, with the shebang chain's own additions (bounded by
+     * SHEB_RESERVE entries of SHEB_WORD) far inside the margin. Raise that clamp
+     * and the arithmetic stops holding, which is what this line is here to say. */
     unsigned long sp = cng_build_stack(argc, eff_argv, envp, cng_host_auxv,
                                        &prog, have_interp ? &interp : 0,
                                        argc > 0 ? eff_argv[0] : path);
     if (!sp)
-        return -E2BIG; /* argv/envp outgrew the guest stack region */
+        exec_fatal(path, "building the initial stack", -E2BIG);
     unsigned long entry = have_interp ? interp.entry : prog.entry;
     if (cng_g_debug)
         cng_dprintf(2, "[cng]   argc=%d sp=%lx entry=%lx -> enter\n", argc, sp,

@@ -177,6 +177,92 @@ if guest_cc_report "$ER/hello" tests/guests/hello.c; then
 fi
 rm -rf "$ER"
 
+# --- M17-10: a failed exec must leave the calling program running -----------
+# A binary whose PT_INTERP names a file that is not there is how an exec fails
+# in a partially populated rootfs — a tree without the loader its binaries were
+# linked against, a musl program under glibc — and the kernel's answer is ENOENT
+# to a program that is still running: it opens and validates the ELF interpreter
+# before it touches the old address space.
+#
+# Ours mapped the program first and looked for the interpreter afterwards. An
+# ET_EXEC image goes down MAP_FIXED at its link-time vaddr — which for two
+# binaries out of one toolchain is the caller's own text — so the errno came back
+# to a program whose code had just been replaced. Measured: rc 139 and no output
+# at all, against the kernel's exec=ENOENT / alive=1 / rc 44.
+#
+# Both halves of the pair have to be non-PIE for anything to be overwritten, and
+# whether a toolchain links that way is not something to assume: the ELF shapes
+# are checked, and a toolchain that cannot produce them skips rather than passing
+# vacuously. qemu-user is no oracle for this one — it emulates execve by
+# re-executing itself, so a missing interpreter is its own loader's complaint and
+# not the kernel's errno — hence a host-native build for the reference side.
+IFD=$(mktemp -d)
+IF_NOINTERP=/cng-no-such-interp.so
+
+# The oracle: on a host that runs AArch64 directly the guest pair is its own
+# reference; otherwise the same two sources built host-native and linked alike.
+if_oracle_build() {
+    if [ -z "$QEMU" ]; then
+        IF_ORACLE=$IFD/interpfail
+        IF_TARGET=$IFD/badinterp
+        return 0
+    fi
+    for _c in ${HOSTCC:-} cc gcc clang; do
+        have "$_c" || continue
+        "$_c" -O2 -no-pie -o "$IFD/if_host" tests/guests/interpfail.c \
+            2>/dev/null || continue
+        "$_c" -O2 -no-pie "-Wl,--dynamic-linker=$IF_NOINTERP" \
+            -o "$IFD/bad_host" tests/guests/hello.c 2>/dev/null || continue
+        IF_ORACLE=$IFD/if_host
+        IF_TARGET=$IFD/bad_host
+        return 0
+    done
+    return 1
+}
+if_host_run() { if [ -n "$TIMEOUT" ]; then "$TIMEOUT" 60 "$@"; else "$@"; fi; }
+
+if [ -z "$GUESTCC" ]; then
+    skip "failed-exec survival: no AArch64 guest toolchain"
+elif [ "$CNG_SECCOMP_LIVE" != 1 ] && [ "$CNG_EXECMEM" != 1 ]; then
+    skip "failed-exec survival: no filter is live and -R cannot rewrite without execmem"
+elif ! guest_cc "$IFD/interpfail" tests/guests/interpfail.c -static -no-pie ||
+    ! guest_cc "$IFD/badinterp" tests/guests/hello.c -no-pie \
+        "-Wl,--dynamic-linker=$IF_NOINTERP"; then
+    skip "failed-exec survival: no non-PIE pair builds here ($(head -1 "$GUEST_CC_LOG" 2>/dev/null))"
+elif [ "$(elf_type "$IFD/interpfail")" != EXEC ] ||
+    [ "$(elf_type "$IFD/badinterp")" != EXEC ] ||
+    ! elf_has_interp "$IFD/badinterp"; then
+    skip "failed-exec survival: this toolchain links no ET_EXEC pair carrying a PT_INTERP, so nothing would be overwritten"
+elif ! if_oracle_build; then
+    skip "failed-exec survival: no host compiler for the differential oracle"
+else
+    if_out_k=$(if_host_run "$IF_ORACLE" "$IF_TARGET" 2>/dev/null); if_rc_k=$?
+    if_out_g=$(run_t 90 -R "$IFD" /interpfail /badinterp 2>/dev/null); if_rc_g=$?
+    if [ "$if_out_k" = "$if_out_g" ] && [ "$if_rc_k" = "$if_rc_g" ]; then
+        pass=$((pass + 1))
+        printf '  ok   a missing ELF interpreter is an errno and a live caller, as the kernel has it\n'
+    else
+        fail=$((fail + 1))
+        printf '  FAIL a missing ELF interpreter does not match the kernel\n'
+        printf '       kernel: %s (rc %s)\n' "$(echo "$if_out_k" | tr '\n' '|')" \
+            "$if_rc_k"
+        printf '       cng   : %s (rc %s)\n' "$(echo "$if_out_g" | tr '\n' '|')" \
+            "$if_rc_g"
+    fi
+
+    # The other shape of the same failure: an interpreter that is there but is
+    # not a loadable ELF, which fails in the header pass rather than in the
+    # resolver. The errno still diverges here — the kernel distinguishes (a
+    # header too short to be one is EIO, measured) where we answer ENOENT for
+    # every interpreter failure — so what is asserted is the part this is about:
+    # the caller is alive to be told.
+    printf 'not an ELF\n' >"$IFD$IF_NOINTERP"
+    chmod 755 "$IFD$IF_NOINTERP"
+    check_contains "an unloadable interpreter also leaves the caller running" \
+        "alive=1" "$(run_t 90 -R "$IFD" /interpfail /badinterp 2>&1)"
+fi
+rm -rf "$IFD"
+
 # emulated execve must close FD_CLOEXEC fds like a real execve, or fork/exec
 # launchers (git run-command, posix_spawn) block on their O_CLOEXEC notify pipe.
 out=$(run -t cloexectest 2>&1); rc=$?

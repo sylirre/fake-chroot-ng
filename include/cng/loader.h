@@ -8,6 +8,8 @@
 
 #include <stddef.h>
 
+#include "cng/elf.h"
+
 /* Set from auxv AT_PAGESZ at startup (default 4096). */
 extern unsigned long cng_page_size;
 
@@ -62,6 +64,46 @@ int cng_load_elf(const char *path, unsigned long base_hint,
  * checks *execute* permission for execve where a reopen needs *read*, and the
  * file may have no readable name at all (memfd, O_TMPFILE, deleted). */
 int cng_load_elf_fd(int fd, unsigned long base_hint, struct cng_loaded *out);
+
+/* Program headers we are willing to look at. */
+#define CNG_MAX_PHDR 64
+
+/* The two halves of a load, so that everything which can be refused happens
+ * before anything is mapped.
+ *
+ * Loading an ET_EXEC image is destructive: its segments go down MAP_FIXED at the
+ * link-time vaddr, which for two binaries out of the same toolchain is the
+ * calling program's own text. Once that mmap lands there is no caller left to
+ * return an errno to — so an emulated execve must first *plan* the program AND
+ * its ELF interpreter (headers read, span computed, everything validated), and
+ * only then map them. This is the same line the kernel draws around
+ * begin_new_exec(): refusals before it, and a fatal signal after.
+ *
+ * A plan holds the file it was read from; cng_elf_plan_release closes it if the
+ * plan opened it (never a borrowed fd). Mapping needs it, so release only after
+ * cng_elf_map — or after giving up on a plan that will not be mapped. */
+struct cng_elf_plan {
+    Elf64_Ehdr eh;
+    Elf64_Phdr ph[CNG_MAX_PHDR];
+    unsigned long lo;  /* page-aligned bottom of the PT_LOAD span */
+    unsigned long hi;  /* page-aligned top of it */
+    int is_dyn;
+    int fd;            /* the file to map from, -1 once released */
+    int own_fd;        /* set when the plan opened it and must close it */
+};
+
+/* Header pass: read and validate, map nothing. Fills *plan and the PT_INTERP
+ * half of *out (interp/has_interp); the rest of *out is cng_elf_map's. */
+int cng_elf_plan(const char *path, struct cng_elf_plan *plan,
+                 struct cng_loaded *out);
+int cng_elf_plan_fd(int fd, struct cng_elf_plan *plan, struct cng_loaded *out);
+
+/* Map pass: the destructive half. `base_hint` is an mmap hint for ET_DYN
+ * (0 = let the kernel choose); an ET_EXEC plan ignores it and goes MAP_FIXED. */
+int cng_elf_map(const struct cng_elf_plan *plan, unsigned long base_hint,
+                struct cng_loaded *out);
+
+void cng_elf_plan_release(struct cng_elf_plan *plan);
 
 /* Size of the fixed anonymous stack each loaded program gets (see stack.c).
  * Exposed because the emulated execve bounds argv/envp against it, exactly as

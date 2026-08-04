@@ -12,7 +12,7 @@
 #include "cng/syscall.h"
 #include "cng/uapi.h"
 
-#define MAX_PHDR 64
+#define MAX_PHDR CNG_MAX_PHDR
 
 static long read_exact(int fd, void *buf, size_t n, long off) {
     size_t done = 0;
@@ -184,40 +184,32 @@ static int map_file(int fd, const Elf64_Ehdr *eh, const Elf64_Phdr *ph,
     return CNG_LOAD_OK;
 }
 
-int cng_load_elf_fd(int fd, unsigned long base_hint, struct cng_loaded *out) {
-    memset(out, 0, sizeof *out);
+/* ---- the header pass: read and validate, map nothing ------------------- */
 
-    int rc = CNG_LOAD_OK;
-    Elf64_Ehdr eh;
-    if (read_exact(fd, &eh, sizeof eh, 0) != (long)sizeof eh) {
-        rc = CNG_LOAD_EIO;
-        goto out;
-    }
-    if (eh.e_ident[0] != ELF_MAG0 || eh.e_ident[1] != ELF_MAG1 ||
-        eh.e_ident[2] != ELF_MAG2 || eh.e_ident[3] != ELF_MAG3 ||
-        eh.e_ident[EI_CLASS] != ELFCLASS64 ||
-        eh.e_ident[EI_DATA] != ELFDATA2LSB || eh.e_machine != EM_AARCH64 ||
-        (eh.e_type != ET_DYN && eh.e_type != ET_EXEC)) {
-        rc = CNG_LOAD_EFORMAT;
-        goto out;
-    }
-    if (eh.e_phnum == 0 || eh.e_phnum > MAX_PHDR ||
-        eh.e_phentsize != sizeof(Elf64_Phdr)) {
-        rc = CNG_LOAD_ETOOBIG;
-        goto out;
-    }
+static int elf_read_headers(int fd, struct cng_elf_plan *plan,
+                            struct cng_loaded *out) {
+    Elf64_Ehdr *eh = &plan->eh;
+    if (read_exact(fd, eh, sizeof *eh, 0) != (long)sizeof *eh)
+        return CNG_LOAD_EIO;
+    if (eh->e_ident[0] != ELF_MAG0 || eh->e_ident[1] != ELF_MAG1 ||
+        eh->e_ident[2] != ELF_MAG2 || eh->e_ident[3] != ELF_MAG3 ||
+        eh->e_ident[EI_CLASS] != ELFCLASS64 ||
+        eh->e_ident[EI_DATA] != ELFDATA2LSB || eh->e_machine != EM_AARCH64 ||
+        (eh->e_type != ET_DYN && eh->e_type != ET_EXEC))
+        return CNG_LOAD_EFORMAT;
+    if (eh->e_phnum == 0 || eh->e_phnum > MAX_PHDR ||
+        eh->e_phentsize != sizeof(Elf64_Phdr))
+        return CNG_LOAD_ETOOBIG;
 
-    Elf64_Phdr ph[MAX_PHDR];
-    size_t phsz = (size_t)eh.e_phnum * sizeof(Elf64_Phdr);
-    if (read_exact(fd, ph, phsz, (long)eh.e_phoff) != (long)phsz) {
-        rc = CNG_LOAD_EIO;
-        goto out;
-    }
+    Elf64_Phdr *ph = plan->ph;
+    size_t phsz = (size_t)eh->e_phnum * sizeof(Elf64_Phdr);
+    if (read_exact(fd, ph, phsz, (long)eh->e_phoff) != (long)phsz)
+        return CNG_LOAD_EIO;
 
     /* Span over all PT_LOAD; capture PT_INTERP path along the way. */
     unsigned long lo = ~0UL, hi = 0;
     int nload = 0;
-    for (int i = 0; i < eh.e_phnum; i++) {
+    for (int i = 0; i < eh->e_phnum; i++) {
         if (ph[i].p_type == PT_INTERP && ph[i].p_filesz > 0 &&
             ph[i].p_filesz < sizeof out->interp) {
             if (read_exact(fd, out->interp, ph[i].p_filesz,
@@ -245,76 +237,122 @@ int cng_load_elf_fd(int fd, unsigned long base_hint, struct cng_loaded *out) {
          * below `lo` and a span that is not the range we then write into. */
         unsigned long fill = ph[i].p_filesz > ph[i].p_memsz ? ph[i].p_filesz
                                                             : ph[i].p_memsz;
-        if (ph[i].p_vaddr + fill < ph[i].p_vaddr) {
-            rc = CNG_LOAD_EFORMAT;
-            goto out;
-        }
+        if (ph[i].p_vaddr + fill < ph[i].p_vaddr)
+            return CNG_LOAD_EFORMAT;
         unsigned long s = cng_page_down(ph[i].p_vaddr);
         unsigned long e = cng_page_up(ph[i].p_vaddr + fill);
-        if (e < s) { /* cng_page_up wrapped at the top of the address space */
-            rc = CNG_LOAD_EFORMAT;
-            goto out;
-        }
+        if (e < s) /* cng_page_up wrapped at the top of the address space */
+            return CNG_LOAD_EFORMAT;
         if (s < lo)
             lo = s;
         if (e > hi)
             hi = e;
     }
-    if (nload == 0) {
-        rc = CNG_LOAD_EFORMAT;
-        goto out;
-    }
+    if (nload == 0)
+        return CNG_LOAD_EFORMAT;
 
-    unsigned long span = hi - lo;
-    int is_dyn = (eh.e_type == ET_DYN);
-    unsigned long bias = 0;
+    plan->lo = lo;
+    plan->hi = hi;
+    plan->is_dyn = (eh->e_type == ET_DYN);
+    return CNG_LOAD_OK;
+}
 
-    rc = cng_g_loader_file
-             ? map_file(fd, &eh, ph, is_dyn, lo, span, base_hint, &bias)
-             : map_anon(fd, &eh, ph, is_dyn, lo, span, base_hint, &bias);
+int cng_elf_plan_fd(int fd, struct cng_elf_plan *plan, struct cng_loaded *out) {
+    memset(out, 0, sizeof *out);
+    plan->fd = fd; /* borrowed: the caller owns it, so never own_fd */
+    plan->own_fd = 0;
+    int rc = elf_read_headers(fd, plan, out);
+    if (rc != CNG_LOAD_OK)
+        plan->fd = -1;
+    return rc;
+}
+
+int cng_elf_plan(const char *path, struct cng_elf_plan *plan,
+                 struct cng_loaded *out) {
+    memset(out, 0, sizeof *out);
+    plan->fd = -1;
+    plan->own_fd = 0;
+    long fd = sys_openat(CNG_AT_FDCWD, path, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    if (fd < 0)
+        return CNG_LOAD_EOPEN;
+    plan->fd = (int)fd;
+    plan->own_fd = 1;
+    int rc = elf_read_headers((int)fd, plan, out);
+    if (rc != CNG_LOAD_OK)
+        cng_elf_plan_release(plan);
+    return rc;
+}
+
+void cng_elf_plan_release(struct cng_elf_plan *plan) {
+    if (plan->own_fd && plan->fd >= 0)
+        sys_close(plan->fd);
+    plan->fd = -1;
+    plan->own_fd = 0;
+}
+
+/* ---- the map pass: from here the address space is being rewritten ------ */
+
+int cng_elf_map(const struct cng_elf_plan *plan, unsigned long base_hint,
+                struct cng_loaded *out) {
+    const Elf64_Ehdr *eh = &plan->eh;
+    const Elf64_Phdr *ph = plan->ph;
+    unsigned long lo = plan->lo, hi = plan->hi, span = hi - lo, bias = 0;
+
+    int rc = cng_g_loader_file ? map_file(plan->fd, eh, ph, plan->is_dyn, lo,
+                                          span, base_hint, &bias)
+                               : map_anon(plan->fd, eh, ph, plan->is_dyn, lo,
+                                          span, base_hint, &bias);
     if (rc == CNG_LOAD_EEXEC) {
         /* Anonymous executable memory was denied (e.g. NO_NEW_PRIVS revoking
          * execmem on Android). Fall back to file-backed exec mapping, which
          * works on an exec-permitted mount, and remember it for next time. */
         cng_g_loader_file = 1;
-        rc = map_file(fd, &eh, ph, is_dyn, lo, span, base_hint, &bias);
+        rc = map_file(plan->fd, eh, ph, plan->is_dyn, lo, span, base_hint,
+                      &bias);
     }
     if (rc != CNG_LOAD_OK)
-        goto out;
+        return rc;
 
     /* Address of the program headers in memory (within the PT_LOAD covering
      * e_phoff). */
     unsigned long phdr_addr = 0;
-    for (int i = 0; i < eh.e_phnum; i++) {
-        if (ph[i].p_type == PT_LOAD && eh.e_phoff >= ph[i].p_offset &&
-            eh.e_phoff < ph[i].p_offset + ph[i].p_filesz) {
-            phdr_addr = bias + ph[i].p_vaddr + (eh.e_phoff - ph[i].p_offset);
+    for (int i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type == PT_LOAD && eh->e_phoff >= ph[i].p_offset &&
+            eh->e_phoff < ph[i].p_offset + ph[i].p_filesz) {
+            phdr_addr = bias + ph[i].p_vaddr + (eh->e_phoff - ph[i].p_offset);
             break;
         }
     }
 
-    out->entry = bias + eh.e_entry;
-    out->phdr = phdr_addr ? phdr_addr : (bias + lo + eh.e_phoff);
-    out->phent = eh.e_phentsize;
-    out->phnum = eh.e_phnum;
+    out->entry = bias + eh->e_entry;
+    out->phdr = phdr_addr ? phdr_addr : (bias + lo + eh->e_phoff);
+    out->phent = eh->e_phentsize;
+    out->phnum = eh->e_phnum;
     out->base = bias;
     out->load_lo = bias + lo;
     out->load_hi = bias + hi;
-    out->is_dyn = is_dyn;
-    rc = CNG_LOAD_OK;
+    out->is_dyn = plan->is_dyn;
+    return CNG_LOAD_OK;
+}
 
-out:
+/* ---- both passes, for the callers that have nothing to validate against
+ * (the initial program, and the debug ops) ------------------------------- */
+
+int cng_load_elf_fd(int fd, unsigned long base_hint, struct cng_loaded *out) {
+    struct cng_elf_plan plan;
+    int rc = cng_elf_plan_fd(fd, &plan, out);
+    if (rc == CNG_LOAD_OK)
+        rc = cng_elf_map(&plan, base_hint, out);
+    cng_elf_plan_release(&plan);
     return rc;
 }
 
 int cng_load_elf(const char *path, unsigned long base_hint,
                  struct cng_loaded *out) {
-    long fd = sys_openat(CNG_AT_FDCWD, path, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
-    if (fd < 0) {
-        memset(out, 0, sizeof *out);
-        return CNG_LOAD_EOPEN;
-    }
-    int rc = cng_load_elf_fd((int)fd, base_hint, out);
-    sys_close((int)fd);
+    struct cng_elf_plan plan;
+    int rc = cng_elf_plan(path, &plan, out);
+    if (rc == CNG_LOAD_OK)
+        rc = cng_elf_map(&plan, base_hint, out);
+    cng_elf_plan_release(&plan);
     return rc;
 }
