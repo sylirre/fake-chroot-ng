@@ -257,11 +257,30 @@ static int elf_read_headers(int fd, struct cng_elf_plan *plan,
     return CNG_LOAD_OK;
 }
 
+/* The two checks open_exec makes before an ELF header is ever looked at, and
+ * the reason a directory and a mode-0644 file both fail an exec with EACCES
+ * rather than with something about their contents. The execute bit is required
+ * even of root: CAP_DAC_OVERRIDE only covers a file with at least one of the
+ * three set. Measured on the host, program and interpreter alike. */
+static int elf_check_execable(int fd) {
+    char st[128];
+    if (CNG_SYS(__NR_newfstatat, fd, (long)"", (long)st, CNG_AT_EMPTY_PATH, 0,
+                0) != 0)
+        return CNG_LOAD_EACCES;
+    unsigned mode = *(unsigned *)(st + 16);
+    if ((mode & 0170000) != 0100000 || !(mode & 0111))
+        return CNG_LOAD_EACCES;
+    return CNG_LOAD_OK;
+}
+
 int cng_elf_plan_fd(int fd, struct cng_elf_plan *plan, struct cng_loaded *out) {
     memset(out, 0, sizeof *out);
     plan->fd = fd; /* borrowed: the caller owns it, so never own_fd */
     plan->own_fd = 0;
-    int rc = elf_read_headers(fd, plan, out);
+    plan->err = 0;
+    int rc = elf_check_execable(fd);
+    if (rc == CNG_LOAD_OK)
+        rc = elf_read_headers(fd, plan, out);
     if (rc != CNG_LOAD_OK)
         plan->fd = -1;
     return rc;
@@ -272,12 +291,17 @@ int cng_elf_plan(const char *path, struct cng_elf_plan *plan,
     memset(out, 0, sizeof *out);
     plan->fd = -1;
     plan->own_fd = 0;
+    plan->err = 0;
     long fd = sys_openat(CNG_AT_FDCWD, path, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
-    if (fd < 0)
+    if (fd < 0) {
+        plan->err = (int)fd; /* ENOENT, EACCES, ENOTDIR, ELOOP: the caller's */
         return CNG_LOAD_EOPEN;
+    }
     plan->fd = (int)fd;
     plan->own_fd = 1;
-    int rc = elf_read_headers((int)fd, plan, out);
+    int rc = elf_check_execable((int)fd);
+    if (rc == CNG_LOAD_OK)
+        rc = elf_read_headers((int)fd, plan, out);
     if (rc != CNG_LOAD_OK)
         cng_elf_plan_release(plan);
     return rc;

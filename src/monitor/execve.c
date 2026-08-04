@@ -354,6 +354,40 @@ static _Noreturn void exec_fatal(const char *path, const char *what, long err) {
         ;
 }
 
+/* What the kernel answers when an image cannot be loaded. All of it is measured
+ * on the host, because the two roles do not answer alike and neither is one
+ * errno:
+ *
+ *   image is...         program      interpreter
+ *   missing             ENOENT       ENOENT
+ *   a directory         EACCES       EACCES
+ *   not executable      EACCES       EACCES
+ *   shorter than a hdr  ENOEXEC      EIO
+ *   not an ELF for us   ENOEXEC      ELIBBAD
+ *
+ * The split is in fs/binfmt_elf.c: the program's header arrives in the 256-byte
+ * buffer bprm_execve already read, so a short file is simply a header that does
+ * not check out and every format declines it — ENOEXEC — while the interpreter
+ * is read on its own with elf_read(), which turns a short read into EIO and a
+ * failed check into ELIBBAD.
+ *
+ * This mattered less when it could not be observed: an interpreter that failed
+ * to load did so after the program had been mapped over the caller, so the
+ * guest died rather than read an errno. It is answered before anything is
+ * mapped now, and the caller lives to see which of the five it was. */
+static long exec_load_errno(int rc, const struct cng_elf_plan *plan, int interp) {
+    switch (rc) {
+    case CNG_LOAD_EOPEN:
+        return plan->err ? plan->err : -ENOENT;
+    case CNG_LOAD_EACCES:
+        return -EACCES;
+    case CNG_LOAD_EIO:
+        return interp ? -EIO : -ENOEXEC;
+    default: /* EFORMAT, ETOOBIG: a header that does not check out */
+        return interp ? -ELIBBAD : -ENOEXEC;
+    }
+}
+
 static long execve_load(int dirfd, const char *path, char **argv, char **envp,
                         int flags, unsigned long *out_sp,
                         unsigned long *out_entry) {
@@ -522,7 +556,7 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
         if (cng_g_debug)
             cng_dprintf(2, "[cng] exec %s (%s): load failed rc=%d\n", path,
                         host, rc);
-        return rc == CNG_LOAD_EOPEN ? -ENOENT : -ENOEXEC;
+        return exec_load_errno(rc, &pplan, 0);
     }
     if (cng_g_debug)
         cng_dprintf(2, "[cng]   prog dyn=%d lo=%lx hi=%lx interp=%d\n",
@@ -538,13 +572,16 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
     int have_interp = 0;
     if (prog.has_interp) {
         char ip[CNG_PATH_MAX];
-        if (cng_resolve(prog.interp, 1, ip, sizeof ip) != 0 ||
-            cng_elf_plan(ip, &iplan, &interp) != CNG_LOAD_OK) {
+        iplan.err = -ENOENT; /* a name that did not resolve has no open to ask */
+        int irc = cng_resolve(prog.interp, 1, ip, sizeof ip) != 0
+                      ? CNG_LOAD_EOPEN
+                      : cng_elf_plan(ip, &iplan, &interp);
+        if (irc != CNG_LOAD_OK) {
             if (cng_g_debug) /* guest-visible stderr: see the load failure above */
-                cng_dprintf(2, "[cng] exec %s: interp %s load failed\n", path,
-                            prog.interp);
+                cng_dprintf(2, "[cng] exec %s: interp %s load failed rc=%d\n",
+                            path, prog.interp, irc);
             cng_elf_plan_release(&pplan);
-            return -ENOENT;
+            return exec_load_errno(irc, &iplan, 1);
         }
         have_interp = 1;
     }

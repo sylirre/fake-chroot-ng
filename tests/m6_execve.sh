@@ -252,16 +252,98 @@ else
 
     # The other shape of the same failure: an interpreter that is there but is
     # not a loadable ELF, which fails in the header pass rather than in the
-    # resolver. The errno still diverges here — the kernel distinguishes (a
-    # header too short to be one is EIO, measured) where we answer ENOENT for
-    # every interpreter failure — so what is asserted is the part this is about:
-    # the caller is alive to be told.
+    # resolver. The caller has to be alive to be told, which is what this
+    # asserts; which errno it is told is the table below.
     printf 'not an ELF\n' >"$IFD$IF_NOINTERP"
     chmod 755 "$IFD$IF_NOINTERP"
     check_contains "an unloadable interpreter also leaves the caller running" \
         "alive=1" "$(run_t 90 -R "$IFD" /interpfail /badinterp 2>&1)"
 fi
 rm -rf "$IFD"
+
+# ...and WHICH errno. There are five, not the two we used to answer, and the two
+# roles do not answer alike: a header too short to be one is EIO for an
+# interpreter and ENOEXEC for a program, a header that does not check out is
+# ELIBBAD or ENOEXEC, and an image that is a directory or carries no execute bit
+# is EACCES for both — before its contents are looked at at all. It was
+# invisible while an interpreter failure killed the caller; now the caller
+# survives to read it.
+#
+# Differential, not a table of numbers: the same nine victims built for the host
+# and run with no chroot-ng in the way. qemu-user is no oracle for an exec (it
+# re-execs itself, so a broken interpreter is its own loader's complaint), so
+# the reference side is always the host-native build — including its PT_INTERP
+# strings, which have to be absolute host paths where the guest's are rootfs
+# ones pointing at the same files.
+EED=$(mktemp -d)
+mkdir -p "$EED/brk" "$EED/host" "$EED/p_dir" "$EED/host/p_dir" "$EED/brk/dir"
+: >"$EED/brk/short.tmp"
+head -c 20 /bin/sh >"$EED/brk/short" 2>/dev/null
+head -c 4096 /dev/zero | tr '\0' 'x' >"$EED/brk/junk"
+cp "$EED/brk/junk" "$EED/p_junk"
+cp "$EED/brk/junk" "$EED/host/p_junk"
+chmod 755 "$EED/brk/short" "$EED/brk/junk" "$EED/p_junk" "$EED/host/p_junk"
+rm -f "$EED/brk/short.tmp"
+
+# One victim per way of being broken; the interpreter ones differ only in the
+# PT_INTERP they carry. EE_CASES is the argument list both sides are given.
+EE_INTERP="missing dir noexec short junk"
+EE_PROG="p_noexec p_junk p_dir p_missing"
+
+ee_build() { # ee_build CC OUTDIR INTERP_PREFIX
+    _cc=$1; _dir=$2; _pfx=$3
+    $_cc -O2 -static -o "$_dir/execerrno" tests/guests/execerrno.c 2>/dev/null ||
+        return 1
+    for _n in $EE_INTERP; do
+        $_cc -O2 "-Wl,--dynamic-linker=$_pfx/brk/$_n" -o "$_dir/v_$_n" \
+            tests/guests/hello.c 2>/dev/null || return 1
+    done
+    $_cc -O2 -static -o "$_dir/p_noexec" tests/guests/hello.c 2>/dev/null ||
+        return 1
+    chmod 644 "$_dir/p_noexec"
+    return 0
+}
+
+ee_args() { # the paths to hand the runner, rooted at $1
+    for _n in $EE_INTERP; do printf '%s/v_%s ' "$1" "$_n"; done
+    for _n in $EE_PROG; do printf '%s/%s ' "$1" "$_n"; done
+}
+
+ee_hostcc=""
+for _c in ${HOSTCC:-} cc gcc clang; do have "$_c" && { ee_hostcc=$_c; break; }; done
+
+if [ -z "$GUESTCC" ]; then
+    skip "failed-exec errno: no AArch64 guest toolchain"
+elif [ "$CNG_SECCOMP_LIVE" != 1 ] && [ "$CNG_EXECMEM" != 1 ]; then
+    skip "failed-exec errno: no filter is live and -R cannot rewrite without execmem"
+elif [ -z "$ee_hostcc" ]; then
+    skip "failed-exec errno: no host compiler for the differential oracle"
+# shellcheck disable=SC2086  # $GUESTLD is a flag or deliberately empty
+elif ! ee_build "$GUESTCC" "$EED" "" ; then
+    skip "failed-exec errno: the guest toolchain links no dynamic victim here"
+elif ! ee_build "$ee_hostcc" "$EED/host" "$EED"; then
+    skip "failed-exec errno: the host toolchain links no dynamic victim here"
+else
+    # The interpreter each victim names, made broken in its own way. `missing`
+    # is the one file that must NOT exist.
+    cp "$EED/host/execerrno" "$EED/brk/noexec" 2>/dev/null
+    chmod 644 "$EED/brk/noexec"
+    # shellcheck disable=SC2046  # ee_args is a deliberately split argument list
+    ee_k=$(if_host_run "$EED/host/execerrno" $(ee_args "$EED/host") 2>/dev/null)
+    # shellcheck disable=SC2046
+    ee_g=$(run_t 90 -R "$EED" /execerrno $(ee_args "") 2>/dev/null)
+    if [ -n "$ee_k" ] && [ "$ee_k" = "$ee_g" ]; then
+        pass=$((pass + 1))
+        printf '  ok   a failed exec answers the errno the kernel does, all five\n'
+    else
+        fail=$((fail + 1))
+        printf '  FAIL a failed exec answers an errno the kernel does not\n'
+        printf '       kernel: %s\n' "$(echo "$ee_k" | tr '\n' '|')"
+        printf '       cng   : %s\n' "$(echo "$ee_g" | tr '\n' '|')"
+    fi
+fi
+rm -rf "$EED"
+
 
 # emulated execve must close FD_CLOEXEC fds like a real execve, or fork/exec
 # launchers (git run-command, posix_spawn) block on their O_CLOEXEC notify pipe.

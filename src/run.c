@@ -51,6 +51,8 @@ static const char *load_err(int rc) {
         return "mmap/mprotect failed (execmem denied?)";
     case CNG_LOAD_ETOOBIG:
         return "too many program headers / interp too long";
+    case CNG_LOAD_EACCES:
+        return "not a regular file, or not executable";
     default:
         return "unknown error";
     }

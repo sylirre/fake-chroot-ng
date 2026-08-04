@@ -41,6 +41,7 @@ struct cng_loaded {
 #define CNG_LOAD_EMAP     -4  /* mmap/mprotect failed */
 #define CNG_LOAD_ETOOBIG  -5  /* too many phdrs / interp too long */
 #define CNG_LOAD_EEXEC    -6  /* anon mprotect(RX) denied — retry file-backed */
+#define CNG_LOAD_EACCES   -7  /* not a regular file, or no execute bit at all */
 
 /* Force file-backed segment mapping (mmap PROT_EXEC from the file) instead of
  * anon copy+mprotect. Set automatically after the first anon-exec denial (e.g.
@@ -90,6 +91,10 @@ struct cng_elf_plan {
     int is_dyn;
     int fd;            /* the file to map from, -1 once released */
     int own_fd;        /* set when the plan opened it and must close it */
+    int err;           /* CNG_LOAD_EOPEN: the open's own errno, negative. An
+                        * exec that fails has to answer with it — ENOENT and
+                        * EACCES are different answers to a caller that lived
+                        * to read them. */
 };
 
 /* Header pass: read and validate, map nothing. Fills *plan and the PT_INTERP
