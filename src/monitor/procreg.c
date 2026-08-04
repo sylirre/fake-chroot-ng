@@ -84,17 +84,38 @@ u64 cng_proc_starttime(int pid, int *zombie_out) {
     if (!p)
         return 0;
     p++;
+    /* Fields, counting the state as 1 (i.e. proc(5)'s field 3): 1 state,
+     * 18 num_threads, 20 starttime.
+     *
+     * State 'Z' alone does not mean the process is gone. A thread group whose
+     * *leader* exits — which is what main() calling pthread_exit() does, and
+     * every Go program and most Java ones end that way — reports 'Z' on
+     * /proc/<tgid>/stat while the rest of its threads run on. Reading that as
+     * death made the broker apply a live process's SEM_UNDO rows behind its
+     * back (releasing a lock it still holds) and answer its parked waiters
+     * -EIDRM. num_threads tells the two apart and is in this same line, so it
+     * costs nothing: a genuinely dead, unreaped process is 'Z' with 1, a live
+     * group with a dead leader is 'Z' with 2 or more. */
+    int is_z = 0;
+    u64 nthr = 1;
     for (int field = 0; *p;) {
         while (*p == ' ')
             p++;
         if (!*p)
             break;
-        if (++field == 1 && zombie_out)
-            *zombie_out = (*p == 'Z');
+        if (++field == 1)
+            is_z = (*p == 'Z');
+        if (field == 18) {
+            nthr = 0;
+            for (const char *q = p; *q >= '0' && *q <= '9'; q++)
+                nthr = nthr * 10 + (u64)(*q - '0');
+        }
         if (field == 20) {
             u64 t = 0;
             for (; *p >= '0' && *p <= '9'; p++)
                 t = t * 10 + (u64)(*p - '0');
+            if (zombie_out)
+                *zombie_out = is_z && nthr <= 1;
             return t ? t : 1; /* 0 means "gone"; never report it for a live pid */
         }
         while (*p && *p != ' ')
