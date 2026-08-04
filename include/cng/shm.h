@@ -37,6 +37,11 @@
 #define CNG_SHM_INFO     14
 #define CNG_SHM_STAT_ANY 15
 
+/* A mode bit rather than a permission: set by IPC_RMID on a segment that still
+ * has attachers, and the only way a caller can tell one marked for destruction
+ * from an ordinary one (`ipcs -m` prints it as the "dest" status). */
+#define CNG_SHM_DEST 01000
+
 /* shmat() shmflg. */
 #define CNG_SHM_RDONLY 010000  /* attach read-only */
 #define CNG_SHM_RND    020000  /* round the attach address down to SHMLBA */

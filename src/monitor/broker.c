@@ -266,7 +266,7 @@ struct seg {
     int used;
     s32 shmid, key; /* key 0 = private or removed: unfindable by key */
     u64 size;       /* the size as requested, which is what IPC_STAT reports */
-    u32 mode;       /* permission bits (low 9) */
+    u32 mode;       /* permission bits (low 9), plus SHM_DEST once removed */
     u32 uid, gid, cuid, cgid;
     s32 cpid, lpid;
     s64 atime, dtime, ctime;
@@ -613,6 +613,16 @@ static s32 shm_do_ctl(const struct cng_breq *q, struct cng_bresp *r) {
         if (!shm_owner(s, q->uid))
             return -EPERM;
         s->key = 0; /* unfindable by key henceforth */
+        /* do_shm_rmid() does two things to a segment that still has attachers,
+         * and both are observable: it makes the key private (above) and it sets
+         * SHM_DEST in the mode. That bit is copied straight out to the caller
+         * by IPC_STAT, and is the only way to tell a live-but-doomed segment
+         * from a leaked one — `ipcs -m` prints it as the "dest" status, and the
+         * allocate/attach/immediately-mark idiom depends on it. Measured: the
+         * kernel reports mode 0600 before the removal and 01600 after, with
+         * nattch still 1. IPC_SET already masks the high bits, so nothing can
+         * clear it. */
+        s->mode |= CNG_SHM_DEST;
         s->rmid = 1;
         shm_reclaim_seg(s); /* frees it if the last attacher is already gone */
         return 0;

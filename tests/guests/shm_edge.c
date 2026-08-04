@@ -72,6 +72,30 @@ int main(void) {
             shmctl(h, IPC_RMID, NULL);
     }
 
+    /* IPC_RMID on a segment that still has an attacher does not free it, it
+     * marks it — and the mark is observable. do_shm_rmid() makes the key
+     * private *and* ORs SHM_DEST into the mode, which is what `ipcs -m` prints
+     * as the "dest" status and the only way a caller can tell a segment on its
+     * way out from one that leaked. The allocate/attach/immediately-mark idiom
+     * rests on it. */
+    {
+        int d = shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0600);
+        void *a = shmat(d, NULL, 0);
+        struct shmid_ds ds;
+        int rc = shmctl(d, IPC_STAT, &ds);
+        printf("dest_before=rc%d mode=%o nattch=%lu\n", rc,
+               (unsigned)ds.shm_perm.mode & 07777, (unsigned long)ds.shm_nattch);
+        shmctl(d, IPC_RMID, NULL);
+        rc = shmctl(d, IPC_STAT, &ds);
+        printf("dest_after=rc%d mode=%o nattch=%lu\n", rc,
+               rc == 0 ? (unsigned)ds.shm_perm.mode & 07777 : 0,
+               rc == 0 ? (unsigned long)ds.shm_nattch : 0);
+        if (a != (void *)-1)
+            shmdt(a);
+        printf("dest_gone=%s\n",
+               shmctl(d, IPC_STAT, &ds) < 0 ? strerror(errno) : "ok");
+    }
+
     shmctl(id, IPC_RMID, NULL);
     printf("done\n");
     return 0;
