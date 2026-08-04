@@ -822,6 +822,33 @@ static int sc_sigact(void) {
     return 0;
 }
 
+/* waitid names the states it will accept, and the kernel honours each one
+ * separately: a WSTOPPED-only wait must not be handed an exit, and a
+ * WEXITED-only wait must still see one. The emulation gated its whole registry
+ * on WSTOPPED, so it did both wrong — it would report an exit to a wait that
+ * asked only for stops, and never consult the registry at all for a wait that
+ * asked only for exits. */
+static int sc_waitid(void) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        child_start();
+        _exit(7);
+    }
+    expect_first_stop(pid);
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    usleep(300000); /* let it run to exit */
+
+    siginfo_t si;
+    memset(&si, 0, sizeof si);
+    int r = waitid(P_PID, pid, &si, WSTOPPED | WNOHANG);
+    printf("stopped_only rc=%d reported=%d\n", r, si.si_pid != 0);
+
+    memset(&si, 0, sizeof si);
+    r = waitid(P_PID, pid, &si, WEXITED);
+    printf("exited rc=%d code=%d status=%d\n", r, si.si_code, si.si_status);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, 0, _IOLBF, 0);
     if (argc > 1 && !strcmp(argv[1], "hello")) {
@@ -867,6 +894,8 @@ int main(int argc, char **argv) {
         return sc_vmrw();
     if (!strcmp(s, "sigact"))
         return sc_sigact();
+    if (!strcmp(s, "waitid"))
+        return sc_waitid();
     fprintf(stderr, "unknown scenario %s\n", s);
     return 2;
 }

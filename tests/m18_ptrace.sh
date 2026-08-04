@@ -156,6 +156,12 @@ else
     # the kernel says EINVAL. Query-only stays allowed on both, which is the
     # half a blanket refusal would get wrong.
     pt_case sigact
+    # waitid names the states it will accept and the kernel honours each one
+    # separately. The emulation gated its whole registry on WSTOPPED, so a wait
+    # asking only for stops could be handed an exit, and one asking only for
+    # exits — what a tracer reaping a dead tracee issues — never consulted the
+    # registry at all.
+    pt_case waitid
 
     # ...and the same, with a rootfs actually in the way: the guest binary is
     # bound in so it can be loaded, and the trace must still read the guest's

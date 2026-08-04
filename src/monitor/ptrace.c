@@ -1547,9 +1547,16 @@ static int pt_have_tracee(s32 wpid) {
     return 0;
 }
 
-/* Consume one ready stop or synthetic exit matching wpid (<=0 means any).
- * Fills *status with a wait-status word and returns the tid, or 0. */
-static s32 pt_collect(s32 wpid, int *status) {
+/* What a caller is willing to be handed. wait4 always takes both — the kernel
+ * reports a *traced* child's stop whether or not WUNTRACED was given — but
+ * waitid's flags are explicit, and it must be told each one separately. */
+#define PT_COLLECT_STOPS 1
+#define PT_COLLECT_EXITS 2
+
+/* Consume one ready stop or synthetic exit matching wpid (<=0 means any), of a
+ * kind the caller asked for. Fills *status with a wait-status word and returns
+ * the tid, or 0. */
+static s32 pt_collect(s32 wpid, int *status, int want) {
     if (!g_tab)
         return 0;
     s32 me = (s32)sys_getpid();
@@ -1564,11 +1571,15 @@ static s32 pt_collect(s32 wpid, int *status) {
             continue;
         u32 st = __atomic_load_n(&e->state, __ATOMIC_ACQUIRE);
         if (st == PT_ST_EXITED) {
+            if (!(want & PT_COLLECT_EXITS))
+                continue; /* leave it for a wait that asked for exits */
             *status = e->exit_status;
             pt_free(e);
             return t;
         }
         if (st != PT_ST_STOPPED)
+            continue;
+        if (!(want & PT_COLLECT_STOPS))
             continue;
         if (__atomic_load_n(&e->reported, __ATOMIC_ACQUIRE))
             continue;
@@ -1659,7 +1670,7 @@ long cng_pt_wait4(long pid, u64 status, long options, u64 rusage,
     for (;;) {
         u32 gen = g_tab ? __atomic_load_n(&g_tab->global_gen, __ATOMIC_ACQUIRE) : 0;
         int st = 0;
-        s32 t = pt_collect((s32)pid, &st);
+        s32 t = pt_collect((s32)pid, &st, PT_COLLECT_STOPS | PT_COLLECT_EXITS);
         if (t > 0) {
             if (status) {
                 if (!cng_user_writable((void *)status, 4))
@@ -1714,7 +1725,15 @@ long cng_pt_waitid(long idtype, long id, u64 infop, long options, u64 rusage,
         u32 gen = g_tab ? __atomic_load_n(&g_tab->global_gen, __ATOMIC_ACQUIRE) : 0;
         int st = 0;
         s32 t = 0;
-        if (wpid && (options & PT_WSTOPPED) && (t = pt_collect(wpid, &st)) > 0) {
+        /* waitid names the states it wants and the kernel refuses a call that
+         * names none. Gating the whole registry on WSTOPPED meant a
+         * WEXITED-only wait — which is what a tracer reaping a dead tracee
+         * issues — never saw the synthetic exit at all: the host waitid answers
+         * ECHILD for a tracee that is not our child, and the loop below treats
+         * that as "keep waiting", so it spun until something else woke it. */
+        int want = ((options & PT_WSTOPPED) ? PT_COLLECT_STOPS : 0) |
+                   ((options & PT_WEXITED) ? PT_COLLECT_EXITS : 0);
+        if (wpid && want && (t = pt_collect(wpid, &st, want)) > 0) {
             if (infop) {
                 if (!cng_user_writable((void *)infop, 128))
                     return -EFAULT;
