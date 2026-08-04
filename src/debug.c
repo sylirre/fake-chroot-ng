@@ -3378,6 +3378,52 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
         cng_g_fake_id = 0;
     }
 
+    /* 8b) ...and it follows the live set, not the one the process started with.
+     * The ids here are the ones getresuid/getresgid/getgroups answer, so the
+     * two views of one process have to agree — a thing the kernel cannot get
+     * wrong and every reader of /proc assumes. */
+    {
+        cng_g_fake_id = 1;
+        cng_g_fake_uid = 0;
+        cng_g_fake_gid = 0;
+        cng_g_host_uid = (unsigned)sys_getuid();
+        cng_g_host_gid = (unsigned)sys_getgid();
+        cng_cred_seed();
+        /* Privileged calls first: the euid change below gives up the privilege
+         * the other two need, exactly as it would for a guest. */
+        unsigned gl[3] = {5, 7, 9};
+        long sg = cng_cred_handle(__NR_setgroups, 3, (long)gl, 0, 0, 0, 0);
+        long rg = cng_cred_handle(__NR_setresgid, 21, 22, 23, 0, 0, 0);
+        long ru = cng_cred_handle(__NR_setresuid, 11, 12, 13, 0, 0, 0);
+
+        unsigned r = 0, e = 0, s = 0, gr = 0, ge = 0, gs = 0, got[3] = {0, 0, 0};
+        cng_cred_handle(__NR_getresuid, (long)&r, (long)&e, (long)&s, 0, 0, 0);
+        cng_cred_handle(__NR_getresgid, (long)&gr, (long)&ge, (long)&gs, 0, 0, 0);
+        long ng = cng_cred_handle(__NR_getgroups, 3, (long)got, 0, 0, 0, 0);
+
+        /* What the credential syscalls report, spelled the way /proc does. */
+        char uline[64], gline[64], grline[64];
+        cng_snprintf(uline, sizeof uline, "\nUid:\t%u\t%u\t%u\t%u\n", r, e, s, e);
+        cng_snprintf(gline, sizeof gline, "\nGid:\t%u\t%u\t%u\t%u\n", gr, ge, gs,
+                     ge);
+        cng_snprintf(grline, sizeof grline, "\nGroups:\t%u %u %u \n", got[0],
+                     got[1], got[2]);
+
+        long fd = pt_open("/proc/self/status");
+        long n = pt_slurp(fd, buf, sizeof buf);
+        int ok = sg == 0 && rg == 0 && ru == 0 && ng == 3 && n > 0 &&
+                 pt_has(buf, uline) && pt_has(buf, gline) && pt_has(buf, grline);
+        if (fd >= 0)
+            sys_close((int)fd);
+        cng_dprintf(1,
+                    "proctest status live: uid=%u/%u/%u gid=%u/%u/%u groups=%ld "
+                    "-> %s\n",
+                    r, e, s, gr, ge, gs, ng, ok ? "OK" : "FAIL");
+        fails += !ok;
+        cng_g_fake_id = 0;
+        cng_cred_seed(); /* leave the set as the later blocks found it */
+    }
+
     /* 9) --no-proc turns all of it off. */
     {
         cng_g_no_proc = 1;

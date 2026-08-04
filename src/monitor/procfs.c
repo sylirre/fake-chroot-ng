@@ -394,11 +394,25 @@ static void put_stat(int fd) {
 
 /* ---- status (fake-id remap) --------------------------------------------- */
 
-/* Copy the host status through, rewriting only the Uid:/Gid:/Groups: numeric
- * fields via the fake-id remap so ps/top resolve the fake identity's user (they
- * read the Uid: line, which otherwise carries our real host uid). Returns 0, or
- * -1 if the host file cannot be read (caller falls back to passthrough). */
-static int put_status(int fd, const char *host) {
+/* Copy the host status through, rewriting the Uid:/Gid:/Groups: lines to the
+ * identity the guest has, so ps/top resolve the fake identity's user (they read
+ * the Uid: line, which otherwise carries our real host uid). Returns 0, or -1 if
+ * the host file cannot be read (caller falls back to passthrough).
+ *
+ * `self` picks where that identity comes from. For this process it is the live
+ * set in cng_g_cred — the one every credential syscall reads and writes, and the
+ * one getresuid/getresgid/getgroups answer from. Remapping the host's numbers
+ * instead described the identity the process STARTED with: a guest that dropped
+ * privilege was still Uid: 0 here while `id` said otherwise, and its Groups:
+ * line was the invoking user's supplementary groups, which getgroups() has never
+ * reported (the synthetic set starts empty). One process cannot have two
+ * answers; the kernel reads both out of the same struct cred.
+ *
+ * Another guest process is a different matter: its set is its own copy, forked
+ * for real and changed since, and nothing publishes it. There the host line
+ * remapped is the closest thing available — that process's startup identity,
+ * which is right until it changes its own credentials. */
+static int put_status(int fd, const char *host, int self) {
     long hf = open_host_ro(host);
     if (hf < 0)
         return -1;
@@ -408,6 +422,15 @@ static int put_status(int fd, const char *host) {
     while ((line = lrd_next(&r)) != 0) {
         int is_uid = !strncmp(line, "Uid:", 4);
         if (is_uid || !strncmp(line, "Gid:", 4)) {
+            if (self) {
+                const struct cng_cred *c = &cng_g_cred;
+                cng_dprintf(fd, "%s\t%u\t%u\t%u\t%u\n", is_uid ? "Uid:" : "Gid:",
+                            is_uid ? c->ruid : c->rgid,
+                            is_uid ? c->euid : c->egid,
+                            is_uid ? c->suid : c->sgid,
+                            is_uid ? c->fsuid : c->fsgid);
+                continue;
+            }
             const char *p = line + 4;
             unsigned id[4];
             int got = 0;
@@ -425,13 +448,24 @@ static int put_status(int fd, const char *host) {
                 continue;
             }
         } else if (!strncmp(line, "Groups:", 7)) {
-            cng_dprintf(fd, "Groups:");
-            const char *p = line + 7;
-            for (;;) {
-                skip_ws(&p);
-                if (*p < '0' || *p > '9')
-                    break;
-                cng_dprintf(fd, " %u", cng_remap_gid((unsigned)parse_ul(&p)));
+            /* The kernel's own spelling: a tab after the keyword, single spaces
+             * between the ids, and a trailing space after the last one — see the
+             * "Trailing space shouldn't have been added in the first place"
+             * comment in fs/proc/array.c, which is why it is still there. This
+             * used to print a leading space and no tab, so the line did not read
+             * like the one every other status file has. Measured on the host. */
+            cng_dprintf(fd, "Groups:\t");
+            if (self) {
+                for (int i = 0; i < cng_g_cred.ngroups; i++)
+                    cng_dprintf(fd, "%u ", cng_g_cred.groups[i]);
+            } else {
+                const char *p = line + 7;
+                for (;;) {
+                    skip_ws(&p);
+                    if (*p < '0' || *p > '9')
+                        break;
+                    cng_dprintf(fd, "%u ", cng_remap_gid((unsigned)parse_ul(&p)));
+                }
             }
             cng_dprintf(fd, "\n");
             continue;
@@ -827,7 +861,7 @@ int cng_procfs_open(const char *canon, long gflags, long *ret) {
         put_stat((int)fd);
         break;
     case PF_STATUS:
-        rc = put_status((int)fd, host);
+        rc = put_status((int)fd, host, pid == (int)sys_getpid());
         break;
     case PF_MAPS:
         rc = put_maps((int)fd, host);

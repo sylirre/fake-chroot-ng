@@ -89,6 +89,14 @@ check_contains "a map_files link target is mapped into the guest view" \
     "proctest map_files:" "$out"
 check_contains "status Uid/Gid remapped under --fake-id" \
     "proctest status remap:" "$out"
+# ...and it has to be the LIVE set. The ids in cng_g_cred are what getresuid,
+# getresgid and getgroups answer, and every credential syscall writes them; the
+# status lines were remapped from the host's instead, so a guest that dropped
+# privilege was still described by the identity it started with, and its
+# supplementary groups were the invoking user's — groups getgroups() never
+# reported. One process, two answers, is a thing the kernel cannot do.
+check_contains "status carries the live credential set, not the startup one" \
+    "proctest status live: uid=11/12/13 gid=21/22/23 groups=3 -> OK" "$out"
 check_contains "--no-proc disables passthrough and synthesis" \
     "proctest no-proc -> OK" "$out"
 rm -rf "$PT" "$PTB"
