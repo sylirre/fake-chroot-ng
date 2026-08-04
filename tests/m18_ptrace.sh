@@ -148,6 +148,14 @@ else
     # wrapped the length validation to nothing (1<<60 entries of 16 bytes is
     # exactly 2^64) and then walked the array off the end of guest memory.
     pt_case vmrw
+    # Signals the emulation does not take over must still reach the kernel while
+    # the task is traced. It hooks every catchable signal to route delivery
+    # through the stop machinery, but SIGKILL and SIGSTOP are not among them —
+    # nothing can be — and treating "traced" as "we own every signal" answered
+    # rt_sigaction(SIGKILL, act) from a private mirror, reporting success where
+    # the kernel says EINVAL. Query-only stays allowed on both, which is the
+    # half a blanket refusal would get wrong.
+    pt_case sigact
 
     # ...and the same, with a rootfs actually in the way: the guest binary is
     # bound in so it can be loaded, and the trace must still read the guest's

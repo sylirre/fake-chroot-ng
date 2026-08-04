@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ptrace.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
@@ -771,6 +772,56 @@ static int sc_vmrw(void) {
     return 0;
 }
 
+/* Signals the emulation deliberately does NOT take over must still reach the
+ * kernel while the task is traced. It hooks every catchable signal to route
+ * delivery through the stop machinery, but SIGKILL and SIGSTOP are not among
+ * them — nothing can be, the kernel refuses — and treating "traced" as "we own
+ * every signal" made rt_sigaction(SIGKILL, act) report success from a private
+ * mirror where the kernel answers EINVAL.
+ *
+ * Raw rt_sigaction, because a libc wrapper is free to pre-screen SIGKILL itself
+ * and we want the kernel's answer, not glibc's. */
+struct ksigaction {
+    void *handler;
+    unsigned long flags;
+    void *restorer;
+    unsigned long mask;
+};
+
+static const char *sigact_res(long r) {
+    if (r == 0)
+        return "ok";
+    return errno == EINVAL ? "EINVAL" : "other";
+}
+
+static int sc_sigact(void) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        child_start();
+        struct ksigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.handler = (void *)1; /* SIG_IGN */
+        errno = 0;
+        printf("traced_setkill=%s\n",
+               sigact_res(syscall(SYS_rt_sigaction, SIGKILL, &sa, (void *)0, 8)));
+        errno = 0;
+        printf("traced_setstop=%s\n",
+               sigact_res(syscall(SYS_rt_sigaction, SIGSTOP, &sa, (void *)0, 8)));
+        /* Query-only is allowed for both, and must stay allowed. */
+        struct ksigaction o;
+        errno = 0;
+        printf("traced_querykill=%s\n",
+               sigact_res(syscall(SYS_rt_sigaction, SIGKILL, (void *)0, &o, 8)));
+        _exit(5);
+    }
+    expect_first_stop(pid);
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    int st;
+    wait_for(pid, &st);
+    show(st);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, 0, _IOLBF, 0);
     if (argc > 1 && !strcmp(argv[1], "hello")) {
@@ -814,6 +865,8 @@ int main(int argc, char **argv) {
         return sc_attach();
     if (!strcmp(s, "vmrw"))
         return sc_vmrw();
+    if (!strcmp(s, "sigact"))
+        return sc_sigact();
     fprintf(stderr, "unknown scenario %s\n", s);
     return 2;
 }

@@ -302,10 +302,22 @@ int cng_pt_sigaction(int sig, u64 act, u64 oact, u64 sz, long *out) {
     if (sig < 1 || sig > PT_NSIG || sz != sizeof(cng_sigset_t))
         return 0; /* not ours to model: let the kernel answer */
     int mine = g_hooked[sig] || sig == cng_g_kicksig;
-    if (!mine && !cng_pt_active()) {
+    if (!mine) {
         /* Not intercepting this one, but keep the mirror current: it is what a
          * later trace_enter installs from, and what the kick handler forwards
-         * a guest-directed signal to. */
+         * a guest-directed signal to.
+         *
+         * The test used to be `!mine && !cng_pt_active()`, which treated "the
+         * task is traced" as "we own every signal". We do not: g_hooked already
+         * records exactly the ones whose real disposition we took over, and
+         * trace_enter deliberately skips SIGKILL, SIGSTOP and a SIGCHLD the
+         * guest had already set to SIG_IGN. For those three the call fell into
+         * the branch below and was answered from the mirror alone — so while
+         * traced, sigaction(SIGKILL, act) reported success where the kernel
+         * answers EINVAL (measured), and a guest that had been auto-reaping its
+         * children and then installed a real SIGCHLD handler never got one:
+         * the kernel went on discarding the children and its wait() answered
+         * ECHILD. */
         if (act) {
             if (!cng_user_readable((void *)act, sizeof(struct pt_ksigaction)))
                 return 0; /* let the re-issue produce the EFAULT */
