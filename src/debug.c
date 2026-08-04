@@ -4138,6 +4138,53 @@ int cng_cmd_shmtest(int argc, char **argv, char **envp, unsigned long *auxv) {
         fails += !ok;
     }
 
+    /* 0d) A peer that closes with nothing sent is the one failure a caller may
+     *     retry, and it has to be told apart from the ones it must not. A
+     *     timeout means the peer may be alive and may already have acted on the
+     *     request; a truncated reply means it certainly did. Both stay -1. */
+    {
+        int sv[2] = {-1, -1};
+        char rb[64];
+        int ok = CNG_SYS(__NR_socketpair, CNG_AF_UNIX, CNG_SOCK_STREAM, 0,
+                         (long)sv, 0, 0) == 0;
+        /* nothing sent, writer closed */
+        if (ok && sv[1] >= 0)
+            sys_close(sv[1]);
+        ok = ok && cng_broker_recv(sv[0], rb, sizeof rb, 0) == CNG_BROKER_GONE;
+        if (sv[0] >= 0)
+            sys_close(sv[0]);
+
+        /* half a reply, then the writer closed: NOT retryable */
+        int sv2[2] = {-1, -1};
+        int ok2 = CNG_SYS(__NR_socketpair, CNG_AF_UNIX, CNG_SOCK_STREAM, 0,
+                          (long)sv2, 0, 0) == 0 &&
+                  cng_broker_send(sv2[1], "abcd", 4, -1) == 0;
+        if (sv2[1] >= 0)
+            sys_close(sv2[1]);
+        ok2 = ok2 && cng_broker_recv(sv2[0], rb, sizeof rb, 0) == -1;
+        if (sv2[0] >= 0)
+            sys_close(sv2[0]);
+
+        /* a peer that simply does not answer: NOT retryable either */
+        int sv3[2] = {-1, -1};
+        int ok3 = CNG_SYS(__NR_socketpair, CNG_AF_UNIX, CNG_SOCK_STREAM, 0,
+                          (long)sv3, 0, 0) == 0;
+        struct cng_timeval tv = {0, 50 * 1000}; /* 50 ms stands in for the 2 s */
+        ok3 = ok3 && CNG_SYS(__NR_setsockopt, sv3[0], CNG_SOL_SOCKET,
+                             CNG_SO_RCVTIMEO, &tv, sizeof tv, 0) == 0 &&
+              cng_broker_recv(sv3[0], rb, sizeof rb, 0) == -1;
+        if (sv3[0] >= 0)
+            sys_close(sv3[0]);
+        if (sv3[1] >= 0)
+            sys_close(sv3[1]);
+
+        cng_dprintf(1,
+                    "shmtest gone/short/timeout told apart: %d%d%d -> %s\n", ok,
+                    ok2, ok3, ok && ok2 && ok3 ? "OK" : "FAIL");
+        fails += !(ok && ok2 && ok3);
+    }
+
+
     /* 1) create, attach, and see the memory. */
     long id = shm_call(__NR_shmget, 0 /*IPC_PRIVATE*/, SHMT_SZ,
                        CNG_IPC_CREAT | 0600);
@@ -4336,6 +4383,56 @@ int cng_cmd_shmtest(int argc, char **argv, char **envp, unsigned long *auxv) {
                  shm_call(__NR_shmget, 0, 0, CNG_IPC_CREAT | 0600) == -EINVAL &&
                  shm_call(__NR_shmdt, 0, 0, 0) == -EINVAL;
         cng_dprintf(1, "shmtest error cases -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* A daemon keeps its listener bound while it decides to leave, so a connect
+     * that lands in that window is queued on the backlog and succeeds, the
+     * request is buffered, and only the reply never comes. Staged with the
+     * timing made deterministic: a stand-in binds the rendezvous name, accepts
+     * one connection, gives the name up, and only then closes without
+     * answering — a dying daemon, in the order that removes the race. The RPC
+     * has to recover: its retry finds nothing listening, spawns a real daemon,
+     * and the shmget below succeeds. With one attempt the silence became a
+     * fabricated ENOSPC, which is what a guest saw for having gone quiet longer
+     * than the grace window.
+     *
+     * Last, and on a namespace of its own: re-seeding the session moves this
+     * off the name the daemon serving everything above is already bound to. */
+    {
+        cng_broker_seed_session();
+        struct cng_sockaddr_un a;
+        unsigned al = cng_broker_self_addr(&a);
+        long ls = CNG_SYS(__NR_socket, CNG_AF_UNIX,
+                          CNG_SOCK_STREAM | CNG_SOCK_CLOEXEC, 0, 0, 0, 0);
+        int ok = ls >= 0 && CNG_SYS(__NR_bind, ls, &a, al, 0, 0, 0) == 0 &&
+                 CNG_SYS(__NR_listen, ls, 8, 0, 0, 0, 0) == 0;
+        long kid = ok ? sys_fork() : -1;
+        if (kid == 0) {
+            /* Bounded: if the RPC never arrives, do not wedge the suite. */
+            struct cng_pollfd pf = {(int)ls, CNG_POLLIN, 0};
+            struct cng_timespec lim = {10, 0};
+            long c = -1;
+            if (CNG_SYS(__NR_ppoll, &pf, 1, &lim, 0, 8 /*sigsetsize*/, 0) > 0)
+                c = CNG_SYS(__NR_accept4, ls, 0, 0, CNG_SOCK_CLOEXEC, 0, 0);
+            sys_close((int)ls); /* release the name BEFORE hanging up */
+            if (c >= 0)
+                sys_close((int)c);
+            sys_exit_group(0);
+        }
+        if (ls >= 0)
+            sys_close((int)ls); /* the child is the only holder now */
+        long id = ok && kid > 0
+                      ? shm_call(__NR_shmget, 0 /*IPC_PRIVATE*/, SHMT_SZ,
+                                 CNG_IPC_CREAT | 0600)
+                      : -1;
+        if (kid > 0)
+            CNG_SYS(__NR_wait4, kid, 0, 0, 0, 0, 0);
+        if (id >= 0)
+            shm_call(__NR_shmctl, id, CNG_IPC_RMID, 0);
+        ok = ok && kid > 0 && id >= 0;
+        cng_dprintf(1, "shmtest a daemon on its way out is retried past: %s\n",
+                    ok ? "OK" : "FAIL");
         fails += !ok;
     }
 

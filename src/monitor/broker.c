@@ -98,10 +98,14 @@ static unsigned broker_addr(struct cng_sockaddr_un *a, u32 hash, u64 sess) {
 
 /* This process's namespace: per-rootfs under --shared-proc (the same daemon
  * procreg.c fetches its table from), else per-invocation. */
-static unsigned ipc_addr(struct cng_sockaddr_un *a) {
+unsigned cng_broker_self_addr(struct cng_sockaddr_un *a) {
     if (cng_g_shared_proc && cng_g_fs && cng_g_fs->rootfs[0])
         return broker_addr(a, cng_broker_key_hash(cng_g_fs->rootfs), 0);
     return broker_addr(a, 0, session());
+}
+
+static unsigned ipc_addr(struct cng_sockaddr_un *a) {
+    return cng_broker_self_addr(a);
 }
 
 /* ---- transport ---------------------------------------------------------- */
@@ -203,7 +207,14 @@ int cng_broker_recv(int sock, void *data, unsigned len, int *fd_out) {
     do {
         r = CNG_SYS(__NR_recvmsg, sock, &msg, 0, 0, 0, 0);
     } while (r == -EINTR);
-    if (r <= 0)
+    /* Told apart from every other failure because it is the only one a caller
+     * may retry: the peer closed with nothing sent at all, so it neither
+     * answered nor could have half-answered. A timeout (EAGAIN, from the 2 s
+     * SO_RCVTIMEO) means the peer may be alive and may already have acted on
+     * the request, and must NOT be retried. */
+    if (r == 0 || r == -ECONNRESET || r == -EPIPE)
+        return CNG_BROKER_GONE;
+    if (r < 0)
         return -1;
     /* The control buffer is supplied whatever the caller asked for, so the
      * kernel's scm_detach_fds installs any attached descriptor into this
@@ -838,8 +849,31 @@ static _Noreturn void broker_main(struct cng_sockaddr_un *a, unsigned al) {
             shm_reclaim_all();
             cng_ipc_reclaim();
             if (!(tab && cng_procreg_table_live(tab)) && !shm_any_live() &&
-                !cng_ipc_any_live())
+                !cng_ipc_any_live()) {
+                /* Those two scans read /proc once per tracked attacher, waiter
+                 * and undo row, and the teardown below closes and unlinks a
+                 * file per segment. A client that connected across any of it
+                 * got a successful connect — the listener is still bound — and
+                 * is owed an answer it would never have got. Look once more
+                 * before giving the socket up, and stay alive if anyone is
+                 * there. */
+                pf[0].fd = (int)ls;
+                pf[0].events = CNG_POLLIN;
+                pf[0].revents = 0;
+                struct cng_timespec zero = {0, 0};
+                if (CNG_SYS(__NR_ppoll, pf, 1, &zero, 0, 8 /*sigsetsize*/, 0) >
+                    0) {
+                    last_active = now;
+                    continue;
+                }
+                /* Stop listening before the teardown rather than after it, so
+                 * what remains of the window is a few instructions instead of
+                 * every scan and unlink. A connect that loses that race is
+                 * refused, and a refusal is what the client can recover from:
+                 * broker_connect spawns a fresh daemon for it. */
+                sys_close((int)ls);
                 break;
+            }
             last_active = now; /* still anchored: re-arm the grace window */
         }
     }
@@ -963,15 +997,34 @@ int cng_broker_open(struct cng_breq *q) {
 }
 
 int cng_broker_rpc(struct cng_breq *q, struct cng_bresp *r, int *fd_out) {
-    int s = cng_broker_open(q);
-    if (s < 0)
-        return -1;
-    int ok = -1;
-    if (cng_broker_send(s, q, sizeof *q, -1) == 0 &&
-        cng_broker_recv(s, r, sizeof *r, fd_out) == 0)
-        ok = 0;
-    sys_close(s); /* transient: keep no persistent broker fd */
-    return ok;
+    /* Twice, because a successful connect is not proof of a daemon that will
+     * answer. The listener stays bound while the daemon decides to leave, so a
+     * connect landing in that window is queued on the backlog and succeeds, the
+     * request is buffered, and only the reply never comes — and callers turn
+     * that into a fabricated errno (ENOSPC from shmget, EIDRM from semop)
+     * rather than a retry, so a guest that simply went quiet for the grace
+     * period saw its next IPC call fail for no reason.
+     *
+     * Retried only on CNG_BROKER_GONE, which is exactly the case where nothing
+     * was answered and nothing can have been applied. A send that fails is the
+     * same thing seen from the other end: a request the daemon never received
+     * whole is a request cng_broker_recv refuses to serve. One retry is enough
+     * because the daemon now closes its listener before tearing anything down,
+     * so the connect that follows is refused and spawns a fresh one. */
+    for (int attempt = 0; attempt < 2; attempt++) {
+        int s = cng_broker_open(q);
+        if (s < 0)
+            return -1;
+        int rc = cng_broker_send(s, q, sizeof *q, -1) == 0
+                     ? cng_broker_recv(s, r, sizeof *r, fd_out)
+                     : CNG_BROKER_GONE;
+        sys_close(s); /* transient: keep no persistent broker fd */
+        if (rc == 0)
+            return 0;
+        if (rc != CNG_BROKER_GONE)
+            return -1;
+    }
+    return -1;
 }
 
 int cng_broker_table_fd(const char *rootfs_key) {

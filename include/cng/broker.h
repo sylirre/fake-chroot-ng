@@ -35,6 +35,7 @@
 #define CNG_BROKER_H
 
 #include "cng/rt.h"
+#include "cng/uapi.h" /* struct cng_sockaddr_un */
 
 /* cng_breq.arg for CNG_REQ_SHMAT: which access the attach is asking for, which
  * is what the segment's permission triad is checked against (a plain attach
@@ -150,6 +151,18 @@ u32 cng_broker_key_hash(const char *s);
  * waiter is answered long after its request was served — so the registry drives
  * its own connection rather than returning a reply for broker.c to send. These
  * are the same four primitives the request/response path uses. */
+
+/* The abstract rendezvous name this process's IPC calls use: per-rootfs under
+ * --shared-proc, else per-invocation. Returns the sockaddr length. */
+unsigned cng_broker_self_addr(struct cng_sockaddr_un *a);
+
+/* cng_broker_recv: the peer closed with nothing sent at all. Distinguished from
+ * a plain -1 because it is the one failure a caller may safely retry — the peer
+ * neither answered nor half-answered, and (the daemon being the only peer here)
+ * whatever state it held died with it, so a retried request cannot be applied
+ * twice. A timeout or a truncated reply stays -1: there the request may already
+ * have been served. */
+#define CNG_BROKER_GONE (-2)
 
 /* One fixed-size payload plus an optional SCM_RIGHTS fd (fd < 0: none). */
 int cng_broker_send(int sock, const void *data, unsigned len, int fd);

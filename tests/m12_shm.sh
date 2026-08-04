@@ -41,6 +41,17 @@ check_contains "a truncated broker reply leaves no descriptor behind" \
 # asked for one, because the control buffer goes on the recvmsg regardless.
 check_contains "a fd attached to a request is not left installed" \
     "shmtest an unwanted fd is not left installed -> OK" "$out"
+# A peer that closed with nothing sent is the one broker failure a caller may
+# retry: it neither answered nor half-answered, and the daemon's state died with
+# it. A timeout and a truncated reply must not be confused with it — there the
+# request may already have been served.
+check_contains "the retryable broker failure is told from the others" \
+    "shmtest gone/short/timeout told apart: 111 -> OK" "$out"
+# ...and the retry itself: the daemon listens across its whole idle-exit
+# teardown, so a connect landing there succeeds and only the reply never comes.
+# Callers turned that into a fabricated ENOSPC/EIDRM instead of trying again.
+check_contains "a daemon on its way out does not fail the caller's request" \
+    "shmtest a daemon on its way out is retried past: OK" "$out"
 check_contains "IPC_SET writes the permission triad back" \
     "shmtest ipc_set -> OK" "$out"
 check_contains "execve detaches every attachment" \
