@@ -558,6 +558,25 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
         cng_dprintf(2, "[cng]   argc=%d sp=%lx entry=%lx -> enter\n", argc, sp,
                     entry);
 
+    /* Anything that needs a descriptor has to ask before the commit point below
+     * closes them. `host` may be a /proc/self/fd/N path — how apk runs a package
+     * script, and what every memfd exec looks like — and the kernel records
+     * /proc/self/exe as the file that fd names, so the magic link has to be read
+     * while the fd is still open. Asked afterwards, it answered ENOENT for the
+     * one caller shape that needs it (those fds are opened O_CLOEXEC, which is
+     * the point of them), the untranslated /proc/self/fd/N was kept instead, and
+     * /proc/self/exe came out as "/". `go` computes GOROOT from it. */
+    char linked[CNG_PATH_MAX];
+    const char *exe_host = host;
+    if (!strncmp(host, "/proc/", 6)) {
+        long n = sys_readlinkat(CNG_AT_FDCWD, host, linked, sizeof linked - 1);
+        if (n > 0) {
+            linked[n] = '\0';
+            if (linked[0] == '/')
+                exe_host = linked;
+        }
+    }
+
     /* Commit point: the new image loaded successfully, so from here we behave
      * like a real execve. Close FD_CLOEXEC descriptors (see cng_close_cloexec)
      * before entering the new program. */
@@ -585,19 +604,6 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
      * load (the shebang interpreter for scripts, matching the kernel); store its
      * guest path in a persistent buffer. */
     static char exe_guest[CNG_PATH_MAX];
-    const char *exe_host = host;
-    char linked[CNG_PATH_MAX];
-    /* Exec through a /proc/self/fd/N path (how apk runs package scripts) keeps
-     * that path as `host`; the kernel would record the file the fd names, so
-     * ask the magic link for it. */
-    if (!strncmp(host, "/proc/", 6)) {
-        long n = sys_readlinkat(CNG_AT_FDCWD, host, linked, sizeof linked - 1);
-        if (n > 0) {
-            linked[n] = '\0';
-            if (linked[0] == '/')
-                exe_host = linked;
-        }
-    }
     if (cng_fs_untranslate(cng_g_fs, exe_host, exe_guest, sizeof exe_guest) == 0)
         cng_g_exe_guest = exe_guest;
 

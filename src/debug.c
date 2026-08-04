@@ -1473,8 +1473,13 @@ int cng_cmd_exectest(int argc, char **argv, char **envp, unsigned long *auxv) {
         dirfd = (int)d;
     }
     if (empty) {
-        long f = cng_dispatch(__NR_openat, dirfd, (long)gpath, CNG_O_RDONLY, 0,
-                              0, 0, 1);
+        /* O_CLOEXEC, because that is how the real callers open it: apk runs a
+         * package script from a descriptor it opened close-on-exec, and every
+         * memfd-based exec does the same. It also makes the fd disappear at the
+         * commit point, which is where anything still needing it has to have
+         * asked already. */
+        long f = cng_dispatch(__NR_openat, dirfd, (long)gpath,
+                              CNG_O_RDONLY | CNG_O_CLOEXEC, 0, 0, 0, 1);
         if (f < 0) {
             cng_dprintf(2, "exectest: open %s failed %ld\n", gpath, f);
             return 1;

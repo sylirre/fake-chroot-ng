@@ -152,6 +152,13 @@ if guest_cc_report "$ER/hello" tests/guests/hello.c; then
         "exe=/hello" "$(exectest -D /sub ../../hello X 2>&1)"
     out=$(exectest -e /hello X 2>&1); rc=$?
     check "AT_EMPTY_PATH executes the fd itself" 42 $rc
+    # ...and /proc/self/exe names the file, not the descriptor it came through.
+    # Those fds are opened O_CLOEXEC (apk's package scripts, every memfd exec),
+    # so the magic link has to be read before the commit point closes them; read
+    # after, it answered ENOENT and the exe link came out as "/". `go` computes
+    # GOROOT from this.
+    check_contains "an fd-exec still reports the file as /proc/self/exe" \
+        "exectest: exe=/hello" "$out"
     check_contains "AT_SYMLINK_NOFOLLOW refuses a symlinked target" \
         "emulate_execve failed x0=-40" "$(exectest -N /go X 2>&1)"
     out=$(exectest -N /hello X 2>&1); rc=$?
