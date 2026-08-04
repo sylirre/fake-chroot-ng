@@ -1835,16 +1835,54 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         char injdir[CNG_PATH_MAX];
         int inject = a1 && sys_lseek((int)a0, 0, CNG_SEEK_CUR) == 0 &&
                      dirfd_guest_dir(a0, injdir, sizeof injdir) == 0;
-        long pre = inject ? inject_dents(a0, injdir, (char *)a1, 0, (long)a2)
-                          : 0;
+
+        /* ...and the room left over has to admit at least one of the kernel's
+         * own records, or the stream never moves. put_dent stops only when the
+         * *next* record does not fit, so what remains was routinely below the
+         * smallest possible dirent (24 bytes, for "."); filldir64 then refuses
+         * the whole batch with EINVAL and iterate_dir writes back an *unchanged*
+         * f_pos (measured). Reporting our records as a short batch left the
+         * position at 0, so the next read decided "first read" all over again
+         * and injected the identical entries — forever. `ls /dev` through a raw
+         * getdents64 of 184..407 bytes never reached the real dirents at all;
+         * only the 32 KiB/2 KiB/4 KiB readdir buffers of glibc, musl and bionic
+         * kept every guest that has been tried out of it.
+         *
+         * So hand a record back and re-ask until the kernel can make progress.
+         * inject_dents fills greedily from the two lists, so a cap one byte
+         * under what it just produced yields strictly fewer records: the loop
+         * shrinks monotonically and ends at worst with pre == 0, which is the
+         * guest's own buffer being too small — the kernel's answer to give.
+         *
+         * Keyed on "it refused", not on one errno: the refusal is EINVAL on a
+         * real kernel, but where we left it exactly nothing qemu-user answers
+         * ENOMEM instead (its bounce buffer for a zero-length read), and both
+         * mean the same thing here. Both measured.
+         *
+         * A record dropped this way is not seen again (injection happens once,
+         * at the start of the stream). That bound is the buffer's, not ours: at
+         * 408 bytes the whole /dev overlay plus a kernel record fits and nothing
+         * is dropped, and no real readdir asks for less. */
+        long pre = 0, n, injcap = (long)a2;
+        for (;;) {
+            pre = inject ? inject_dents(a0, injdir, (char *)a1, 0, injcap) : 0;
+            n = reissue(a0, (long)a1 + pre, (long)a2 - pre, a3, a4, a5,
+                        __NR_getdents64);
+            if (n >= 0 || pre == 0)
+                break;
+            injcap = pre - 1;
+        }
         char *buf = (char *)a1 + pre;
         long cap = (long)a2 - pre;
 
-        long n = reissue(a0, (long)buf, cap, a3, a4, a5, __NR_getdents64);
-        /* Whatever was spliced in has been handed over; the kernel's answer —
-         * including an end-of-directory, or the EINVAL a buffer we filled
-         * draws — is the next read's to give. */
-        if (n <= 0 || !a1)
+        /* A refusal is the guest's to see: the position did not move, so
+         * answering with the spliced-in bytes would repeat them next time. */
+        if (n < 0)
+            return n;
+        /* End of stream on the very first read means a directory that emitted
+         * neither "." nor "..", which no filesystem does; the overlay records
+         * are the whole answer. */
+        if (n == 0 || !a1)
             return pre ? pre : n;
         /* Hidden-process view, listing side: the path layer makes a host
          * process's /proc entry unreachable, but `ls /proc` and `ps` read the

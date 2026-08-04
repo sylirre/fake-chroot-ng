@@ -149,6 +149,38 @@ for bufsz in 256 128; do
 done
 rm -rf "$M14S" "$M14SB"
 
+# ...and the room the injection leaves has to admit at least one of the kernel's
+# own records. put_dent stops only when the *next* record does not fit, so what
+# remained was routinely under the 24 bytes the smallest dirent (".") needs;
+# filldir64 then refuses the whole batch with EINVAL and writes back an
+# unchanged f_pos (measured on this kernel; qemu-user answers ENOMEM where we
+# left it exactly nothing, which means the same thing). The injected bytes were
+# reported as a short batch, so the next read decided "first read" from that
+# same position and spliced the identical entries in again: `ls /dev` through a
+# raw getdents64 of 184..407 bytes repeated the whitelist forever and never
+# reached "." at all. Only the 32 KiB/2 KiB/4 KiB readdir buffers of glibc, musl
+# and bionic kept every guest that has been tried out of it.
+#
+# The /dev whitelist is 14 entries totalling 384 bytes, so the sizes below
+# bracket it: below it, across each cumulative record boundary, exactly at the
+# first size that fits everything, and well above.
+M14W=$(mktemp -d)
+mkdir -p "$M14W/dev"
+for bufsz in 32 64 128 184 200 256 376 400 408 512 65536; do
+    m14w=$(run_t 30 -t dtest -r "$M14W" dents /dev $bufsz 2>&1 | head -1 |
+        sed 's/^dents://')
+    check "m14 a $bufsz-byte getdents64 of /dev repeats no entry" "" \
+        "$(echo "$m14w" | tr ' ' '\n' | grep -v '^$' | sort | uniq -d |
+            tr '\n' ' ')"
+    check_contains "m14 ...and still reaches the directory's own entries ($bufsz)" \
+        " .. " "$m14w "
+done
+# The buffer is what bounds how many overlay records a first read can carry;
+# once one kernel record fits alongside the whole set, nothing is dropped.
+check_contains "m14 a buffer that holds the whole overlay lists all of it" \
+    " stderr " "$(run_t 30 -t dtest -r "$M14W" dents /dev 65536 2>&1 | head -1) "
+rm -rf "$M14W"
+
 M14D=$(mktemp -d)
 M14DB=$(mktemp -d)
 mkdir -p "$M14D/dev" # the zone overlays entries INTO it; the directory is real
