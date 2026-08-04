@@ -4,17 +4,25 @@
 # tier being inert under qemu-user.
 echo "== M8: svc rewriting =="
 
-run -t rwtest >/dev/null 2>&1
-check "trampoline preserves regs + correct syscall" 0 $?
-check_contains "rewrote the svc sites" "rewrote 2 site" "$(run -t rwtest 2>&1)"
-# The FP register file is part of "preserves regs": the kernel leaves it alone
-# across a syscall, so a rewritten site owes it back, and the C dispatcher the
-# site branches into is under no such discipline. Measured: gcc spends d0/d1/d16
-# on an openat of a synthesized /proc/stat — `cnt v0.8b` for the CPU popcount,
-# and `fmov d1, x0` as a cheap spill slot for a pointer. Nothing puts them back;
-# the monitor is built -mgeneral-regs-only so the instructions never exist.
-check_contains "no FP register is spent behind a rewritten syscall" \
-    "openat=4 -> OK" "$(run -t rwtest 2>&1)"
+rwout=$(run -t rwtest 2>&1); rwrc=$?
+check "trampoline preserves regs + correct syscall" 0 "$rwrc"
+check_contains "rewrote the svc sites" "rewrote 2 site" "$rwout"
+# "Preserves regs" means the whole register file, not the arguments. A syscall
+# leaves everything but x0 alone — the kernel saves the integer registers into
+# pt_regs and never touches the FP ones — and the C dispatcher a rewritten site
+# branches into is under no such discipline. Two ways it took what it did not own,
+# both measured: gcc spends d0/d1/d16 on an openat of a synthesized /proc/stat
+# (`cnt v0.8b` for the CPU popcount, `fmov d1, x0` as a cheap spill slot), and the
+# trampoline kept x16/x17 as scratch, on the reasoning that a veneer may — but a
+# veneer stands at a *call*, and gcc -O2 does hold live values in IP0/IP1 across
+# an `svc`. This line prints only when every sentinel came back.
+check_contains "nothing behind a rewritten syscall is spent from the guest's own" \
+    "openat=4 -> OK" "$rwout"
+# The other exit: when a tracer moves pc or sp at a syscall stop there is nowhere
+# to keep them but x16/x17, so that arm still spends the pair — and it has to get
+# everything else right, including entering the pc it was handed.
+check_contains "the exit for a tracer-moved pc enters it, with the rest restored" \
+    "marker=9a9a x12=c0c -> OK" "$rwout"
 
 ROOT=$(mktemp -d)
 mkdir -p "$ROOT/bin" "$ROOT/etc"

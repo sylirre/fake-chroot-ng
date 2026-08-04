@@ -1099,6 +1099,19 @@ int cng_cmd_faketest(int argc, char **argv, char **envp, unsigned long *auxv) {
  * the C dispatch call). No seccomp involved. */
 extern char cng_rwtest_fn[];
 extern char cng_rwtest_fn_end[];
+extern char cng_rwtest_gen_fn[];
+extern char cng_rwtest_gen_fn_end[];
+extern char cng_svc_tramp_tpl[];
+extern char cng_svc_tramp_disp[];
+
+/* Stand-in for cng_tramp_dispatch, patched into one emitted trampoline below: a
+ * dispatcher that hands back a moved pc. That is what a tracer's SETREGSET does
+ * at a syscall stop, and it is the only thing that takes the trampoline's
+ * general exit — so it is the only way to run those instructions here. */
+static void rw_move_pc(struct cng_uregs *r) {
+    cng_tramp_dispatch(r);
+    r->pc += 4;
+}
 
 int cng_cmd_rwtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     (void)argc;
@@ -1107,6 +1120,7 @@ int cng_cmd_rwtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     (void)auxv;
 
     size_t fsz = (size_t)(cng_rwtest_fn_end - cng_rwtest_fn);
+    size_t gsz = (size_t)(cng_rwtest_gen_fn_end - cng_rwtest_gen_fn);
     /* One mapping: [code page | trampoline pool], so the pool is adjacent and
      * within a `b`'s reach (same reason the loader over-allocates). */
     unsigned long total = 4096 + CNG_TRAMP_POOL;
@@ -1118,6 +1132,8 @@ int cng_cmd_rwtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     }
     void *buf = region;
     memcpy(buf, cng_rwtest_fn, fsz);
+    void *gbuf = (char *)region + ((fsz + 15) & ~(size_t)15);
+    memcpy(gbuf, cng_rwtest_gen_fn, gsz);
     unsigned long pool = (unsigned long)region + 4096;
     unsigned long used = 0;
 
@@ -1128,12 +1144,19 @@ int cng_cmd_rwtest(int argc, char **argv, char **envp, unsigned long *auxv) {
 
     int n = cng_rewrite_seg((unsigned long)buf, (unsigned long)buf + fsz, pool,
                             CNG_TRAMP_POOL, &used);
+    /* The general-exit copy's own trampoline is the next one out of the pool, so
+     * its dispatcher literal is at a known offset. */
+    unsigned long gslot = pool + used;
+    int gn = cng_rewrite_seg((unsigned long)gbuf, (unsigned long)gbuf + gsz, pool,
+                             CNG_TRAMP_POOL, &used);
+    *(unsigned long *)(gslot + (cng_svc_tramp_disp - cng_svc_tramp_tpl)) =
+        (unsigned long)&rw_move_pc;
     sys_mprotect(region, total, CNG_PROT_READ | CNG_PROT_EXEC);
     cng_flush_icache(buf, (char *)buf + fsz);
     cng_flush_icache((void *)pool, (void *)(pool + used));
 
     long real = sys_getpid();
-    unsigned long res[7];
+    unsigned long res[9];
     memset(res, 0, sizeof res);
     /* The openat below goes to a synthesized /proc/stat, forced here the way the
      * --proc-stat-synth flag forces it: that path counts the CPUs in the
@@ -1142,30 +1165,44 @@ int cng_cmd_rwtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     cng_g_procstat_synth = 1;
     long (*fn)(void *, const char *) = (long (*)(void *, const char *))buf;
     long got = fn(res, "/proc/stat");
-    if ((long)res[6] >= 0)
-        sys_close((int)res[6]);
+    if ((long)res[8] >= 0)
+        sys_close((int)res[8]);
 
     /* The FP register file is the guest's across a syscall — the kernel does
      * not touch it — so the C dispatcher a rewritten site calls must not spend
      * any of it. Nothing puts it back; the monitor is built to never generate an
-     * FP instruction in the first place (-mgeneral-regs-only). */
-    static const unsigned long want[6] = {0xfd00UL, 0xfd01UL, 0xfd08UL,
-                                          0xfd10UL, 0xfd1fUL, 0x400000UL};
-    static const char *const nm[6] = {"d0", "d1", "d8", "d16", "d31", "fpcr"};
+     * FP instruction in the first place (-mgeneral-regs-only). x16/x17 are the
+     * same claim about IP0/IP1, which the trampoline used to keep for itself. */
+    static const unsigned long want[8] = {0xfd00UL,     0xfd01UL,  0xfd08UL,
+                                          0xfd10UL,     0xfd1fUL,  0x400000UL,
+                                          0xdead1616UL, 0xbeef1717UL};
+    static const char *const nm[8] = {"d0",   "d1",   "d8",  "d16",
+                                      "d31",  "fpcr", "x16", "x17"};
     int regs_ok = 1;
-    for (int i = 0; i < 6; i++)
+    for (int i = 0; i < 8; i++)
         if (res[i] != want[i]) {
             regs_ok = 0;
             cng_dprintf(1, "rwtest: %s clobbered: %lx want %lx\n", nm[i], res[i],
                         want[i]);
         }
 
-    int ok = (n >= 2 && got == real && (long)res[6] >= 0 && regs_ok);
+    int ok = (n >= 2 && got == real && (long)res[8] >= 0 && regs_ok);
     cng_dprintf(1,
                 "rwtest: rewrote %d site(s); real_pid=%d fn_pid=%d openat=%ld "
                 "-> %s\n",
-                n, (int)real, (int)got, (long)res[6], ok ? "OK" : "FAIL");
-    return ok ? 0 : 1;
+                n, (int)real, (int)got, (long)res[8], ok ? "OK" : "FAIL");
+
+    /* The general exit: a pc the guest did not arrive with has to be entered,
+     * and everything but the two registers that exit spends has to be back. */
+    unsigned long g[3];
+    memset(g, 0, sizeof g);
+    long (*gfn)(void *) = (long (*)(void *))gbuf;
+    gfn(g);
+    int gok = (gn == 1 && (long)g[0] == real && g[1] == 0x9a9a && g[2] == 0x0c0c);
+    cng_dprintf(1, "rwtest general exit: pid=%ld marker=%lx x12=%lx -> %s\n",
+                (long)g[0], g[1], g[2], gok ? "OK" : "FAIL");
+
+    return (ok && gok) ? 0 : 1;
 }
 
 /* _blocktest — validate that a syscall marked blocked (as cng_probe_blocked
