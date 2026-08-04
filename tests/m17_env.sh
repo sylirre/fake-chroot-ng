@@ -26,8 +26,12 @@ check_contains "the missing --env argument is diagnosed" \
     "option '--env' requires an argument" "$out"
 
 # The cap: CNG_MAX_ENV entries, then a refusal rather than a silent truncation.
-# In a subshell, so setting the positional parameters cannot disturb the harness.
+# In a subshell, so setting the positional parameters cannot disturb the
+# harness — and cleared first, so the harness's own arguments cannot disturb
+# this: `$@` here is whatever run.sh was invoked with, and appending to it
+# spliced that in front of the -E list as the rootfs.
 out=$(
+    set --
     i=0
     while [ "$i" -lt 200 ]; do
         set -- "$@" -E "V$i=1"
