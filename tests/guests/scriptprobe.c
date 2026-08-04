@@ -28,10 +28,15 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+/* Upper bound on the argv `manyargv` builds. Well past any fixed cap the exec
+ * emulation might have, and small enough to stay inside every ARG_MAX. */
+#define MANY_MAX 1000
 
 /* Name the errno rather than print it: the numbers agree across these libcs,
  * but a name is what makes a failing diff readable. */
@@ -75,6 +80,36 @@ int main(int argc, char **argv) {
         printf("\n");
         fflush(stdout);
         return 0;
+    }
+    /* Same thing counted rather than printed, for the leg that hands a script
+     * more arguments than fit on one line of output. A #! exec must carry all
+     * of them: the kernel bounds argv by bytes, never by entry count. */
+    if (argc > 1 && strcmp(argv[1], "argcount") == 0) {
+        printf("shebargc=%d\n", argc);
+        fflush(stdout);
+        return 0;
+    }
+    /* `scriptprobe manyargv SCRIPT N` — exec SCRIPT with an argv of N entries,
+     * which is how a shell expands a glob onto a script. The interpreter should
+     * then see N + 2: its own name, the argument off the #! line and the script
+     * path replace argv[0], and argv[1..N-1] follow. */
+    if (argc > 3 && strcmp(argv[1], "manyargv") == 0) {
+        int n = atoi(argv[3]);
+        if (n < 1 || n > MANY_MAX)
+            n = 1;
+        static char slots[MANY_MAX][12];
+        static char *av[MANY_MAX + 1];
+        for (int i = 0; i < n; i++) {
+            snprintf(slots[i], sizeof slots[i], "a%d", i);
+            av[i] = slots[i];
+        }
+        av[n] = 0;
+        char *ev[] = {(char *)"SHEBENV=x", NULL};
+        fflush(stdout);
+        execve(argv[2], av, ev);
+        printf("manyargv=%s\n", how(-1));
+        fflush(stdout);
+        return 125;
     }
 
     struct stat st;

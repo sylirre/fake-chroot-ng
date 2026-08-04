@@ -95,6 +95,20 @@ void cng_close_cloexec(void) {
     sys_close((int)dfd);
 }
 
+/* Shebang nesting, as fs/exec.c bounds it: a script whose interpreter is itself
+ * a script is followed up to four times, and the fifth is -ELOOP. Each level
+ * needs its interpreter (and optional argument) to stay alive until the stack is
+ * built, since both end up in the new argv. */
+#define SHEB_MAX   4
+#define SHEB_WORD  256
+/* Pointer slots reserved ahead of the snapshot's argv for the shebang chain.
+ * Each level contributes its interpreter and at most one argument, and the
+ * script the guest named goes in once at the end: 2 * SHEB_MAX + 1. The
+ * rebuilt vector is written into those slots, ending where the caller's own
+ * argv[1] already sits — so the tail is not copied at all and there is no
+ * length to run out of. */
+#define SHEB_RESERVE (2 * SHEB_MAX + 1)
+
 /* argv/envp snapshot.
  *
  * The strings the exec'ing program hands us are copied into the NEW program's
@@ -209,8 +223,10 @@ static long exec_args_take(struct exec_args *a, const char *path, char **argv,
         return eb;
     unsigned long bytes = (unsigned long)pn + 1 + (unsigned long)ab +
                           (unsigned long)eb;
-    /* Two NULL-terminated pointer arrays, 8-aligned, ahead of the strings. */
-    unsigned long vecs = ((unsigned long)argc + 1 + (unsigned long)envc + 1) * 8;
+    /* Two NULL-terminated pointer arrays, 8-aligned, ahead of the strings —
+     * plus the slots a shebang chain prepends into (see SHEB_RESERVE). */
+    unsigned long vecs = ((unsigned long)SHEB_RESERVE + (unsigned long)argc + 1 +
+                          (unsigned long)envc + 1) * 8;
     unsigned long max = exec_arg_max();
     if (bytes > max || vecs > max - bytes)
         return -E2BIG;
@@ -225,7 +241,7 @@ static long exec_args_take(struct exec_args *a, const char *path, char **argv,
 
     char *pool = (char *)a->mem + vecs;
     char *end = (char *)a->mem + a->len;
-    a->argv = (char **)a->mem;
+    a->argv = (char **)a->mem + SHEB_RESERVE;
     a->envp = copy_vec(argv, a->argv, argc + 1, &pool, end);
     if (!a->envp || !copy_vec(envp, a->envp, envc + 1, &pool, end) ||
         (size_t)pn + 1 > (size_t)(end - pool)) {
@@ -304,26 +320,18 @@ static void cng_exec_reset(void) {
     }
 }
 
-/* Shebang nesting, as fs/exec.c bounds it: a script whose interpreter is itself
- * a script is followed up to four times, and the fifth is -ELOOP. Each level
- * needs its interpreter (and optional argument) to stay alive until the stack is
- * built, since both end up in the new argv. */
-#define SHEB_MAX   4
-#define SHEB_WORD  256
-#define SHEB_ARGV  128
-
 static long execve_load(int dirfd, const char *path, char **argv, char **envp,
                         int flags, unsigned long *out_sp,
                         unsigned long *out_entry) {
     char host[CNG_PATH_MAX];
     char sheb_interp[SHEB_MAX][SHEB_WORD], sheb_arg[SHEB_MAX][SHEB_WORD];
-    char *sheb_argv[SHEB_ARGV];
+    int sheb_hasarg[SHEB_MAX];
     const char *cur = path; /* the guest path of the image at this level */
-    char **eff_argv = argv;
     int gfd = -1;           /* an open fd for the image, when we have one */
     int nofollow = (flags & CNG_AT_SYMLINK_NOFOLLOW) != 0;
+    int depth = 0;          /* how many #! levels were followed */
 
-    for (int depth = 0;; depth++) {
+    for (;; depth++) {
         if (depth > SHEB_MAX) {
             if (cng_g_debug)
                 cng_dprintf(2, "[cng] execve %s -> shebang nesting\n", path);
@@ -448,28 +456,11 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
             return -ELOOP; /* no room to record another level */
         memcpy(sheb_interp[depth], i0, ilen);
         sheb_interp[depth][ilen] = '\0';
-
-        char *nv[SHEB_ARGV];
-        int k = 0;
-        nv[k++] = sheb_interp[depth];
-        if (alen > 0 && alen < SHEB_WORD) {
+        sheb_hasarg[depth] = alen > 0 && alen < SHEB_WORD;
+        if (sheb_hasarg[depth]) {
             memcpy(sheb_arg[depth], a0, alen);
             sheb_arg[depth][alen] = '\0';
-            nv[k++] = sheb_arg[depth];
         }
-        nv[k++] = (char *)cur; /* the script path, as the guest named it */
-        /* The caller's argv from [1] on, since [0] is what the interpreter
-         * name replaces. An *empty* argv is a legal exec — the kernel's
-         * remove_arg_zero simply has nothing to remove — and there [1] is one
-         * past the terminator: the snapshot lays envp out directly behind
-         * argv, so the walk ran on into the environment and handed the
-         * interpreter every variable as an argument. */
-        if (eff_argv && eff_argv[0])
-            for (int j = 1; eff_argv[j] && k < SHEB_ARGV - 2; j++)
-                nv[k++] = eff_argv[j];
-        nv[k] = 0;
-        memcpy(sheb_argv, nv, (size_t)(k + 1) * sizeof *nv);
-        eff_argv = sheb_argv;
         cur = sheb_interp[depth];
         gfd = -1; /* the image to load is now the interpreter, by path */
         nofollow = 0;
@@ -519,14 +510,45 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
                         interp.load_hi);
     }
 
+    /* The argv the kernel would have built for a #! chain: each level's
+     * interpreter and optional argument, innermost first, then the script as
+     * the guest named it, then the caller's argv from [1] on — [0] is what the
+     * interpreter name replaces.
+     *
+     * Written into the slots reserved in front of the caller's own vector, so
+     * the tail stays exactly where it already is. It used to be copied into a
+     * fixed 128-entry array, which silently dropped everything past ~123: a
+     * `#!/bin/sh` script run as `./s.sh *` in a directory of 500 files saw the
+     * first 123 of them and exited 0. The kernel has no such limit — argv is
+     * bounded by bytes, not entries — so nothing was reported and the rest of
+     * the files were simply never processed.
+     *
+     * An *empty* argv is a legal exec (the kernel's remove_arg_zero has nothing
+     * to remove), and there the tail is the terminator itself. */
+    char **eff_argv = argv;
     int argc = 0;
-    if (eff_argv)
-        while (eff_argv[argc])
+    if (argv)
+        while (argv[argc])
             argc++;
+    if (depth > 0) {
+        char *pre[SHEB_RESERVE];
+        int np = 0;
+        for (int d = depth - 1; d >= 0; d--) {
+            pre[np++] = sheb_interp[d];
+            if (sheb_hasarg[d])
+                pre[np++] = sheb_arg[d];
+        }
+        pre[np++] = (char *)path; /* the script, as the guest named it */
+        char **tail = argc >= 1 ? argv + 1 : argv;
+        eff_argv = tail - np;
+        for (int i = 0; i < np; i++)
+            eff_argv[i] = pre[i];
+        argc = np + (argc >= 1 ? argc - 1 : 0);
+    }
 
     unsigned long sp = cng_build_stack(argc, eff_argv, envp, cng_host_auxv,
                                        &prog, have_interp ? &interp : 0,
-                                       eff_argv ? eff_argv[0] : path);
+                                       argc > 0 ? eff_argv[0] : path);
     if (!sp)
         return -E2BIG; /* argv/envp outgrew the guest stack region */
     unsigned long entry = have_interp ? interp.entry : prog.entry;

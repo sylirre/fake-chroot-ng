@@ -51,8 +51,12 @@ printf '#!/scriptprobe argok\n' >"$M19/real/noargv.sh"
 # time. The kernel walks back over the line's trailing spaces and tabs before it
 # parses anything, so the interpreter never sees them on its argument.
 printf '#!/scriptprobe argok \n' >"$M19/real/trail.sh"
+# ...and one to exec with a LOT of arguments, which is what a shell expanding a
+# glob onto a script produces. The kernel bounds argv by bytes, never by entry
+# count, so every one of them has to arrive.
+printf '#!/scriptprobe argcount\n' >"$M19/real/many.sh"
 chmod 755 "$M19/real/short.sh" "$M19/real/empty.bin" "$M19/real/noargv.sh" \
-    "$M19/real/trail.sh"
+    "$M19/real/trail.sh" "$M19/real/many.sh"
 
 # That rule is the host kernel's own, so establish it here rather than claim it:
 # a script whose interpreter is itself a script prints the argument it was
@@ -111,6 +115,19 @@ elif guest_cc_report "$GDIR/scriptprobe" tests/guests/scriptprobe.c; then
         /trail.sh 2>/dev/null)
     check_contains "the #! argument loses the line's trailing blanks, as it just did on the kernel" \
         "shebargv=$M19_KERN[/trail.sh]" "$out"
+
+    # A script exec'd with N arguments reaches its interpreter with N + 2: the
+    # interpreter's own name, the #! argument and the script path go in front,
+    # and they replace argv[0] alone. Two sizes, because the formula is what the
+    # small one proves and the absence of a cap is what the large one proves --
+    # the rebuilt vector used to live in a fixed 128-entry array, so `./s.sh *`
+    # in a directory of 500 files silently ran on the first ~123 of them and
+    # exited 0.
+    for _n in 8 400; do
+        out=$(m19_run "$M19/real" /scriptprobe manyargv /many.sh $_n 2>/dev/null)
+        check_contains "a #! script exec'd with $_n arguments gets all of them" \
+            "shebargc=$((_n + 2))" "$out"
+    done
 
     # And it says so with the errno alone. A failed exec used to narrate itself
     # onto the guest's own stderr naming the resolved host path -- the one
