@@ -144,6 +144,36 @@ elif guest_cc_report "$EPD/emptypath" tests/guests/emptypath.c; then
 fi
 rm -rf "$EPD"
 
+# name_to_handle_at's flag runs the other way from every other *at() call: it
+# does NOT follow a final symlink unless AT_SYMLINK_FOLLOW is given. Translation
+# treated it as a follower, so it encoded the target instead of the link, and a
+# dangling link — which the kernel encodes happily, never looking at the target —
+# came back ENOENT. Byte-for-byte against the host build.
+NHD=$(mktemp -d)
+printf hi > "$NHD/f"; ln -s f "$NHD/l"; ln -s nowhere "$NHD/dang"
+if ! guest_xlate_ready "name_to_handle_at legs"; then
+    :
+elif guest_cc_report "$NHD/handleat" tests/guests/handleat.c; then
+    nh_k=""
+    if have cc && cc -O1 -o "$NHD/nh_host" tests/guests/handleat.c 2>/dev/null; then
+        nh_k=$("$NHD/nh_host" "$NHD" 2>/dev/null)
+    fi
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+    nh_g=$(run_t 60 -R $GUEST_BINDS "$NHD" /handleat 2>/dev/null)
+    if [ -z "$nh_k" ]; then
+        skip "name_to_handle_at differential: no host compiler for the oracle"
+    elif [ "$nh_k" = "$nh_g" ]; then
+        pass=$((pass + 1))
+        echo "  ok   name_to_handle_at matches the kernel byte-for-byte"
+    else
+        fail=$((fail + 1))
+        echo "  FAIL name_to_handle_at diverges from the kernel"
+        printf '    kernel: %s\n' "$(echo "$nh_k" | tr '\n' '|')"
+        printf '    cng   : %s\n' "$(echo "$nh_g" | tr '\n' '|')"
+    fi
+fi
+rm -rf "$NHD"
+
 # The xattr family was never trapped, so a guest's absolute path reached the HOST
 # filesystem: getxattr answered existence questions about it and setxattr wrote
 # it. Translation shows up in the errno: a name that resolves inside the rootfs

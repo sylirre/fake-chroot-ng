@@ -1395,6 +1395,16 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * the guest believes that name IS the file.) */
         int deref = !(nr == __NR_mkdirat || nr == __NR_mknodat) &&
                     !(is_open && (oflags & CNG_O_NOFOLLOW));
+#ifdef __NR_name_to_handle_at
+        /* ...except this one, whose flag runs the other way: it does NOT follow
+         * a final symlink unless AT_SYMLINK_FOLLOW is given, where every other
+         * *at() call follows unless told not to. Taken as a follower, it
+         * described the target instead of the link — and a dangling link, which
+         * the kernel happily encodes because it never looks at the target, came
+         * back ENOENT (measured both ways). */
+        if (nr == __NR_name_to_handle_at)
+            deref = ((int)a4 & CNG_AT_SYMLINK_FOLLOW) != 0;
+#endif
         /* A read-only open of a /proc file that would describe chroot-ng
          * instead of the guest is served from an in-memory copy of the guest
          * view (see procfs.c). */
