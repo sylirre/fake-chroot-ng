@@ -8,6 +8,7 @@
 #include "cng/l2s.h"
 #include "cng/loader.h"
 #include "cng/monitor.h"
+#include "cng/netlink.h"
 #include "cng/path.h"
 #include "cng/procfs.h"
 #include "cng/procreg.h"
@@ -1144,6 +1145,33 @@ int cng_cmd_faulttest(int argc, char **argv, char **envp, unsigned long *auxv) {
                 "faulttest socket-addr bind=%d sendmmsg=%d recvmmsg=%d -> %s\n",
                 (int)rb, (int)rsm, (int)rrm, oksa ? "OK" : "FAIL");
     fails += !oksa;
+
+    /* A send on an emulated netlink socket is the one send that never reaches
+     * the kernel at all: the request is parsed here and answered from the
+     * stand-in pair, so nothing else was ever going to look at the pointer.
+     * Both spellings a netlink library uses are driven — sendto's buffer and
+     * sendmsg's first iovec base, which was probed one level short. */
+    cng_nl_force_block = 1;
+    long nlfd = cng_dispatch(__NR_socket, 16 /*AF_NETLINK*/, 3 /*SOCK_RAW*/,
+                             0 /*NETLINK_ROUTE*/, 0, 0, 0, 1);
+    if (nlfd >= 0) {
+        struct cng_iovec biov = {bad, 32};
+        char mh[56];
+        memset(mh, 0, sizeof mh);
+        *(struct cng_iovec **)(mh + 16) = &biov;
+        *(unsigned long *)(mh + 24) = 1;
+        long rst = cng_dispatch(__NR_sendto, nlfd, (long)bad, 32, 0, 0, 0, 1);
+        long rsg = cng_dispatch(__NR_sendmsg, nlfd, (long)mh, 0, 0, 0, 0, 1);
+        int oknl = (rst == -EFAULT && rsg == -EFAULT);
+        cng_dprintf(1, "faulttest netlink sendto=%d sendmsg=%d want=%d -> %s\n",
+                    (int)rst, (int)rsg, (int)-EFAULT, oknl ? "OK" : "FAIL");
+        fails += !oknl;
+        sys_close((int)nlfd);
+    } else {
+        cng_dprintf(1, "faulttest netlink unavailable (%d) -> SKIP\n",
+                    (int)nlfd);
+    }
+    cng_nl_force_block = 0;
 
     /* And the same calls with real memory still work. */
     long rr = cng_dispatch(__NR_getresuid, (long)good, (long)(good + 8),

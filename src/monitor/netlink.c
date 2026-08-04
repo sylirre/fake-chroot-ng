@@ -885,9 +885,25 @@ int cng_nl_send(int fd, const void *buf, long len, long *out) {
     struct nl_slot *s = slot_of(fd);
     if (!s)
         return 0;
+    /* The request is the guest's own buffer, and this is the one send path that
+     * never reaches the kernel — nothing else was going to check the pointer.
+     * Reading it where it lies made `sendto(nlfd, garbage, n, ...)` a SIGSEGV
+     * inside the SIGSYS handler, where every signal but SIGSYS is masked, so it
+     * is unblockable and kills the guest outright: a real kernel answers
+     * -EFAULT. Take a copy on the same terms the write(2)-submitted path has
+     * always had (drain_requests reads into 256 bytes), which also bounds what
+     * a hostile length can cost us in probe syscalls. */
+    unsigned char req[256];
+    long n = len < 0 ? 0 : (len > (long)sizeof req ? (long)sizeof req : len);
+    if (n && !cng_user_readable(buf, (unsigned long)n)) {
+        *out = -EFAULT;
+        return 1;
+    }
+    if (n)
+        memcpy(req, buf, (size_t)n);
     *out = len; /* the guest's request is always "sent" in full */
     drain_requests(s); /* older write()-submitted requests keep their order */
-    process_request(s, (const unsigned char *)buf, len);
+    process_request(s, req, n);
     return 1;
 }
 

@@ -49,6 +49,14 @@ case "$out" in
     # faulted" leg above enforces and a crash would take the whole run down.
     check_contains "a bad socket address answers rather than faults" \
         "faulttest socket-addr" "$out"
+    # A send on an emulated netlink socket is the one send that never reaches
+    # the kernel: the request is parsed here and answered from the stand-in
+    # pair, so nothing else was going to look at the pointer. Both spellings
+    # count — sendto's buffer and sendmsg's first iovec base, which was probed
+    # one level short. Before, neither was an EFAULT but a SIGSEGV inside the
+    # handler, which is unblockable: the whole `-t faulttest` run died here.
+    check_contains "a netlink send with a bad buffer answers EFAULT" \
+        "faulttest netlink sendto=-14 sendmsg=-14 want=-14 -> OK" "$out"
     check_contains "valid pointers still work" \
         "faulttest valid getresuid=0" "$out"
     ;;
