@@ -262,10 +262,19 @@ void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si) {
 /* Per-thread scratch stacks for the handler. The path dispatcher needs tens of
  * KiB (multiple PATH_MAX buffers deep); a seccomp SIGSYS can fire on any thread,
  * and Go goroutine stacks are only ~8 KiB, so we run the dispatcher on a large
- * stack of our own keyed by TID. Slots are claimed lock-free and never freed
- * (a recycled TID safely reuses its slot; the table is sized well above any
- * realistic live-thread count). If the table is full or mmap fails we fall back
- * to the interrupted stack. */
+ * stack of our own keyed by TID. Slots are claimed lock-free. If the table is
+ * full or mmap fails we fall back to the interrupted stack — which is not a
+ * fault but something worse: cng_dispatch's frame is bigger than a guard page,
+ * so on a small stack it steps over the guard and writes into ordinary guest
+ * memory below, silently. That is the reason a slot has to be recoverable.
+ *
+ * The table is sized above any realistic count of threads alive *at once*, which
+ * is not the same as the number of TIDs a process gets through: a runtime that
+ * spawns short-lived threads (Go, a JVM's GC workers) runs through hundreds, and
+ * a slot keyed by a TID that has since exited was never coming back into use. So
+ * when the table is full, a slot whose thread is gone is taken over, stack and
+ * all. Nothing else frees one: there is no thread-exit hook — exit_group is not
+ * trapped, and a SIGKILL never could be. */
 extern long cng_run_on_stack(void *newsp, void *fn, void *a0, void *a1);
 
 #define CNG_SCR_N  256
@@ -281,13 +290,14 @@ static struct {
     struct cng_ucontext *uc;
 } cng_scr[CNG_SCR_N];
 
-/* Claim `*p` from 0 to `tid` (inline LL/SC so we need no libgcc atomics helper;
- * works on any ARMv8). Returns 1 if this call performed the store. */
-static int cng_claim_slot(volatile long *p, long tid) {
+/* Claim `*p` from `want` to `tid` (inline LL/SC so we need no libgcc atomics
+ * helper; works on any ARMv8). Returns 1 if this call performed the store. */
+static int cng_claim_slot(volatile long *p, long want, long tid) {
     long old;
     int fail;
     __asm__ volatile("1: ldaxr %[old], [%[p]]\n"
-                     "   cbnz  %[old], 2f\n"     /* already taken */
+                     "   cmp   %[old], %[want]\n"
+                     "   b.ne  2f\n"             /* already someone else's */
                      "   stlxr %w[f], %[tid], [%[p]]\n"
                      "   cbnz  %w[f], 1b\n"      /* store lost; retry */
                      "   b     3f\n"
@@ -295,35 +305,80 @@ static int cng_claim_slot(volatile long *p, long tid) {
                      "   mov   %w[f], #1\n"
                      "3:\n"
                      : [old] "=&r"(old), [f] "=&r"(fail)
-                     : [p] "r"(p), [tid] "r"(tid)
+                     : [p] "r"(p), [want] "r"(want), [tid] "r"(tid)
                      : "cc", "memory");
     return fail == 0;
 }
 
+/* Map a stack into a slot this thread has just claimed. 0, or -1 with the slot
+ * given back. `hi` is what publishes it: see the re-entry note below. */
+static int scr_map(unsigned i) {
+    void *base = sys_mmap(0, CNG_SCR_SZ, CNG_PROT_READ | CNG_PROT_WRITE,
+                          CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (base == CNG_MAP_FAILED || cng_is_err((long)base)) {
+        cng_scr[i].tid = 0;
+        return -1;
+    }
+    cng_scr[i].lo = (unsigned long)base;
+    __atomic_store_n(&cng_scr[i].hi, ((unsigned long)base + CNG_SCR_SZ) & ~15UL,
+                     __ATOMIC_RELEASE);
+    return 0;
+}
+
+/* Is `tid` still a thread of this process? tgkill with signal 0 does the
+ * existence check and delivers nothing — one syscall, where a /proc read would
+ * be several, and this runs inside the handler. */
+static int scr_tid_live(long tid) {
+    return CNG_SYS(__NR_tgkill, sys_getpid(), tid, 0, 0, 0, 0) == 0;
+}
+
 /* Find this thread's scratch slot (allocating one on first use). Returns the
- * slot index, or -1 if the table is full or mmap failed. */
+ * slot index, or -1 if the table is full of live threads or mmap failed. */
 static int cng_scratch_slot(long tid) {
     unsigned h = (unsigned)((unsigned long)tid * 2654435761u) % CNG_SCR_N;
     for (unsigned k = 0; k < CNG_SCR_N; k++) {
         unsigned i = (h + k) % CNG_SCR_N;
         long t = cng_scr[i].tid;
         if (t == tid)
-            return (int)i;
-        if (t == 0 && cng_claim_slot(&cng_scr[i].tid, tid)) {
-            void *base =
-                sys_mmap(0, CNG_SCR_SZ, CNG_PROT_READ | CNG_PROT_WRITE,
-                         CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
-            if (base == CNG_MAP_FAILED || cng_is_err((long)base)) {
-                cng_scr[i].tid = 0;
-                return -1;
-            }
-            cng_scr[i].lo = (unsigned long)base;
-            cng_scr[i].hi = ((unsigned long)base + CNG_SCR_SZ) & ~15UL;
-            return (int)i;
-        }
+            /* Ours, but the stack is published after the TID, so a re-entry
+             * landing between the two would be handed a slot with no stack and
+             * switch SP to 0 — an unblockable SIGSEGV. The window is one mmap
+             * wide and reachable on the -R tier, where a guest signal can be
+             * delivered on the way out of that very syscall and reach a
+             * rewritten `svc` from the handler. Run in place until it closes. */
+            return __atomic_load_n(&cng_scr[i].hi, __ATOMIC_ACQUIRE) ? (int)i
+                                                                     : -1;
+        if (t == 0 && cng_claim_slot(&cng_scr[i].tid, 0, tid))
+            return scr_map(i) == 0 ? (int)i : -1;
         /* slot taken by another thread (or we lost the CAS): keep probing */
     }
+    /* Full: take over a slot whose thread has exited, stack and all. The busy
+     * flag and the frame pointer are that thread's, not ours. */
+    for (unsigned k = 0; k < CNG_SCR_N; k++) {
+        unsigned i = (h + k) % CNG_SCR_N;
+        long t = cng_scr[i].tid;
+        if (t == 0 || t == tid || scr_tid_live(t))
+            continue;
+        if (!cng_claim_slot(&cng_scr[i].tid, t, tid))
+            continue; /* another thread reclaimed it first */
+        cng_scr[i].busy = 0;
+        cng_scr[i].uc = 0;
+        /* Its owner can have died between claiming the slot and mapping it. */
+        if (!cng_scr[i].hi && scr_map(i) != 0)
+            return -1;
+        return (int)i;
+    }
     return -1;
+}
+
+/* Testing: the allocator, for a TID the caller names rather than its own, with
+ * the slot's stack top so a caller can tell a mapped slot from a claimed one.
+ * There is no other way to fill the table — it takes hundreds of threads. */
+int cng_scratch_slot_for(long tid, unsigned long *hi_out) {
+    int i = cng_scratch_slot(tid);
+    if (hi_out)
+        *hi_out = i >= 0 ? cng_scr[i].hi : 0;
+    return i;
 }
 
 /* Run the dispatcher on this thread's scratch stack. A nested trap (the outer

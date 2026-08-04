@@ -353,6 +353,17 @@ out=$(run -t stackswtest 2>&1); rc=$?
 check "stackswtest exit 0" 0 "$rc"
 check_contains "handler stack switch runs on scratch and preserves caller" \
     "stacksw: ran_on_scratch=1 ret=0xc0de caller_ok=1 -> OK" "$out"
+# ...and there has to be a stack to switch to. The table those come from is keyed
+# by TID and had no way to give a slot back: nothing hooks thread exit, so a
+# runtime that gets through hundreds of short-lived threads (Go, a JVM's GC
+# workers) filled it, and from then on the dispatcher ran on the guest's own
+# stack — where its frame is bigger than a guard page, so it steps over the guard
+# into guest memory instead of faulting. A slot whose thread has exited is now
+# taken over, stack and all; a live thread's is never touched.
+check_contains "a full scratch table recovers the slots of threads that exited" \
+    "stacksw reclaim: filled=300/300 then=" "$out"
+check_contains "...with a stack, and never at the expense of a live thread" \
+    "mapped=1 mine_kept=1 -> OK" "$out"
 
 # ...and what runs there must not itself scale with the guest's argv. The
 # emulated execve accepts a quarter of RLIMIT_STACK of arguments (megabytes),

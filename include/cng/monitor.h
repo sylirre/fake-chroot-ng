@@ -266,6 +266,12 @@ int cng_sig_install(int signo, cng_sighandler_t h);
 int cng_run_scratch(void (*fn)(void *), void *arg);
 void cng_scratch_leave(void);
 
+/* The same allocator for a TID the caller names, with the slot's stack top (0
+ * when there is no slot). Exposed for testing: filling the table takes hundreds
+ * of threads, and what happens then — a slot whose thread has exited is taken
+ * over — has no other way to be reached. */
+int cng_scratch_slot_for(long tid, unsigned long *hi_out);
+
 /* Core SIGSYS logic (exposed for testing): given the trapped signal context and
  * info, either translate+dispatch the guest syscall, or — when the trap is
  * Android's seccomp filter blocking a syscall WE re-issued from the gate —

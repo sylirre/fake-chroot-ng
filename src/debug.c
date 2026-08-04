@@ -2486,7 +2486,45 @@ int cng_cmd_stackswtest(int argc, char **argv, char **envp, unsigned long *auxv)
     cng_dprintf(1, "stacksw: ran_on_scratch=%d ret=0x%lx caller_ok=%d -> %s\n",
                 r == 0xC0DE, (unsigned long)r, marker == 0xA5A5A5A5,
                 ok ? "OK" : "FAIL");
-    return ok ? 0 : 1;
+    int fails = !ok;
+
+    /* The table those stacks come out of is keyed by TID, and a TID that has
+     * exited is not coming back for its slot. A runtime that spawns short-lived
+     * threads gets through hundreds, and once every slot was spoken for the
+     * dispatcher ran on the guest's own stack instead — where its frame is
+     * bigger than a guard page, so it walks over the guard into guest memory
+     * without faulting. Fill the table with TIDs that are not threads of this
+     * process and check a live one is still served; then check the one live
+     * entry that IS ours was never the slot taken.
+     *
+     * The TIDs are past pid_max on any kernel, so nothing can collide with a
+     * real one and every one of them reads as exited. */
+    {
+        long mine = sys_gettid();
+        unsigned long hi_mine = 0, hi_new = 0;
+        int slot_mine = cng_scratch_slot_for(mine, &hi_mine);
+        int filled = 0, mapped_all = 1;
+#define CNG_SCR_TEST_N 300 /* more than the table holds, so it must recover */
+        for (long t = 0x40000000L; t < 0x40000000L + CNG_SCR_TEST_N; t++) {
+            unsigned long hi = 0;
+            if (cng_scratch_slot_for(t, &hi) < 0)
+                break;
+            filled++;
+            mapped_all &= (hi != 0);
+        }
+        /* One more, with the table now full of exited TIDs. */
+        int slot_new = cng_scratch_slot_for(0x50000000L, &hi_new);
+        int again = cng_scratch_slot_for(mine, &hi_mine);
+        int gok = slot_mine >= 0 && filled == CNG_SCR_TEST_N && mapped_all &&
+                  slot_new >= 0 && hi_new != 0 && again == slot_mine;
+        cng_dprintf(1,
+                    "stacksw reclaim: filled=%d/%d then=%d mapped=%d "
+                    "mine_kept=%d -> %s\n",
+                    filled, CNG_SCR_TEST_N, slot_new, hi_new != 0,
+                    slot_mine >= 0 && again == slot_mine, gok ? "OK" : "FAIL");
+        fails += !gok;
+    }
+    return fails ? 1 : 0;
 }
 
 /* _argvtest — building a guest stack must not cost the *caller's* stack in
