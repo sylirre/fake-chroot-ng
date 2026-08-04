@@ -56,26 +56,39 @@ void cng_cred_setup(unsigned host_uid, unsigned host_gid) {
 }
 
 void cng_cred_exec(const char *host) {
-    if (!cng_g_fake_id || !host ||
-        (!cng_g_setuid_root && !cng_g_setgid_root))
+    if (!cng_g_fake_id)
         return;
-    unsigned char st[128]; /* AArch64 struct stat is 128 bytes */
-    if (cng_syscall6(CNG_AT_FDCWD, (long)host, (long)st, 0, 0, 0,
-                     __NR_newfstatat) != 0)
-        return;
-    unsigned mode = *(unsigned *)(st + ST_MODE_OFF);
     struct cng_cred *c = &cng_g_cred;
-    /* setuid/setgid-on-exec: effective, saved, and fs id take the file's visible
-     * owner/group, which cng_exec_vis_* reports as 0 for a setuid/setgid regular
-     * file under the flags. ruid/rgid (the caller's real id) are unchanged. */
-    if (cng_g_setuid_root && (mode & CNG_S_ISUID) &&
-        (mode & CNG_S_IFMT) == CNG_S_IFREG)
-        c->euid = c->suid = c->fsuid =
-            cng_exec_vis_uid(*(unsigned *)(st + ST_UID_OFF), mode);
-    if (cng_g_setgid_root && (mode & CNG_S_ISGID) &&
-        (mode & CNG_S_IFMT) == CNG_S_IFREG)
-        c->egid = c->sgid = c->fsgid =
-            cng_exec_vis_gid(*(unsigned *)(st + ST_GID_OFF), mode);
+    if (host && (cng_g_setuid_root || cng_g_setgid_root)) {
+        unsigned char st[128]; /* AArch64 struct stat is 128 bytes */
+        if (cng_syscall6(CNG_AT_FDCWD, (long)host, (long)st, 0, 0, 0,
+                         __NR_newfstatat) == 0) {
+            unsigned mode = *(unsigned *)(st + ST_MODE_OFF);
+            /* setuid/setgid-on-exec: effective, saved, and fs id take the
+             * file's visible owner/group, which cng_exec_vis_* reports as 0 for
+             * a setuid/setgid regular file under the flags. ruid/rgid (the
+             * caller's real id) are unchanged. */
+            if (cng_g_setuid_root && (mode & CNG_S_ISUID) &&
+                (mode & CNG_S_IFMT) == CNG_S_IFREG)
+                c->euid = cng_exec_vis_uid(*(unsigned *)(st + ST_UID_OFF), mode);
+            if (cng_g_setgid_root && (mode & CNG_S_ISGID) &&
+                (mode & CNG_S_IFMT) == CNG_S_IFREG)
+                c->egid = cng_exec_vis_gid(*(unsigned *)(st + ST_GID_OFF), mode);
+        }
+    }
+    /* Every exec resets the saved set-ids to the effective ones, set-id bit or
+     * not, and that is the rule that makes a privilege drop permanent. Skipping
+     * it left a saved 0 in place across the exec: a program that had been
+     * elevated, had dropped its *effective* id only — which POSIX allows,
+     * keeping suid at 0 so it can come back — and then exec'd anything at all
+     * handed the new program a root it could still take. The kernel closes that
+     * at the exec; here the chain went on carrying it.
+     *
+     * Runs whatever the flags are, since it is the exec that does this and not
+     * the set-id bit, and outside the stat above, whose failure must not skip
+     * it either. */
+    c->suid = c->fsuid = c->euid;
+    c->sgid = c->fsgid = c->egid;
 }
 
 #define ID_KEEP ((unsigned)-1) /* setres*id / setre*id "leave unchanged" */

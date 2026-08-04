@@ -38,6 +38,14 @@ check_contains "setuid-root shows setuid exec as root:root" \
 check_contains "setuid-on-exec elevates euid/egid to 0 (ruid kept)" \
     "suid_exec ruid=1000 euid=0 egid=0" "$out"
 check_contains "su can then become root" "su_to_root rc=0 uid=0" "$out"
+# ...and an exec resets the saved set-user-ID to the effective one, which is
+# what makes a privilege drop permanent. An elevated program that drops only its
+# EFFECTIVE id keeps suid at 0 and can come back (the "before" half asserts the
+# setup is real); once it execs anything, set-id bit or not, the kernel clears
+# that and the regain must fail. It did not, so a dropped root survived every
+# exec in the chain and any later program could take it back.
+check_contains "exec clears the saved set-user-ID, so a drop is final" \
+    "exec_clears_saved before=0 after=-1 -> OK" "$out"
 check_contains "implied identity defaults to real invoking id (not root)" \
     "implied_id uid=4321 gid=8765" "$out"
 check_contains "explicit -u overrides the implied default" \

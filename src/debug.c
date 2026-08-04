@@ -927,6 +927,34 @@ int cng_cmd_faketest(int argc, char **argv, char **envp, unsigned long *auxv) {
     cng_dprintf(1, "su_to_root rc=%d uid=%d\n", (int)root,
                 (int)cng_dispatch(__NR_getuid, 0, 0, 0, 0, 0, 0, 1));
 
+    /* An exec resets the saved set-user-ID to the effective one, which is the
+     * rule that makes a privilege drop permanent. Start from the elevated state
+     * the setuid exec produces (ruid 1000, euid 0, suid 0) and drop the
+     * EFFECTIVE id only: POSIX keeps suid at 0, so root is still regainable —
+     * asserted, so the setup is not passing for free. Then exec something with
+     * no set-id bits. The kernel sets suid = euid = 1000 there and the second
+     * regain must fail; without the reset it stayed 0 and every later program
+     * in the chain could take root back. */
+    cng_g_fake_uid = 1000;
+    cng_g_fake_gid = 1000;
+    cng_cred_seed();
+    if (cng_fs_translate(&fs, "/suid", suidhost, sizeof suidhost) == 0)
+        cng_cred_exec(suidhost);
+    cng_dispatch(__NR_setresuid, -1L, 1000, -1L, 0, 0, 0, 1);
+    long regain_pre = cng_dispatch(__NR_setresuid, -1L, 0, -1L, 0, 0, 0, 1);
+    cng_dispatch(__NR_setresuid, -1L, 1000, -1L, 0, 0, 0, 1);
+    cng_g_setuid_root = 0; /* an ordinary exec: no set-id bit applies */
+    cng_g_setgid_root = 0;
+    char plainhost[CNG_PATH_MAX];
+    if (cng_fs_translate(&fs, "/f", plainhost, sizeof plainhost) == 0)
+        cng_cred_exec(plainhost);
+    long regain_post = cng_dispatch(__NR_setresuid, -1L, 0, -1L, 0, 0, 0, 1);
+    cng_dprintf(1, "exec_clears_saved before=%d after=%d -> %s\n",
+                (int)regain_pre, (int)regain_post,
+                (regain_pre == 0 && regain_post == -EPERM) ? "OK" : "FAIL");
+    cng_g_setuid_root = 1;
+    cng_g_setgid_root = 1;
+
     /* Identity resolution (cng_cred_setup): an id only implied by --setuid-root
      * (explicit=0) defaults to the real invoking id, so those flags alone don't
      * turn the guest into root; an explicit -u/--fake-id (explicit=1) wins. */
