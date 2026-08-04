@@ -191,6 +191,31 @@ static struct pt_link *pt_find(s32 tid) {
     return 0;
 }
 
+/* Reserves a slot while its body is cleared, so no scan ever sees a link that
+ * is about to be wiped. Never a valid tid, which is always > 0. */
+#define PT_CLAIMING ((s32)-1)
+
+/* Find or create the link for `tid`.
+ *
+ * The find and the create cannot be one atomic step, and both callers of the
+ * fork pair race for the same key: the parent publishes the child from
+ * cng_pt_report_event while the child claims itself from cng_pt_fork_child, and
+ * a fork gives pid == tid so both ask for the same value. The scan is not
+ * quick — a link is ~1.2 KiB and PT_MAX of them is well over 100 KiB of shared
+ * memory — so the window between "not found" and "claimed" is microseconds, and
+ * a followed fork lands two links for one tid often enough to be seen: it is
+ * what made `pt_case fork` flaky here, reporting a death for a pid that had
+ * already been reaped.
+ *
+ * Two links for one tid is not merely untidy. pt_find takes the lowest index,
+ * and the ghost the parent made has state PT_ST_RUNNING, so every
+ * PTRACE_CONT/SYSCALL/GETREGS against the real stop answers -ESRCH and the
+ * tracee is never resumed.
+ *
+ * So publish, then look below: whoever holds the lower index keeps it, and the
+ * other releases and adopts it. Each racer scans only strictly below itself, so
+ * exactly one can conclude it lost — and the SEQ_CST publish is what guarantees
+ * the loser sees the winner. */
 static struct pt_link *pt_claim(s32 tid, s32 tgid) {
     if (!g_tab)
         return 0;
@@ -199,16 +224,24 @@ static struct pt_link *pt_claim(s32 tid, s32 tgid) {
         return e;
     for (int i = 0; i < PT_MAX; i++) {
         s32 expect = 0;
-        if (!__atomic_compare_exchange_n(&g_tab->links[i].tracee, &expect, tid, 0,
-                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+        if (!__atomic_compare_exchange_n(&g_tab->links[i].tracee, &expect,
+                                         PT_CLAIMING, 0, __ATOMIC_ACQ_REL,
+                                         __ATOMIC_RELAXED))
             continue;
         e = &g_tab->links[i];
         /* Everything but the claim key: a recycled slot must not inherit the
-         * previous tenant's stop state or mailbox sequence. */
-        s32 keep = e->tracee;
+         * previous tenant's stop state or mailbox sequence. Done under the
+         * reservation, so a concurrent pt_find cannot be handed the link
+         * between its key going in and its body being cleared. */
         memset((char *)e + sizeof(s32), 0, sizeof *e - sizeof(s32));
-        e->tracee = keep;
         e->tgid = tgid;
+        __atomic_store_n(&e->tracee, tid, __ATOMIC_SEQ_CST);
+        for (int j = 0; j < i; j++)
+            if (__atomic_load_n(&g_tab->links[j].tracee, __ATOMIC_SEQ_CST) ==
+                tid) {
+                __atomic_store_n(&e->tracee, 0, __ATOMIC_RELEASE);
+                return &g_tab->links[j];
+            }
         return e;
     }
     return 0; /* registry full: the caller degrades to untraced */
