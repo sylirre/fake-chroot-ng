@@ -503,6 +503,30 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
         cng_dprintf(1, "accessgb: clean=%d dirty=%d\n", (int)clean, (int)dirty);
         return 0;
     }
+    /* Root's DAC bypass covers a permission denial and nothing else. GUESTPATH
+     * names a file the invoking user cannot write (mode 0444, so the real check
+     * is EACCES and the bypass is what grants it) — or one on a genuinely
+     * read-only mount, where the kernel refuses MAY_WRITE with EROFS before the
+     * DAC check and root gets the same answer. The mode word is asked about too:
+     * bits outside R_OK|W_OK|X_OK are EINVAL for everyone. */
+    if (!strcmp(op, "accessfr")) {
+        cng_g_fake_id = 1;
+        cng_g_fake_uid = cng_g_fake_gid = 0;
+        cng_cred_seed();
+        long w = cng_dispatch(__NR_faccessat, CNG_AT_FDCWD, (long)gpath,
+                              2 /*W_OK*/, 0, 0, 0, /*trapped=*/0);
+        long rd = cng_dispatch(__NR_faccessat, CNG_AT_FDCWD, (long)gpath,
+                               4 /*R_OK*/, 0, 0, 0, /*trapped=*/0);
+        long bad = cng_dispatch(__NR_faccessat, CNG_AT_FDCWD, (long)gpath, 8, 0,
+                                0, 0, /*trapped=*/0);
+        long miss = cng_dispatch(__NR_faccessat, CNG_AT_FDCWD,
+                                 (long)"/cng-no-such-file", 0, 0, 0, 0,
+                                 /*trapped=*/0);
+        cng_g_fake_id = 0;
+        cng_dprintf(1, "accessfr: w=%d r=%d badmode=%d missing=%d\n", (int)w,
+                    (int)rd, (int)bad, (int)miss);
+        return 0;
+    }
     /* A ":ro" bind must answer -EROFS for every mutating path syscall while
      * still serving reads, the way a real read-only mount does. GUESTPATH names
      * an existing file inside the bind. Without ":ro" on the -b spec the same

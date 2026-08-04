@@ -48,6 +48,44 @@ check_contains "faccessat has no flags word, so x3 cannot change its answer" \
     "$(run -t dtest -r "$ROOT" accessgb /proc/self/fd/7 2>&1)"
 exec 7<&-
 
+# Root's DAC bypass covers a *permission* denial and nothing else. It used to
+# fire on any negative answer at all and recover it from a stat, so two refusals
+# the kernel gives root as readily as anyone else came back as "granted":
+# EINVAL, for a mode word carrying bits outside R_OK|W_OK|X_OK, and EROFS, which
+# sb_permission() raises for MAY_WRITE on a read-only superblock before it ever
+# reaches the DAC check ("Nobody gets write access to a read-only fs" — no
+# capability escape, so real root sees it too).
+#
+# The EROFS half is the failure ro_denied() exists to prevent, reached by a
+# route it cannot see: it knows our own :ro binds, not a rootfs that is
+# genuinely mounted read-only — on Android /system, /vendor and /apex all are.
+# `test -w` answered yes and the write that followed got EROFS.
+ARW=$(mktemp -d)
+: >"$ARW/f"
+chmod 0444 "$ARW/f"
+a_out=$(run -t dtest -r "$ARW" accessfr /f 2>&1)
+check_contains "fake-root still grants a write the file's own mode denies" \
+    "w=0" "$a_out"
+check_contains "...but an invalid access mode stays EINVAL" "badmode=-22" \
+    "$a_out"
+check_contains "...and a missing file stays ENOENT" "missing=-2" "$a_out"
+rm -rf "$ARW"
+
+# ...and the same question asked of a filesystem that really is mounted
+# read-only. Field 4 of /proc/mounts is the option list; `test -w` on the result
+# is the host kernel confirming the premise, since inode_permission() runs
+# sb_permission() before the DAC check and so answers EROFS whatever the mode.
+M5RO=$(awk '$4 ~ /(^|,)ro(,|$)/ { print $2; exit }' /proc/mounts 2>/dev/null)
+if [ -z "$M5RO" ] || [ ! -r "$M5RO" ] || [ -w "$M5RO" ]; then
+    skip "read-only-mount leg: no read-only mount on this host to check against"
+else
+    ro_out=$(run -t dtest -r "$M5RO" accessfr / 2>&1)
+    check_contains "a genuinely read-only mount is EROFS to fake-root too" \
+        "w=-30" "$ro_out"
+    check_contains "...while a read of the same name still succeeds" "r=0" \
+        "$ro_out"
+fi
+
 # Plant a file OUTSIDE the rootfs; guest /../ must not reach it.
 printf SECRET > "$ROOT/../esc_$$"
 check_contains "dispatch blocks .. escape" \

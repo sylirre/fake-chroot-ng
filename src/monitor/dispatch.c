@@ -1505,7 +1505,23 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         }
 #endif
         long r = reissue(dfd, (long)p, a2, fl, a4, a5, nr);
-        if (r < 0 && cng_fake_root()) {
+        /* Only what root actually bypasses, which is a *permission* denial.
+         * This used to fire on any negative answer at all, and the stat below
+         * succeeds for most of them, so two refusals the kernel gives root as
+         * readily as anyone else came back as "granted":
+         *
+         *  - EROFS. sb_permission() refuses MAY_WRITE on a read-only superblock
+         *    before it ever reaches the DAC check — "Nobody gets write access to
+         *    a read-only fs", no capability escape — so real root sees it too.
+         *    ro_denied() below re-applies it, but only for our own :ro binds; a
+         *    rootfs that is genuinely mounted read-only (on Android /system,
+         *    /vendor, /apex, and anything on a ro mount) is invisible to it. The
+         *    result was exactly what that check exists to prevent: `test -w`
+         *    answers yes and the write that follows gets EROFS. Measured on a
+         *    squashfs mount: access(W_OK) = -EROFS, open(O_WRONLY) = -EROFS.
+         *  - EINVAL, for a mode word with bits outside R_OK|W_OK|X_OK. Not a
+         *    permission question at all; measured faccessat(..., 8) = -EINVAL. */
+        if ((r == -EACCES || r == -EPERM) && cng_fake_root()) {
             /* Root's DAC bypass, applied to the file the check asked about:
              * under AT_SYMLINK_NOFOLLOW that is the symlink itself, so the
              * stat has to carry the flag too or the mode it reads — and the
