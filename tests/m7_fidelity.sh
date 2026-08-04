@@ -45,6 +45,23 @@ check_contains "explicit -u overrides the implied default" \
 
 rm -rf "$ROOT"
 
+# An id spec out of range must be refused, not wrapped. Accumulated into an
+# `unsigned`, "4294967296" is 0 — and 0 is root, so a spec that should have been
+# an error instead selected the fake identity with the most authority there is
+# and turned on every DAC check the emulation fakes for root. All three spellings
+# reach the same parser, and two of them ignored its verdict entirely.
+for _spec in "-u 4294967296" "-u4294967296" "--fake-id=4294967296" \
+    "-u 1000:99999999999"; do
+    # shellcheck disable=SC2086  # _spec is a deliberately split arg list
+    out=$(run $_spec / /bin/true 2>&1)
+    check_contains "an out-of-range id spec ($_spec) is refused" \
+        "expected UID or UID:GID" "$out"
+done
+# ...and the largest one that does fit still works.
+out=$(run -t faketest -u 4294967295 2>&1 || true)
+check_absent "a uid at the top of the range is not refused" \
+    "expected UID or UID:GID" "$out"
+
 # link2symlink backing-file scheme (present emulated hardlinks as regular files
 # with a shared inode + st_nlink) + fchdir cwd tracking. Force the l2s fallback
 # via the block-list (tmpfs allows hardlinks); the test toggles the opt-in flag

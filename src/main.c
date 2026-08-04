@@ -536,15 +536,33 @@ static int is_id_spec(const char *s) {
 
 /* Parse a validated "N" (gid defaults to uid) or "N:M" spec into the fake-id
  * globals. Returns 0, or -1 if the spec is malformed. */
+/* Accumulate one decimal id, refusing anything a uid_t cannot hold. An unsigned
+ * that simply wraps is the wrong kind of wrong here: "4294967296" is 0, and 0 is
+ * root — so a spec out of range did not fail, it quietly asked for the fake
+ * identity with the most authority there is, and every DAC check the emulation
+ * fakes for root started passing. Returns 0, or -1 on overflow. */
+static int parse_id_num(const char **pp, unsigned *out) {
+    const char *p = *pp;
+    unsigned long long v = 0;
+    for (; *p >= '0' && *p <= '9'; p++) {
+        v = v * 10 + (unsigned long long)(*p - '0');
+        if (v > 0xffffffffull)
+            return -1;
+    }
+    *pp = p;
+    *out = (unsigned)v;
+    return 0;
+}
+
 static int parse_id_spec(const char *s) {
     if (!is_id_spec(s)) return -1;
     unsigned u = 0;
     const char *p = s;
-    for (; *p >= '0' && *p <= '9'; p++) u = u * 10 + (unsigned)(*p - '0');
+    if (parse_id_num(&p, &u) < 0) return -1;
     unsigned g;
     if (*p == ':') {
-        g = 0;
-        for (p++; *p >= '0' && *p <= '9'; p++) g = g * 10 + (unsigned)(*p - '0');
+        p++;
+        if (parse_id_num(&p, &g) < 0) return -1;
     } else {
         g = u;   /* a single value applies to both uid and gid */
     }
@@ -702,7 +720,9 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
                 if (val) {
                     if (parse_id_spec(val) < 0) return err_badid(val);
                 } else if (i + 1 < argc && is_id_spec(argv[i + 1])) {
-                    parse_id_spec(argv[++i]);   /* "--fake-id 1000:1000" form */
+                    /* "--fake-id 1000:1000" form. is_id_spec only vouches for
+                     * the shape, so the range check still has to be acted on. */
+                    if (parse_id_spec(argv[++i]) < 0) return err_badid(argv[i]);
                 }
             } else if (!strcmp(n, "setuid-root")) {
                 if (val) return err_noval(arg);
@@ -784,7 +804,10 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
                     if (*p) {                                    /* -uID */
                         if (parse_id_spec(p) < 0) return err_badid(p);
                     } else if (i + 1 < argc && is_id_spec(argv[i + 1])) {
-                        parse_id_spec(argv[++i]);                /* -u ID */
+                        /* -u ID. is_id_spec vouches for the shape only, so the
+                         * range check still has to be acted on. */
+                        if (parse_id_spec(argv[++i]) < 0)
+                            return err_badid(argv[i]);
                     }
                     break;   /* -u takes the rest of the cluster / next token */
                 }
