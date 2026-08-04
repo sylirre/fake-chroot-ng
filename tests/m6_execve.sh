@@ -75,27 +75,68 @@ if guest_cc_report "$ER/hello" tests/guests/hello.c; then
     fi
 
     # --- M17-10: shebang nesting -------------------------------------------
-    # A script whose interpreter is itself a script is followed up to four
-    # times, as fs/exec.c bounds it; the fifth is ELOOP. Each level prepends its
-    # own interpreter and pushes the previous one down, so the whole chain shows
-    # up in the final argv — which is the only way to see that the levels ran in
-    # order rather than being collapsed.
-    printf '#!/hello\n'  >"$ER/s4"
-    printf '#!/s4\n'     >"$ER/s3"
-    printf '#!/s3\n'     >"$ER/s2"
-    printf '#!/s2\n'     >"$ER/s1"
-    printf '#!/s1\n'     >"$ER/s0"
-    out=$(exectest /s1 AA 2>&1); rc=$?
+    # A script whose interpreter is itself a script is followed a bounded number
+    # of times (BINPRM_MAX_RECURSION) and then answered ELOOP. Each level
+    # prepends its own interpreter and pushes the previous one down, so the whole
+    # chain shows up in the final argv — which is the only way to see that the
+    # levels ran in order rather than being collapsed.
+    #
+    # d1 is one script level, d2 two, and so on. The depth the kernel stops at is
+    # measured rather than encoded: an identical chain is built on the host and
+    # the deepest one that runs is the number the guest has to match. It did not
+    # — the emulation stopped one level early and refused a chain the kernel
+    # executes, which no amount of reading fs/exec.c had settled.
+    _d=1
+    printf '#!/hello\n' >"$ER/d1"
+    while [ $_d -lt 8 ]; do
+        printf '#!/d%d\n' $_d >"$ER/d$((_d + 1))"
+        _d=$((_d + 1))
+    done
+    chmod 755 "$ER"/d? 2>/dev/null || :
+
+    NREF=$(mktemp -d)
+    printf '#!/bin/sh\nexit 0\n' >"$NREF/d1"
+    _d=1
+    while [ $_d -lt 8 ]; do
+        printf '#!%s/d%d\n' "$NREF" $_d >"$NREF/d$((_d + 1))"
+        _d=$((_d + 1))
+    done
+    chmod 755 "$NREF"/d?
+    KDEPTH=0
+    _d=1
+    while [ $_d -le 8 ]; do
+        "$NREF/d$_d" 2>/dev/null || break
+        KDEPTH=$_d
+        _d=$((_d + 1))
+    done
+    rm -rf "$NREF"
+    check_contains "the host kernel bounds #! nesting somewhere sane" "$KDEPTH" \
+        "$(echo 4 5 6)"
+
+    GDEPTH=0
+    _d=1
+    while [ $_d -le 8 ]; do
+        exectest "/d$_d" AA >/dev/null 2>&1
+        [ $? = 42 ] || break   # 42 is what the exec'd guest exits with
+        GDEPTH=$_d
+        _d=$((_d + 1))
+    done
+    check "a #! chain nests exactly as deep as the kernel allows" "$KDEPTH" \
+        "$GDEPTH"
+    check_contains "one level past that is ELOOP" "emulate_execve failed x0=-40" \
+        "$(exectest "/d$((KDEPTH + 1))" AA 2>&1)"
+
+    # The whole chain, in order, in the final argv: four levels is enough to
+    # show the pushing-down without depending on where the limit sits.
+    out=$(exectest /d4 AA 2>&1); rc=$?
     check "a four-deep shebang chain runs" 42 $rc
     check_contains "the innermost interpreter is argv0" "argv0=/hello" "$out"
-    check_contains "each level pushed its script down (1)" "argv1=/s4" "$out"
-    check_contains "each level pushed its script down (2)" "argv2=/s3" "$out"
-    check_contains "each level pushed its script down (3)" "argv3=/s2" "$out"
-    check_contains "the original script is last" "argv4=/s1" "$out"
+    check_contains "each level pushed its script down (1)" "argv1=/d1" "$out"
+    check_contains "each level pushed its script down (2)" "argv2=/d2" "$out"
+    check_contains "each level pushed its script down (3)" "argv3=/d3" "$out"
+    check_contains "the original script is last" "argv4=/d4" "$out"
     check_contains "the guest's own argument survives all of it" "argv5=AA" \
         "$out"
-    check_contains "a fifth level is ELOOP" "emulate_execve failed x0=-40" \
-        "$(exectest /s0 AA 2>&1)"
 
     # --- M17-10: execveat's flags word -------------------------------------
     # It was never read: a real dirfd resolved against the cwd instead, and

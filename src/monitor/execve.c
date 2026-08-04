@@ -95,11 +95,13 @@ void cng_close_cloexec(void) {
     sys_close((int)dfd);
 }
 
-/* Shebang nesting, as fs/exec.c bounds it: a script whose interpreter is itself
- * a script is followed up to four times, and the fifth is -ELOOP. Each level
- * needs its interpreter (and optional argument) to stay alive until the stack is
- * built, since both end up in the new argv. */
-#define SHEB_MAX   4
+/* Shebang nesting, as fs/exec.c bounds it. The kernel's limit is
+ * BINPRM_MAX_RECURSION, and what that works out to in scripts is five: a chain
+ * of five #! files runs, and the sixth is -ELOOP. Measured, not read — at four
+ * this refused a chain the kernel executes. Each level needs its interpreter
+ * (and optional argument) to stay alive until the stack is built, since both
+ * end up in the new argv. */
+#define SHEB_MAX   5
 #define SHEB_WORD  256
 /* Pointer slots reserved ahead of the snapshot's argv for the shebang chain.
  * Each level contributes its interpreter and at most one argument, and the
