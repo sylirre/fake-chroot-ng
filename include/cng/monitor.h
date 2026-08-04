@@ -272,6 +272,16 @@ void cng_scratch_leave(void);
  * over — has no other way to be reached. */
 int cng_scratch_slot_for(long tid, unsigned long *hi_out);
 
+/* Install the SIGSYS handler alone (no filter, no probes): testing. */
+int cng_sigsys_install_only(void);
+
+/* Test aid: when set, the handler raises one real SIGSYS from the scratch stack
+ * — the nested-trap state, which otherwise needs an ambient filter to block a
+ * syscall we re-issue, i.e. a device. The two frame addresses land in
+ * cng_g_sigsys_frame[outer, nested]; they must not be the same one. */
+extern int cng_g_sigsys_nest;
+extern unsigned long cng_g_sigsys_frame[2];
+
 /* Core SIGSYS logic (exposed for testing): given the trapped signal context and
  * info, either translate+dispatch the guest syscall, or — when the trap is
  * Android's seccomp filter blocking a syscall WE re-issued from the gate —

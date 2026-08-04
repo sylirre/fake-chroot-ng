@@ -365,6 +365,22 @@ check_contains "a full scratch table recovers the slots of threads that exited" 
 check_contains "...with a stack, and never at the expense of a live thread" \
     "mapped=1 mine_kept=1 -> OK" "$out"
 
+# And a SIGSYS that arrives while the handler is already on that scratch stack
+# must not land on the frame of the one that put it there. The kernel picks a
+# frame's address with sigsp(): SA_ONSTACK plus an SP that is not on the
+# alt-stack means the alt-stack TOP — which the handler satisfies a second time
+# once it has switched stacks, so the nested frame was written at exactly the
+# outer frame's address (measured with a plain C repro, natively and under qemu:
+# delta 0). The alt-stack is now disarmed for the duration; rt_sigreturn puts the
+# guest's back from the frame. A real nested SIGSYS needs an ambient filter to
+# block a syscall we re-issue, so the handler raises one itself on request.
+out=$(run -t nesttest 2>&1); rc=$?
+check "nesttest exit 0" 0 "$rc"
+check_contains "a nested SIGSYS frame does not land on the outer one" \
+    "nested=elsewhere same=0 -> OK" "$out"
+check_contains "...and the outer handler still returns through its own frame" \
+    "nest: child status 0 -> OK" "$out"
+
 # ...and what runs there must not itself scale with the guest's argv. The
 # emulated execve accepts a quarter of RLIMIT_STACK of arguments (megabytes),
 # and the guest-stack builder used to collect one address per entry in a VLA of

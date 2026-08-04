@@ -2527,6 +2527,87 @@ int cng_cmd_stackswtest(int argc, char **argv, char **envp, unsigned long *auxv)
     return fails ? 1 : 0;
 }
 
+/* _nesttest — a SIGSYS arriving while the handler already runs on the scratch
+ * stack must not land on the frame of the one that put it there.
+ *
+ * The kernel picks a frame's address with sigsp(): SA_ONSTACK and an SP that is
+ * not on the alt-stack means the alt-stack top. Having moved SP to the scratch
+ * stack, the handler satisfies that for a second time, so a nested SIGSYS — kept
+ * deliverable by SA_NODEFER, for the gate-net — was written at the same address
+ * as the outer frame. Measured on this host and under qemu with a plain C
+ * repro: delta from the outer frame, exactly 0.
+ *
+ * It runs in a child, because the failure mode is not a wrong answer. The outer
+ * frame becomes the nested one, so the sigreturn that reads it resumes a context
+ * from inside our own re-issue, and the handler re-enters itself for ever with
+ * every signal but SIGSYS masked — not even SIGTERM ends it. So: bounded wait,
+ * then SIGKILL. */
+#define NEST_ALT_SZ (64 * 1024)
+
+int cng_cmd_nesttest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    static struct cng_fs fs;
+    cng_fs_init(&fs, "/");
+    cng_g_fs = &fs;
+
+    void *alt = sys_mmap(0, NEST_ALT_SZ, CNG_PROT_READ | CNG_PROT_WRITE,
+                         CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (alt == CNG_MAP_FAILED || cng_is_err((long)alt)) {
+        cng_dprintf(1, "nest: no alt stack -> FAIL\n");
+        return 1;
+    }
+    /* Without a registered alt-stack there is nowhere for two frames to
+     * collide — this is the guest that has one: Go, a JVM, anything that wants
+     * to survive its own stack overflow. */
+    cng_stack_t ss = {alt, 0, NEST_ALT_SZ};
+    if (CNG_SYS(__NR_sigaltstack, (long)&ss, 0, 0, 0, 0, 0) != 0 ||
+        cng_sigsys_install_only() < 0) {
+        cng_dprintf(1, "nest: setup failed -> FAIL\n");
+        return 1;
+    }
+
+    long kid = sys_fork();
+    if (kid == 0) {
+        cng_g_sigsys_nest = 1;
+        CNG_SYS(__NR_tgkill, sys_getpid(), sys_gettid(), CNG_SIGSYS, 0, 0, 0);
+        /* Reaching this line at all means the outer frame was still the outer
+         * frame when its sigreturn read it. */
+        unsigned long o = cng_g_sigsys_frame[0], n = cng_g_sigsys_frame[1];
+        unsigned long lo = (unsigned long)alt, hi = lo + NEST_ALT_SZ;
+        int ok = o && n && n != o && !(n >= lo && n < hi);
+        cng_dprintf(1, "nest: outer=%s nested=%s same=%d -> %s\n",
+                    o >= lo && o < hi ? "altstack" : "elsewhere",
+                    n >= lo && n < hi ? "altstack" : "elsewhere", n == o,
+                    ok ? "OK" : "FAIL");
+        sys_exit_group(ok ? 0 : 1);
+    }
+    if (kid < 0) {
+        cng_dprintf(1, "nest: fork failed -> FAIL\n");
+        return 1;
+    }
+    int st = 0;
+    long r = 0;
+    for (int i = 0; i < 300; i++) { /* ~3s, then it is not coming back */
+        r = sys_wait4((int)kid, &st, 1 /*WNOHANG*/, 0);
+        if (r == kid)
+            break;
+        struct cng_timespec nap = {0, 10 * 1000 * 1000};
+        CNG_SYS(__NR_nanosleep, &nap, 0, 0, 0, 0, 0);
+    }
+    if (r != kid) {
+        CNG_SYS(__NR_tgkill, kid, kid, 9 /*SIGKILL*/, 0, 0, 0);
+        sys_wait4((int)kid, &st, 0, 0);
+        cng_dprintf(1, "nest: the handler never came back -> FAIL\n");
+        return 1;
+    }
+    int ok = (st & 0x7f) == 0 && ((st >> 8) & 0xff) == 0;
+    cng_dprintf(1, "nest: child status %d -> %s\n", st, ok ? "OK" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 /* _argvtest — building a guest stack must not cost the *caller's* stack in
  * proportion to argc.
  *

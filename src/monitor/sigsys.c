@@ -381,6 +381,49 @@ int cng_scratch_slot_for(long tid, unsigned long *hi_out) {
     return i;
 }
 
+/* Runs on the scratch stack, and the first thing it does is take the guest's
+ * alt-stack out of the picture for the duration.
+ *
+ * The kernel picks where a signal frame goes with sigsp(): SA_ONSTACK plus an SP
+ * that is not currently on the alt-stack means the alt-stack TOP. That is how
+ * our own frame got there — and having moved SP to the scratch stack, it is also
+ * true of a *nested* SIGSYS, which SA_NODEFER deliberately leaves deliverable so
+ * the gate-net can catch a re-issue Android's own filter blocks. So the nested
+ * frame is written at the alt-stack top: the same address as the outer one.
+ * Measured on the host and under qemu — delta from the outer frame, exactly 0.
+ * The outer frame is then rubble, and the sigreturn that reads it resumes a
+ * context from the middle of our own re-issue; in the repro that is an endless
+ * loop of the handler re-entering itself, with every signal but SIGSYS masked.
+ *
+ * Disarming the alt-stack sends the nested frame to the current SP instead —
+ * the scratch stack, below the dispatcher's own frames, where it belongs. It
+ * needs no undo: the kernel saves the alt-stack settings in each signal frame
+ * and rt_sigreturn restores them, so the guest gets its own back at every exit
+ * from here, including the nested one's.
+ *
+ * The check is free: uc_stack is what the kernel saved in the frame, so a guest
+ * with no alt-stack registered — most of them — costs nothing, and one that has
+ * registered it is exactly the guest at risk. */
+int cng_g_sigsys_nest = 0;
+unsigned long cng_g_sigsys_frame[2];
+
+static void sigsys_on_scratch(void *ucv, void *si) {
+    struct cng_ucontext *uc = ucv;
+    if (uc->uc_stack.ss_size && !(uc->uc_stack.ss_flags & CNG_SS_DISABLE)) {
+        cng_stack_t off = {0, CNG_SS_DISABLE, 0};
+        CNG_SYS(__NR_sigaltstack, (long)&off, 0, 0, 0, 0, 0);
+    }
+    /* Test aid: reach the nested state from a host with no ambient filter, by
+     * raising a real SIGSYS from right here — on the scratch stack, with the
+     * outer frame wherever the kernel put it. */
+    if (cng_g_sigsys_nest) {
+        cng_g_sigsys_nest = 0;
+        cng_g_sigsys_frame[0] = (unsigned long)uc;
+        CNG_SYS(__NR_tgkill, sys_getpid(), sys_gettid(), CNG_SIGSYS, 0, 0, 0);
+    }
+    cng_sigsys_body(uc, si);
+}
+
 /* Run the dispatcher on this thread's scratch stack. A nested trap (the outer
  * invocation's slot is already busy) runs on the current stack instead — that
  * is the shallow gate-net path, which does not touch the deep buffers, so it
@@ -393,12 +436,14 @@ static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {
     long tid = sys_gettid();
     int i = cng_scratch_slot(tid);
     if (i < 0 || cng_scr[i].busy) {
+        if (cng_g_sigsys_frame[0]) /* the test above: this is the nested one */
+            cng_g_sigsys_frame[1] = (unsigned long)ucv;
         cng_sigsys_body((struct cng_ucontext *)ucv, si);
         return;
     }
     cng_scr[i].busy = 1;
     cng_scr[i].uc = (struct cng_ucontext *)ucv;
-    cng_run_on_stack((void *)cng_scr[i].hi, (void *)cng_sigsys_body, ucv, si);
+    cng_run_on_stack((void *)cng_scr[i].hi, (void *)sigsys_on_scratch, ucv, si);
     cng_scr[i].uc = 0;
     cng_scr[i].busy = 0;
 }
@@ -504,6 +549,13 @@ int cng_sig_deliverable(void) {
         return 1;
     }
     return 0;
+}
+
+/* Testing: the SIGSYS handler on its own — no filter, no blocked-syscall probe,
+ * no ptrace plumbing. Enough for a fabricated SIGSYS to reach the real handler
+ * and be delivered where the kernel would really put it. */
+int cng_sigsys_install_only(void) {
+    return cng_sig_install(CNG_SIGSYS, sigsys_handler);
 }
 
 int cng_install_monitor(struct cng_fs *fs) {

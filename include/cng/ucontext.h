@@ -15,6 +15,10 @@ typedef struct {
     unsigned long ss_size;
 } cng_stack_t;
 
+/* ss_flags */
+#define CNG_SS_ONSTACK 1
+#define CNG_SS_DISABLE 2
+
 struct cng_sigcontext {
     unsigned long long fault_address;
     unsigned long long regs[31]; /* x0..x30 */
