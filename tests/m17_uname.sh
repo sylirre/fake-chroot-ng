@@ -35,4 +35,16 @@ check_contains "/proc/version repeats the same release" \
 check_contains "...and the same version string" "#1 SMP chroot-ng" "$vout"
 check_absent "the host release does not leak through /proc/version" \
     "$(uname -r 2>/dev/null || echo IMPOSSIBLE)" "$vout"
+
+# ...and named against a /proc dirfd, which is the other way a program spells
+# it. The dirfd-relative pre-filter lists the names worth resolving and omitted
+# this one, so the open fell through to the host file: uname said
+# 6.1.0-chroot-ng while openat(dirfd, "version") returned the host's real
+# kernel, its build host and its compiler — the exact contradiction faking both
+# of them exists to avoid, plus a device fingerprint.
+vout=$(run -t dtest -r "$UR" atrel /proc version 2>&1)
+check_contains "a dirfd-relative /proc/version is synthesized too" \
+    "Linux version 6.1.0-chroot-ng" "$vout"
+check_absent "...and leaks no host release either" \
+    "$(uname -r 2>/dev/null || echo IMPOSSIBLE)" "$vout"
 rm -rf "$UR"

@@ -1001,9 +1001,14 @@ static long proc_self_fixup(const char *canon, char *buf, unsigned long bufsz) {
  * resolving — procps opens "<pid>/stat" and "status" against a /proc dirfd, so
  * the test is on the basename, not the whole path. */
 static int leaf_may_synth(const char *p) {
+    /* Every name cng_procfs_open() can serve has to be here, or that name is
+     * simply not synthesized when it arrives against a dirfd. "version" was
+     * missing, and it is the one whose absence contradicts something else we
+     * fake: uname reported 6.1.0-chroot-ng while openat(dirfd_of_/proc,
+     * "version") returned the host's real kernel, build host and compiler. */
     static const char *const leafs[] = {
-        "cmdline", "environ",   "auxv",   "maps",  "mounts", "mountinfo",
-        "status",  "mountstats", "loadavg", "uptime", "stat",
+        "cmdline", "environ",   "auxv",    "maps",   "mounts", "mountinfo",
+        "status",  "mountstats", "loadavg", "uptime", "stat",   "version",
     };
     const char *b = strrchr(p, '/');
     b = b ? b + 1 : p;
