@@ -1666,9 +1666,19 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         int bufsiz = (int)a3;
         if (bufsiz <= 0)
             return -EINVAL;
-        if (gp && (gp[0] == '/' || (int)a0 == CNG_AT_FDCWD)) {
+        /* at_canon rather than cng_fs_abscanon: a name relative to a real dirfd
+         * is a guest path too, and skipping it here meant `exe`, `cwd` and
+         * `root` were passed to the kernel and answered with the HOST path.
+         * `readlink /proc/self/exe` was right while `readlinkat(dirfd, "exe")`
+         * handed back the monitor's own binary, and "cwd" handed back where the
+         * rootfs lives on the device — the one thing this layer exists to keep
+         * from the guest. It is not an exotic spelling either: it is what GNU
+         * coreutils does for every entry of `ls -l /proc/self/`. The fd-link
+         * fixup below already canonicalizes this way; only the magic-link one
+         * did not. */
+        if (gp) {
             char canon[CNG_PATH_MAX], val[CNG_PATH_MAX];
-            if (cng_fs_abscanon(cng_g_fs, gp, canon, sizeof canon) == 0) {
+            if (at_canon(a0, gp, canon, sizeof canon) == 0) {
                 long fx = proc_self_fixup(canon, val, sizeof val);
                 if (fx >= 0) {
                     if (fx > bufsiz)

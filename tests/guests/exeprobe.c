@@ -4,8 +4,32 @@
  * the guest before main. Used to pin the initial program's own link, the one no
  * emulated execve ever republishes.
  */
+#include <fcntl.h>
 #include <stdio.h>
 #include <unistd.h>
+
+/* The same links read the other way a program can spell them: against an open
+ * directory fd, with a bare component. That is what GNU coreutils does for
+ * every entry of `ls -l /proc/self/`, and the magic-link fixups used to be
+ * reached only for an absolute name or AT_FDCWD — so this spelling was handed
+ * to the kernel and answered with the HOST path: the monitor's own binary for
+ * "exe", and for "cwd" where the rootfs lives on the device. Both must read
+ * exactly as the absolute spelling does. */
+static void at_links(void) {
+    char buf[4096];
+    int d = open("/proc/self", O_RDONLY | O_DIRECTORY);
+    if (d < 0) {
+        printf("at_exe=(no dirfd)\nat_cwd=(no dirfd)\n");
+        return;
+    }
+    ssize_t n = readlinkat(d, "exe", buf, sizeof buf - 1);
+    buf[n > 0 ? n : 0] = '\0';
+    printf("at_exe=%s\n", n > 0 ? buf : "(readlinkat failed)");
+    n = readlinkat(d, "cwd", buf, sizeof buf - 1);
+    buf[n > 0 ? n : 0] = '\0';
+    printf("at_cwd=%s\n", n > 0 ? buf : "(readlinkat failed)");
+    close(d);
+}
 
 int main(void) {
     char buf[4096];
@@ -17,6 +41,7 @@ int main(void) {
     }
     buf[n] = '\0';
     printf("exe=%s\n", buf);
+    at_links();
 
     /* comm rides along: it is derived from the same recorded program, so a change
      * to one shows up here rather than in a surprise somewhere else. */

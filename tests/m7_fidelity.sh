@@ -177,6 +177,17 @@ elif guest_cc_report "$EXG/exeprobe" tests/guests/exeprobe.c; then
     check "the initial program reports its own exe link" 0 $rc
     check_contains "an absolute <program> names itself" "exe=/bin/exeprobe" "$out"
 
+    # The same links named against an open /proc/self fd, which is how GNU
+    # coreutils resolves every entry of `ls -l /proc/self/`. The magic-link
+    # fixups were reached only for an absolute name or AT_FDCWD, so this
+    # spelling went to the kernel: "exe" came back as the monitor's own binary
+    # and "cwd" as the rootfs's location on the device.
+    check_contains "a dirfd-relative /proc/self/exe reads as the guest path" \
+        "at_exe=/bin/exeprobe" "$out"
+    check_contains "...and cwd likewise, leaking no host path" "at_cwd=/" "$out"
+    check_absent "no rootfs host path reaches the guest through readlinkat" \
+        "$EXD" "$out"
+
     out=$(exerun "$EXD/rootfs" bin/exeprobe 2>/dev/null); rc=$?
     check "a relative <program> starts at all" 0 $rc
     check_contains "a relative <program> still reports an absolute exe" \
