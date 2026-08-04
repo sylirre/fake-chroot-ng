@@ -51,24 +51,31 @@ static void skip_ws(const char **p) {
 
 /* Buffered line reader over a host file: enough to walk status/maps without an
  * allocator. Returns a NUL-terminated line (newline stripped) or NULL at EOF.
- * A line longer than the buffer is delivered in pieces, which is fine for both
- * callers (they only match on a line's leading keyword or copy it through). */
+ * A line longer than the buffer is still delivered in pieces — the line buffer
+ * holds the longest maps line the kernel can produce for a path we could
+ * render, so that is unreachable in practice — and lrd_whole() tells a caller
+ * that re-parses what it reads whether it is looking at one. */
 struct lrd {
     int fd;
     unsigned pos, len;
     int eof;
+    int cut;  /* the chunk just returned was ended by the buffer, not a newline */
+    int cont; /* ...and this one continues it */
     char buf[4096];
-    char line[2048];
+    char line[CNG_PATH_MAX + 256]; /* pathname column plus the five fixed ones */
 };
 
 static void lrd_init(struct lrd *r, int fd) {
     r->fd = fd;
     r->pos = r->len = 0;
     r->eof = 0;
+    r->cut = r->cont = 0;
 }
 
 static const char *lrd_next(struct lrd *r) {
     unsigned n = 0;
+    r->cont = r->cut;
+    r->cut = 0;
     for (;;) {
         if (r->pos == r->len) {
             if (r->eof)
@@ -86,13 +93,21 @@ static const char *lrd_next(struct lrd *r) {
             break;
         if (n < sizeof r->line - 1)
             r->line[n++] = c;
-        if (n == sizeof r->line - 1)
+        if (n == sizeof r->line - 1) {
+            r->cut = 1;
             break; /* over-long line: hand back what we have */
+        }
     }
     if (!n && r->eof && r->pos == r->len)
         return 0;
     r->line[n] = '\0';
     return r->line;
+}
+
+/* Whether the chunk just returned is a line in its own right, rather than one
+ * piece of an over-long one. */
+static int lrd_whole(const struct lrd *r) {
+    return !r->cut && !r->cont;
 }
 
 /* The host path behind a canonical guest /proc path (identity under the
@@ -387,7 +402,7 @@ static int put_status(int fd, const char *host) {
     long hf = open_host_ro(host);
     if (hf < 0)
         return -1;
-    struct lrd r; /* 6 KiB — the dispatcher runs on its own 256 KiB stack */
+    struct lrd r; /* 8.5 KiB — the dispatcher runs on its own 256 KiB stack */
     lrd_init(&r, (int)hf);
     const char *line;
     while ((line = lrd_next(&r)) != 0) {
@@ -445,6 +460,17 @@ static int put_maps(int fd, const char *host) {
     lrd_init(&r, (int)hf);
     const char *line;
     while ((line = lrd_next(&r)) != 0) {
+        /* Every other caller of lrd only matches a leading keyword or copies
+         * the line through; this one re-parses it, so a piece of an over-long
+         * line must not reach the scan below. Only the first piece carries the
+         * five fixed fields, so the rest is bare path characters: the scan runs
+         * to the terminator, comes up short of five fields, and the "no
+         * pathname column" branch prints the raw host path — the one thing this
+         * function exists to prevent. There is nothing faithful to emit for a
+         * line we could not read whole, so drop it, as an untranslatable path
+         * is dropped below. */
+        if (!lrd_whole(&r))
+            continue;
         /* The pathname column starts at the first '/' or '[' after the five
          * fixed fields; everything before it is copied verbatim. */
         const char *p = line;

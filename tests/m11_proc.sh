@@ -93,6 +93,70 @@ check_contains "--no-proc disables passthrough and synthesis" \
     "proctest no-proc -> OK" "$out"
 rm -rf "$PT" "$PTB"
 
+# --- maps lines longer than the line reader ---------------------------------
+# put_maps re-parses every chunk the line reader hands it, and a line longer
+# than that reader's buffer arrives in pieces. Only the first piece carries the
+# five fixed columns; the rest is bare path characters, which the five-field
+# scan runs straight past, so the "no pathname column" branch printed the raw
+# host tail — the one thing put_maps exists to prevent. Two legs, because the
+# fix has two halves: a buffer that fits any path the kernel can print, and a
+# refusal to re-parse a piece of a line when it does not.
+#
+# The length has to come from the guest side of a short rootfs: a bind's host
+# path is capped at 512 bytes, so it cannot supply one. The rootfs prefix is
+# then the only part of the host spelling the guest cannot also say, which makes
+# the mktemp directory's own name the marker to count.
+ML_DIR=$(mktemp -d)
+ML_MARK=$(basename "$ML_DIR")
+ML_ROOT="$ML_DIR/rootfs"
+mkdir -p "$ML_ROOT"
+if guest_xlate_ready "maps over-long-line legs" &&
+    guest_cc_report "$ML_ROOT/mapslong" tests/guests/mapslong.c; then
+    # (a) A host path long enough to have overrun the old 2 KiB line buffer,
+    # which is an ordinary deep tree: a nested node_modules, a Java class
+    # hierarchy. The mapping must still appear, under its guest name.
+    ml_deep=""
+    ml_i=0
+    while [ "$ml_i" -lt 50 ]; do
+        ml_deep="$ml_deep/cngdeepcngdeepcngdeepcngdeepcngdeepcngdeepcng"
+        ml_i=$((ml_i + 1))
+    done
+    if mkdir -p "$ML_ROOT$ml_deep" 2>/dev/null &&
+        printf 'x' > "$ML_ROOT$ml_deep/blob" 2>/dev/null; then
+        out=$(run_t 60 -R "$ML_ROOT" /mapslong "$ml_deep/blob" "$ML_MARK" 2>&1)
+        check_contains "maps a long host path survives whole" \
+            "lines=1 hostleak=0 mapped=1 malformed=0" "$out"
+    else
+        skip "maps long-path leg: the host filesystem refused the path"
+    fi
+
+    # (b) Past any buffer, so the size alone cannot be the whole fix. The kernel
+    # escapes '\n' in the pathname column as the four bytes \012, so a path made
+    # of newlines prints four times its own length: measured, fourteen 251-byte
+    # components print as a 14155-byte line, and PATH_MAX bounds only the path.
+    # A guest can make such a directory inside its own rootfs. Nothing faithful
+    # can be emitted for that line — but half of it is not the answer either,
+    # and re-parsing the second half is what printed the raw host tail.
+    ml_nl=$(printf 'a'; printf '%0249d' 0 | tr '0' '\n'; printf 'b')
+    ml_wide=""
+    ml_i=0
+    while [ "$ml_i" -lt 14 ]; do
+        ml_wide="$ml_wide/$ml_nl"
+        ml_i=$((ml_i + 1))
+    done
+    if mkdir -p "$ML_ROOT$ml_wide" 2>/dev/null &&
+        printf 'x' > "$ML_ROOT$ml_wide/blob" 2>/dev/null; then
+        out=$(run_t 60 -R "$ML_ROOT" /mapslong "$ml_wide/blob" "$ML_MARK" 2>&1)
+        # mapped=0 by construction: the guest names the path in raw bytes and
+        # maps prints it escaped, so the row cannot be found by that spelling.
+        check_contains "maps an unprintable-length path emits no half-line" \
+            "hostleak=0 mapped=0 malformed=0" "$out"
+    else
+        skip "maps escaped-path leg: the host filesystem refused the path"
+    fi
+fi
+rm -rf "$ML_DIR"
+
 # --- guest-shell scenarios -------------------------------------------------
 m11_ready=0
 if [ -n "$M11_ALPINE" ] && [ -x "$M11_ALPINE/bin/busybox" ]; then
