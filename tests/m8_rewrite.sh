@@ -55,6 +55,30 @@ elif guest_cc_report "$ROOT/bin/readfile" tests/guests/readfile.c; then
     fi
 fi
 
+# A thread's clone is a rewritten site like any other, and it is the one site
+# whose child cannot come back through the trampoline: it returns from the
+# dispatcher with SP pointing at the stack the guest just allocated for it,
+# where none of those frames exist. The seccomp tier never meets this, because
+# the filter tests CLONE_VM/CLONE_VFORK and lets a thread run untrapped; -R
+# rewrites everything it can reach, so the dispatcher took the call and stripped
+# CLONE_VM — which with CLONE_THREAD is what the kernel answers EINVAL to.
+# pthread_create did not work under -R at all. Differential against the same
+# program run straight under the kernel, which is what "threads work" means.
+if guest_xlate_ready "threads-under-rewrite leg" &&
+    guest_cc_report "$ROOT/bin/threads" tests/guests/threads.c -lpthread; then
+    printf 'THREADS-OK\n' > "$ROOT/etc/threads-marker"
+    want=$(emu "$ROOT/bin/threads" "$ROOT/etc/threads-marker" 2>/dev/null)
+    out=$(m8run -R "$ROOT" /bin/threads /etc/threads-marker 2>/dev/null); rc=$?
+    check "a threaded guest runs under -R" 0 $rc
+    check_contains "every thread started, opened a guest path and kept its FP" \
+        "threads: started=8 reads=8 tids=8 fp=8" "$out"
+    if [ -n "$want" ]; then
+        check "and matches the same program under the kernel" "$want" "$out"
+    else
+        skip "threads kernel differential: the reference run produced nothing"
+    fi
+fi
+
 # execve from a rewritten svc site must be emulated in-process (translated,
 # monitor kept), not re-issued raw — raw would exec the untranslated guest path
 # on the host and fail with ENOENT.

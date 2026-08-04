@@ -41,7 +41,41 @@
     .balign 8
 cng_svc_tramp_tpl:
     sub     sp, sp, #288
-    stp     x0, x1,   [sp, #0]
+    /* x16/x17 and the flags go in first, because the test below spends them and
+     * every one of the three belongs to the guest.
+     *
+     * A thread's clone must not reach the dispatcher. The child returns from
+     * that call with SP pointing at the stack the guest just allocated for it,
+     * where none of these frames exist — it would restore its register file
+     * from an empty stack. The seccomp tier never has this problem because the
+     * filter lets a thread clone run untrapped (it tests exactly these two
+     * flags); -R rewrites every site it can reach, so the same rule has to be
+     * applied here, where the filter cannot. What is left — a clone making a
+     * process, or a vfork-style one the dispatcher converts — is what the
+     * filter does trap, and goes on below.
+     *
+     * Before the fix the dispatcher took it and stripped CLONE_VM, which with
+     * CLONE_THREAD is what the kernel answers EINVAL to: pthread_create did not
+     * work under -R at all. */
+    stp     x16, x17, [sp, #128]
+    mrs     x16, nzcv
+    str     x16,      [sp, #264]
+    cmp     w8, #220                /* __NR_clone (w8: the kernel reads it as an
+                                     * int, and so does the filter) */
+    b.ne    2f
+    tst     x0, #0x100              /* CLONE_VM: a thread, or a vfork */
+    b.eq    2f
+    tst     x0, #0x4000             /* CLONE_VFORK: the dispatcher converts it */
+    b.ne    2f
+    ldr     x16,      [sp, #264]
+    msr     nzcv, x16
+    ldp     x16, x17, [sp, #128]
+    add     sp, sp, #288
+    svc     #0                      /* exactly what an unrewritten site does */
+    b       cng_svc_tramp_back      /* patched: b S+4 — the child arrives here
+                                     * with the kernel's SP and returns to the
+                                     * guest without touching a frame of ours */
+2:  stp     x0, x1,   [sp, #0]
     stp     x2, x3,   [sp, #16]
     stp     x4, x5,   [sp, #32]
     stp     x6, x7,   [sp, #48]
@@ -49,7 +83,6 @@ cng_svc_tramp_tpl:
     stp     x10, x11, [sp, #80]
     stp     x12, x13, [sp, #96]
     stp     x14, x15, [sp, #112]
-    stp     x16, x17, [sp, #128]
     stp     x18, x19, [sp, #144]
     stp     x20, x21, [sp, #160]
     stp     x22, x23, [sp, #176]
@@ -61,8 +94,6 @@ cng_svc_tramp_tpl:
     str     x16,      [sp, #248]
     ldr     x16, cng_svc_tramp_ret  /* pc = S+4 */
     str     x16,      [sp, #256]
-    mrs     x16, nzcv
-    str     x16,      [sp, #264]
     mov     x0, sp                  /* cng_tramp_dispatch(&frame) */
     ldr     x16, cng_svc_tramp_disp
     blr     x16
