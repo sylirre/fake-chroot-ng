@@ -159,9 +159,19 @@ cng_svc_tramp_tpl_end:
  *
  * Buffer layout, 8 bytes each: d0, d1, d8, d16, d31, fpcr, x16, x17, then the
  * openat result.
+ *
+ * This is the one place in the monitor allowed to name an FP register, so it
+ * has to re-enable them for itself. The build passes -mgeneral-regs-only, which
+ * gcc treats as a codegen flag and never forwards to the assembler, but clang
+ * (Termux/NDK, where cc *is* the assembler) turns into a target feature and
+ * rejects `fmov`/`msr fpcr` outright. `.arch_extension fp` opens exactly this
+ * function and `nofp` below shuts it again, so the ban still holds over the
+ * trampoline template — where an accidental FP instruction would be a real bug,
+ * since it runs on the guest's own register file.
  */
     .global cng_rwtest_fn
     .global cng_rwtest_fn_end
+    .arch_extension fp
     .balign 4
 cng_rwtest_fn:                      /* (void *results, const char *path) */
     mov     x10, x0                 /* result buffer; x0 is about to be a fd */
@@ -234,6 +244,7 @@ cng_rwtest_fn:                      /* (void *results, const char *path) */
     ret
 cng_rwtest_fn_end:
     .size cng_rwtest_fn, . - cng_rwtest_fn
+    .arch_extension nofp
 
 /* Second self-test function: the trampoline's *general* exit, the one taken
  * when the dispatcher hands back a pc or sp the guest did not arrive with —
