@@ -11,11 +11,19 @@
  * tree while the guest build uses its rootfs. Protocol only: the handle bytes
  * are filesystem-specific and are never printed, only whether the call
  * succeeded and what it refused with.
+ *
+ * Called through syscall() rather than the libc wrapper, because bionic hides
+ * the declaration behind __INTRODUCED_IN(30) and Termux's clang targets a lower
+ * API by default — the wrapper builds nowhere on-device, while the syscall
+ * number is in the uapi headers at every level. The house style for a call libc
+ * may not offer (sem_block.c, threads.c) anyway.
  */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 struct fh {
     unsigned handle_bytes;
@@ -31,8 +39,7 @@ static void probe(const char *tag, const char *base, const char *name,
     h.handle_bytes = sizeof h.f_handle;
     int mid = 0;
     errno = 0;
-    int r = name_to_handle_at(AT_FDCWD, p, (struct file_handle *)&h, &mid,
-                              flags);
+    int r = (int)syscall(SYS_name_to_handle_at, AT_FDCWD, p, &h, &mid, flags);
     printf("%s=%s\n", tag,
            r == 0                ? "ok"
            : errno == ENOENT     ? "ENOENT"

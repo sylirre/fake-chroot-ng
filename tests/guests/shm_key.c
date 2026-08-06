@@ -16,6 +16,7 @@
 #include <string.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include "sysvipc.h"
 
 int main(int argc, char **argv) {
     if (argc < 3) return 2;

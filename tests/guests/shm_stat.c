@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include "sysvipc.h"
 
 int main(void) {
     const size_t SZ = 12288;   /* 3 pages: a distinctive size to match on */

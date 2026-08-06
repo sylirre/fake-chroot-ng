@@ -18,6 +18,7 @@
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <sys/wait.h>
+#include "sysvipc.h"
 
 int main(void) {
     const size_t SZ = 8192;

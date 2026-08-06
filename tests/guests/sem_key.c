@@ -20,12 +20,7 @@
 #include <sys/ipc.h>
 #include <sys/msg.h>
 #include <sys/sem.h>
-
-union semun {
-    int val;
-    struct semid_ds *buf;
-    unsigned short *array;
-};
+#include "sysvipc.h"
 
 int main(int argc, char **argv) {
     if (argc < 3)
@@ -52,7 +47,7 @@ int main(int argc, char **argv) {
         char t[16];
     } m;
     if (creat) {
-        union semun u;
+        union cng_semun u;
         u.val = argc > 3 ? atoi(argv[3]) : 0;
         semctl(sid, 0, SETVAL, u);
         m.mtype = 1;

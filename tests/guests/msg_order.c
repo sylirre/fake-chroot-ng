@@ -26,6 +26,7 @@
 #include <sys/mman.h>
 #include <sys/msg.h>
 #include <unistd.h>
+#include "sysvipc.h"
 
 static int q;
 

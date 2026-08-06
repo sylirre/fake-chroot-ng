@@ -18,6 +18,7 @@
 #include <string.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include "sysvipc.h"
 
 static const char *r_of(void *r) {
     return r == (void *)-1 ? strerror(errno) : "ok";

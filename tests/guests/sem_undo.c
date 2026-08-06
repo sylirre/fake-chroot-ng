@@ -17,12 +17,7 @@
 #include <sys/sem.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
-union semun {
-    int val;
-    struct semid_ds *buf;
-    unsigned short *array;
-};
+#include "sysvipc.h"
 
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -31,7 +26,7 @@ int main(void) {
         printf("semget: %s\n", strerror(errno));
         return 1;
     }
-    union semun u;
+    union cng_semun u;
     u.val = 2;
     semctl(sid, 0, SETVAL, u);
     printf("start: %d\n", semctl(sid, 0, GETVAL));

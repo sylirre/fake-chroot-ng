@@ -17,18 +17,12 @@
 #include <sys/msg.h>
 #include <sys/sem.h>
 #include <unistd.h>
+#include "sysvipc.h"
 
 /* glibc hides MSG_EXCEPT behind __USE_GNU; the value is the same everywhere. */
 #ifndef MSG_EXCEPT
 #define MSG_EXCEPT 020000
 #endif
-
-union semun {
-    int val;
-    struct semid_ds *buf;
-    unsigned short *array;
-    struct seminfo *__buf;
-};
 
 static const char *e(void) {
     switch (errno) {
@@ -55,7 +49,7 @@ int main(void) {
     if (sid < 0)
         return 1;
 
-    union semun u;
+    union cng_semun u;
     printf("fresh values: %d %d %d\n", semctl(sid, 0, GETVAL),
            semctl(sid, 1, GETVAL), semctl(sid, 2, GETVAL));
 

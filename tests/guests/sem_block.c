@@ -22,12 +22,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
-
-union semun {
-    int val;
-    struct semid_ds *buf;
-    unsigned short *array;
-};
+#include "sysvipc.h"
 
 /* semtimedop has no glibc prototype in some sysroots; the syscall is stable. */
 #include <sys/syscall.h>
@@ -68,13 +63,13 @@ int main(void) {
     waitpid(p, 0, 0);
 
     /* 2. A wait-for-zero, which is the other way an operation can block. */
-    union semun u;
+    union cng_semun u;
     u.val = 4;
     semctl(sid, 0, SETVAL, u);
     p = fork();
     if (p == 0) {
         usleep(300000);
-        union semun z;
+        union cng_semun z;
         z.val = 0;
         semctl(sid, 0, SETVAL, z);
         _exit(0);

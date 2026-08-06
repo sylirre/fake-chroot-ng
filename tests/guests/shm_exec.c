@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include "sysvipc.h"
 
 int main(int argc, char **argv) {
     struct shmid_ds ds;
