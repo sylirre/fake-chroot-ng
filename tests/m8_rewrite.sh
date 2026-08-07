@@ -17,7 +17,7 @@ check_contains "rewrote the svc sites" "rewrote 2 site" "$rwout"
 # veneer stands at a *call*, and gcc -O2 does hold live values in IP0/IP1 across
 # an `svc`. This line prints only when every sentinel came back.
 check_contains "nothing behind a rewritten syscall is spent from the guest's own" \
-    "openat=4 -> OK" "$rwout"
+    "openat=ok -> OK" "$rwout"
 # The other exit: when a tracer moves pc or sp at a syscall stop there is nowhere
 # to keep them but x16/x17, so that arm still spends the pair — and it has to get
 # everything else right, including entering the pc it was handed.

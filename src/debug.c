@@ -1202,10 +1202,18 @@ int cng_cmd_rwtest(int argc, char **argv, char **envp, unsigned long *auxv) {
         }
 
     int ok = (n >= 2 && got == real && (long)res[8] >= 0 && regs_ok);
+    /* The descriptor number itself is the host's to choose — 3 where the three
+     * standard ones are all that is open, 4 under an emulator that keeps one of
+     * its own — so report whether the call succeeded, and say what went wrong
+     * on its own line when it did not. A test pinned to a literal fd passes on
+     * one host and fails on the other for no reason of ours. */
+    if ((long)res[8] < 0)
+        cng_dprintf(1, "rwtest: openat failed: %ld\n", (long)res[8]);
     cng_dprintf(1,
-                "rwtest: rewrote %d site(s); real_pid=%d fn_pid=%d openat=%ld "
+                "rwtest: rewrote %d site(s); real_pid=%d fn_pid=%d openat=%s "
                 "-> %s\n",
-                n, (int)real, (int)got, (long)res[8], ok ? "OK" : "FAIL");
+                n, (int)real, (int)got, (long)res[8] >= 0 ? "ok" : "failed",
+                ok ? "OK" : "FAIL");
 
     /* The general exit: a pc the guest did not arrive with has to be entered,
      * and everything but the two registers that exit spends has to be back. */
