@@ -1272,11 +1272,16 @@ int cng_cmd_blocktest(int argc, char **argv, char **envp, unsigned long *auxv) {
 int cng_cmd_faulttest(int argc, char **argv, char **envp, unsigned long *auxv) {
     (void)argc;
     (void)argv;
-    (void)envp;
     (void)auxv;
     static struct cng_fs fs;
     cng_fs_init(&fs, "/");
     cng_g_fs = &fs;
+    /* CNG_UACCESS_MEMFD is read through cng_broker_env, which walks this — so
+     * without it the knob that forces the descriptor-backed probe is silently
+     * inert, and the forced run measures whatever the host would have picked
+     * anyway. That went unnoticed because the host it runs on most is qemu,
+     * where process_vm_readv is absent and the fallback is the only tier. */
+    cng_g_host_envp = envp;
 
     void *bad = (void *)0x10; /* non-NULL, and no mapping starts that low */
     char *badv[2] = {(char *)0x10, 0}; /* a readable vector of unreadable strings */
