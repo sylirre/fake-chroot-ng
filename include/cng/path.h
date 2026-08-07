@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Path virtualization core: map guest paths onto host paths using a rootfs plus
  * bind mounts, exactly like proot but mechanism-independent (the SIGSYS monitor
  * calls this; so does the `_xlate` debug command). Lexical `..` canonicalization

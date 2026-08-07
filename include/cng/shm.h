@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* System V shared memory (shmget/shmat/shmdt/shmctl), emulated in-process.
  *
  * Android denies all four syscalls (they are not on the app seccomp allow-list

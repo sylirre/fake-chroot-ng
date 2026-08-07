@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Synthesized /proc files (see include/cng/procfs.h). Freestanding: raw
  * syscalls, cng_dprintf for formatting, no allocator. Every entry point runs
  * inside the SIGSYS handler, so nothing here may block on a lock. */

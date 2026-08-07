@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* M8: ahead-of-time rewriting of `svc #0` sites to per-site trampolines that
  * call the dispatcher directly — skipping the kernel seccomp+SIGSYS round trip.
  *

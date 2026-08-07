@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* long cng_run_on_stack(void *newsp, void *fn, void *a0, void *a1)
  *
  * Switch SP to `newsp`, call fn(a0, a1), then restore SP and return fn's

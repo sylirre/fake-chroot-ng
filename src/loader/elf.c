@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* ul_exec core: map an ELF64 guest into our address space from a read-only fd.
  *
  * Reading the file as data (never execve, never file-backed PROT_EXEC) is what

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* System V semaphores and message queues, emulated in-process.
  *
  * The companion to shm.h. M12 gave the guest its own shared-memory namespace but

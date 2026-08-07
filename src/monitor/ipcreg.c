@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Daemon-side System V semaphores and message queues (see include/cng/ipcreg.h).
  *
  * Ported from the sem/msg half of arm64chroot's proctab.c. Runs only inside the

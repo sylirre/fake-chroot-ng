@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* cng_run() — load the guest program with the userland loader, install the
  * path-translation monitor, and transfer control. Command-line parsing lives in
  * main.c; the parameters below arrive already resolved.

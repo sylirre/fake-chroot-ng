@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Daemon-side System V semaphore and message-queue registry (src/monitor/
  * ipcreg.c). Lives only inside the broker daemon; the guest-side half is
  * sysvipc.h. broker.c owns the rendezvous socket and the poll loop and calls

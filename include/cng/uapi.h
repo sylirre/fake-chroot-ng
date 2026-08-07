@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Self-contained UAPI constants for AArch64 Linux.
  *
  * We deliberately avoid pulling in libc or hunting through kernel headers for

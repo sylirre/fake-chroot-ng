@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* chroot-ng: ptrace-free chroot/bind emulation for rootless, SELinux-restricted
  * Android. Command-line front end.
  *

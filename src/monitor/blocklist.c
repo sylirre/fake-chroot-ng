@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Startup probe of the ambient (Android zygote) seccomp filter.
  *
  * We can re-issue a translated path syscall through the gate, but if Android

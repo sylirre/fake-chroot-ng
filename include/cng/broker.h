@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Unified IPC broker: one per-namespace daemon serving the guest-PID registry
  * table AND the whole of System V IPC — shared memory, semaphores and message
  * queues.

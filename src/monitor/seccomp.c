@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Build and install the seccomp-BPF filter.
  *
  * Logic: if arch != AArch64 -> KILL; else if the syscall's instruction pointer

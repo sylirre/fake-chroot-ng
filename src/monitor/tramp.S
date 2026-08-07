@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Per-site syscall trampoline template + a self-test function (M8).
  *
  * A rewritten `svc #0` at site S becomes `b tramp`. `b` (not `bl`) preserves

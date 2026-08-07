@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* The syscall gate: the ONLY `svc #0` in chroot-ng.
  *
  * long cng_syscall6(long a0,a1,a2,a3,a4,a5, long nr)

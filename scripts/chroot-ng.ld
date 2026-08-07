@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Link chroot-ng at a high fixed base (64 GiB), clear of the 0x400000 region
  * where non-PIE ET_EXEC guests (e.g. gcc's cc1) load. Setting the location
  * counter explicitly makes the first PT_LOAD *start* at the base — unlike

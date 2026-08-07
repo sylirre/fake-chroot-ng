@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* AF_UNIX address containment: a pathname socket carries a filesystem path in
  * sun_path, so it needs the same rootfs/bind translation as any other path
  * argument. Abstract names have no filesystem node and are isolated per rootfs

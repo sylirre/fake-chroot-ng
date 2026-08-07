@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Signal-return trampoline. The kernel resumes here when a handler returns; it
  * must invoke rt_sigreturn to restore the interrupted context. We supply our
  * own (via SA_RESTORER) so we don't depend on a vDSO. rt_sigreturn is not in

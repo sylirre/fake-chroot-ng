@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Signal mediation for traced tasks, and the reserved kick signal.
  *
  * Everything else in the monitor lets the guest's signals reach the guest's own

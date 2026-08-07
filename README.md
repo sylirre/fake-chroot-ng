@@ -207,4 +207,12 @@ design depends on the SELinux `execmem` permission being granted.
 
 ## License
 
-Not yet chosen; to be decided by the project owner before any release.
+**Apache License 2.0** — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+chroot-ng is original, freestanding (no libc) AArch64 C and assembly. The
+guest-PID registry, the synthesized `/proc` files, the System V IPC layer, the
+guest `ptrace` model and the help renderer are ported from the sibling
+[arm64chroot](https://github.com/sylirre/arm64emu-user) emulator, which has the
+same copyright holder and the same license. chroot-ng is functionally comparable
+to `proot` but shares no code with it; `qemu-aarch64` is used only as a
+differential-testing oracle and is neither included nor linked.

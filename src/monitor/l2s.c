@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* link2symlink backing-file scheme (see include/cng/l2s.h). Freestanding: raw
  * syscalls + the cng runtime string helpers only, so it is safe to run inside
  * the SIGSYS handler. Every path here is an already-resolved host path. */

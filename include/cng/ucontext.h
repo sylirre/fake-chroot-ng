@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* AArch64 signal-frame structures, matching the kernel UAPI so the SIGSYS
  * handler can read the trapped syscall's registers and write its return value.
  * Layout is part of the stable arch ABI; we mirror it rather than pull in libc.

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Guest ptrace(2): the shared link registry, the tracee's stop/service loop,
  * and the tracer's request and wait4 handling. See include/cng/ptrace.h for the
  * model; this file is its implementation.

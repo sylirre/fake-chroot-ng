@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* System V shared memory, emulated in-process (see include/cng/shm.h).
  *
  * Ported from arm64chroot's src/sys_ipc.c. The broker daemon (broker.c) is the

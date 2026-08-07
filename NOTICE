@@ -1,0 +1,27 @@
+chroot-ng
+Copyright 2026 Sylirre
+
+This product is licensed under the Apache License, Version 2.0 (see the LICENSE
+file for the full text).
+
+chroot-ng is an original implementation: a freestanding (no libc) AArch64
+runtime that emulates a chroot environment and bind mounts in-process, using a
+seccomp-BPF SIGSYS monitor and ahead-of-time rewriting of `svc #0` sites instead
+of ptrace. The path-containment resolver, the userland ELF loader, the syscall
+monitor and its dispatcher, the link2symlink layer, the AF_UNIX and NETLINK_ROUTE
+emulation, and the freestanding runtime are written from scratch.
+
+Portions are ported from the sibling arm64chroot user-space emulator — among
+them the guest-PID registry, the synthesized /proc files, the System V shared
+memory / semaphore / message-queue layer, the guest ptrace model, and the
+command-line help renderer. Both projects are authored by the same copyright
+holder and licensed identically.
+
+chroot-ng is functionally comparable to proot but shares no code with it; no
+third-party source code is included or distributed with this project. The UAPI
+constants and signal-frame layouts in include/cng/ are re-declared from the
+stable AArch64 Linux syscall ABI rather than copied from kernel headers, which
+is what keeps the freestanding build hermetic.
+
+qemu-aarch64 is used only as a differential-testing oracle (see tests/); it is
+neither included nor linked.

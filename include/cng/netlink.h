@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* NETLINK_ROUTE emulation for hosts that deny app domains rtnetlink (Android).
  * A guest netlink socket is stood in for by one end of an AF_UNIX datagram
  * socketpair whose peer the monitor holds: replies are pushed into the pair,

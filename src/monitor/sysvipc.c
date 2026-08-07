@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* System V semaphores and message queues, guest side (see cng/sysvipc.h).
  *
  * Ported from arm64chroot's src/sys_ipc.c. The emulator there copied every

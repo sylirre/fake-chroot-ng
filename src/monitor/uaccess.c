@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Validated access to guest memory.
  *
  * The dispatcher runs inside the SIGSYS handler, where every signal but SIGSYS

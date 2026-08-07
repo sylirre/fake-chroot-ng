@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Raw syscall layer for AArch64.
  *
  * Every syscall chroot-ng issues goes through the single out-of-line gate

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* NETLINK_ROUTE emulation.
  *
  * Android denies app domains rtnetlink: `socket(AF_NETLINK, …)` may be refused

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Process entry for the freestanding, statically-linked chroot-ng binary.
  *
  * On entry the kernel places the stack pointer at the base of the initial

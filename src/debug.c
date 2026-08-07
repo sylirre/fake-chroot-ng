@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Hidden debug subcommands for testing internals without a real kernel.
  *   _xlate -r ROOT [-b GUEST:HOST]... [-C CWD] [-c CHROOT] PATH...
  * prints guest->host path translations (-c first emulates a chroot to CHROOT).

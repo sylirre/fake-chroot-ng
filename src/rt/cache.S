@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* cng_flush_icache(void *start, void *end)
  *
  * Make freshly-written code visible to the instruction stream on AArch64:

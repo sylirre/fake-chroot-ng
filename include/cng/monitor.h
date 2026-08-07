@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* The in-process syscall monitor: a seccomp filter traps the path-bearing
  * syscalls to SIGSYS (unless the syscall's IP is inside our gate), and the
  * handler translates path arguments via cng_fs before re-issuing the real

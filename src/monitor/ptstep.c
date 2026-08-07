@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* PTRACE_SINGLESTEP, in software.
  *
  * Hardware single-step on AArch64 is PSTATE.SS plus MDSCR_EL1.SS, and the only

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Userland ELF loader (ul_exec): map a guest program into this address space
  * from a read-only file descriptor — no kernel execve, no file-backed
  * PROT_EXEC — so it works off a true noexec mount and lets us instrument the

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Guest-PID registry: the shared memory every guest process publishes its own
  * identity into, so any other guest process can be told apart from a host one
  * and described in guest terms.

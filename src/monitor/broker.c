@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Unified IPC broker (see include/cng/broker.h): the rendezvous, the transport,
  * the detached daemon, and — daemon-side — the System V shared-memory registry.
  *

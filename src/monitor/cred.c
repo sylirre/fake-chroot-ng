@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Fake user identity (--fake-id): the synthetic credential set and the
  * credential syscalls that read and mutate it.
  *

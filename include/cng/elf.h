@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Minimal ELF64 definitions (AArch64, little-endian). */
 #ifndef CNG_ELF_H
 #define CNG_ELF_H

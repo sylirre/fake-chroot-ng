@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* link2symlink: emulate hardlinks with tracked symlinks + a backing file, for
  * hosts that refuse link(2) (Android/SELinux returns EACCES/EXDEV, some EPERM).
  *

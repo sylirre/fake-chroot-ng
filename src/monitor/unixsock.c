@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* AF_UNIX address containment.
  *
  * A pathname socket carries a filesystem path in sun_path, so it needs exactly

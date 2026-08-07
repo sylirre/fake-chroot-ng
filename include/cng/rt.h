@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Freestanding runtime: mem/str helpers and minimal formatted output.
  * No libc — chroot-ng must run with no external dependencies so it behaves
  * identically for glibc, musl, static and Go/Rust guests, and so the SIGSYS

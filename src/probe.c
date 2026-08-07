@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* chroot-ng probe — report the capabilities the in-process design depends on.
  *
  * Run this FIRST on any target device. The whole primary tier (seccomp

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* cng_enter(unsigned long sp, unsigned long entry) -> never returns
  *
  * Emulate the kernel's execve register state: set the stack pointer to our

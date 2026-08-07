@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* In-process execve/execveat emulation.
  *
  * A real kernel execve replaces the address space, wiping our SIGSYS handler

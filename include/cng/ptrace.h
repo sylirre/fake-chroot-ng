@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Guest ptrace(2) emulation.
  *
  * chroot-ng runs the guest natively and in-process, so a guest tracer cannot be

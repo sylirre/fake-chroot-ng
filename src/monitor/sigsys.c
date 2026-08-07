@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* SIGSYS handler + signal installation.
  *
  * On a seccomp RET_TRAP the kernel delivers SIGSYS with the interrupted

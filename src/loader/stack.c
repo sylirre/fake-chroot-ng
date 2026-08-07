@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Build the initial process stack the way the kernel would for execve:
  *   [argc][argv..][NULL][envp..][NULL][auxv pairs..][AT_NULL] + string data.
  * We synthesize the loader-controlled auxv entries (AT_PHDR/ENTRY/BASE/...) and

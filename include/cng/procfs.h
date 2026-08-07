@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Synthesized /proc files.
  *
  * Host /proc passes through (see cng_fs_translate), but a few files there

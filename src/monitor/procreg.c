@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Guest-PID registry (see include/cng/procreg.h). Freestanding: raw syscalls,
  * no allocator, no locks — a CAS-claimed slot per process and a seqlock around
  * the payload. */

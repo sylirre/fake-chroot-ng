@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Syscall dispatcher: translate path arguments of a trapped syscall and
  * re-issue the real syscall through the gate (cng_syscall6), whose IP the
  * seccomp filter allows so we don't re-trap. Runs in-process, so path pointers

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 #include "cng/path.h"
 #include "cng/procreg.h"
 #include "cng/rt.h"

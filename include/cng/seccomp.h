@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Classic-BPF structures and helpers for seccomp filters.
  *
  * Used by the capability probe (M2) and the SIGSYS monitor (M5).  seccomp_data
