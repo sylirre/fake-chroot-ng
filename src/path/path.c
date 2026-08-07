@@ -387,44 +387,61 @@ int cng_fs_translate(const struct cng_fs *fs, const char *path, char *out,
     return 0;
 }
 
+/* Does `host` start with the host prefix `pfx` (of length `len`) at a component
+ * boundary? A zero-length prefix is the identity rootfs, which covers the whole
+ * filesystem and so matches everything. */
+static int host_under(const char *host, const char *pfx, size_t len) {
+    return len == 0 || (strncmp(host, pfx, len) == 0 &&
+                        (host[len] == '/' || host[len] == '\0'));
+}
+
 int cng_fs_untranslate(const struct cng_fs *fs, const char *host, char *out,
                        size_t outsz) {
-    /* Longest host-prefix bind match, reversed. */
-    int best = -1;
+    /* Longest host-prefix match, with the rootfs standing in the same contest as
+     * the binds rather than being consulted only after they all miss.
+     *
+     * Forward, the rule is "longest *guest* prefix wins", and the rootfs is the
+     * shortest prefix there is ("/"), so every matching bind outranks it for
+     * free. The mirror of that rule is this one — and it is not the same thing
+     * as "binds first, rootfs otherwise", because a rootfs that lives *inside*
+     * a bound directory is reachable both ways, and then the bind is the
+     * shorter, less specific of the two.
+     *
+     * That is not a contrived arrangement: on Termux the suite's own rootfs
+     * comes from mktemp under $TMPDIR, which is inside $PREFIX — and $PREFIX is
+     * bound in so a dynamically linked guest can find its linker. Answering
+     * with the bind spelling then reported the guest's own /bin/prog, its cwd,
+     * and every AF_UNIX name it bound as the host path they sit at on the
+     * device, and left the /dev zone and the bind mount points unrecognizable
+     * when a dirfd was resolved back through here. */
+    int best = -2; /* -2 nothing matched, -1 the rootfs, >= 0 that bind */
     size_t blen = 0;
+    size_t rl = strlen(fs->rootfs); /* "" for an identity rootfs */
+    if (host_under(host, fs->rootfs, rl)) {
+        best = -1;
+        blen = rl;
+    }
     for (int i = 0; i < fs->nbinds; i++) {
         const char *bh = fs->binds[i].host;
         size_t hl = strlen(bh);
-        if (hl && strncmp(host, bh, hl) == 0 &&
-            (host[hl] == '/' || host[hl] == '\0') && hl > blen) {
+        if (hl > blen && host_under(host, bh, hl)) {
             best = i;
             blen = hl;
         }
     }
+    if (best == -2)
+        return -1; /* outside the guest view */
+
     /* Truncation is a failure here too, and a bind can make the guest spelling
      * the LONGER of the two — `-b /x:/a/very/long/mount/point` grows every path
      * under it — so this direction is not safe by construction either. Callers
      * read a non-zero return as "outside the guest view" and leave the host
      * name alone, which is the right answer for a name that cannot be said. */
-    if (best >= 0) {
-        const char *suffix = host + blen;
-        size_t n = cng_strlcpy(out, fs->binds[best].guest, outsz);
-        if (n >= outsz || cng_strlcpy(out + n, suffix, outsz - n) >= outsz - n)
-            return -1;
-        if (out[0] == '\0')
-            cng_strlcpy(out, "/", outsz);
-        return 0;
-    }
-
-    size_t rl = strlen(fs->rootfs);
-    if (rl == 0) { /* identity rootfs */
-        return cng_strlcpy(out, host, outsz) >= outsz ? -1 : 0;
-    }
-    if (strncmp(host, fs->rootfs, rl) == 0 &&
-        (host[rl] == '/' || host[rl] == '\0')) {
-        const char *suffix = host + rl;
-        return cng_strlcpy(out, suffix[0] ? suffix : "/", outsz) >= outsz ? -1
-                                                                         : 0;
-    }
-    return -1; /* outside the guest view */
+    const char *suffix = host + blen;
+    size_t n = cng_strlcpy(out, best >= 0 ? fs->binds[best].guest : "", outsz);
+    if (n >= outsz || cng_strlcpy(out + n, suffix, outsz - n) >= outsz - n)
+        return -1;
+    if (out[0] == '\0')
+        cng_strlcpy(out, "/", outsz);
+    return 0;
 }
