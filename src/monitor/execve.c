@@ -315,8 +315,16 @@ static void cng_exec_reset(void) {
         CNG_SYS(__NR_timer_delete, g_timers[i], 0, 0, 0, 0, 0);
     g_ntimers = 0;
     CNG_SYS(__NR_set_tid_address, 0, 0, 0, 0, 0, 0);
-    CNG_SYS(__NR_set_robust_list, 0, 24 /* sizeof(struct robust_list_head) */, 0,
-            0, 0, 0);
+    /* Android blocks set_robust_list (measured: SIGSYS from the zygote filter on
+     * Android 13), and a syscall we know is refused is not one to issue — the
+     * trap would be answered by the gate-net, i.e. by the nested SIGSYS delivery
+     * the design does not want to depend on, and where no handler is installed
+     * at all (the direct-drive `-t exectest` driver) it is simply fatal. The
+     * list is then the old program's to leave behind: nothing we can do about
+     * it on a kernel that will not let us say so. */
+    if (!cng_blocked[__NR_set_robust_list])
+        CNG_SYS(__NR_set_robust_list, 0,
+                24 /* sizeof(struct robust_list_head) */, 0, 0, 0, 0);
     if (cng_g_brk0) {
         long cur = CNG_SYS(__NR_brk, 0, 0, 0, 0, 0, 0);
         if (cur > 0 && (unsigned long)cur > cng_g_brk0)

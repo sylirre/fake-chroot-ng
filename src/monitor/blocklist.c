@@ -46,6 +46,12 @@ static const int probe_set[] = {
      * is what keeps that question out of the SIGSYS handler, where a refused
      * syscall would need nested delivery to survive. */
     __NR_process_vm_readv, __NR_process_vm_writev,
+    /* Nor this one: it is how an emulated execve drops the robust futex list
+     * the old program left behind (execve.c). Android blocks the pair outright
+     * — measured on an Android 13 device — so without this entry the reset
+     * traps once per exec and is answered by the gate-net, which is the nested
+     * delivery the design goes out of its way not to need. */
+    __NR_set_robust_list,
 #ifdef __NR_fchmodat2
     __NR_fchmodat2,
 #endif

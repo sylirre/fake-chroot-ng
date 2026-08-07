@@ -1636,6 +1636,12 @@ int cng_cmd_exectest(int argc, char **argv, char **envp, unsigned long *auxv) {
         cng_fs_add_bind(&fs, bind_g[b], bind_h[b], bind_ro[b]);
     cng_g_fs = &fs;
     cng_host_auxv = auxv;
+    cng_g_host_envp = envp;
+    /* The emulation asks this what the ambient (Android) filter refuses, the
+     * same as it does when the real monitor installs it — and here nothing
+     * catches a SIGSYS, so a syscall issued in ignorance is fatal rather than
+     * merely re-answered. */
+    cng_probe_blocked();
 
     char **gargv = argv + i;
     const char *gpath = gargv[0];
