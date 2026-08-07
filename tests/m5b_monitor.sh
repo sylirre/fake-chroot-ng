@@ -67,12 +67,22 @@ check_contains "chroot needs CAP_SYS_CHROOT (fake-root), else EPERM" \
     "chroot: unpriv=-1 root=0 cwd=/" \
     "$(run -t dtest -r "$ROOT" chroot /sub 2>&1)"
 
-check_contains "faccessat2 AT_SYMLINK_NOFOLLOW answers for the link itself" \
-    "accessnf: nofollow=0 follow=-2" \
-    "$(run -t dtest -r "$ROOT" accessnf /dangling 2>&1)"
-check_contains "...and for an ordinary file both forms agree" \
-    "accessnf: nofollow=0 follow=0" \
-    "$(run -t dtest -r "$ROOT" accessnf /etc/greeting 2>&1)"
+# Android's own seccomp filter refuses faccessat2 (measured on Android 13), and
+# dispatch then answers the ENOSYS an older kernel would have. There is no flag
+# behaviour left to compare there, so the driver says so and this pair sits out.
+nf_out=$(run -t dtest -r "$ROOT" accessnf /dangling 2>&1)
+case "$nf_out" in
+*"accessnf: unavailable"*)
+    skip "faccessat2 legs: the ambient seccomp filter refuses the syscall here"
+    ;;
+*)
+    check_contains "faccessat2 AT_SYMLINK_NOFOLLOW answers for the link itself" \
+        "accessnf: nofollow=0 follow=-2" "$nf_out"
+    check_contains "...and for an ordinary file both forms agree" \
+        "accessnf: nofollow=0 follow=0" \
+        "$(run -t dtest -r "$ROOT" accessnf /etc/greeting 2>&1)"
+    ;;
+esac
 
 # faccessat(2) is a three-argument syscall -- dirfd, path, mode -- and has no
 # flags word; only faccessat2 has one. Read as flags, a stray AT_SYMLINK_NOFOLLOW

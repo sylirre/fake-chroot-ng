@@ -163,6 +163,13 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
         }
     }
     cng_g_fs = &fs;
+    /* What the ambient (Android) filter refuses, measured the same way the real
+     * monitor measures it. Two reasons this driver needs it as much as the
+     * monitor does: dispatch may only answer ENOSYS for a blocked syscall if it
+     * knows which ones those are, and nothing here catches a SIGSYS — so a
+     * re-issue of a refused syscall does not come back as an errno, it kills
+     * the run (faccessat2 on Android 13, measured). */
+    cng_probe_blocked();
 
     if (!strcmp(op, "open")) {
         long fd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
@@ -470,6 +477,14 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
      * dangling one exists (F_OK) where following it is ENOENT. Resolving the
      * final component during translation answered for the target instead. */
     if (!strcmp(op, "accessnf")) {
+        /* Android refuses faccessat2 outright (measured on Android 13), and
+         * dispatch then answers the ENOSYS an older kernel would have — there
+         * is no flag behaviour left to compare. Say so rather than reporting
+         * two ENOSYSes as if they were an answer. */
+        if (cng_blocked[__NR_faccessat2]) {
+            cng_dprintf(1, "accessnf: unavailable (faccessat2 refused here)\n");
+            return 0;
+        }
         long f = cng_dispatch(__NR_faccessat2, CNG_AT_FDCWD, (long)gpath, 0,
                               CNG_AT_SYMLINK_NOFOLLOW, 0, 0, /*trapped=*/0);
         long d = cng_dispatch(__NR_faccessat2, CNG_AT_FDCWD, (long)gpath, 0, 0,
