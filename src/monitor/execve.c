@@ -95,13 +95,19 @@ void cng_close_cloexec(void) {
     sys_close((int)dfd);
 }
 
-/* Shebang nesting, as fs/exec.c bounds it. The kernel's limit is
- * BINPRM_MAX_RECURSION, and what that works out to in scripts is five: a chain
- * of five #! files runs, and the sixth is -ELOOP. Measured, not read — at four
- * this refused a chain the kernel executes. Each level needs its interpreter
- * (and optional argument) to stay alive until the stack is built, since both
- * end up in the new argv. */
-#define SHEB_MAX   5
+/* Shebang nesting, as fs/exec.c bounds it: a chain of SHEB_MAX #! files runs and
+ * the next one is -ELOOP. Each level needs its interpreter (and optional
+ * argument) to stay alive until the stack is built, since both end up in the
+ * new argv.
+ *
+ * Measured, not read — at four this refused a chain the kernel executes. And it
+ * is not one number across kernels: the same ladder of scripts ending in an ELF
+ * runs six deep on the Android 13 device (5.15 GKI, seventh -ELOOP) and five
+ * deep on a 6.17 dev host (sixth -ELOOP). We advertise 6.1.0 through uname and
+ * exist to run on Android, so the device's answer is the one to match; a guest
+ * never reaches the host kernel with these anyway, which is why the divergence
+ * costs a level of nesting off-device and nothing else. */
+#define SHEB_MAX   6
 #define SHEB_WORD  256
 /* Pointer slots reserved ahead of the snapshot's argv for the shebang chain.
  * Each level contributes its interpreter and at most one argument, and the

@@ -81,11 +81,16 @@ if guest_cc_report "$ER/hello" tests/guests/hello.c; then
     # chain shows up in the final argv — which is the only way to see that the
     # levels ran in order rather than being collapsed.
     #
-    # d1 is one script level, d2 two, and so on. The depth the kernel stops at is
-    # measured rather than encoded: an identical chain is built on the host and
-    # the deepest one that runs is the number the guest has to match. It did not
-    # — the emulation stopped one level early and refused a chain the kernel
-    # executes, which no amount of reading fs/exec.c had settled.
+    # d1 is one script level, d2 two, and so on. The depth is measured rather
+    # than read: at four the emulation refused a chain the kernel executes, which
+    # no amount of reading fs/exec.c had settled.
+    #
+    # The host kernel's own answer is measured too, but as a sanity range rather
+    # than as the number to match — it is not a constant across kernels. The same
+    # ladder runs six deep on an Android 13 device (5.15 GKI) and five deep on a
+    # 6.17 dev host, both then ELOOP. The emulation carries one number and
+    # advertises 6.1.0, so it matches the device; what every host must show is
+    # that number followed by ELOOP.
     _d=1
     printf '#!/hello\n' >"$ER/d1"
     while [ $_d -lt 8 ]; do
@@ -121,10 +126,9 @@ if guest_cc_report "$ER/hello" tests/guests/hello.c; then
         GDEPTH=$_d
         _d=$((_d + 1))
     done
-    check "a #! chain nests exactly as deep as the kernel allows" "$KDEPTH" \
-        "$GDEPTH"
+    check "a #! chain nests as deep as the emulation bounds it" 6 "$GDEPTH"
     check_contains "one level past that is ELOOP" "emulate_execve failed x0=-40" \
-        "$(exectest "/d$((KDEPTH + 1))" AA 2>&1)"
+        "$(exectest "/d$((GDEPTH + 1))" AA 2>&1)"
 
     # The whole chain, in order, in the final argv: four levels is enough to
     # show the pushing-down without depending on where the limit sits.
