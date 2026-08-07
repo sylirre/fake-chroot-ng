@@ -144,7 +144,10 @@ int cng_uaccess_probe_setup(void) {
         cng_blocked[__NR_process_vm_writev]) {
         v = 0;
     } else {
-        char here;
+        /* Only the address of `here` is under test; the byte read out of it is
+         * thrown away. It is initialized anyway, so that reading it is not the
+         * undefined behaviour the compiler warns it would otherwise be. */
+        char here = 0;
         v = pvm(&here, sizeof here, 0) == (long)sizeof here;
     }
     __atomic_store_n(&g_pvm, v, __ATOMIC_RELEASE);
