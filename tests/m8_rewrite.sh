@@ -141,7 +141,8 @@ printf 'guest\n' > "$SSR/etc/hostname"
 if guest_xlate_ready "small-stack syscall leg" &&
     guest_cc_report "$SSR/smallstack" tests/guests/smallstack.c; then
     for _k in 8 16 64; do
-        out=$(run_t 60 -R "$SSR" /smallstack $_k 2>/dev/null)
+        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
+        out=$(run_t 60 -R $GUEST_BINDS "$SSR" /smallstack $_k 2>/dev/null)
         check "a syscall on a ${_k} KiB guest stack writes nothing below it" \
             "clobbered=0" "$out"
     done

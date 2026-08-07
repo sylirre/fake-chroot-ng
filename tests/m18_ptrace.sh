@@ -187,8 +187,9 @@ else
     # bound in so it can be loaded, and the trace must still read the guest's
     # own string rather than the translated host path.
     mkdir -p "$PT_DIR/rootfs"
-    out=$(run_t 90 -R -b "$PT_DIR:$PT_DIR" "$PT_DIR/rootfs" "$PT_GUEST" \
-        patharg 2>/dev/null)
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+    out=$(run_t 90 -R $GUEST_BINDS -b "$PT_DIR:$PT_DIR" "$PT_DIR/rootfs" \
+        "$PT_GUEST" patharg 2>/dev/null)
     check_contains "no host path reaches the trace under a rootfs" \
         "openat path /cng-probe-path" "$out"
 

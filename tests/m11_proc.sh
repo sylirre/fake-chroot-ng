@@ -131,7 +131,9 @@ if guest_xlate_ready "maps over-long-line legs" &&
     done
     if mkdir -p "$ML_ROOT$ml_deep" 2>/dev/null &&
         printf 'x' > "$ML_ROOT$ml_deep/blob" 2>/dev/null; then
-        out=$(run_t 60 -R "$ML_ROOT" /mapslong "$ml_deep/blob" "$ML_MARK" 2>&1)
+        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
+        out=$(run_t 60 -R $GUEST_BINDS "$ML_ROOT" /mapslong "$ml_deep/blob" \
+            "$ML_MARK" 2>&1)
         check_contains "maps a long host path survives whole" \
             "lines=1 hostleak=0 mapped=1 malformed=0" "$out"
     else
@@ -154,7 +156,9 @@ if guest_xlate_ready "maps over-long-line legs" &&
     done
     if mkdir -p "$ML_ROOT$ml_wide" 2>/dev/null &&
         printf 'x' > "$ML_ROOT$ml_wide/blob" 2>/dev/null; then
-        out=$(run_t 60 -R "$ML_ROOT" /mapslong "$ml_wide/blob" "$ML_MARK" 2>&1)
+        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
+        out=$(run_t 60 -R $GUEST_BINDS "$ML_ROOT" /mapslong "$ml_wide/blob" \
+            "$ML_MARK" 2>&1)
         # mapped=0 by construction: the guest names the path in raw bytes and
         # maps prints it escaped, so the row cannot be found by that spelling.
         check_contains "maps an unprintable-length path emits no half-line" \
