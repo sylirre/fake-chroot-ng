@@ -17,7 +17,7 @@
 /* 0.1.0 reversed -b to SRC:DST (host first), matching arm64chroot. This tree
  * reaches devices by hand-copy, so the version must distinguish a build that
  * carries the old GUEST:HOST order from one that does not. */
-#define CNG_VERSION "0.1.0"
+#define CNG_VERSION "1.0.0"
 
 /* The kernel identity the guest is told about, by uname(2) and by
  * /proc/version, which must agree — faking one and leaking the other through

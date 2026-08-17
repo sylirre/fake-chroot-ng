@@ -328,8 +328,7 @@ static void help(char **envp) {
                       "resolve to SRC on the host; append ':ro' to make the "
                       "mount read-only (mutating syscalls under it answer "
                       "EROFS). DST must be absolute; host paths may not contain "
-                      "':'. Note the order is host-first, matching arm64chroot "
-                      "— it was GUEST:HOST before 0.1.0."},
+                      "':'."},
         {"-E, --env VAR=VAL", "Set a guest environment variable (repeatable, up "
                       "to 128). The guest does NOT inherit chroot-ng's "
                       "environment: a host variable describes the host, not the "
