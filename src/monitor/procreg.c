@@ -180,7 +180,20 @@ static int open_broker(const char *key, unsigned long size) {
  * invocation maps MAP_SHARED. The ftruncate is idempotent under racing
  * creators and guarantees a fully-backed, zero-filled mapping (a fresh file
  * is an all-free table, since pid == 0 means free). Registry writes are rare
- * (exec/fork/chdir), so a non-tmpfs dir costs nothing noticeable. */
+ * (exec/fork/chdir), so a non-tmpfs dir costs nothing noticeable.
+ *
+ * Unlike the shm backing file, this name cannot be random: it IS the
+ * rendezvous — separate invocations of --shared-proc find each other by
+ * computing it. So the file is proved to be ours after it is opened instead.
+ * The directory is /tmp or /dev/shm, writable by everyone on the machine, and
+ * without this any of them could leave a symlink or a file of their own on the
+ * name: the ftruncate below would then have cut down whatever it pointed at,
+ * and the mapping would have been shared with its owner — a table this process
+ * publishes its pids, cwd and exe path into, and trusts when answering /proc.
+ * O_NOFOLLOW stops the symlink; the fstat stops the rest. A name that fails
+ * either is not adopted and not touched: the caller degrades to the
+ * per-process anonymous tier, which is a lost namespace but never a shared
+ * one. */
 static int open_shared_file(const char *key, unsigned long size) {
     const char *dir = cng_broker_shared_dir();
     if (!dir)
@@ -192,9 +205,24 @@ static int open_shared_file(const char *key, unsigned long size) {
     if (n >= sizeof path)
         return 0;
     long fd = sys_openat(CNG_AT_FDCWD, path,
-                         CNG_O_RDWR | CNG_O_CREAT | CNG_O_CLOEXEC, 0600);
+                         CNG_O_RDWR | CNG_O_CREAT | CNG_O_NOFOLLOW |
+                             CNG_O_CLOEXEC,
+                         0600);
     if (fd < 0)
         return 0;
+    char st[144];
+    unsigned mode, uid;
+    if (CNG_SYS(__NR_fstat, fd, (long)st, 0, 0, 0, 0) != 0) {
+        sys_close((int)fd);
+        return 0;
+    }
+    mode = *(unsigned *)(st + 16); /* st_mode */
+    uid = *(unsigned *)(st + 24);  /* st_uid  */
+    if ((mode & 0170000) != 0100000 || (mode & 077) != 0 ||
+        uid != (unsigned)sys_getuid()) {
+        sys_close((int)fd);
+        return 0; /* not a private regular file of ours: leave it alone */
+    }
     if (sys_ftruncate((int)fd, (long)size) != 0) {
         sys_close((int)fd);
         return 0;
@@ -221,7 +249,12 @@ void cng_procreg_init(const char *shared_key) {
         return;
     unsigned long sz = cng_procreg_table_size();
     if (shared_key && *shared_key) {
-        if (open_broker(shared_key, sz)) {
+        /* CNG_PROCREG_FORCE_FILE=1: skip the broker so the named-file tier is
+         * the one exercised. It is otherwise only reached on a host without
+         * memfd_create — nothing a dev host or a device offers — and it is the
+         * tier that has to prove it will not adopt somebody else's file. */
+        if (!cng_broker_env("CNG_PROCREG_FORCE_FILE") &&
+            open_broker(shared_key, sz)) {
             cng_g_procreg_backing = CNG_PROCREG_B_BROKER;
             return;
         }

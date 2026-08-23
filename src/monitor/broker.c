@@ -110,6 +110,37 @@ static unsigned ipc_addr(struct cng_sockaddr_un *a) {
     return cng_broker_self_addr(a);
 }
 
+/* Is the process on the other end of this connection us?
+ *
+ * The rendezvous is an ABSTRACT socket: it has no inode, so no directory
+ * permission stands between the name and anyone else on the machine, and the
+ * --shared-proc name is a plain hash of the rootfs — anybody can compute it,
+ * bind it first, and then serve a namespace of their own to our guest (a PID
+ * table it trusts for /proc, a memfd it maps as shared memory, a message queue
+ * it reads), or connect to ours and read whatever a guest put in a segment. The
+ * kernel will tell us who is there, so ask: SO_PEERCRED reports the credentials
+ * the peer had at connect(), which no client can forge.
+ *
+ * The identity is the uid the socket NAME is keyed on, so the two always agree:
+ * a guest that really changes its uid computes a different name and gets its own
+ * namespace, rather than being refused this one. A guest that changes only its
+ * effective uid keeps the name and is refused — no host in the target
+ * environment lets it (Android denies the credential setters outright, and
+ * --fake-id emulates them), and a refusal is the safe direction.
+ *
+ * Returns 1 for a peer we accept. A kernel that cannot answer (SO_PEERCRED is
+ * ancient, but a sandbox may still refuse the getsockopt) leaves the check
+ * unmade rather than closing every connection. */
+static int peer_is_ours(int sock) {
+    unsigned uc[3] = {0, 0, 0}; /* struct ucred: pid, uid, gid */
+    unsigned len = sizeof uc;
+    if (CNG_SYS(__NR_getsockopt, sock, CNG_SOL_SOCKET, CNG_SO_PEERCRED, uc,
+                &len, 0) != 0 ||
+        len < sizeof uc)
+        return 1;
+    return uc[1] == (unsigned)sys_getuid() || uc[1] == (unsigned)sys_geteuid();
+}
+
 /* ---- transport ---------------------------------------------------------- */
 
 /* Exactly `len` bytes in each direction, looping over short transfers. The
@@ -422,9 +453,10 @@ static s32 shm_alloc_id(void) {
 /* Create a segment's backing: an anonymous memfd (the normal, Android-safe
  * path) or — where memfd_create is unavailable, or CNG_SHM_FORCE_FILE forces it
  * for a test — a file in the first writable dir. `path_out` gets the file path
- * (to unlink on free) or "". Returns the fd, or -1 (no backing: the caller
- * fails the syscall rather than handing back memory nobody can share). */
-static int shm_make_backing(u64 size, s32 shmid, char *path_out, size_t path_sz) {
+ * (to unlink on free) or "". The file's name says nothing about the segment:
+ * see the note below. Returns the fd, or -1 (no backing: the caller fails the
+ * syscall rather than handing back memory nobody can share). */
+static int shm_make_backing(u64 size, char *path_out, size_t path_sz) {
     path_out[0] = '\0';
     long fd = -1;
     if (!cng_broker_env("CNG_SHM_FORCE_FILE"))
@@ -433,15 +465,42 @@ static int shm_make_backing(u64 size, s32 shmid, char *path_out, size_t path_sz)
         const char *dir = cng_broker_shared_dir();
         if (!dir)
             return -1;
-        size_t n = cng_snprintf(path_out, path_sz, "%s/chroot-ng-shm.v1.%u.%d",
-                                dir, (unsigned)sys_getuid(), (int)shmid);
-        if (n >= path_sz) {
-            path_out[0] = '\0';
-            return -1;
+        /* The directory this lands in is /tmp or /dev/shm — writable by every
+         * user on the machine — and nothing outside this daemon ever needs to
+         * find the file by name: attachers are handed the descriptor over
+         * SCM_RIGHTS, and the path is kept only to unlink it again. So the name
+         * carries no meaning at all, just 64 random bits, and it is created
+         * with O_EXCL|O_NOFOLLOW.
+         *
+         * Named after the segment (which is what this used to do) it was both
+         * guessable and re-openable: another user could pre-create the name as
+         * a symlink and have O_TRUNC destroy whatever it pointed at, or leave a
+         * file of their own there and read every byte the guest put in the
+         * segment. O_EXCL is what makes the creation the whole test — a name
+         * that is already taken, symlink or not, is simply not ours. */
+        for (int tries = 0; tries < 8 && fd < 0; tries++) {
+            u64 tag = 0;
+            if (sys_getrandom(&tag, sizeof tag, 0) != (long)sizeof tag) {
+                /* No getrandom (pre-3.17): the name only has to be unlikely,
+                 * and O_EXCL catches it when it is not. */
+                struct cng_timespec ts = {0, 0};
+                sys_clock_gettime(CNG_CLOCK_MONOTONIC, &ts);
+                tag = ((u64)sys_getpid() << 40) ^ ((u64)ts.tv_sec << 20) ^
+                      (u64)ts.tv_nsec ^ ((u64)tries << 56);
+            }
+            size_t n = cng_snprintf(path_out, path_sz,
+                                    "%s/chroot-ng-shm.v1.%u.%016llx", dir,
+                                    (unsigned)sys_getuid(),
+                                    (unsigned long long)tag);
+            if (n >= path_sz) {
+                path_out[0] = '\0';
+                return -1;
+            }
+            fd = sys_openat(CNG_AT_FDCWD, path_out,
+                            CNG_O_RDWR | CNG_O_CREAT | CNG_O_EXCL |
+                                CNG_O_NOFOLLOW | CNG_O_CLOEXEC,
+                            0600);
         }
-        fd = sys_openat(CNG_AT_FDCWD, path_out,
-                        CNG_O_RDWR | CNG_O_CREAT | CNG_O_TRUNC | CNG_O_CLOEXEC,
-                        0600);
         if (fd < 0) {
             path_out[0] = '\0';
             return -1;
@@ -499,7 +558,7 @@ static s32 shm_do_get(const struct cng_breq *q) {
     if (id < 0)
         return -ENOSPC;
     char path[128];
-    int fd = shm_make_backing(q->size, id, path, sizeof path);
+    int fd = shm_make_backing(q->size, path, sizeof path);
     if (fd < 0)
         return -ENOSPC; /* fail loud: no backing available */
     struct seg *s = &g_seg[slot];
@@ -827,6 +886,10 @@ static _Noreturn void broker_main(struct cng_sockaddr_un *a, unsigned al) {
             cng_ipc_poll_ready(pf, 1, nfds);
             if (pf[0].revents & CNG_POLLIN) {
                 long c = CNG_SYS(__NR_accept4, ls, 0, 0, CNG_SOCK_CLOEXEC, 0, 0);
+                if (c >= 0 && !peer_is_ours((int)c)) {
+                    sys_close((int)c); /* somebody else's process: not a client */
+                    c = -1;
+                }
                 if (c >= 0) {
                     struct cng_timeval tv = {2, 0}; /* never wedge on a client */
                     CNG_SYS(__NR_setsockopt, c, CNG_SOL_SOCKET, CNG_SO_RCVTIMEO,
@@ -969,8 +1032,16 @@ static int broker_connect(struct cng_sockaddr_un *a, unsigned al) {
         CNG_SYS(__NR_setsockopt, s, CNG_SOL_SOCKET, CNG_SO_SNDTIMEO, &tv,
                 sizeof tv, 0);
         long cr = CNG_SYS(__NR_connect, s, a, al, 0, 0, 0);
-        if (cr == 0)
-            return (int)s;
+        if (cr == 0) {
+            if (peer_is_ours((int)s))
+                return (int)s;
+            /* Somebody else holds the name. They will keep holding it, so
+             * there is nothing to retry and nothing to spawn: the caller fails
+             * the IPC call, and --shared-proc's registry degrades to its file
+             * tier rather than joining a namespace we do not own. */
+            sys_close((int)s);
+            return -1;
+        }
         sys_close((int)s);
         if (cr != -ECONNREFUSED && cr != -ENOENT)
             return -1; /* unexpected (sandbox?): give up */

@@ -1909,6 +1909,47 @@ vfork/`posix_spawn` child-stack handling.
     runs `tests/guests/openat2.c` twice, once with no emulation, and demands the
     host kernel's answers for all 21 cases byte for byte.
 
+- [x] **M25 — the three objects chroot-ng leaves where everyone can reach them**
+  `cng_broker_shared_dir()` is `/dev/shm`, `$XDG_RUNTIME_DIR`, `$TMPDIR`,
+  `/data/local/tmp` or `/tmp` — on a normal machine, a directory every user may
+  create names in. Two files and one socket lived there under names anybody
+  could work out, and none of them checked who it was talking to.
+  - **The System V shm backing file** (the fallback where `memfd_create` is
+    unavailable) was `chroot-ng-shm.v1.<uid>.<shmid>`, opened
+    `O_CREAT|O_TRUNC` with neither `O_EXCL` nor `O_NOFOLLOW`. A symlink left on
+    that name had the `O_TRUNC` destroy whatever it pointed at; a file left on it
+    was read back by its owner with the guest's shared memory in it. Nothing
+    outside the daemon ever needs to find it — attachers are handed the
+    descriptor over `SCM_RIGHTS`, and the path is kept only to unlink again — so
+    the name now carries nothing but 64 random bits and the creation is
+    `O_EXCL|O_NOFOLLOW`, which makes taking the name the whole test.
+  - **The process registry's named-file tier** cannot do that: its name *is* how
+    separate `--shared-proc` invocations find each other. So it proves the file
+    is its own after opening it — `O_NOFOLLOW`, then a regular file, owned by us,
+    with no group or other permission — and declines anything else rather than
+    `ftruncate`ing it and mapping it shared. Declining costs a shared namespace
+    (it degrades to the per-process anonymous table); adopting cost the guest's
+    pid table, cwd and exe path, which `/proc` then answers from.
+  - **The broker rendezvous is an abstract socket**, so it has no inode and no
+    directory permission stands between the name and anyone else on the machine
+    — and the `--shared-proc` name is a plain hash of the rootfs path, which
+    anybody can compute. Both ends now ask `SO_PEERCRED`, which reports
+    credentials the peer had at `connect()` and cannot forge: a daemon refuses a
+    client that is not us, and a client refuses to join a daemon that is not
+    ours (and does not retry or spawn — the name is held, so `--shared-proc`
+    degrades to the file tier instead). The identity is the uid the socket name
+    is keyed on, so the two always agree.
+  - Validated by `-t sharedtest` (a symlink and a world-readable file planted on
+    the registry's exact name, each declined with the planted file left intact,
+    against a control that shows the tier does engage) and a `shmtest` leg that
+    weighs every backing file in the shared directory against the shape it must
+    now have — asserted in both directions, since the memfd tier must leave no
+    file at all. `CNG_PROCREG_FORCE_FILE=1` reaches the registry's file tier,
+    which is otherwise only used on a host without `memfd_create`.
+  - Not covered by the suite: the peer-credential *refusal*, which needs a
+    second uid to produce. What the suite does hold is the other direction —
+    every broker-backed leg in M11/M12/M20/M22 goes through the check.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

@@ -289,3 +289,22 @@ if [ "$m11_ready" -eq 1 ]; then
     wait "$m11_bg" 2>/dev/null
 fi
 rm -rf "$M11TMP"
+
+# The registry's named-file tier is the one object here whose name CANNOT be
+# random: separate --shared-proc invocations find each other by computing it, in
+# a directory (/dev/shm, /tmp) every user on the machine may write to. So it
+# proves the file is its own after opening it — O_NOFOLLOW, then a regular file,
+# owned by us, with no group or other permission — and declines anything else
+# rather than ftruncating it and mapping it shared. Driven through
+# CNG_PROCREG_FORCE_FILE, since that tier is otherwise reached only on a host
+# without memfd_create.
+SHT=$(mktemp -d)
+out=$(CNG_PROCREG_FORCE_FILE=1 run -t sharedtest "$SHT" 2>&1); rc=$?
+check "sharedtest overall" 0 "$rc"
+check_contains "a symlink on the registry name is declined, and its target kept" \
+    "sharedtest symlinked registry declined=1 victim_intact=1 -> OK" "$out"
+check_contains "so is a file with permission our own 0600 creation never gives" \
+    "sharedtest world-readable registry declined=1 -> OK" "$out"
+check_contains "...while an unplanted name is adopted, so those are refusals" \
+    "sharedtest an unplanted name is adopted=1 -> OK" "$out"
+rm -rf "$SHT"

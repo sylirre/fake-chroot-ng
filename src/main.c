@@ -56,6 +56,8 @@ int cng_cmd_argvtest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_elfspan(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_imgtest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_o2test(int argc, char **argv, char **envp, unsigned long *auxv);
+int cng_cmd_sharedtest(int argc, char **argv, char **envp,
+                       unsigned long *auxv);
 int cng_cmd_clonetest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_clonestktest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv);
@@ -87,6 +89,7 @@ static const struct test_entry g_tests[] = {
     {"elfspan", cng_cmd_elfspan},
     {"imgtest", cng_cmd_imgtest},
     {"o2test", cng_cmd_o2test},
+    {"sharedtest", cng_cmd_sharedtest},
     {"clonetest", cng_cmd_clonetest},
     {"clonestktest", cng_cmd_clonestktest},
     {"proctest", cng_cmd_proctest},   {"bpftest", cng_cmd_bpftest},
@@ -450,6 +453,9 @@ static void help(char **envp) {
         {"CNG_MMAP_FORCE_ANON", "Serve every executable file mapping from an "
                       "anonymous copy without asking the kernel first. Test "
                       "aid: it is what a true noexec mount forces anyway."},
+        {"CNG_PROCREG_FORCE_FILE", "With --shared-proc: skip the broker and use "
+                      "the named-file registry tier. Test aid: that tier is "
+                      "otherwise reached only without memfd_create."},
     };
     static const char *const examples[] = {
         "chroot-ng --probe",

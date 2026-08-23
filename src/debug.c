@@ -2956,6 +2956,126 @@ int cng_cmd_o2test(int argc, char **argv, char **envp, unsigned long *auxv) {
     return fails ? 1 : 0;
 }
 
+/* _sharedtest — the two objects chroot-ng leaves in a world-writable directory.
+ *
+ * cng_broker_shared_dir() is /dev/shm, $XDG_RUNTIME_DIR, $TMPDIR, /data/local/tmp
+ * or /tmp — on a normal machine every user can create names there. The System V
+ * shm backing file gets an unguessable name and O_EXCL, so there is nothing to
+ * squat; the process registry cannot, because its name IS how separate
+ * --shared-proc invocations find each other, so it proves the file is ours after
+ * opening it instead. This drives the second: plant a symlink, then a file with
+ * group/other permission, on the exact name the registry will compute, and the
+ * tier must decline both — leaving the planted file untouched and degrading to
+ * the per-process anonymous table rather than sharing one it does not own.
+ *
+ * Each case runs in a fork, since cng_procreg_init is one-shot per process.
+ */
+static int shared_child(const char *key) {
+    cng_procreg_init(key);
+    /* The file tier must not have been adopted. Reported as the exit status so
+     * the parent can tell "declined" from "took it". */
+    return cng_g_procreg_backing == CNG_PROCREG_B_FILE ? 1 : 0;
+}
+
+int cng_cmd_sharedtest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)auxv;
+    cng_g_host_envp = envp;
+    const char *scratch = argc > 1 ? argv[1] : "/tmp";
+    int fails = 0;
+
+    const char *dir = cng_broker_shared_dir();
+    if (!dir) {
+        cng_dprintf(1, "sharedtest: no writable shared dir -> SKIP\n");
+        return 0;
+    }
+    /* A key nobody else can be using: the scratch directory mktemp made. */
+    char path[CNG_PATH_MAX];
+    size_t n = cng_snprintf(path, sizeof path, "%s/chroot-ng-procreg.v1.%u.%x",
+                            dir, (unsigned)sys_getuid(),
+                            cng_broker_key_hash(scratch));
+    if (n >= sizeof path) {
+        cng_dprintf(1, "sharedtest: name does not fit -> SKIP\n");
+        return 0;
+    }
+    char victim[CNG_PATH_MAX];
+    n = cng_snprintf(victim, sizeof victim, "%s/cng-sharedtest-victim", scratch);
+    if (n >= sizeof victim) {
+        cng_dprintf(1, "sharedtest: victim name does not fit -> SKIP\n");
+        return 0;
+    }
+
+    /* Case 1: the name is a symlink onto a file of ours. Following it would
+     * ftruncate that file to the table's size and then share it. */
+    CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, (long)path, 0, 0, 0, 0);
+    long vfd = sys_openat(CNG_AT_FDCWD, victim,
+                          CNG_O_RDWR | CNG_O_CREAT | CNG_O_TRUNC, 0600);
+    int wrote = vfd >= 0 && sys_write((int)vfd, "keep-me", 7) == 7;
+    if (vfd >= 0)
+        sys_close((int)vfd);
+    long sl = CNG_SYS(__NR_symlinkat, (long)victim, CNG_AT_FDCWD, (long)path, 0,
+                      0, 0);
+    int declined = 0, intact = 0;
+    if (wrote && sl == 0) {
+        long p = sys_fork();
+        if (p == 0)
+            sys_exit_group(shared_child(scratch));
+        int st = 0;
+        sys_wait4((int)p, &st, 0, 0);
+        declined = ((st & 0x7f) == 0 && ((st >> 8) & 0xff) == 0);
+        char sb[144];
+        intact = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, (long)victim, (long)sb,
+                         0, 0, 0) == 0 &&
+                 *(unsigned long *)(sb + 48) == 7; /* st_size */
+    }
+    int ok = wrote && sl == 0 && declined && intact;
+    cng_dprintf(1, "sharedtest symlinked registry declined=%d victim_intact=%d"
+                   " -> %s\n",
+                declined, intact, ok ? "OK" : "FAIL");
+    fails += !ok;
+    CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, (long)path, 0, 0, 0, 0);
+
+    /* Case 2: a real file on the name, but group/other-readable — which our own
+     * 0600 creation never produces, so somebody else put it there. */
+    long ffd = sys_openat(CNG_AT_FDCWD, path,
+                          CNG_O_RDWR | CNG_O_CREAT | CNG_O_TRUNC, 0666);
+    int declined2 = 0;
+    if (ffd >= 0) {
+        CNG_SYS(__NR_fchmod, ffd, 0666, 0, 0, 0, 0); /* past any umask */
+        sys_close((int)ffd);
+        long p = sys_fork();
+        if (p == 0)
+            sys_exit_group(shared_child(scratch));
+        int st = 0;
+        sys_wait4((int)p, &st, 0, 0);
+        declined2 = ((st & 0x7f) == 0 && ((st >> 8) & 0xff) == 0);
+    }
+    ok = ffd >= 0 && declined2;
+    cng_dprintf(1, "sharedtest world-readable registry declined=%d -> %s\n",
+                declined2, ok ? "OK" : "FAIL");
+    fails += !ok;
+    CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, (long)path, 0, 0, 0, 0);
+
+    /* ...and the control: with nothing planted, the tier IS adopted, so the two
+     * refusals above are refusals and not a tier that never engages. */
+    int adopted = 0;
+    {
+        long p = sys_fork();
+        if (p == 0)
+            sys_exit_group(shared_child(scratch));
+        int st = 0;
+        sys_wait4((int)p, &st, 0, 0);
+        adopted = ((st & 0x7f) == 0 && ((st >> 8) & 0xff) == 1);
+    }
+    cng_dprintf(1, "sharedtest an unplanted name is adopted=%d -> %s\n", adopted,
+                adopted ? "OK" : "FAIL");
+    fails += !adopted;
+    CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, (long)path, 0, 0, 0, 0);
+    CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, (long)victim, 0, 0, 0, 0);
+
+    cng_dprintf(1, "sharedtest: %d failure(s)\n", fails);
+    return fails ? 1 : 0;
+}
+
 /* _imgtest — an ET_EXEC guest is mapped MAP_FIXED at its link-time vaddr, and
  * the monitor is in the same address space. A vaddr reaching chroot-ng's own
  * image therefore does not fail: it succeeds, over the code performing the
@@ -4579,6 +4699,67 @@ int cng_cmd_ptracetest(int argc, char **argv, char **envp, unsigned long *auxv) 
  */
 #define SHMT_SZ 8192
 
+/* Every "chroot-ng-shm.v1.<our uid>." entry in the shared directory, weighed
+ * against the shape the daemon now gives them: sixteen hex digits of randomness
+ * and nothing else, a plain file, mode 0600, ours. The name used to end in the
+ * shmid, which made it both guessable and re-openable by anyone with write
+ * access to /tmp or /dev/shm — a symlink left on it had O_TRUNC destroy whatever
+ * it pointed at, and a file left on it was read back by its owner with the
+ * guest's shared memory in it. Returns the count and, through *bad, how many
+ * failed. -1 if the directory could not be listed at all. */
+static int shm_scan_files(int *bad) {
+    *bad = 0;
+    const char *dir = cng_broker_shared_dir();
+    if (!dir)
+        return -1;
+    long fd = sys_openat(CNG_AT_FDCWD, dir,
+                         CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
+    if (fd < 0)
+        return -1;
+    char pfx[64];
+    size_t pl = cng_snprintf(pfx, sizeof pfx, "chroot-ng-shm.v1.%u.",
+                             (unsigned)sys_getuid());
+    int found = 0;
+    char buf[8192];
+    for (;;) {
+        long n = CNG_SYS(__NR_getdents64, fd, buf, sizeof buf, 0, 0, 0);
+        if (n <= 0)
+            break;
+        for (long off = 0; off + 19 <= n;) {
+            unsigned short reclen = *(unsigned short *)(buf + off + 16);
+            const char *name = buf + off + 19;
+            if (!reclen)
+                break;
+            if (!strncmp(name, pfx, pl)) {
+                found++;
+                const char *tag = name + pl;
+                int hex = 0;
+                while (tag[hex] && ((tag[hex] >= '0' && tag[hex] <= '9') ||
+                                    (tag[hex] >= 'a' && tag[hex] <= 'f')))
+                    hex++;
+                char full[CNG_PATH_MAX];
+                size_t k = cng_strlcpy(full, dir, sizeof full);
+                if (k < sizeof full - 1) {
+                    full[k++] = '/';
+                    cng_strlcpy(full + k, name, sizeof full - k);
+                }
+                char st[144];
+                long r = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, (long)full,
+                                 (long)st, CNG_AT_SYMLINK_NOFOLLOW, 0, 0);
+                unsigned mode = r == 0 ? *(unsigned *)(st + 16) : 0;
+                unsigned uid = r == 0 ? *(unsigned *)(st + 24) : ~0u;
+                if (hex != 16 || tag[hex] != '\0' || r != 0 ||
+                    (mode & 0170000) != 0100000 || (mode & 07777) != 0600 ||
+                    uid != (unsigned)sys_getuid())
+                    (*bad)++;
+            }
+            off += reclen;
+        }
+    }
+    sys_close((int)fd);
+    return found;
+}
+
 static long shm_call(long nr, long a0, long a1, long a2) {
     return cng_dispatch(nr, a0, a1, a2, 0, 0, 0, /*trapped=*/0);
 }
@@ -4833,6 +5014,25 @@ int cng_cmd_shmtest(int argc, char **argv, char **envp, unsigned long *auxv) {
             shm_call(__NR_shmdt, over, 0, 0);
         if (!cng_is_err(rnd))
             shm_call(__NR_shmdt, rnd, 0, 0);
+    }
+
+    /* 3c) the file-backed tier's name. It lands in /dev/shm or /tmp, where every
+     *     user on the machine may create names, and nothing outside the daemon
+     *     needs to find it — attachers get the descriptor over SCM_RIGHTS, and
+     *     the path is kept only to unlink again. So it carries no meaning, just
+     *     random bits, and it is created O_EXCL|O_NOFOLLOW. Asserted in both
+     *     directions: forced onto the file tier there is one and it is well
+     *     formed, and on the memfd tier there is no file at all. */
+    {
+        int bad = 0;
+        int found = shm_scan_files(&bad);
+        int forced = cng_broker_env("CNG_SHM_FORCE_FILE") != 0;
+        int ok = found >= 0 && bad == 0 && (forced ? found > 0 : found == 0);
+        cng_dprintf(1,
+                    "shmtest backing files forced=%d found=%d malformed=%d"
+                    " -> %s\n",
+                    forced, found, bad, ok ? "OK" : "FAIL");
+        fails += !ok;
     }
 
     /* 4) a read-only attach sees the same memory. */
