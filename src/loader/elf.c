@@ -252,6 +252,16 @@ static int elf_read_headers(int fd, struct cng_elf_plan *plan,
     }
     if (nload == 0)
         return CNG_LOAD_EFORMAT;
+    /* The same question one step out from the per-segment wrap above. What gets
+     * reserved is the span, plus — under -R — a trampoline pool on top of it
+     * (map_anon), and that sum is a mapping length: a span within a pool's
+     * distance of the top of the address space wraps it, and the mmap then
+     * succeeds at some small length while every pread and every trampoline
+     * write goes outside. Checked against the pool unconditionally, since
+     * whether -R is on is not a property of the header, and a span nothing can
+     * map describes nothing either way. */
+    if (hi - lo > ~0UL - CNG_TRAMP_POOL)
+        return CNG_LOAD_EFORMAT;
     /* An ET_EXEC image goes down MAP_FIXED at its link-time vaddr, and the
      * monitor shares this address space: a span reaching 0x1000000000 would
      * map the guest over chroot-ng's own text and data, which is how the

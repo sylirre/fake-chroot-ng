@@ -1950,6 +1950,22 @@ vfork/`posix_spawn` child-stack handling.
     second uid to produce. What the suite does hold is the other direction —
     every broker-backed leg in M11/M12/M20/M22 goes through the check.
 
+- [x] **M26 — the span that could not carry its own trampoline pool**
+  `elf_read_headers` checks each `PT_LOAD` for a `p_vaddr + size` that wraps,
+  but not the aggregate: what `map_anon` reserves is `hi - lo` **plus**
+  `CNG_TRAMP_POOL` under `-R`, and that sum is a mapping length. Two segments —
+  one at vaddr 0, one at `0xFFFFFFFFFFF80000`, each perfectly well formed on its
+  own — make a span within a pool's distance of the top of the address space, so
+  the addition wraps: the `mmap` then succeeds at a few pages while `read_exact`
+  preads at `bias + p_vaddr` and `cng_rewrite_seg` writes trampolines at
+  `seg + span`, both far outside the mapping. Measured: without the check the
+  load returns `CNG_LOAD_OK`.
+  Refused in the header pass, which maps nothing, and against the pool
+  unconditionally — whether `-R` is running is not a property of the header, and
+  a span nothing can map describes nothing either way. Gated by an `-t elfspan`
+  leg that builds exactly that object and asserts the refusal with `-R` off and
+  on alike (with it on there would be nothing left to report the failure with).
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

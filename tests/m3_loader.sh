@@ -70,6 +70,14 @@ check "a PT_LOAD whose file part exceeds its memory part stays in its reserve" \
     0 $?
 check_contains "...and every byte of it arrived" "rc=0 tail=1" \
     "$(run -t elfspan 2>&1)"
+# The same arithmetic one step out: what gets reserved is that span plus, under
+# -R, a trampoline pool on top of it, and the sum is a mapping length. A span
+# within a pool's distance of the top of the address space wraps it, the mmap
+# then succeeds at a few pages, and the load writes at bias + p_vaddr while the
+# rewriter writes at seg + span — both far outside. Two PT_LOADs are all it
+# takes, and each passes the per-segment wrap check on its own.
+check_contains "a PT_LOAD span that cannot carry the trampoline pool is refused" \
+    "elfspan wrap: plain=-2 rewrite=-2 -> OK" "$(run -t elfspan 2>&1)"
 
 # An ET_EXEC goes down MAP_FIXED at its link-time vaddr, and the monitor lives
 # in the same address space: a vaddr reaching chroot-ng's own image maps the

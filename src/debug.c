@@ -2732,11 +2732,18 @@ int cng_cmd_argvtest(int argc, char **argv, char **envp, unsigned long *auxv) {
  * executable segment pulls the -R trampoline pool in behind the span. Returns
  * the fd (positioned past the header, for a caller that wants to pad it out)
  * or a negative errno. */
-#define SYNTH_ELF_HDRSZ 0x78 /* Ehdr (64) + one Phdr (56) */
+#define SYNTH_ELF_NSEG  4
+#define SYNTH_ELF_HDRSZ (64 + SYNTH_ELF_NSEG * 56) /* Ehdr + the phdr table */
 
-static long synth_elf_memfd(unsigned short type, unsigned long vaddr,
-                            unsigned long filesz, unsigned long memsz,
-                            unsigned flags) {
+struct synth_seg {
+    unsigned long vaddr, filesz, memsz;
+    unsigned flags; /* p_flags; PF_X is the caller's call, see below */
+};
+
+static long synth_elf_memfd(unsigned short type, const struct synth_seg *segs,
+                            int nseg) {
+    if (nseg < 1 || nseg > SYNTH_ELF_NSEG)
+        return -EINVAL;
     long fd = sys_memfd_create("cng-synth-elf", 0);
     if (fd < 0)
         return fd;
@@ -2755,16 +2762,18 @@ static long synth_elf_memfd(unsigned short type, unsigned long vaddr,
     *(unsigned long *)(hdr + 32) = 0x40; /* e_phoff */
     *(unsigned short *)(hdr + 52) = 64;  /* e_ehsize */
     *(unsigned short *)(hdr + 54) = 56;  /* e_phentsize */
-    *(unsigned short *)(hdr + 56) = 1;   /* e_phnum */
-    unsigned char *p = hdr + 0x40;
-    *(unsigned *)(p + 0) = 1;     /* p_type = PT_LOAD */
-    *(unsigned *)(p + 4) = flags; /* p_flags */
-    *(unsigned long *)(p + 8) = 0;       /* p_offset */
-    *(unsigned long *)(p + 16) = vaddr;  /* p_vaddr */
-    *(unsigned long *)(p + 24) = vaddr;  /* p_paddr */
-    *(unsigned long *)(p + 32) = filesz; /* p_filesz */
-    *(unsigned long *)(p + 40) = memsz;  /* p_memsz */
-    *(unsigned long *)(p + 48) = 0x1000; /* p_align */
+    *(unsigned short *)(hdr + 56) = (unsigned short)nseg; /* e_phnum */
+    for (int i = 0; i < nseg; i++) {
+        unsigned char *p = hdr + 0x40 + (size_t)i * 56;
+        *(unsigned *)(p + 0) = 1;              /* p_type = PT_LOAD */
+        *(unsigned *)(p + 4) = segs[i].flags;  /* p_flags */
+        *(unsigned long *)(p + 8) = 0;         /* p_offset */
+        *(unsigned long *)(p + 16) = segs[i].vaddr;
+        *(unsigned long *)(p + 24) = segs[i].vaddr;
+        *(unsigned long *)(p + 32) = segs[i].filesz;
+        *(unsigned long *)(p + 40) = segs[i].memsz;
+        *(unsigned long *)(p + 48) = 0x1000;   /* p_align */
+    }
     if (cng_write_all((int)fd, hdr, sizeof hdr) != (long)sizeof hdr) {
         sys_close((int)fd);
         return -EIO;
@@ -2779,8 +2788,8 @@ int cng_cmd_elfspan(int argc, char **argv, char **envp, unsigned long *auxv) {
     (void)auxv;
     /* p_flags = PF_R|PF_W, never PF_X: an executable segment would draw the -R
      * trampoline pool in after the span and hide the overrun. */
-    long fd = synth_elf_memfd(3 /*ET_DYN*/, 0, ELFSPAN_FILESZ, ELFSPAN_MEMSZ,
-                              6 /*PF_R|PF_W*/);
+    struct synth_seg one = {0, ELFSPAN_FILESZ, ELFSPAN_MEMSZ, 6 /*PF_R|PF_W*/};
+    long fd = synth_elf_memfd(3 /*ET_DYN*/, &one, 1);
     if (fd < 0) {
         cng_dprintf(1, "elfspan: memfd_create errno=%d -> SKIP\n", (int)-fd);
         return 0;
@@ -2812,7 +2821,34 @@ int cng_cmd_elfspan(int argc, char **argv, char **envp, unsigned long *auxv) {
     int ok = rc == CNG_LOAD_OK && tail;
     cng_dprintf(1, "elfspan: rc=%d tail=%d -> %s\n", rc, tail,
                 ok ? "OK" : "FAIL");
-    return ok ? 0 : 1;
+
+    /* ...and the same arithmetic one step out. What gets reserved is the span
+     * plus, under -R, a trampoline pool on top of it, and that sum is a mapping
+     * length: a span within a pool's distance of the top of the address space
+     * wraps it. The mmap then succeeds at a few pages while the load writes at
+     * bias + p_vaddr and the rewriter at seg + span — both far outside. Two
+     * PT_LOADs are all it takes, and each passes the per-segment wrap check on
+     * its own. Refused with -R off and on alike, since whether -R is running is
+     * not a property of the header (and with it on there is nothing left to
+     * report the failure with). */
+    struct synth_seg wrap[2] = {
+        {0, SYNTH_ELF_HDRSZ, 0x1000, 6 /*PF_R|PF_W*/},
+        {0xFFFFFFFFFFF80000UL, 0, 0x1000, 6 /*PF_R|PF_W*/},
+    };
+    int wrc[2];
+    int saved = cng_g_rewrite;
+    for (int i = 0; i < 2; i++) {
+        cng_g_rewrite = i; /* the pool is only added when -R asked for one */
+        long wfd = synth_elf_memfd(3 /*ET_DYN*/, wrap, 2);
+        wrc[i] = wfd < 0 ? (int)wfd : cng_load_elf_fd((int)wfd, 0, &prog);
+        if (wfd >= 0)
+            sys_close((int)wfd);
+    }
+    cng_g_rewrite = saved;
+    int wok = wrc[0] == CNG_LOAD_EFORMAT && wrc[1] == CNG_LOAD_EFORMAT;
+    cng_dprintf(1, "elfspan wrap: plain=%d rewrite=%d -> %s\n", wrc[0], wrc[1],
+                wok ? "OK" : "FAIL");
+    return ok && wok ? 0 : 1;
 }
 
 /* _o2test ROOT — openat2's open_how.resolve.
@@ -3101,8 +3137,8 @@ int cng_cmd_imgtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     unsigned int gate0 = *(volatile unsigned int *)__cng_gate_start;
     struct cng_loaded ld;
 
-    long fd = synth_elf_memfd(2 /*ET_EXEC*/, img, SYNTH_ELF_HDRSZ, 0x1000,
-                              6 /*PF_R|PF_W*/);
+    struct synth_seg over_seg = {img, SYNTH_ELF_HDRSZ, 0x1000, 6 /*PF_R|PF_W*/};
+    long fd = synth_elf_memfd(2 /*ET_EXEC*/, &over_seg, 1);
     if (fd < 0) {
         cng_dprintf(1, "imgtest: memfd_create errno=%d -> SKIP\n", (int)-fd);
         return 0;
@@ -3113,16 +3149,17 @@ int cng_cmd_imgtest(int argc, char **argv, char **envp, unsigned long *auxv) {
 
     /* One page below the base, sized to end exactly where the image starts. */
     unsigned long below = img - cng_page_size;
-    fd = synth_elf_memfd(2 /*ET_EXEC*/, below, SYNTH_ELF_HDRSZ, cng_page_size,
-                         6 /*PF_R|PF_W*/);
+    struct synth_seg under_seg = {below, SYNTH_ELF_HDRSZ, cng_page_size,
+                                  6 /*PF_R|PF_W*/};
+    fd = synth_elf_memfd(2 /*ET_EXEC*/, &under_seg, 1);
     int under = fd < 0 ? (int)fd : cng_load_elf_fd((int)fd, 0, &ld);
     if (fd >= 0)
         sys_close((int)fd);
     if (under == CNG_LOAD_OK)
         sys_munmap((void *)below, cng_page_size);
 
-    fd = synth_elf_memfd(3 /*ET_DYN*/, img, SYNTH_ELF_HDRSZ, 0x1000,
-                         6 /*PF_R|PF_W*/);
+    struct synth_seg dyn_seg = {img, SYNTH_ELF_HDRSZ, 0x1000, 6 /*PF_R|PF_W*/};
+    fd = synth_elf_memfd(3 /*ET_DYN*/, &dyn_seg, 1);
     int dyn = fd < 0 ? (int)fd : cng_load_elf_fd((int)fd, img, &ld);
     if (fd >= 0)
         sys_close((int)fd);
