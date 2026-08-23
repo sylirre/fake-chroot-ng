@@ -58,4 +58,18 @@ _Noreturn void cng_die(const char *msg, long err);
  * coherent after writing code into it. */
 void cng_flush_icache(void *start, void *end);
 
+/* Linker-provided bounds of chroot-ng's own image (scripts/chroot-ng.ld).
+ * The guest runs in this address space, so a mapping chroot-ng makes at an
+ * address the *guest* chose can land on the monitor itself — which is not a
+ * failure the guest gets to see, because there is no monitor left to report
+ * it. Both such places (an ET_EXEC's link-time vaddr going down MAP_FIXED,
+ * and shmat(SHM_REMAP)) ask cng_hits_image() first and refuse instead. */
+extern char __cng_image_start[];
+extern char __cng_image_end[];
+
+/* Does [addr, addr+len) overlap the image? A length that wraps past the top of
+ * the address space counts as reaching everything above `addr`, since that is
+ * what mapping it would have to cover. */
+int cng_hits_image(unsigned long addr, unsigned long len);
+
 #endif /* CNG_RT_H */

@@ -399,7 +399,7 @@ static long exec_load_errno(int rc, const struct cng_elf_plan *plan, int interp)
         return -EACCES;
     case CNG_LOAD_EIO:
         return interp ? -EIO : -ENOEXEC;
-    default: /* EFORMAT, ETOOBIG: a header that does not check out */
+    default: /* EFORMAT, ETOOBIG, ECLOBBER: a header that does not check out */
         return interp ? -ELIBBAD : -ENOEXEC;
     }
 }

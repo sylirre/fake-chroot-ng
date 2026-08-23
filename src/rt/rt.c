@@ -363,6 +363,23 @@ _Noreturn void cng_die(const char *msg, long err) {
     sys_exit_group(1);
 }
 
+/* ---- the monitor's own image ------------------------------------------ */
+
+/* [addr, addr+len) against [__cng_image_start, __cng_image_end). `len` is
+ * guest-supplied at both call sites, so a wrapping sum is a real input: treat
+ * it as reaching the top of the address space rather than wrapping round to a
+ * range that happens to miss us. */
+int cng_hits_image(unsigned long addr, unsigned long len) {
+    unsigned long lo = (unsigned long)__cng_image_start;
+    unsigned long hi = (unsigned long)__cng_image_end;
+    if (!len)
+        return 0; /* an empty range covers nothing */
+    unsigned long end = addr + len;
+    if (end < addr)
+        end = ~0UL;
+    return addr < hi && end > lo;
+}
+
 /* ---- process bootstrap ------------------------------------------------ */
 
 /* Actual page size, set from auxv AT_PAGESZ (declared in loader.h). Some

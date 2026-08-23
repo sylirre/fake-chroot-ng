@@ -18,6 +18,9 @@ mounts. See [docs/DESIGN.md](docs/DESIGN.md) for the full rationale and
 - AArch64, Linux 3.5+ (real floor), rootless, SELinux-confined, no `user_ns`.
 - Guest binaries on a true `noexec` mount.
 - Works for glibc/musl (dynamic & static) and Go/Rust without version pinning.
+- Containment, not a sandbox: the monitor shares the guest's address space, so
+  it confines a guest's mistakes, not a guest's malice. See
+  [Threat model](docs/DESIGN.md#threat-model--containment-not-a-sandbox).
 
 ## Build
 

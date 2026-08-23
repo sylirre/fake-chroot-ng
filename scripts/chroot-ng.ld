@@ -10,7 +10,12 @@
  * FILEHDR/PHDRS place the ELF header + program headers in the text segment;
  * SIZEOF_HEADERS reserves room for them so .text is correctly file/vaddr
  * aligned. Only the allocatable sections chroot-ng actually emits are listed
- * (.text incl. the svc gate, .rodata, .eh_frame, .data, .bss). */
+ * (.text incl. the svc gate, .rodata, .eh_frame, .data, .bss).
+ *
+ * __cng_image_start/__cng_image_end bracket the whole image. The guest shares
+ * this address space, so anything chroot-ng maps MAP_FIXED at an address the
+ * guest chose (an ET_EXEC's link-time vaddr, a shmat(SHM_REMAP)) has to be
+ * refused when it lands here — see cng_hits_image(). */
 ENTRY(_start)
 
 PHDRS
@@ -21,7 +26,8 @@ PHDRS
 
 SECTIONS
 {
-    . = 0x1000000000 + SIZEOF_HEADERS;
+    __cng_image_start = 0x1000000000;
+    . = __cng_image_start + SIZEOF_HEADERS;
 
     .text : {
         KEEP(*(.text.gate))
@@ -34,6 +40,7 @@ SECTIONS
 
     .data : { *(.data .data.*) } :data
     .bss : { *(.bss .bss.* COMMON) } :data
+    __cng_image_end = .;
 
     /DISCARD/ : { *(.note .note.* .comment .gnu.hash .hash .dynsym .dynstr) }
 }

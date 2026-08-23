@@ -70,3 +70,15 @@ check "a PT_LOAD whose file part exceeds its memory part stays in its reserve" \
     0 $?
 check_contains "...and every byte of it arrived" "rc=0 tail=1" \
     "$(run -t elfspan 2>&1)"
+
+# An ET_EXEC goes down MAP_FIXED at its link-time vaddr, and the monitor lives
+# in the same address space: a vaddr reaching chroot-ng's own image maps the
+# guest over the loader that is running. That is the 0x400000/cc1 crash the
+# 64 GiB relocation moved out of the way of — but p_vaddr is a field in a file,
+# so the collision is refused outright now. `-t imgtest` builds the three
+# objects (over the image, one page below it, and the same address as an
+# ET_DYN hint) against the live linker symbols.
+run -t imgtest >/dev/null 2>&1
+check "an ET_EXEC whose span covers chroot-ng's own image is refused" 0 $?
+check_contains "...before anything is mapped, and only for the overlap" \
+    "exec-over=-8 intact=1 exec-below=0 dyn-hint=0" "$(run -t imgtest 2>&1)"

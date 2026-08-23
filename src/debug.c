@@ -2726,18 +2726,21 @@ int cng_cmd_argvtest(int argc, char **argv, char **envp, unsigned long *auxv) {
 #define ELFSPAN_MEMSZ  0x1000u
 #define ELFSPAN_MARK   0x5Au
 
-int cng_cmd_elfspan(int argc, char **argv, char **envp, unsigned long *auxv) {
-    (void)argc;
-    (void)argv;
-    (void)envp;
-    (void)auxv;
-    long fd = sys_memfd_create("cng-elfspan", 0);
-    if (fd < 0) {
-        cng_dprintf(1, "elfspan: memfd_create errno=%d -> SKIP\n", (int)-fd);
-        return 0;
-    }
+/* A memfd holding a minimal, well-formed AArch64 ELF64 with one PT_LOAD whose
+ * geometry the caller dictates — the only way to hand the loader a header no
+ * toolchain emits. `flags` is p_flags; PF_X is left to the caller because an
+ * executable segment pulls the -R trampoline pool in behind the span. Returns
+ * the fd (positioned past the header, for a caller that wants to pad it out)
+ * or a negative errno. */
+#define SYNTH_ELF_HDRSZ 0x78 /* Ehdr (64) + one Phdr (56) */
 
-    unsigned char hdr[0x78];
+static long synth_elf_memfd(unsigned short type, unsigned long vaddr,
+                            unsigned long filesz, unsigned long memsz,
+                            unsigned flags) {
+    long fd = sys_memfd_create("cng-synth-elf", 0);
+    if (fd < 0)
+        return fd;
+    unsigned char hdr[SYNTH_ELF_HDRSZ];
     memset(hdr, 0, sizeof hdr);
     hdr[0] = 0x7f;
     hdr[1] = 'E';
@@ -2746,7 +2749,7 @@ int cng_cmd_elfspan(int argc, char **argv, char **envp, unsigned long *auxv) {
     hdr[4] = 2; /* ELFCLASS64 */
     hdr[5] = 1; /* ELFDATA2LSB */
     hdr[6] = 1; /* EV_CURRENT */
-    *(unsigned short *)(hdr + 16) = 3;   /* e_type = ET_DYN */
+    *(unsigned short *)(hdr + 16) = type;
     *(unsigned short *)(hdr + 18) = 183; /* e_machine = EM_AARCH64 */
     *(unsigned *)(hdr + 20) = 1;         /* e_version */
     *(unsigned long *)(hdr + 32) = 0x40; /* e_phoff */
@@ -2754,26 +2757,38 @@ int cng_cmd_elfspan(int argc, char **argv, char **envp, unsigned long *auxv) {
     *(unsigned short *)(hdr + 54) = 56;  /* e_phentsize */
     *(unsigned short *)(hdr + 56) = 1;   /* e_phnum */
     unsigned char *p = hdr + 0x40;
-    *(unsigned *)(p + 0) = 1; /* p_type = PT_LOAD */
-    *(unsigned *)(p + 4) = 6; /* p_flags = PF_R|PF_W (never PF_X: an executable
-                               * segment would draw the -R trampoline pool in
-                               * after the span and hide the overrun) */
-    *(unsigned long *)(p + 8) = 0;                /* p_offset */
-    *(unsigned long *)(p + 16) = 0;               /* p_vaddr */
-    *(unsigned long *)(p + 24) = 0;               /* p_paddr */
-    *(unsigned long *)(p + 32) = ELFSPAN_FILESZ;  /* p_filesz */
-    *(unsigned long *)(p + 40) = ELFSPAN_MEMSZ;   /* p_memsz  < p_filesz */
-    *(unsigned long *)(p + 48) = 0x1000;          /* p_align */
-
+    *(unsigned *)(p + 0) = 1;     /* p_type = PT_LOAD */
+    *(unsigned *)(p + 4) = flags; /* p_flags */
+    *(unsigned long *)(p + 8) = 0;       /* p_offset */
+    *(unsigned long *)(p + 16) = vaddr;  /* p_vaddr */
+    *(unsigned long *)(p + 24) = vaddr;  /* p_paddr */
+    *(unsigned long *)(p + 32) = filesz; /* p_filesz */
+    *(unsigned long *)(p + 40) = memsz;  /* p_memsz */
+    *(unsigned long *)(p + 48) = 0x1000; /* p_align */
     if (cng_write_all((int)fd, hdr, sizeof hdr) != (long)sizeof hdr) {
-        cng_dprintf(1, "elfspan: short header write -> FAIL\n");
         sys_close((int)fd);
-        return 1;
+        return -EIO;
+    }
+    return fd;
+}
+
+int cng_cmd_elfspan(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    /* p_flags = PF_R|PF_W, never PF_X: an executable segment would draw the -R
+     * trampoline pool in after the span and hide the overrun. */
+    long fd = synth_elf_memfd(3 /*ET_DYN*/, 0, ELFSPAN_FILESZ, ELFSPAN_MEMSZ,
+                              6 /*PF_R|PF_W*/);
+    if (fd < 0) {
+        cng_dprintf(1, "elfspan: memfd_create errno=%d -> SKIP\n", (int)-fd);
+        return 0;
     }
     /* Pad out to p_filesz, ending in a byte we can look for in memory. */
     static unsigned char pad[4096];
     memset(pad, 0, sizeof pad);
-    unsigned long left = ELFSPAN_FILESZ - sizeof hdr;
+    unsigned long left = ELFSPAN_FILESZ - SYNTH_ELF_HDRSZ;
     while (left) {
         unsigned long k = left > sizeof pad ? sizeof pad : left;
         if (k == left)
@@ -2797,6 +2812,68 @@ int cng_cmd_elfspan(int argc, char **argv, char **envp, unsigned long *auxv) {
     int ok = rc == CNG_LOAD_OK && tail;
     cng_dprintf(1, "elfspan: rc=%d tail=%d -> %s\n", rc, tail,
                 ok ? "OK" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+/* _imgtest — an ET_EXEC guest is mapped MAP_FIXED at its link-time vaddr, and
+ * the monitor is in the same address space. A vaddr reaching chroot-ng's own
+ * image therefore does not fail: it succeeds, over the code performing the
+ * load, and the process dies with no monitor left to say why. That is how the
+ * pre-relocation build died on gcc's cc1 at 0x400000 (STATUS.md); moving the
+ * base to 64 GiB put it clear of every real toolchain, but p_vaddr is a field
+ * in a file, so the collision has to be refused rather than designed around.
+ *
+ * Three legs, all against the live linker symbols rather than a constant:
+ *   - an ET_EXEC covering __cng_image_start is refused, and the first
+ *     instruction of the gate is unchanged afterwards (a refusal that "passed"
+ *     by mapping over us would read as a pass otherwise);
+ *   - an ET_EXEC one page below the image still loads, so the guard is the
+ *     overlap and not the neighbourhood;
+ *   - the same vaddr as ET_DYN loads, because a shared object carries a hint
+ *     the kernel is free to ignore and nothing goes down MAP_FIXED. */
+int cng_cmd_imgtest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    unsigned long img = (unsigned long)__cng_image_start;
+    unsigned int gate0 = *(volatile unsigned int *)__cng_gate_start;
+    struct cng_loaded ld;
+
+    long fd = synth_elf_memfd(2 /*ET_EXEC*/, img, SYNTH_ELF_HDRSZ, 0x1000,
+                              6 /*PF_R|PF_W*/);
+    if (fd < 0) {
+        cng_dprintf(1, "imgtest: memfd_create errno=%d -> SKIP\n", (int)-fd);
+        return 0;
+    }
+    int over = cng_load_elf_fd((int)fd, 0, &ld);
+    sys_close((int)fd);
+    int intact = *(volatile unsigned int *)__cng_gate_start == gate0;
+
+    /* One page below the base, sized to end exactly where the image starts. */
+    unsigned long below = img - cng_page_size;
+    fd = synth_elf_memfd(2 /*ET_EXEC*/, below, SYNTH_ELF_HDRSZ, cng_page_size,
+                         6 /*PF_R|PF_W*/);
+    int under = fd < 0 ? (int)fd : cng_load_elf_fd((int)fd, 0, &ld);
+    if (fd >= 0)
+        sys_close((int)fd);
+    if (under == CNG_LOAD_OK)
+        sys_munmap((void *)below, cng_page_size);
+
+    fd = synth_elf_memfd(3 /*ET_DYN*/, img, SYNTH_ELF_HDRSZ, 0x1000,
+                         6 /*PF_R|PF_W*/);
+    int dyn = fd < 0 ? (int)fd : cng_load_elf_fd((int)fd, img, &ld);
+    if (fd >= 0)
+        sys_close((int)fd);
+    if (dyn == CNG_LOAD_OK)
+        sys_munmap((void *)ld.base, 0x1000);
+
+    int ok = over == CNG_LOAD_ECLOBBER && intact && under == CNG_LOAD_OK &&
+             dyn == CNG_LOAD_OK;
+    cng_dprintf(1,
+                "imgtest exec-over=%d intact=%d exec-below=%d dyn-hint=%d"
+                " -> %s\n",
+                over, intact, under, dyn, ok ? "OK" : "FAIL");
     return ok ? 0 : 1;
 }
 
@@ -4548,6 +4625,31 @@ int cng_cmd_shmtest(int argc, char **argv, char **envp, unsigned long *auxv) {
             shm_call(__NR_shmdt, rnd, 0, 0);
         if (!cng_is_err(remap))
             shm_call(__NR_shmdt, remap, 0, 0);
+    }
+
+    /* 3b) ...and the one address SHM_REMAP must NOT take over: our own. The
+     *     monitor shares the guest's address space, so a MAP_FIXED attach
+     *     placed on chroot-ng's image replaces the code performing the attach.
+     *     Asserted on the live symbol rather than a constant, and with the
+     *     first instruction of the gate read back afterwards so a leg that
+     *     "passed" by mapping over us cannot go unnoticed. */
+    {
+        unsigned long img = (unsigned long)__cng_image_start;
+        unsigned int gate0 = *(volatile unsigned int *)__cng_gate_start;
+        long over = shm_call(__NR_shmat, id, (long)img, CNG_SHM_REMAP);
+        long rnd = shm_call(__NR_shmat, id, (long)(img + 0x40),
+                            CNG_SHM_REMAP | CNG_SHM_RND);
+        int intact = *(volatile unsigned int *)__cng_gate_start == gate0;
+        int ok = over == -EINVAL && rnd == -EINVAL && intact;
+        cng_dprintf(1, "shmtest remap over our own image refused=%d intact=%d"
+                       " -> %s\n",
+                    over == -EINVAL && rnd == -EINVAL, intact,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+        if (!cng_is_err(over))
+            shm_call(__NR_shmdt, over, 0, 0);
+        if (!cng_is_err(rnd))
+            shm_call(__NR_shmdt, rnd, 0, 0);
     }
 
     /* 4) a read-only attach sees the same memory. */

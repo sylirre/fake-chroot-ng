@@ -55,6 +55,8 @@ static const char *load_err(int rc) {
         return "too many program headers / interp too long";
     case CNG_LOAD_EACCES:
         return "not a regular file, or not executable";
+    case CNG_LOAD_ECLOBBER:
+        return "fixed load address overlaps chroot-ng's own image";
     default:
         return "unknown error";
     }

@@ -182,6 +182,14 @@ static long do_shmat(s32 shmid, u64 shmaddr, s32 shmflg) {
             addr = cng_page_down(addr);
         if (addr & (cng_page_size - 1))
             err = -EINVAL;
+        /* SHM_REMAP is MAP_FIXED, and the monitor lives in the guest's own
+         * address space: an attach placed over chroot-ng's image would replace
+         * the code that is running the attach. The kernel has no such range to
+         * protect, so there is no errno to copy — EINVAL is what shmat already
+         * answers for an address it will not honor, and it is what a plain
+         * (non-REMAP) attach here produces anyway, since the range is taken. */
+        else if (cng_hits_image(addr, len))
+            err = -EINVAL;
     }
 
     void *p = CNG_MAP_FAILED;

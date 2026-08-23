@@ -24,6 +24,10 @@ check_contains "a fork child shares the memory; nattch drops when it dies" \
     "shmtest fork share=1 nattch-after-exit=1 -> OK" "$out"
 check_contains "attach-address rules (unaligned, SHM_RND, occupied, SHM_REMAP)" \
     "shmtest attach-addr unaligned/rnd/occupied/remap -> OK" "$out"
+# SHM_REMAP is MAP_FIXED, and chroot-ng shares the guest's address space: an
+# attach aimed at the monitor's own image would replace the code performing it.
+check_contains "a SHM_REMAP attach onto chroot-ng's own image is refused" \
+    "shmtest remap over our own image refused=1 intact=1 -> OK" "$out"
 check_contains "a read-only attach sees the same memory" \
     "shmtest rdonly attach -> OK" "$out"
 check_contains "detach then IPC_RMID kills the id" \

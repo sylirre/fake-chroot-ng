@@ -20,6 +20,36 @@ paying `proot`'s per-syscall `ptrace` overhead.
 - **Fidelity beyond chroot+bind:** fake user identity (`-u`/`--fake-id`), `/proc`
   emulation (`--no-proc` to disable), and `link2symlink` (`-l`/`--link2symlink`).
 
+## Threat model — containment, not a sandbox
+
+chroot-ng runs the guest **in its own address space**: the monitor's code, its
+`svc` gate and the path-translation state are ordinary pages of the same
+process. A guest that sets out to defeat translation needs no syscall to do it
+— a store into the monitor's `.data`, or executable memory placed over the gate
+range the seccomp filter allowlists, is enough, and neither is something a
+syscall filter can see. Interception here is therefore **containment for guests
+that are not attacking it**, which is the standing `proot` has and for the same
+reason.
+
+What that does and does not buy:
+
+- A guest's *mistakes* are contained exactly: a path escaping the rootfs, a
+  `..` run, an absolute symlink, a dirfd opened outside the view, an untranslated
+  name reaching the host. Those are the bugs the path layer exists for.
+- A guest's *malice* is not. Hostile code sharing an address space with its own
+  monitor is not confined by it; put a kernel boundary — a container, a VM, a
+  separate uid — around the whole invocation instead.
+
+One rule follows for the implementation: chroot-ng must never be the instrument.
+Wherever a **guest-chosen address** reaches a `MAP_FIXED` of ours — an `ET_EXEC`
+guest's link-time vaddr (`src/loader/elf.c`) and `shmat(SHM_REMAP)`
+(`src/monitor/shm.c`) — the range is checked against `[__cng_image_start,
+__cng_image_end)` and refused (`ENOEXEC` / `EINVAL`), because a monitor mapped
+over by its own hand has nothing left to report the failure with. That is what
+the 64 GiB link base (see the 0x400000 entry in `docs/STATUS.md`) moved out of
+the way of, and `p_vaddr` is a field in a file, so the base alone is not a
+guarantee.
+
 ## Why not the obvious approaches
 
 - **LD_PRELOAD / linker interception** (termux-exec): fails for static musl/glibc,
