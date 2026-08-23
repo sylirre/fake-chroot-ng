@@ -445,6 +445,9 @@ static void help(char **envp) {
         {"CNG_UACCESS_MEMFD", "Validate guest pointers through a scratch memfd "
                       "instead of process_vm_readv/writev. Test aid: it is the "
                       "fallback a host without that pair already uses."},
+        {"CNG_MMAP_FORCE_ANON", "Serve every executable file mapping from an "
+                      "anonymous copy without asking the kernel first. Test "
+                      "aid: it is what a true noexec mount forces anyway."},
     };
     static const char *const examples[] = {
         "chroot-ng --probe",

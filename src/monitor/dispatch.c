@@ -8,6 +8,7 @@
  * Also applies the M7 fidelity fixups: credential/ownership faking (--fake-id),
  * /proc/self readlink fixups, and the link2symlink fallback (--link2symlink).
  */
+#include "cng/execmap.h"
 #include "cng/l2s.h"
 #include "cng/monitor.h"
 #include "cng/path.h"
@@ -3000,6 +3001,21 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         }
         return reissue(a0, a1, a2, a3, a4, a5, nr);
     }
+
+    /* mmap. Only one shape of it is ours: a PROT_EXEC mapping of a file, which
+     * on a true MNT_NOEXEC mount the kernel refuses outright — and that
+     * refusal, taken by a dynamic guest's own ld.so mapping a library, is the
+     * end of every dynamically linked guest on such a mount. execmap.c serves
+     * it from anonymous memory instead. Every other mmap (all the anonymous
+     * ones, which is nearly all of them) goes straight back out; the filter
+     * already tests the same two arguments, so on the seccomp tier this case is
+     * only reached by the mappings it is for, while under -R it sees them all
+     * and has to say so itself. */
+    case __NR_mmap:
+        if (!((int)a2 & CNG_PROT_EXEC) || ((int)a3 & CNG_MAP_ANONYMOUS))
+            return reissue(a0, a1, a2, a3, a4, a5, nr);
+        return cng_execmap((unsigned long)a0, (unsigned long)a1, a2, a3, a4,
+                           (unsigned long)a5);
 
     /* --- credential syscalls (trapped only when --fake-id is active) ---
      * All get/set uid/gid family, groups, and capability calls are emulated

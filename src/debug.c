@@ -4006,6 +4006,48 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
         fails += !ok;
     }
 
+    /* mmap's band is two arguments wide — prot in args[2], flags in args[3] —
+     * so it needs a data buffer the single-arg table above cannot express. Only
+     * a PROT_EXEC mapping that is NOT anonymous may trap: that is a library
+     * text mapping, the one thing a noexec mount refuses outright, and
+     * everything else mmap does is the guest's ordinary allocation traffic. */
+    {
+        static const struct {
+            const char *what;
+            u32 prot, flags;
+            u32 want;
+        } mm[] = {
+            {"exec file mapping traps", CNG_PROT_READ | CNG_PROT_EXEC,
+             CNG_MAP_PRIVATE, CNG_SECCOMP_RET_TRAP},
+            {"exec fixed file mapping traps", CNG_PROT_EXEC,
+             CNG_MAP_PRIVATE | CNG_MAP_FIXED, CNG_SECCOMP_RET_TRAP},
+            {"anonymous exec runs native", CNG_PROT_READ | CNG_PROT_EXEC,
+             CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, CNG_SECCOMP_RET_ALLOW},
+            {"a plain RW file mapping runs native",
+             CNG_PROT_READ | CNG_PROT_WRITE, CNG_MAP_PRIVATE,
+             CNG_SECCOMP_RET_ALLOW},
+            {"an anonymous RW allocation runs native",
+             CNG_PROT_READ | CNG_PROT_WRITE,
+             CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, CNG_SECCOMP_RET_ALLOW},
+        };
+        for (unsigned k = 0; k < sizeof mm / sizeof mm[0]; k++) {
+            u32 d[16];
+            int bad = 0;
+            bpf_data(d, __NR_mmap, 0x1000, 0);
+            d[8] = mm[k].prot;  /* args[2] low */
+            d[10] = mm[k].flags; /* args[3] low */
+            u32 got = bpf_run(f, n, d, &bad);
+            int ok = !bad && got == mm[k].want;
+            cng_dprintf(1, "bpftest mmap %s: %s -> %s\n", mm[k].what,
+                        bad ? "malformed"
+                        : got == CNG_SECCOMP_RET_TRAP    ? "TRAP"
+                        : got == CNG_SECCOMP_RET_ALLOW   ? "ALLOW"
+                                                         : "other",
+                        ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+    }
+
     /* A foreign architecture must be killed, not allowed. */
     {
         u32 d[16];

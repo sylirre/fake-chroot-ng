@@ -27,6 +27,7 @@
  * on a real AArch64 kernel (and via the `-t dtest` self-test).
  */
 #include "cng/broker.h"
+#include "cng/execmap.h"
 #include "cng/l2s.h"
 #include "cng/loader.h"
 #include "cng/monitor.h"
@@ -302,6 +303,12 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
      * emulation, so forcing one must not force the other. */
     if (cng_broker_env("CNG_NETLINK_DENY_AUDIT"))
         cng_nl_deny_audit = 1;
+
+    /* No host here has a true noexec mount to offer, so the one path that only
+     * such a mount reaches has a knob of its own: take the anonymous route for
+     * every executable file mapping without asking the kernel first. */
+    if (cng_broker_env("CNG_MMAP_FORCE_ANON"))
+        cng_g_execmap_force = 1;
 
     /* Resolve the program itself through the map (following symlinks) to find
      * the host file. */

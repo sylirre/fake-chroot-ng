@@ -47,6 +47,11 @@ dynamically *and* the seccomp tier is inert, so neither tier reaches libc's own
 | `CNG_ORACLE` | `arm64chroot` binary for M10's real-hardlink differential. Dropped automatically if its machine does not match the host — it is a host-native emulator, not an AArch64 program |
 | `CNG_SYSROOT` | sysroot holding the AArch64 ELF interpreter for M4 (cross host default `/usr/aarch64-linux-gnu`; empty on an AArch64 host, where it is on the system paths) |
 
+`cng_dyn_binds` sets `GUEST_DYN_BINDS`, the same list for a guest that is
+dynamic even where the probed link mode is static — M23 builds one deliberately,
+since the noexec `.so` path only exists for a guest whose own `ld.so` maps
+libraries.
+
 Rootfs images are searched in `$CNG_ROOTFS_DIR`, `tests/.cache/rootfs/`,
 `$HOME/arm64chroot/tests/.cache/rootfs/` and `$HOME/arm64-rootfs/`.
 

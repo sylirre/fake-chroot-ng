@@ -254,6 +254,31 @@ cng_guest_binds() {
     done
 }
 
+# cng_dyn_binds — the same directories, for a guest that is dynamic even though
+# this host's probed link mode is static (M23 builds one deliberately, since the
+# noexec .so path only exists for a guest whose OWN ld.so maps libraries). On a
+# cross host the AArch64 interpreter and libc are under the toolchain sysroot
+# rather than at the host's own /lib, so they are exposed at the guest paths the
+# binary names instead of at their host ones. Sets GUEST_DYN_BINDS.
+cng_dyn_binds() {
+    GUEST_DYN_BINDS=
+    if [ "$CNG_NATIVE" = 1 ]; then _sr=${CNG_SYSROOT-}; else
+        _sr=${CNG_SYSROOT-/usr/aarch64-linux-gnu}
+    fi
+    if [ -n "$_sr" ]; then
+        for _d in lib lib64 usr/lib usr/lib64; do
+            [ -d "$_sr/$_d" ] || continue
+            GUEST_DYN_BINDS="$GUEST_DYN_BINDS -b $_sr/$_d:/$_d"
+        done
+    else
+        for _d in /system /apex /linkerconfig /vendor /lib /lib64 /usr/lib \
+            /usr/lib64 ${PREFIX:+"$PREFIX"}; do
+            [ -d "$_d" ] || continue
+            GUEST_DYN_BINDS="$GUEST_DYN_BINDS -b $_d:$_d"
+        done
+    fi
+}
+
 # guest_cc OUT SRC [flags...] — build an AArch64 guest program.
 #   rc 0   built
 #   rc 1   build failed (diagnostics in $GUEST_CC_LOG) — a real failure

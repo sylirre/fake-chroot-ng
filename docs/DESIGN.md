@@ -150,7 +150,14 @@ result back into the return register. Non-path syscalls run natively.
 **The mmap hook is the choke point** for both `noexec`-defeat and rewriting of
 dynamically-loaded code: when `ld.so` tries to `mmap(PROT_EXEC)` a `.so` from
 the `noexec` rootfs (which fails natively), we intercept it, read+map the file
-into anon RW→RX, and rewrite its `svc` sites before flipping to RX.
+into anon RW→RX, and rewrite its `svc` sites before flipping to RX
+(`src/monitor/execmap.c`). The filter tests the arguments rather than the
+syscall — `PROT_EXEC` set, `MAP_ANONYMOUS` clear — so every anonymous
+allocation a guest makes stays untrapped and only a library's text mapping
+reaches the handler. The conversion runs *after* the kernel has refused, so an
+exec-permitted mount keeps its real file mapping, its page-cache sharing and
+its identity in `/proc/self/maps`; only `MAP_PRIVATE` can be served this way,
+since a copy cannot carry `MAP_SHARED`'s visibility.
 
 **Rewriting needs no seccomp** (a rewritten site is a plain `b` to a trampoline
 that calls the dispatcher directly). So the rewriting tier is not only the speed

@@ -58,8 +58,8 @@ vfork/`posix_spawn` child-stack handling.
   the interpreter path; `LD_LIBRARY_PATH` lets ld.so find libc at a real host
   path until M5 redirects its opens into the guest rootfs).
   Note: on a real noexec mount, ld.so's own file-backed `PROT_EXEC` mmap of
-  `.so`s will fail — M5's mmap hook must convert those to anon-exec. Under qemu
-  the libs live on an exec-permitted mount so this isn't exercised yet.
+  `.so`s fails, and the loader cannot help — it never sees that mapping. Closed
+  by **M23** below (the mmap hook), which converts it to anon-exec.
 
 - [x] **M5a — path-translation core**
   rootfs + longest-prefix component-aware binds, lexical `..` canonicalization
@@ -1815,7 +1815,48 @@ vfork/`posix_spawn` child-stack handling.
     no oracle — the host has exactly one IPC namespace — and the suite also
     asserts the point of the whole exercise: the guest's keyed objects never
     appear in the host's `ipcs`.
-  - Filter is 138 of 256 instructions.
+  - Filter is 138 of 256 instructions (158 once M23's mmap band lands).
+
+- [x] **M23 — the mmap hook: a library mapping a noexec mount will not grant**
+  The loader defeats `noexec` for everything *it* loads, by reading the image
+  with `pread` and mapping it anonymously. A dynamic guest's libraries are not
+  in that set: they are mapped by the guest's OWN `ld.so`, which asks for
+  `PROT_EXEC` straight from the file, and on a true `MNT_NOEXEC` mount the
+  kernel refuses. Every dynamically linked guest died in its interpreter, and
+  there was no second place to fix it — the mapping request is where the
+  failure is visible. (`docs/DESIGN.md` has described this hook since M4; it
+  was the last piece of the design that had no code.)
+  - `execmap.c`: on `EPERM`/`EACCES`, map the range anonymously RW, `pread` the
+    file's bytes into it, and `mprotect` to what the guest asked for. Only
+    `MAP_PRIVATE` (a copy cannot carry `MAP_SHARED`'s visibility) and only after
+    the kernel has actually refused, so an exec-permitted mount keeps its real
+    file mapping, its page-cache sharing and its `/proc/self/maps` identity.
+    Past end-of-file the copy reads as zeroes where the real thing would
+    `SIGBUS` — the same forgiving edge the loader's own anon strategy has.
+  - The filter tests the arguments, not the syscall: `PROT_EXEC` set and
+    `MAP_ANONYMOUS` clear. Every anonymous allocation a guest makes — nearly all
+    of them — stays untrapped; a handful of mappings per `dlopen` do not.
+  - **-R now reaches library code**, which it never could before: the copy is
+    still writable when it arrives, so the `svc` sites go through the M8
+    rewriter on the way. Only the PF_X `PT_LOAD`s are scanned (read from the
+    file, since the mapping may start past the headers) — scanning a whole
+    library would put `.rodata` words that happen to equal `svc #0` through the
+    rewriter, which is the M8 caveat. The trampoline pool cannot be
+    over-allocated here the way the loader does it, because the span belongs to
+    the guest's linker, so it goes immediately outside the object's own load
+    span (`MAP_FIXED_NOREPLACE`, both sides tried), and failing that wherever
+    the kernel puts one; a pool nothing could reach is handed straight back.
+  - Validated by `tests/m23_execmap.sh`: the BPF band (four shapes of `mmap`,
+    through the interpreter), and a deliberately **dynamic** guest run with
+    `CNG_MMAP_FORCE_ANON=1` — it starts with every library served from a copy,
+    and its own libc `openat` lands in the rootfs. That last one is the case
+    `guest_xlate_ready` used to skip as unreachable ("seccomp inert here and the
+    guest links dynamically, so neither tier reaches libc's svc sites"). The
+    control is the same run unforced, which on a cross host is not translated.
+  - `CNG_MMAP_FORCE_ANON=1` takes the anonymous route without asking the kernel
+    first, since no dev host has a true noexec mount to offer. Same testing
+    convention as `CNG_SHM_FORCE_FILE` / `CNG_PROCREG_NONE`.
+  - Filter is 158 of 256 instructions.
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 

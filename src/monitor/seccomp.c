@@ -483,6 +483,42 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
     f[n++] = (struct sock_filter)CNG_BPF_STMT(
         CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* reload A=nr */
 
+    /* mmap, for the executable file-mapping band only. A .so on a true noexec
+     * mount cannot be mapped PROT_EXEC from its file at all, and it is the
+     * guest's OWN ld.so that asks — chroot-ng's loader never does, since it
+     * preads its images into anonymous memory, which is the whole noexec
+     * defeat. Without this trap a dynamic guest dies in its interpreter before
+     * main; with it the dispatcher serves the mapping from anonymous memory
+     * instead (execmap.c).
+     *
+     * Trapping mmap wholesale would put every anonymous allocation a guest
+     * makes through the handler, so the arguments are tested instead: prot
+     * carries PROT_EXEC (args[2]) and flags do not carry MAP_ANONYMOUS
+     * (args[3]). Both are scalars, so BPF can read them, and the pair is rare
+     * — a handful per dlopen. */
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, (uint32_t)__NR_mmap, 0,
+        8); /* not mmap -> reload nr */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_ARGS + 16); /* A = prot */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_ALU | CNG_BPF_AND | CNG_BPF_K, CNG_PROT_EXEC);
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, 0, 4, 0); /* no EXEC -> allow */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_ARGS + 24); /* A = flags */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_ALU | CNG_BPF_AND | CNG_BPF_K, CNG_MAP_ANONYMOUS);
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, 0, 0,
+        1); /* file-backed -> trap, anonymous -> allow */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
+                                              CNG_SECCOMP_RET_TRAP);
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_RET | CNG_BPF_K, CNG_SECCOMP_RET_ALLOW); /* not the band */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* reload A=nr */
+
     /* Synthesized-file refresh: a read on one of the high fds reserved for the
      * time-varying /proc files (loadavg, uptime, stat) must reach the
      * dispatcher, which regenerates the content when the read starts at offset
