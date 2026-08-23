@@ -76,10 +76,22 @@ int cng_path_canon(const char *abs, char *out, size_t outsz);
 int cng_fs_abscanon(const struct cng_fs *fs, const char *path, char *out,
                     size_t outsz);
 
+/* Which entry of the guest's mount table a path falls in — the identity
+ * RESOLVE_NO_XDEV is judged against, and the same table the synthesized
+ * /proc/self/mounts is built from. A bind is its own index; everything else is
+ * one of these. */
+#define CNG_MOUNT_ROOTFS (-1)
+#define CNG_MOUNT_PROC   (-2)
+#define CNG_MOUNT_DEV    (-3)
+
 /* Translate a guest path (absolute, or relative to fs->cwd) to a host path.
- * Returns 0 on success, -1 on overflow. */
+ * Returns 0 on success, -1 on overflow. The _mnt form also reports which mount
+ * answered (see above); `mount_out` may be 0, which is what cng_fs_translate
+ * passes. */
 int cng_fs_translate(const struct cng_fs *fs, const char *path, char *out,
                      size_t outsz);
+int cng_fs_translate_mnt(const struct cng_fs *fs, const char *path, char *out,
+                         size_t outsz, int *mount_out);
 
 /* Reverse translation: map a host path back to the guest path it represents
  * (strip rootfs / reverse binds). Returns 0 on success, -1 if the host path is

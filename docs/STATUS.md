@@ -1858,6 +1858,57 @@ vfork/`posix_spawn` child-stack handling.
     convention as `CNG_SHM_FORCE_FILE` / `CNG_PROCREG_NONE`.
   - Filter is 158 of 256 instructions.
 
+- [x] **M24 — `openat2`'s `open_how.resolve` describes OUR resolution**
+  `openat2` was translated like `openat` and re-issued with the guest's own
+  `open_how` — carrying a `resolve` word that constrains the very walk the
+  translation had just performed, and that the kernel then re-applied to an
+  absolute host path the guest never wrote. Every bit of it landed in the wrong
+  namespace:
+  - `RESOLVE_BENEATH` rejects an absolute pathname (`EXDEV`), and the
+    translated one always is — so a relative name that must open was `EXDEV`,
+    every time;
+  - `RESOLVE_IN_ROOT` re-roots an absolute pathname at `dirfd`, so the host path
+    was re-rooted at the guest's directory and named a file nobody asked for;
+  - `RESOLVE_NO_SYMLINKS` was simply violated: the resolver had already followed
+    the links the guest asked it not to, and handed the kernel the target;
+  - `RESOLVE_NO_XDEV` was judged against the *host* mount list, where the
+    rootfs prefix is a crossing the guest cannot see.
+
+  Two answers, split by what the constraint is relative to:
+  - **`BENEATH` / `IN_ROOT` scope the resolution to `dirfd`**, which the guest
+    can only hold because we handed it over — so it already names a directory
+    inside the view, and the kernel's own scoping contains the call at least as
+    tightly as the rootfs does. The call goes over untranslated and is answered
+    exactly, absolute symlinks and escaping `..` included. Two policies that
+    were keyed on a path get re-expressed against the directory, which is sound
+    because the answer must lie under it: a `:ro` bind covering the dirfd covers
+    everything the open can reach (the ENOENT-vs-EROFS half is asked with the
+    guest's own scoping, so it describes the same file), and a dirfd already
+    inside `/proc` is the only way to reach a hidden pid, so that case asks the
+    descriptor afterwards where it landed.
+  - **The rest constrain the walk itself**, so they are answered during it —
+    `cng_resolve_lim`, the same function every translation goes through — and
+    then stripped from the copy of `open_how` that is re-issued. `NO_SYMLINKS`
+    and `NO_MAGICLINKS` are `ELOOP` on the guest's own links (a `/proc` magic
+    link counts, and `NO_SYMLINKS` implies `NO_MAGICLINKS`); `NO_XDEV` is
+    `EXDEV` on leaving the guest mount the walk started in — the rootfs, a bind,
+    the `/proc` or `/dev` zone, which is the same table the synthesized
+    `/proc/self/mounts` is built from. The re-issue never writes to the guest's
+    struct: it gets our copy.
+  - `build_open_flags()` runs before any resolution, so a `how` the kernel
+    refuses is `EINVAL` whatever the path says — ahead of any constraint we
+    would answer ourselves. Asked of the kernel directly, with a name that
+    resolves to nothing. The `size` rules are the kernel's own too: below the
+    struct is `EINVAL`, above it a non-zero tail is `E2BIG`, and a zero tail
+    makes the call identical to a sized one (which is what makes it safe to
+    re-issue as one).
+  - Validated by `tests/m24_openat2.sh`. `-t o2test` drives everything decided
+    before the re-issue, which is where all the new judgement is, and so runs on
+    every host — no qemu-user build implements `openat2`, and a cross host
+    cannot reach the syscall at all. On a host that has it, the differential
+    runs `tests/guests/openat2.c` twice, once with no emulation, and demands the
+    host kernel's answers for all 21 cases byte for byte.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

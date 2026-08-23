@@ -31,6 +31,7 @@
 #define CNG_O_NOFOLLOW  0100000
 #define CNG_O_CLOEXEC   02000000
 #define CNG_O_TMPFILE   (020000000 | CNG_O_DIRECTORY)
+#define CNG_O_PATH      010000000
 
 /* renameat2 flags */
 #define CNG_RENAME_NOREPLACE 1
@@ -53,6 +54,21 @@
 #define CNG_MAP_GROWSDOWN       0x0100
 #define CNG_MAP_FIXED_NOREPLACE 0x100000
 #define CNG_MAP_FAILED          ((void *)-1L)
+
+/* openat2(2): struct open_how and its resolve constraints. The struct is the
+ * kernel's ABI — three u64s, and `size` is checked against it — so it is
+ * spelled out here rather than read a field at a time. */
+struct cng_open_how {
+    unsigned long flags;
+    unsigned long mode;
+    unsigned long resolve;
+};
+#define CNG_RESOLVE_NO_XDEV       0x01
+#define CNG_RESOLVE_NO_MAGICLINKS 0x02
+#define CNG_RESOLVE_NO_SYMLINKS   0x04
+#define CNG_RESOLVE_BENEATH       0x08
+#define CNG_RESOLVE_IN_ROOT       0x10
+#define CNG_RESOLVE_CACHED        0x20
 
 /* clone(2) flags (subset). */
 #define CNG_CLONE_VM     0x00000100

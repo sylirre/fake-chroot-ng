@@ -340,7 +340,14 @@ int cng_fs_abscanon(const struct cng_fs *fs, const char *path, char *out,
 
 int cng_fs_translate(const struct cng_fs *fs, const char *path, char *out,
                      size_t outsz) {
+    return cng_fs_translate_mnt(fs, path, out, outsz, 0);
+}
+
+int cng_fs_translate_mnt(const struct cng_fs *fs, const char *path, char *out,
+                         size_t outsz, int *mount_out) {
     char canon[CNG_PATH_MAX];
+    if (mount_out)
+        *mount_out = CNG_MOUNT_ROOTFS;
     if (cng_fs_abscanon(fs, path, canon, sizeof canon) < 0)
         return -1;
 
@@ -370,14 +377,20 @@ int cng_fs_translate(const struct cng_fs *fs, const char *path, char *out,
         size_t n = cng_strlcpy(out, fs->binds[best].host, outsz);
         if (n >= outsz || cng_strlcpy(out + n, suffix, outsz - n) >= outsz - n)
             return -1;
+        if (mount_out)
+            *mount_out = best;
     } else if (proc_zone(canon)) {
         /* A bind wins over the passthrough (checked first, above): an explicit
          * -b DIR:/proc is the user overriding the host view. */
         if (cng_strlcpy(out, canon, outsz) >= outsz)
             return -1;
+        if (mount_out)
+            *mount_out = CNG_MOUNT_PROC;
     } else if ((dz = dev_zone(canon, out, outsz)) != 0) {
         if (dz < 0)
             return -1; /* filled by the zone, unless it did not fit */
+        if (mount_out)
+            *mount_out = CNG_MOUNT_DEV;
     } else {
         size_t n = cng_strlcpy(out, fs->rootfs, outsz); /* "" or "/root" */
         if (n >= outsz || cng_strlcpy(out + n, canon, outsz - n) >= outsz - n)

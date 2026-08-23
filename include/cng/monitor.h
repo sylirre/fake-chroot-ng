@@ -206,10 +206,34 @@ extern int cng_g_debug;
  * is read from here, an -E entry is only ever handed to the guest. */
 extern char **cng_g_host_envp;
 
+/* openat2(2)'s scoping constraints, carried into the walk that translates the
+ * path. The guest asked for them against ITS namespace, so they are answered
+ * there and stripped before the call is re-issued: the rootfs prefix is not
+ * part of the resolution the guest described, and RESOLVE_NO_XDEV means the
+ * guest's own mount table (rootfs + binds + the /proc and /dev zones), which is
+ * also what the synthesized /proc/self/mounts shows it. NULL for every other
+ * caller, which is all of them — nothing else in the syscall table has these.
+ *
+ * RESOLVE_BENEATH and RESOLVE_IN_ROOT are NOT here: they scope resolution to a
+ * dirfd the guest already holds inside the view, which contains the call at
+ * least as tightly as the rootfs does, so those are handed to the kernel
+ * untranslated and answered exactly (see the openat2 case in dispatch.c). */
+struct cng_res_limit {
+    unsigned no_symlinks : 1;   /* RESOLVE_NO_SYMLINKS: magic links included */
+    unsigned no_magiclinks : 1; /* RESOLVE_NO_MAGICLINKS */
+    unsigned no_xdev : 1;       /* RESOLVE_NO_XDEV */
+    const char *xdev_base;      /* guest dir the walk starts in (0 = its base) */
+    long err;                   /* the violation: -ELOOP or -EXDEV */
+};
+
 /* Resolve a guest path to a host path, following symlinks within the guest
  * (absolute link targets re-rooted into the rootfs). deref_final follows the
- * last component's own symlink. Returns 0/-errno. Uses cng_g_fs + readlink. */
+ * last component's own symlink. Returns 0/-errno. Uses cng_g_fs + readlink.
+ * The _lim form applies an openat2 constraint set on the way; `lim` may be 0,
+ * which is what cng_resolve passes. */
 int cng_resolve(const char *path, int deref_final, char *out, size_t outsz);
+int cng_resolve_lim(const char *path, int deref_final, char *out, size_t outsz,
+                    struct cng_res_limit *lim);
 
 /* Resolve (dirfd, path) to a HOST path: absolute names and AT_FDCWD through the
  * rootfs, a real dirfd through the guest path it names — so a relative name is

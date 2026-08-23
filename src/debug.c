@@ -2815,6 +2815,147 @@ int cng_cmd_elfspan(int argc, char **argv, char **envp, unsigned long *auxv) {
     return ok ? 0 : 1;
 }
 
+/* _o2test ROOT — openat2's open_how.resolve.
+ *
+ * Two halves, both reachable without the syscall itself, which matters: no
+ * qemu-user build implements openat2, so on a cross host the only thing that
+ * can be exercised is everything decided *before* the re-issue — which is where
+ * all of the new judgement lives.
+ *
+ *  - the constraint walk (cng_resolve_lim): NO_SYMLINKS, NO_MAGICLINKS and
+ *    NO_XDEV are answered against the GUEST's namespace, since that is the one
+ *    the guest described. A bind is the only mount crossing a guest can see, so
+ *    it is what NO_XDEV is judged against;
+ *  - the ABI half (read_open_how, through the dispatcher): `size` below the
+ *    struct is EINVAL, above it a non-zero tail is E2BIG and a zero tail is the
+ *    same call, and a pointer that will not read is EFAULT. All three are the
+ *    kernel's own rules, and all three are decided before any path is touched.
+ *
+ * ROOT must contain w/ (writable). A bind of ROOT/b onto /mnt is added here, so
+ * the crossing exists without needing a real mount.
+ */
+int cng_cmd_o2test(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)envp;
+    (void)auxv;
+    const char *rootfs = argc > 1 ? argv[1] : "/";
+    static struct cng_fs fs;
+    cng_fs_init(&fs, rootfs);
+    cng_g_fs = &fs;
+    char bhost[CNG_PATH_MAX];
+    size_t n = cng_strlcpy(bhost, rootfs, sizeof bhost);
+    cng_strlcpy(bhost + n, "/b", sizeof bhost - n);
+    cng_fs_add_bind(&fs, "/mnt", bhost, 0);
+    int fails = 0;
+
+    /* The tree, made through the dispatcher so it lands in the rootfs. */
+    long fd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/file",
+                           CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (fd >= 0) {
+        sys_write((int)fd, "X", 1);
+        sys_close((int)fd);
+    }
+    fd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/mnt/file",
+                      CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (fd >= 0)
+        sys_close((int)fd);
+    cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/link", 0, 0, 0, 0, 0);
+    cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/mag", 0, 0, 0, 0, 0);
+    cng_dispatch(__NR_symlinkat, (long)"file", CNG_AT_FDCWD, (long)"/w/link", 0,
+                 0, 0, 0);
+    cng_dispatch(__NR_symlinkat, (long)"/proc/self/fd/0", CNG_AT_FDCWD,
+                 (long)"/w/mag", 0, 0, 0, 0);
+
+    char out[CNG_PATH_MAX];
+    struct cng_res_limit lim;
+#define O2_RESOLVE(path, deref, setup)                                         \
+    (memset(&lim, 0, sizeof lim), setup,                                       \
+     cng_resolve_lim((path), (deref), out, sizeof out, &lim))
+
+    /* NO_SYMLINKS: any link, and only a link. */
+    {
+        long a = O2_RESOLVE("/w/link", 1, lim.no_symlinks = 1);
+        long b = O2_RESOLVE("/w/link", 1, (void)0);
+        long c = O2_RESOLVE("/w/file", 1, lim.no_symlinks = 1);
+        int ok = a == -ELOOP && b == 0 && c == 0;
+        cng_dprintf(1, "o2test nosym link=%ld plain=%ld unconstrained=%ld -> %s\n",
+                    a, c, b, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* A magic link is a link too: NO_MAGICLINKS refuses it, NO_SYMLINKS
+     * implies NO_MAGICLINKS, and an ordinary link is none of its business. */
+    {
+        long a = O2_RESOLVE("/w/mag", 1, lim.no_magiclinks = 1);
+        long b = O2_RESOLVE("/w/mag", 1, lim.no_symlinks = 1);
+        long c = O2_RESOLVE("/w/link", 1, lim.no_magiclinks = 1);
+        long d = O2_RESOLVE("/w/mag", 1, (void)0);
+        int ok = a == -ELOOP && b == -ELOOP && c == 0 && d == 0;
+        cng_dprintf(1,
+                    "o2test nomagic magic=%ld via-nosym=%ld ordinary=%ld"
+                    " unconstrained=%ld -> %s\n",
+                    a, b, c, d, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* NO_XDEV against the guest's own mount table: the rootfs and a bind are
+     * two mounts, and the crossing is refused in both directions. */
+    {
+        long a = O2_RESOLVE("/mnt/file", 1, lim.no_xdev = 1);
+        long b = O2_RESOLVE("/w/file", 1, lim.no_xdev = 1);
+        long c = O2_RESOLVE("/mnt/file", 1, (void)0);
+        /* ...and out of one: a walk that starts inside the bind may not climb
+         * back into the rootfs. */
+        memset(&lim, 0, sizeof lim);
+        lim.no_xdev = 1;
+        lim.xdev_base = "/mnt";
+        long d = cng_resolve_lim("/mnt/../w/file", 1, out, sizeof out, &lim);
+        int ok = a == -EXDEV && b == 0 && c == 0 && d == -EXDEV;
+        cng_dprintf(1,
+                    "o2test noxdev into-bind=%ld same-mount=%ld out-of-bind=%ld"
+                    " unconstrained=%ld -> %s\n",
+                    a, b, d, c, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+#undef O2_RESOLVE
+
+#ifdef __NR_openat2
+    /* The size/pointer rules, through the dispatcher. Each is answered before
+     * any path is looked at, so the answer does not depend on this host having
+     * openat2 at all. */
+    {
+        struct {
+            struct cng_open_how how;
+            unsigned long tail;
+        } big = {{CNG_O_RDONLY, 0, 0}, 0};
+        long small = cng_dispatch(__NR_openat2, CNG_AT_FDCWD, (long)"/w/file",
+                                  (long)&big, 8, 0, 0, 0);
+        big.tail = 1;
+        long e2big = cng_dispatch(__NR_openat2, CNG_AT_FDCWD, (long)"/w/file",
+                                  (long)&big, (long)sizeof big, 0, 0, 0);
+        big.tail = 0;
+        long zero = cng_dispatch(__NR_openat2, CNG_AT_FDCWD, (long)"/w/file",
+                                 (long)&big, (long)sizeof big, 0, 0, 0);
+        long bad = cng_dispatch(__NR_openat2, CNG_AT_FDCWD, (long)"/w/file", 0,
+                                (long)sizeof big.how, 0, 0, 0);
+        /* A zero tail is the same call as a sized one, so it must NOT be
+         * refused by either rule; whether it then opens depends on the host
+         * (qemu-user has no openat2 and answers ENOSYS). */
+        int ok = small == -EINVAL && e2big == -E2BIG && bad == -EFAULT &&
+                 zero != -EINVAL && zero != -E2BIG && zero != -EFAULT;
+        if (zero >= 0)
+            sys_close((int)zero);
+        cng_dprintf(1,
+                    "o2test abi small=%ld tail=%ld null=%ld zero-tail=%ld"
+                    " -> %s\n",
+                    small, e2big, bad, zero, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+#endif
+
+    cng_dprintf(1, "o2test: %d failure(s)\n", fails);
+    return fails ? 1 : 0;
+}
+
 /* _imgtest — an ET_EXEC guest is mapped MAP_FIXED at its link-time vaddr, and
  * the monitor is in the same address space. A vaddr reaching chroot-ng's own
  * image therefore does not fail: it succeeds, over the code performing the

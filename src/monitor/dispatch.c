@@ -499,6 +499,25 @@ static long inject_dents(long dirfd, const char *gdir, char *buf, long used,
     return added;
 }
 
+/* Which guest mount a canonical guest path belongs to, for RESOLVE_NO_XDEV.
+ * Asked of the path layer rather than reimplemented, so it can never disagree
+ * with where the path actually resolves. */
+static int mount_of(const char *canon) {
+    char tmp[CNG_PATH_MAX];
+    int m = CNG_MOUNT_ROOTFS;
+    cng_fs_translate_mnt(cng_g_fs, canon, tmp, sizeof tmp, &m);
+    return m;
+}
+
+/* Has the walk left the mount it started in? Records the violation so the
+ * caller can tell it from a translation that merely did not fit. */
+static int xdev_hit(struct cng_res_limit *lim, int start, const char *canon) {
+    if (!lim || !lim->no_xdev || mount_of(canon) == start)
+        return 0;
+    lim->err = -EXDEV;
+    return 1;
+}
+
 /* Append one component to the resolved prefix ("/a" + "b" -> "/a/b"). 0/-1. */
 static int canon_push(char *c, size_t sz, const char *comp, size_t clen) {
     size_t n = strlen(c);
@@ -551,6 +570,11 @@ static int splice_rest(char *rest, size_t sz, const char *tgt,
  * "last" is judged against the path as it stands, so a symlink expanded earlier
  * moves it, exactly as O_NOFOLLOW behaves. Returns 0/-errno. */
 int cng_resolve(const char *path, int deref_final, char *out, size_t outsz) {
+    return cng_resolve_lim(path, deref_final, out, outsz, 0);
+}
+
+int cng_resolve_lim(const char *path, int deref_final, char *out, size_t outsz,
+                    struct cng_res_limit *lim) {
     char canon[CNG_PATH_MAX], rest[CNG_PATH_MAX];
     if (!path || !path[0])
         return -ENOENT;
@@ -560,6 +584,14 @@ int cng_resolve(const char *path, int deref_final, char *out, size_t outsz) {
     if (cng_strlcpy(canon, base, sizeof canon) >= sizeof canon ||
         cng_strlcpy(rest, path, sizeof rest) >= sizeof rest)
         return -ENAMETOOLONG;
+
+    /* The mount the resolution starts in. For a name reached through a real
+     * dirfd the walk is handed an absolute path built from that directory, so
+     * the caller names the true starting point; otherwise it is this base. */
+    int start = CNG_MOUNT_ROOTFS;
+    if (lim && lim->no_xdev)
+        start = mount_of(lim->xdev_base && lim->xdev_base[0] ? lim->xdev_base
+                                                             : base);
 
     int nlinks = 0;
     char *p = rest;
@@ -585,10 +617,16 @@ int cng_resolve(const char *path, int deref_final, char *out, size_t outsz) {
             continue;
         if (clen == 2 && comp[0] == '.' && comp[1] == '.') {
             canon_pop(canon);
+            /* Backing out of a bind leaves its mount as surely as entering one
+             * does, and RESOLVE_NO_XDEV forbids the crossing either way. */
+            if (xdev_hit(lim, start, canon))
+                return lim->err;
             continue;
         }
         if (canon_push(canon, sizeof canon, comp, clen) < 0)
             return -ENAMETOOLONG;
+        if (xdev_hit(lim, start, canon))
+            return lim->err;
 
         /* /dev/fd/N and /dev/std{in,out,err} are the same magic links as their
          * /proc spelling, so rewrite them to it and let the checks below treat
@@ -597,6 +635,15 @@ int cng_resolve(const char *path, int deref_final, char *out, size_t outsz) {
          * path at all ("pipe:[12345]"). */
         dev_magic(canon, sizeof canon);
         int magic = proc_magic(canon, sizeof canon);
+        /* A magic link is a link: RESOLVE_NO_MAGICLINKS refuses it, and
+         * RESOLVE_NO_SYMLINKS implies NO_MAGICLINKS. Both are ELOOP, which is
+         * what the kernel answers for a constraint it cannot satisfy by
+         * resolving. */
+        if (magic != PROC_MAGIC_NONE && lim &&
+            (lim->no_magiclinks || lim->no_symlinks)) {
+            lim->err = -ELOOP;
+            return -ELOOP;
+        }
         if (magic == PROC_MAGIC_HOST) {
             /* The magic path IS the host path. Any components left ride along,
              * as they do for a real dirfd. */
@@ -626,6 +673,10 @@ int cng_resolve(const char *path, int deref_final, char *out, size_t outsz) {
         if (n <= 0)
             continue; /* not a symlink, or missing */
         link[n] = '\0';
+        if (lim && lim->no_symlinks) {
+            lim->err = -ELOOP;
+            return -ELOOP;
+        }
         if (++nlinks > 40)
             return -ELOOP;
         canon_pop(canon); /* the link itself is replaced by its target */
@@ -645,6 +696,8 @@ int cng_resolve(const char *path, int deref_final, char *out, size_t outsz) {
     /* cng_fs_translate fails only on length — the canonical form overflowing,
      * or the rootfs prefix pushing the result past `outsz` — so its refusal is
      * the same -ENAMETOOLONG the walk above answers. */
+    if (xdev_hit(lim, start, canon))
+        return lim->err;
     return cng_fs_translate(cng_g_fs, canon, out, outsz) == 0 ? 0
                                                               : -ENAMETOOLONG;
 }
@@ -692,7 +745,8 @@ static int dirfd_host(int dfd, char *hdir, size_t sz) {
  * Returns -1 when the dirfd names a directory outside the guest view (a /proc
  * dirfd, say) — there is no guest path to express it as, and the /proc zone
  * wants the host namespace anyway, so the caller passes the name through. */
-static int xlate_at(int dfd, const char *path, char *out, size_t sz, int deref) {
+static int xlate_at_lim(int dfd, const char *path, char *out, size_t sz,
+                        int deref, struct cng_res_limit *lim) {
     char hdir[CNG_PATH_MAX], gdir[CNG_PATH_MAX], gp[CNG_PATH_MAX];
     if (dirfd_host(dfd, hdir, sizeof hdir) != 0)
         return -1;
@@ -707,7 +761,14 @@ static int xlate_at(int dfd, const char *path, char *out, size_t sz, int deref) 
     }
     if (cng_strlcpy(gp + k, path, sizeof gp - k) >= sizeof gp - k)
         return XLATE_AT_LONG;
-    long r = cng_resolve(gp, deref, out, sz);
+    /* RESOLVE_NO_XDEV is judged from where the resolution really starts, which
+     * for a dirfd-relative name is the directory it names — not the "/" the
+     * absolute form built above begins at. */
+    if (lim)
+        lim->xdev_base = gdir;
+    long r = cng_resolve_lim(gp, deref, out, sz, lim);
+    if (lim)
+        lim->xdev_base = 0; /* gdir dies with this frame */
     if (r == 0)
         return 0;
     /* A name that does not fit must not be passed through: the kernel would
@@ -715,6 +776,10 @@ static int xlate_at(int dfd, const char *path, char *out, size_t sz, int deref) 
      * the walk above exists to prevent. Every other failure (ELOOP) is one the
      * kernel reproduces for itself on the guest's own name. */
     return r == -ENAMETOOLONG ? XLATE_AT_LONG : -1;
+}
+
+static int xlate_at(int dfd, const char *path, char *out, size_t sz, int deref) {
+    return xlate_at_lim(dfd, path, out, sz, deref, 0);
 }
 
 /* Could this single component name an entry that exists only as a resolution
@@ -915,14 +980,17 @@ long cng_fd_reopen(const char *host, long flags, long mode, long err) {
     return r;
 }
 
-static const char *xlate(long dirfd, const char *gp, char *buf, size_t bufsz,
-                         int deref_final) {
+static const char *xlate_lim(long dirfd, const char *gp, char *buf,
+                             size_t bufsz, int deref_final,
+                             struct cng_res_limit *lim) {
     if (!gp)
         return gp;
     int dfd = (int)dirfd; /* int arg: the x-register's top half may be dirty */
     if (gp[0] == '/' || dfd == CNG_AT_FDCWD) {
-        if (cng_resolve(gp, deref_final, buf, bufsz) == 0)
+        if (cng_resolve_lim(gp, deref_final, buf, bufsz, lim) == 0)
             return buf;
+        if (lim && lim->err)
+            return XLATE_TOOLONG; /* the caller reads lim->err, not this */
         if (cng_fs_translate(cng_g_fs, gp, buf, bufsz) == 0)
             return buf;
         /* Both routes failing means the name does not fit — cng_fs_translate
@@ -953,9 +1021,11 @@ static const char *xlate(long dirfd, const char *gp, char *buf, size_t bufsz,
      * the guest view, which is what contains it. AT_FDCWD is handled above and
      * still resolves through the virtual cwd. */
     if (dfd >= 0 && gp[0] && at_needs_xlate(dfd, gp, deref_final)) {
-        int r = xlate_at(dfd, gp, buf, bufsz, deref_final);
+        int r = xlate_at_lim(dfd, gp, buf, bufsz, deref_final, lim);
         if (r == 0)
             return buf;
+        if (lim && lim->err)
+            return XLATE_TOOLONG; /* the caller reads lim->err, not this */
         if (r == XLATE_AT_LONG)
             return XLATE_TOOLONG;
         /* The dirfd names no guest path — the /proc zone, which passes through
@@ -986,6 +1056,11 @@ static const char *xlate(long dirfd, const char *gp, char *buf, size_t bufsz,
     /* A plain name against a dirfd already inside the guest view: the kernel
      * resolves it there, which is the containment. */
     return gp;
+}
+
+static const char *xlate(long dirfd, const char *gp, char *buf, size_t bufsz,
+                         int deref_final) {
+    return xlate_lim(dirfd, gp, buf, bufsz, deref_final, 0);
 }
 
 /* /proc/<pid>/{exe,cwd,root} -> guest-visible link target. Our own process
@@ -1244,6 +1319,107 @@ static void path_args_of(long nr, long a0, long a1, long a2, long a3,
     }
 }
 
+#ifdef __NR_openat2
+/* RESOLVE_BENEATH / RESOLVE_IN_ROOT scope the whole resolution to `dirfd`, and
+ * the kernel is the only thing that can apply them exactly — so the call goes
+ * over untranslated and the two policies that a path-keyed check would have
+ * applied are re-expressed against the directory instead. Both are sound
+ * because the scoping guarantees the answer lies under that directory:
+ *
+ *  - a :ro bind covering the dirfd covers everything the open can reach, so a
+ *    write-intent open is refused here exactly as it would be by name. The
+ *    existence half of the refusal (ENOENT for a name that is not there, EROFS
+ *    for one that is) is asked with the guest's OWN scoping, so it describes
+ *    the same file the open would have found;
+ *  - the /proc zone hides processes by path, and a scoped resolution never
+ *    produces one. Only a dirfd already inside /proc can reach a hidden pid, so
+ *    that case asks the descriptor afterwards where it landed. Nothing in /proc
+ *    is created or truncated by an open, so asking after the fact costs
+ *    nothing.
+ *
+ * Returns the syscall result. */
+static long openat2_scoped(long a0, long a1, long a2, long a3, long a4, long a5,
+                           const struct cng_open_how *how) {
+    char hdir[CNG_PATH_MAX];
+    int have_dir = (int)a0 == CNG_AT_FDCWD
+                       ? sys_getcwd(hdir, sizeof hdir) > 0
+                       : dirfd_host((int)a0, hdir, sizeof hdir) == 0;
+    long oflags = (long)how->flags;
+
+    if (have_dir && ro_denied(hdir) &&
+        ((oflags & 3) != CNG_O_RDONLY ||
+         (oflags & (CNG_O_CREAT | CNG_O_TRUNC)))) {
+        if (oflags & CNG_O_CREAT)
+            return -EROFS; /* creation takes write access on the parent first */
+        struct cng_open_how probe = *how;
+        /* O_PATH so nothing is opened for real, and the caller's own
+         * O_NOFOLLOW carried over — ro_refusal() passes AT_SYMLINK_NOFOLLOW the
+         * same way, or a write-open of a dangling link reads as absent. */
+        probe.flags = CNG_O_PATH | CNG_O_CLOEXEC | (oflags & CNG_O_NOFOLLOW);
+        probe.mode = 0;
+        long e = cng_syscall6(a0, a1, (long)&probe, (long)sizeof probe, 0, 0,
+                              __NR_openat2);
+        if (e < 0)
+            return e; /* the lookup's own error: ENOENT, ENOTDIR, ELOOP... */
+        sys_close((int)e);
+        return -EROFS;
+    }
+
+    long r = reissue(a0, a1, a2, a3, a4, a5, __NR_openat2);
+    if (r >= 0 && have_dir && !cng_g_no_proc && !strncmp(hdir, "/proc", 5) &&
+        (!hdir[5] || hdir[5] == '/')) {
+        char land[CNG_PATH_MAX];
+        if (dirfd_host((int)r, land, sizeof land) == 0 &&
+            proc_pid_prefix(land, 0) && !proc_pid_visible(land)) {
+            sys_close((int)r);
+            return -ENOENT; /* the answer the hidden view gives by name */
+        }
+    }
+    return r;
+}
+
+/* Read the guest's `struct open_how`, applying the kernel's own ABI rules for
+ * `size` before anything else looks at the contents: below the struct is
+ * EINVAL, above it every trailing byte must be zero (E2BIG otherwise) — which
+ * is also what makes an oversized call identical to one sized exactly, and so
+ * safe to re-issue as one. Returns 0, or the errno to answer with. */
+static long read_open_how(long a2, unsigned long size, struct cng_open_how *out) {
+    memset(out, 0, sizeof *out);
+    if (size < sizeof *out)
+        return -EINVAL;
+    if (!a2 || !cng_user_readable((void *)a2, sizeof *out))
+        return -EFAULT;
+    *out = *(struct cng_open_how *)a2;
+    unsigned long extra = size - sizeof *out;
+    if (extra) {
+        const unsigned char *tail = (const unsigned char *)a2 + sizeof *out;
+        if (!cng_user_readable((void *)tail, extra))
+            return -EFAULT;
+        for (unsigned long i = 0; i < extra; i++)
+            if (tail[i])
+                return -E2BIG;
+    }
+    return 0;
+}
+
+/* build_open_flags() runs before any path resolution, so an open_how the kernel
+ * refuses is EINVAL whatever the path was going to say — an unknown resolve
+ * bit, BENEATH and IN_ROOT together, a mode without O_CREAT. We are about to
+ * answer a constraint of our own, which would put our error in front of that
+ * one, so ask the kernel first with a name that resolves to nothing: it
+ * validates the struct, then fails the empty path. Returns 0 when the how is
+ * good, else the errno the kernel gave it. */
+static long how_precheck(const struct cng_open_how *how) {
+    long r = cng_syscall6(CNG_AT_FDCWD, (long)"", (long)how, (long)sizeof *how,
+                          0, 0, __NR_openat2);
+    if (r >= 0) {
+        sys_close((int)r); /* an empty name cannot open, but never leak one */
+        return 0;
+    }
+    return (r == -ENOENT || r == -EAGAIN) ? 0 : r;
+}
+#endif
+
 /* May the *first* path argument of `nr` legitimately be the empty string? Only
  * where the call names the dirfd itself instead: AT_EMPTY_PATH where the guest
  * set it, and readlinkat, which has read the link a dirfd names since Linux
@@ -1410,15 +1586,24 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         int is_open = (nr == __NR_openat);
 #endif
         long oflags = 0;
+#ifdef __NR_openat2
+        struct cng_open_how how;
+        struct cng_res_limit lim = {0, 0, 0, 0, 0};
+        unsigned long resolve = 0;
+#endif
         if (is_open) {
             oflags = a2;
 #ifdef __NR_openat2
             /* openat2's flags live in the open_how it points at, so reading
-             * them is a guest dereference like any other. */
+             * them is a guest dereference like any other — and so is the
+             * `resolve` beside them, which constrains a resolution WE are the
+             * ones performing. */
             if (nr == __NR_openat2) {
-                if (a2 && !cng_user_readable((void *)a2, sizeof(unsigned long)))
-                    return -EFAULT;
-                oflags = a2 ? (long)*(unsigned long *)a2 : 0;
+                long e = read_open_how(a2, (unsigned long)a3, &how);
+                if (e)
+                    return e;
+                oflags = (long)how.flags;
+                resolve = how.resolve;
             }
 #endif
         }
@@ -1458,7 +1643,40 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 cng_procfs_open(canon, oflags, &pr))
                 return pr;
         }
+#ifdef __NR_openat2
+        if (resolve) {
+            /* RESOLVE_BENEATH / RESOLVE_IN_ROOT scope the whole resolution to
+             * `dirfd`, which the guest can only hold because we handed it over
+             * — so it already names a directory inside the view, and the
+             * kernel's own scoping then contains the call at least as tightly
+             * as the rootfs does. Translating breaks it either way: BENEATH
+             * rejects an absolute pathname outright (EXDEV, which is what the
+             * translated one always is), and IN_ROOT re-roots that host path at
+             * the dirfd and names a file nobody asked for. Handed over
+             * untouched the answer is exactly the kernel's — absolute symlinks,
+             * escaping `..`, mount crossings and all. */
+            if (resolve & (CNG_RESOLVE_BENEATH | CNG_RESOLVE_IN_ROOT))
+                return openat2_scoped(a0, a1, a2, a3, a4, a5, &how);
+            /* The rest constrain the walk itself, and are answered against the
+             * GUEST's namespace — the one the guest described — then stripped.
+             * Left in place they would be re-judged against the host path,
+             * where the rootfs prefix is a symlink chain and a mount boundary
+             * that the guest cannot see and did not mean. */
+            long e = how_precheck(&how);
+            if (e)
+                return e;
+            lim.no_symlinks = (resolve & CNG_RESOLVE_NO_SYMLINKS) != 0;
+            lim.no_magiclinks = (resolve & CNG_RESOLVE_NO_MAGICLINKS) != 0;
+            lim.no_xdev = (resolve & CNG_RESOLVE_NO_XDEV) != 0;
+        }
+        const char *p =
+            xlate_lim(a0, (const char *)a1, b1, sizeof b1, deref,
+                      (resolve && nr == __NR_openat2) ? &lim : 0);
+        if (lim.err)
+            return lim.err;
+#else
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
+#endif
         if (p == XLATE_TOOLONG)
             return -ENAMETOOLONG;
         /* :ro bind — mkdirat/mknodat always create; an open only offends with
@@ -1482,7 +1700,24 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                     return ro;
             }
         }
-        long r = reissue(a0, (long)p, a2, a3, a4, a5, nr);
+        long ha2 = a2, ha3 = a3;
+#ifdef __NR_openat2
+        if (nr == __NR_openat2) {
+            /* Our copy, never the guest's struct: the constraints we answered
+             * are cleared for the re-issue, and editing guest memory would
+             * change what the caller believes it asked for. `size` becomes our
+             * struct's, which is what the kernel's ABI check compares against —
+             * an oversized one was already proved zero-tailed, and a zero tail
+             * is exactly what makes the two forms the same call. */
+            how.resolve =
+                resolve & ~(unsigned long)(CNG_RESOLVE_NO_SYMLINKS |
+                                           CNG_RESOLVE_NO_MAGICLINKS |
+                                           CNG_RESOLVE_NO_XDEV);
+            ha2 = (long)&how;
+            ha3 = (long)sizeof how;
+        }
+#endif
+        long r = reissue(a0, (long)p, ha2, ha3, a4, a5, nr);
         /* O_NOFOLLOW through a real dirfd lands on the l2s symlink and draws
          * ELOOP where a real hardlink would open. Retry on the backing file —
          * never a symlink itself, so O_NOFOLLOW stays honored for real

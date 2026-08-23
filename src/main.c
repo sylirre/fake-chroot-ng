@@ -55,6 +55,7 @@ int cng_cmd_nesttest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_argvtest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_elfspan(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_imgtest(int argc, char **argv, char **envp, unsigned long *auxv);
+int cng_cmd_o2test(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_clonetest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_clonestktest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv);
@@ -85,6 +86,7 @@ static const struct test_entry g_tests[] = {
     {"nesttest", cng_cmd_nesttest},
     {"elfspan", cng_cmd_elfspan},
     {"imgtest", cng_cmd_imgtest},
+    {"o2test", cng_cmd_o2test},
     {"clonetest", cng_cmd_clonetest},
     {"clonestktest", cng_cmd_clonestktest},
     {"proctest", cng_cmd_proctest},   {"bpftest", cng_cmd_bpftest},
