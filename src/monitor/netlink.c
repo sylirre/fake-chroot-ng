@@ -931,12 +931,10 @@ int cng_nl_send(int fd, const void *buf, long len, long *out) {
      * a hostile length can cost us in probe syscalls. */
     unsigned char req[256];
     long n = len < 0 ? 0 : (len > (long)sizeof req ? (long)sizeof req : len);
-    if (n && !cng_user_readable(buf, (unsigned long)n)) {
+    if (n && cng_user_copyin(req, buf, (unsigned long)n) < 0) {
         *out = -EFAULT;
         return 1;
     }
-    if (n)
-        memcpy(req, buf, (size_t)n);
     *out = len; /* the guest's request is always "sent" in full */
     drain_requests(s); /* older write()-submitted requests keep their order */
     process_request(s, req, n);
@@ -977,19 +975,20 @@ int cng_nl_recv(int fd, void *buf, long len, long flags, long *out) {
 static long write_nladdr(void *addr, unsigned *alen, unsigned pid) {
     if (!addr || !alen)
         return 0;
-    if (!cng_user_readable(alen, sizeof *alen))
+    unsigned want;
+    if (cng_user_copyin(&want, alen, sizeof want) < 0)
         return -EFAULT;
-    if (*alen < sizeof(struct sockaddr_nl_))
+    if (want < sizeof(struct sockaddr_nl_))
         return 0;
-    if (!cng_user_writable(addr, sizeof(struct sockaddr_nl_)) ||
-        !cng_user_writable(alen, sizeof *alen))
-        return -EFAULT;
     struct sockaddr_nl_ sa;
     memset(&sa, 0, sizeof sa);
     sa.family = AF_NETLINK_;
     sa.pid = pid;
-    memcpy(addr, &sa, sizeof sa);
-    *alen = (unsigned)sizeof sa;
+    if (cng_user_copyout(addr, &sa, sizeof sa) < 0)
+        return -EFAULT;
+    unsigned back = (unsigned)sizeof sa;
+    if (cng_user_copyout(alen, &back, sizeof back) < 0)
+        return -EFAULT;
     return 0;
 }
 
@@ -1109,12 +1108,17 @@ int cng_nl_ioctl(int fd, unsigned long req, void *arg, long *out) {
         /* struct ifconf { int ifc_len; char *ifc_buf; } — 16 bytes on LP64.
          * A NULL buffer asks for the size only, which is how every caller
          * sizes its allocation. */
-        if (!cng_user_readable(arg, 16)) {
+        struct {
+            int len;
+            int pad;
+            char *buf;
+        } ifc;
+        if (cng_user_copyin(&ifc, arg, sizeof ifc) < 0) {
             *out = -EFAULT;
             return 1;
         }
-        int len = *(int *)arg;
-        char *buf = *(char **)((char *)arg + 8);
+        int len = ifc.len;
+        char *buf = ifc.buf;
         /* SIOCGIFCONF is an IPv4 interface list: the kernel reports only
          * interfaces that carry an AF_INET address, and an interface with none
          * simply is not in it (it is still nameable by every getter below). */
@@ -1123,14 +1127,12 @@ int cng_nl_ioctl(int fd, unsigned long req, void *arg, long *out) {
             if (v[i].addr)
                 nv4++;
         int need = nv4 * (int)sizeof(struct ifreq_);
-        /* Only ifc_len is written back — the kernel leaves ifc_buf alone, and
-         * the write probe would zero whatever it validates. */
-        if (!cng_user_writable(arg, sizeof(int))) {
-            *out = -EFAULT;
-            return 1;
-        }
+        /* Only ifc_len is written back — the kernel leaves ifc_buf alone. */
         if (!buf) {
-            *(int *)arg = need;
+            if (cng_user_copyout(arg, &need, sizeof need) < 0) {
+                *out = -EFAULT;
+                return 1;
+            }
             *out = 0;
             return 1;
         }
@@ -1148,23 +1150,29 @@ int cng_nl_ioctl(int fd, unsigned long req, void *arg, long *out) {
             memset(&r, 0, sizeof r);
             cng_strlcpy(r.name, v[i].fi.name, IFNAMSIZ_);
             put_sin(r.u, v[i].addr);
-            memcpy(buf + w, &r, sizeof r);
+            if (cng_user_copyout(buf + w, &r, sizeof r) < 0) {
+                *out = -EFAULT;
+                return 1;
+            }
             w += (int)sizeof r;
         }
-        *(int *)arg = w;
+        if (cng_user_copyout(arg, &w, sizeof w) < 0) {
+            *out = -EFAULT;
+            return 1;
+        }
         *out = 0;
         return 1;
     }
 
-    /* Read before probing for write: every request here names its target in the
-     * same buffer it answers into, and the write probe zeroes what it
-     * validates (see uaccess.c). */
-    if (!cng_user_readable(arg, sizeof(struct ifreq_))) {
+    /* Taken as a copy: every request here names its target in the same buffer
+     * it answers into, so the name has to be read out before anything is
+     * written back — and reading it where it lies would leave the answer
+     * decided by bytes the guest can still change (see uaccess.c). */
+    struct ifreq_ ifr;
+    if (cng_user_copyin(&ifr, arg, sizeof ifr) < 0) {
         *out = -EFAULT;
         return 1;
     }
-    struct ifreq_ ifr;
-    memcpy(&ifr, arg, sizeof ifr);
     ifr.name[IFNAMSIZ_ - 1] = '\0';
 
     /* SIOCGIFNAME is the one that names its target by index; every other form
@@ -1241,11 +1249,10 @@ int cng_nl_ioctl(int fd, unsigned long req, void *arg, long *out) {
     default:
         return 0; /* not one of ours: let the host answer */
     }
-    if (!cng_user_writable(arg, sizeof ifr)) {
+    if (cng_user_copyout(arg, &ifr, sizeof ifr) < 0) {
         *out = -EFAULT;
         return 1;
     }
-    memcpy(arg, &ifr, sizeof ifr);
     *out = 0;
     return 1;
 }

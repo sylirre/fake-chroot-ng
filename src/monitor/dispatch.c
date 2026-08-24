@@ -32,6 +32,10 @@ const char *cng_g_exe_guest = "/";
 
 /* AArch64 struct stat / statx field offsets for ownership rewriting, plus the
  * st_mode offset used by the fake-root access() fallback. */
+/* The kernel's own struct sizes: what a stat/statx writes, and so exactly what
+ * has to come back out of a guest buffer and go back into it. */
+#define STAT_BUF_SIZE  128
+#define STATX_BUF_SIZE 256
 #define STAT_MODE_OFF  16
 #define STAT_UID_OFF   24
 #define STAT_GID_OFF   28
@@ -131,43 +135,40 @@ void cng_note_blocked(int nr) {
 int cng_g_debug = 0;
 char **cng_g_host_envp = 0;
 
-/* Is `p` safe to print as a path string? A magnitude test is not enough: the
- * args of a *failing* syscall include plain scalars (a uid, an offset, a
- * length) that are large enough to look like pointers, and dereferencing one
- * reads a wild address — a SIGSEGV inside the handler, with SIGSEGV masked,
- * kills the guest outright. CNG_DEBUG must never change behaviour, so ask the
- * kernel instead: faccessat() copies the path in from user space before doing
- * anything else, and EFAULT/ENAMETOOLONG mean "not a readable C string". */
-static int dbg_str(long p) {
-    if (p <= 0x1000 || cng_blocked[__NR_faccessat])
-        return 0;
-    long r = CNG_SYS(__NR_faccessat, CNG_AT_FDCWD, p, 0 /*F_OK*/, 0, 0, 0);
-    return r != -EFAULT && r != -ENAMETOOLONG;
-}
-
-/* Best-effort path pointer among a0/a1 for logging (path syscalls put the path
- * in a0 or a1). */
-static const char *dbg_path(long a0, long a1) {
-    if (dbg_str(a1) && *(const char *)a1 == '/')
-        return (const char *)a1;
-    if (dbg_str(a0) && *(const char *)a0 == '/')
-        return (const char *)a0;
+/* Best-effort path argument among a0/a1 for logging (path syscalls put the path
+ * in a0 or a1), taken into `buf` rather than handed back as a guest pointer.
+ *
+ * A magnitude test would not do: the args of a *failing* syscall include plain
+ * scalars (a uid, an offset, a length) that are large enough to look like
+ * pointers, and dereferencing one reads a wild address — a SIGSEGV inside the
+ * handler, with SIGSEGV masked, kills the guest outright. CNG_DEBUG must never
+ * change behaviour. Neither would asking the kernel first (a faccessat that
+ * answers EFAULT for what is not a string): that leaves the printing itself
+ * walking guest memory a syscall later, and the guest is free to unmap it in
+ * between. Copying it settles both questions at once — what will not come
+ * across is not a string, and what did is ours to print. */
+static const char *dbg_path(long a0, long a1, char *buf, unsigned long sz) {
+    if (cng_user_strcopyin(buf, (const char *)a1, sz) > 0 && buf[0] == '/')
+        return buf;
+    if (cng_user_strcopyin(buf, (const char *)a0, sz) > 0 && buf[0] == '/')
+        return buf;
     return "";
 }
 
 static long reissue(long a0, long a1, long a2, long a3, long a4, long a5,
                     long nr) {
+    char pb[CNG_PATH_MAX];
     if (nr >= 0 && nr < CNG_NR_MAX && cng_blocked[nr]) {
         cng_note_blocked((int)nr);
         if (cng_g_debug)
             cng_dprintf(2, "[cng] nr=%ld %s -> BLOCKED ENOSYS\n", nr,
-                        dbg_path(a0, a1));
+                        dbg_path(a0, a1, pb, sizeof pb));
         return -ENOSYS;
     }
     long r = cng_syscall6(a0, a1, a2, a3, a4, a5, nr);
     if (cng_g_debug && r < 0 && r != -ENOENT)
-        cng_dprintf(2, "[cng] nr=%ld %s -> errno=%ld\n", nr, dbg_path(a0, a1),
-                    -r);
+        cng_dprintf(2, "[cng] nr=%ld %s -> errno=%ld\n", nr,
+                    dbg_path(a0, a1, pb, sizeof pb), -r);
     return r;
 }
 
@@ -379,17 +380,14 @@ static long put_dent(char *buf, long at, long cap, const char *name,
                      unsigned long long ino, unsigned char dtype,
                      long long cookie) {
     size_t nl = strlen(name);
+    if (nl > 255) /* NAME_MAX: no dirent the kernel emits is longer either */
+        return 0;
     long reclen = (long)((19 + nl + 1 + 7) & ~(size_t)7);
     if (at < 0 || cap < 0 || at + reclen > cap)
         return 0;
+    /* `buf` is the dispatcher's own batch buffer, not the guest's — see
+     * do_getdents64 for why nothing here may touch the guest's. */
     char *rec = buf + at;
-    /* These records go in ahead of the kernel's, so nothing has established
-     * that the guest's buffer is writable this far — only that it said so.
-     * A fault here is inside the handler, where SIGSEGV is masked and fatal;
-     * refusing the record instead just makes the batch a short one, which is
-     * legal, and leaves the kernel to answer the bad pointer with -EFAULT. */
-    if (!cng_user_writable(rec, (unsigned long)reclen))
-        return 0;
     memset(rec, 0, (size_t)reclen);
     memcpy(rec, &ino, 8);
     memcpy(rec + 8, &cookie, 8);
@@ -1247,19 +1245,180 @@ static int fd_is_rootfs_root(long fd) {
     return strcmp(hp, root) == 0;
 }
 
+/* getdents64: hide the l2s machinery from directory listings — backing
+ * data/marker names anywhere, and the ".l2s" store dir in the rootfs root; when
+ * a whole batch is ours, re-read so a filtered 0 isn't mistaken for
+ * end-of-directory. Then splice in the entries that exist only as resolution
+ * overlays (bind mount points, /dev nodes) and so have no physical dirent to
+ * return.
+ *
+ * All of that reads the records back and rewrites them, and the buffer they sit
+ * in is the guest's. The kernel having just filled it says nothing about the
+ * moment after: another thread of the guest can unmap it, and this runs with
+ * SIGSEGV masked, where a fault is the death of the process rather than an
+ * -EFAULT. So the records are examined in a batch buffer of our own and the
+ * guest's is written only through cng_user_copyout.
+ *
+ * A function of its own because of that buffer: DENTS_BOUNCE is stack, and in
+ * cng_dispatch's frame every other syscall would carry it — that frame already
+ * runs ~100 KiB deep on the execve path. noinline keeps it here (there is one
+ * call site, so gcc would otherwise fold it straight back in).
+ *
+ * The bound costs nothing a guest can see. It is the size of glibc's own
+ * readdir buffer, musl's is 2 KiB and bionic's 4 KiB, and a batch shorter than
+ * the buffer offered is legal and simply read again — which is the same
+ * contract the injection path below already relies on. */
+#define DENTS_BOUNCE 32768
+__attribute__((noinline)) static long do_getdents64(long a0, long a1, long a2,
+                                                    long a3, long a4, long a5) {
+    /* Injection belongs at the start of the stream and only there, so the
+     * decision is taken before the read: lseek(SEEK_CUR) == 0 means nothing
+     * has been read from this fd yet. Deciding it up front also means an
+     * empty directory still gets its overlay entries.
+     *
+     * They go in *ahead* of the kernel's own, which is what guarantees they
+     * go in at all. Appended to a batch the kernel had already filled, they
+     * had nowhere to fit and were simply dropped — and since injection
+     * happens only on the first read of the stream, dropped meant the guest
+     * never saw them. Whether that happened came down to the guest libc's
+     * readdir buffer: musl reads 2 KiB at a time where glibc reads 32 KiB,
+     * so a bind mount point in a directory of any size was listed on a
+     * Debian rootfs and invisible on an Alpine one. */
+    char injdir[CNG_PATH_MAX];
+    int inject = a1 && sys_lseek((int)a0, 0, CNG_SEEK_CUR) == 0 &&
+                 dirfd_guest_dir(a0, injdir, sizeof injdir) == 0;
+    /* Whether anything here is going to look at the records at all. When
+     * nothing is — no injection, no l2s, no hidden-process view — the call is
+     * a plain pass-through and the guest's own buffer size is honored whole. */
+    int bounce = inject || cng_g_l2s || !cng_g_no_proc;
+    char bnc[DENTS_BOUNCE];
+    long ask = (long)a2;
+    if (bounce && ask > DENTS_BOUNCE)
+        ask = DENTS_BOUNCE;
+
+    /* ...and the room left over has to admit at least one of the kernel's
+     * own records, or the stream never moves. put_dent stops only when the
+     * *next* record does not fit, so what remains was routinely below the
+     * smallest possible dirent (24 bytes, for "."); filldir64 then refuses
+     * the whole batch with EINVAL and iterate_dir writes back an *unchanged*
+     * f_pos (measured). Reporting our records as a short batch left the
+     * position at 0, so the next read decided "first read" all over again
+     * and injected the identical entries — forever. `ls /dev` through a raw
+     * getdents64 of 184..407 bytes never reached the real dirents at all;
+     * only the 32 KiB/2 KiB/4 KiB readdir buffers of glibc, musl and bionic
+     * kept every guest that has been tried out of it.
+     *
+     * So hand a record back and re-ask until the kernel can make progress.
+     * inject_dents fills greedily from the two lists, so a cap one byte
+     * under what it just produced yields strictly fewer records: the loop
+     * shrinks monotonically and ends at worst with pre == 0, which is the
+     * guest's own buffer being too small — the kernel's answer to give.
+     *
+     * Keyed on "it refused", not on one errno: the refusal is EINVAL on a
+     * real kernel, but where we left it exactly nothing qemu-user answers
+     * ENOMEM instead (its bounce buffer for a zero-length read), and both
+     * mean the same thing here. Both measured.
+     *
+     * A record dropped this way is not seen again (injection happens once,
+     * at the start of the stream). That bound is the buffer's, not ours: at
+     * 408 bytes the whole /dev overlay plus a kernel record fits and nothing
+     * is dropped, and no real readdir asks for less.
+     *
+     * The injected records are handed over before the kernel is asked, not
+     * after: a guest buffer that cannot take them is -EFAULT with the stream
+     * still where it was, which is what a plain getdents64 on the same buffer
+     * would have answered. */
+    long pre = 0, n, injcap = ask;
+    for (;;) {
+        pre = inject ? inject_dents(a0, injdir, bnc, 0, injcap) : 0;
+        if (pre && cng_user_copyout((char *)a1, bnc, (unsigned long)pre) < 0)
+            return -EFAULT;
+        n = reissue(a0, a1 + pre, ask - pre, a3, a4, a5, __NR_getdents64);
+        if (n >= 0 || pre == 0)
+            break;
+        injcap = pre - 1;
+    }
+    char *buf = (char *)a1 + pre;
+    long cap = ask - pre;
+
+    /* A refusal is the guest's to see: the position did not move, so
+     * answering with the spliced-in bytes would repeat them next time. */
+    if (n < 0)
+        return n;
+    /* End of stream on the very first read means a directory that emitted
+     * neither "." nor "..", which no filesystem does; the overlay records
+     * are the whole answer. */
+    if (n == 0 || !a1 || !bounce)
+        return pre ? pre : n;
+    /* The kernel wrote its records into the guest's buffer, so it has already
+     * answered for that pointer; taking them back out is ours to make safe. */
+    char *kb = bnc + pre;
+    if (cng_user_copyin(kb, buf, (unsigned long)n) < 0)
+        return -EFAULT;
+    /* Hidden-process view, listing side: the path layer makes a host
+     * process's /proc entry unreachable, but `ls /proc` and `ps` read the
+     * directory, so the numeric entries have to go as well. Deciding that
+     * costs a readlink of the fd, so it is asked only when this batch
+     * actually holds a numeric name — outside /proc almost nothing does. */
+    int at_proc = !cng_g_no_proc && dents_have_pid(kb, n) && fd_is_host_proc(a0);
+    if (!cng_g_l2s && !at_proc)
+        return pre + n;
+    int at_root = cng_g_l2s && fd_is_rootfs_root(a0);
+    for (;;) {
+        /* linux_dirent64: d_reclen u16 @16, d_name @19. d_off cookies are
+         * directory-stream positions, so compaction is seek-safe. */
+        long w = 0, o = 0;
+        while (o + 19 <= n) {
+            unsigned short reclen;
+            memcpy(&reclen, kb + o + 16, 2);
+            if (reclen == 0 || o + reclen > n)
+                break;
+            const char *nm = kb + o + 19;
+            int hide = (cng_g_l2s && (cng_l2s_hidden(nm) ||
+                                      (at_root && !strcmp(nm, ".l2s")))) ||
+                       (at_proc && !proc_name_visible(nm));
+            if (!hide) {
+                if (w != o)
+                    memmove(kb + w, kb + o, reclen);
+                w += reclen;
+            }
+            o += reclen;
+        }
+        if (w > 0) {
+            /* Only a batch that lost a record has to go back: what the filter
+             * left untouched is already exactly what the kernel wrote there. */
+            if (w != n && cng_user_copyout(buf, kb, (unsigned long)w) < 0)
+                return -EFAULT;
+            return pre + w;
+        }
+        /* A whole batch of ours: re-read, so a filtered 0 is not mistaken
+         * for end-of-directory. */
+        n = reissue(a0, (long)buf, cap, a3, a4, a5, __NR_getdents64);
+        if (n <= 0)
+            return pre ? pre : n;
+        if (cng_user_copyin(kb, buf, (unsigned long)n) < 0)
+            return -EFAULT;
+    }
+}
+
 /* The guest's own path arguments of a trapped syscall — up to two (dirfd, path)
  * pairs, as the guest wrote them, before any resolution. `p1`/`p2` stay 0 for a
  * syscall that carries no path there (and utimensat's legitimate NULL path,
- * which means "operate on the dirfd"). */
+ * which means "operate on the dirfd"), and the index of the a0..a5 slot each
+ * came out of. The index is what lets cng_dispatch put its own copy of a path
+ * back where the guest's pointer was, so that everything downstream — the
+ * resolver, the l2s check, the re-issue — reads bytes nobody else can change. */
 struct path_args {
     const char *p1, *p2;
     long d1, d2;
+    int i1, i2; /* which argument p1/p2 arrived in; -1 for none */
 };
 
 static void path_args_of(long nr, long a0, long a1, long a2, long a3,
                          struct path_args *pa) {
     pa->p1 = pa->p2 = 0;
     pa->d1 = pa->d2 = CNG_AT_FDCWD;
+    pa->i1 = pa->i2 = -1;
     switch (nr) {
     case __NR_openat:
 #ifdef __NR_openat2
@@ -1286,21 +1445,26 @@ static void path_args_of(long nr, long a0, long a1, long a2, long a3,
     case __NR_readlinkat:
         pa->d1 = a0;
         pa->p1 = (const char *)a1;
+        pa->i1 = 1;
         break;
     case __NR_symlinkat: /* only the linkpath names something new */
         pa->d1 = a1;
         pa->p1 = (const char *)a2;
+        pa->i1 = 2;
         break;
     case __NR_inotify_add_watch: /* a0 is the instance, not a dirfd */
         pa->p1 = (const char *)a1;
+        pa->i1 = 1;
         break;
     case __NR_renameat:
     case __NR_renameat2:
     case __NR_linkat:
         pa->d1 = a0;
         pa->p1 = (const char *)a1;
+        pa->i1 = 1;
         pa->d2 = a2;
         pa->p2 = (const char *)a3;
+        pa->i2 = 3;
         break;
     case __NR_truncate:
     case __NR_statfs:
@@ -1315,6 +1479,7 @@ static void path_args_of(long nr, long a0, long a1, long a2, long a3,
     case __NR_removexattr:
     case __NR_lremovexattr:
         pa->p1 = (const char *)a0;
+        pa->i1 = 0;
         break;
     }
 }
@@ -1387,17 +1552,24 @@ static long read_open_how(long a2, unsigned long size, struct cng_open_how *out)
     memset(out, 0, sizeof *out);
     if (size < sizeof *out)
         return -EINVAL;
-    if (!a2 || !cng_user_readable((void *)a2, sizeof *out))
+    if (!a2 || cng_user_copyin(out, (void *)a2, sizeof *out) < 0)
         return -EFAULT;
-    *out = *(struct cng_open_how *)a2;
     unsigned long extra = size - sizeof *out;
-    if (extra) {
-        const unsigned char *tail = (const unsigned char *)a2 + sizeof *out;
-        if (!cng_user_readable((void *)tail, extra))
+    const unsigned char *tail = (const unsigned char *)a2 + sizeof *out;
+    /* The tail is examined out of a copy, a window at a time — reading the
+     * guest's own bytes after probing them lets another thread fill in a
+     * non-zero one between the check and the re-issue, which is the difference
+     * between the call the kernel refuses and the call it performs. */
+    while (extra) {
+        unsigned char win[256];
+        unsigned long k = extra > sizeof win ? sizeof win : extra;
+        if (cng_user_copyin(win, tail, k) < 0)
             return -EFAULT;
-        for (unsigned long i = 0; i < extra; i++)
-            if (tail[i])
+        for (unsigned long i = 0; i < k; i++)
+            if (win[i])
                 return -E2BIG;
+        tail += k;
+        extra -= k;
     }
     return 0;
 }
@@ -1479,22 +1651,37 @@ static long addr_out(const void *src, long slen, long aa, long alp) {
         return 0;
     /* The writability probe validates a range by zeroing it (uaccess.c), so the
      * caller's length has to be read out before anything is probed for writing. */
-    if (!cng_user_readable((void *)alp, sizeof(int)))
+    int n;
+    if (cng_user_copyin(&n, (void *)alp, sizeof n) < 0)
         return -EFAULT;
-    int n = *(int *)alp;
     if (n > (int)slen)
         n = (int)slen;
     if (n < 0)
         return -EINVAL;
-    if (n) {
-        if (!cng_user_writable((void *)aa, (unsigned long)n))
-            return -EFAULT;
-        memcpy((void *)aa, src, (size_t)n);
-    }
-    if (!cng_user_writable((void *)alp, sizeof(int)))
+    if (n && cng_user_copyout((void *)aa, src, (unsigned long)n) < 0)
         return -EFAULT;
-    *(int *)alp = (int)slen;
+    int back = (int)slen;
+    if (cng_user_copyout((void *)alp, &back, sizeof back) < 0)
+        return -EFAULT;
     return 0;
+}
+
+/* Take a window of a guest mmsghdr array into our own memory. A window at a
+ * time is what keeps the array forms to a syscall per MMSG_WIN messages rather
+ * than one per message — sendmmsg exists to spend one syscall on a batch, and
+ * probing (or copying) each element in turn would give that back. A window that
+ * will not come across whole is retried element by element, because the kernel
+ * stops at the first unreadable message rather than refusing the batch, and
+ * that boundary is part of the answer. Returns how many elements landed. */
+#define MMSG_WIN 16
+static unsigned long mmsg_take(struct cng_mmsghdr *dst,
+                               const struct cng_mmsghdr *v, unsigned long k) {
+    if (cng_user_copyin(dst, v, k * sizeof *dst) == 0)
+        return k;
+    unsigned long got = 0;
+    while (got < k && cng_user_copyin(dst + got, v + got, sizeof *dst) == 0)
+        got++;
+    return got;
 }
 
 /* Run the readback translation over an address the kernel just wrote into our
@@ -1517,19 +1704,41 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     path_args_of(nr, a0, a1, a2, a3, &pa);
 
     /* The path itself is guest memory, and everything below reads it — the
-     * empty test right here, the l2s check, the resolver's 4 KiB copy — before
-     * the kernel has been given a chance to validate anything. A pointer into
-     * nothing, or a string with no terminator before the end of its mapping,
-     * is what the kernel answers -EFAULT and -ENAMETOOLONG for; here it faulted
-     * inside the handler, where SIGSEGV is masked and the fault is the death of
-     * the guest. So measure it first, without ever reading past accessible
-     * memory (cng_user_strlen), and give the two answers the kernel gives. */
+     * empty test right here, the l2s check, the resolver's 4 KiB copy, the
+     * re-issue — before the kernel has been given a chance to validate
+     * anything. A pointer into nothing, or a string with no terminator before
+     * the end of its mapping, is what the kernel answers -EFAULT and
+     * -ENAMETOOLONG for; here it faulted inside the handler, where SIGSEGV is
+     * masked and the fault is the death of the guest.
+     *
+     * Measuring it first was half an answer. It gave the two errnos, but it
+     * left every later reader looking at the guest's own bytes, which another
+     * thread of the guest is free to unmap or rewrite in between — so the walk
+     * that survived the measurement could still fault, and a name that passed
+     * the l2s and /proc checks need not be the name the kernel was then handed.
+     * (fs/namei.c has no such gap: getname() copies the path in once, and every
+     * decision after that is taken on the kernel's own copy.)
+     *
+     * So take the copy here, in one act, and put it back where the guest's
+     * pointer was: pa.p1/p2 and the argument slot itself now name bytes only we
+     * can reach, and nothing downstream needs to know. -E2BIG from the copy is
+     * a path with no terminator inside PATH_MAX, which is -ENAMETOOLONG. */
+    char pb1[CNG_PATH_MAX], pb2[CNG_PATH_MAX];
     if (pa.p1 || pa.p2) {
-        long n1 = pa.p1 ? cng_user_strlen(pa.p1, CNG_PATH_MAX) : 0;
-        long n2 = pa.p2 ? cng_user_strlen(pa.p2, CNG_PATH_MAX) : 0;
+        long *arg[6] = {&a0, &a1, &a2, &a3, &a4, &a5};
+        long n1 = pa.p1 ? cng_user_strcopyin(pb1, pa.p1, CNG_PATH_MAX) : 0;
+        long n2 = pa.p2 ? cng_user_strcopyin(pb2, pa.p2, CNG_PATH_MAX) : 0;
         if (n1 < 0 || n2 < 0) {
             long e = n1 < 0 ? n1 : n2;
             return e == -E2BIG ? -ENAMETOOLONG : e;
+        }
+        if (pa.p1) {
+            pa.p1 = pb1;
+            *arg[pa.i1] = (long)pb1;
+        }
+        if (pa.p2) {
+            pa.p2 = pb2;
+            *arg[pa.i2] = (long)pb2;
         }
     }
 
@@ -1913,52 +2122,71 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * st_nlink = the live group count, regardless of the NOFOLLOW flag — so the
      * guest never sees the emulation as a symlink. */
     case __NR_newfstatat: {
+        /* The kernel fills this buffer and then this layer edits it: an l2s
+         * name's link count, a fake-id uid/gid. Editing it where it lies reads
+         * the struct back out of guest memory a syscall later, and the guest
+         * can have unmapped it by then — a fault in the handler rather than the
+         * answer it already earned. So whenever there is an edit to make, the
+         * kernel fills a struct of ours and the guest gets it in one copy;
+         * where there is none, it fills the guest's directly as before. */
+        int bounce = a2 && (cng_g_l2s || cng_g_fake_id);
+        char sb[STAT_BUF_SIZE];
+        long ob = bounce ? (long)sb : a2;
         if (cng_g_l2s && a2) {
             char hnf[CNG_PATH_MAX];
             if (cng_resolve_at(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0 &&
-                cng_l2s_stat(hnf, (void *)a2) == 1) {
+                cng_l2s_stat(hnf, sb) == 1) {
                 if (cng_g_fake_id)
-                    stat_remap((void *)a2);
-                return 0;
+                    stat_remap(sb);
+                return cng_user_copyout((void *)a2, sb, sizeof sb) < 0 ? -EFAULT
+                                                                       : 0;
             }
         }
         int deref = !((int)a3 & CNG_AT_SYMLINK_NOFOLLOW);
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
         if (p == XLATE_TOOLONG)
             return -ENAMETOOLONG;
-        long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_newfstatat);
+        long r = reissue(a0, (long)p, ob, a3, a4, a5, __NR_newfstatat);
         if (r == 0 && cng_g_l2s && a2 && ((int)a3 & CNG_AT_EMPTY_PATH)) {
             const char *gp = (const char *)a1; /* fstat-by-fd form */
             if (!gp || !gp[0])
-                cng_l2s_fix_fd(a0, (void *)a2);
+                cng_l2s_fix_fd(a0, sb);
         }
         if (r == 0 && cng_g_fake_id && a2)
-            stat_remap((void *)a2);
+            stat_remap(sb);
+        if (r == 0 && bounce && cng_user_copyout((void *)a2, sb, sizeof sb) < 0)
+            return -EFAULT;
         return r;
     }
     case __NR_statx: {
+        /* Bounced on the same terms as newfstatat above. */
+        int bounce = a4 && (cng_g_l2s || cng_g_fake_id);
+        char sx[STATX_BUF_SIZE];
+        long ob = bounce ? (long)sx : a4;
         if (cng_g_l2s && a4) {
             char hnf[CNG_PATH_MAX];
             if (cng_resolve_at(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0 &&
-                cng_l2s_statx(hnf, (void *)a4, (unsigned)a3, (unsigned)a2) ==
-                    1) {
+                cng_l2s_statx(hnf, sx, (unsigned)a3, (unsigned)a2) == 1) {
                 if (cng_g_fake_id)
-                    statx_remap((void *)a4);
-                return 0;
+                    statx_remap(sx);
+                return cng_user_copyout((void *)a4, sx, sizeof sx) < 0 ? -EFAULT
+                                                                       : 0;
             }
         }
         int deref = !((int)a2 & CNG_AT_SYMLINK_NOFOLLOW);
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
         if (p == XLATE_TOOLONG)
             return -ENAMETOOLONG;
-        long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_statx);
+        long r = reissue(a0, (long)p, a2, a3, ob, a5, __NR_statx);
         if (r == 0 && cng_g_l2s && a4 && ((int)a2 & CNG_AT_EMPTY_PATH)) {
             const char *gp = (const char *)a1; /* fstat-by-fd form */
             if (!gp || !gp[0])
-                cng_l2s_fix_fd_statx(a0, (void *)a4);
+                cng_l2s_fix_fd_statx(a0, sx);
         }
         if (r == 0 && cng_g_fake_id && a4)
-            statx_remap((void *)a4);
+            statx_remap(sx);
+        if (r == 0 && bounce && cng_user_copyout((void *)a4, sx, sizeof sx) < 0)
+            return -EFAULT;
         return r;
     }
 
@@ -2016,9 +2244,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                     /* Our own copy_to_user. The kernel never sees this buffer,
                      * so a bad one has to come back -EFAULT rather than fault
                      * in the handler, where SIGSEGV is masked and fatal. */
-                    if (!cng_user_writable((void *)a2, (unsigned long)fx))
+                    if (cng_user_copyout((void *)a2, val, (unsigned long)fx) < 0)
                         return -EFAULT;
-                    memcpy((void *)a2, val, (size_t)fx);
                     return fx;
                 }
             }
@@ -2043,16 +2270,20 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * lsof's map_files walk all land here. Targets outside the view
          * (memfd:, pipe:[..], a host-only file) are left exactly as the kernel
          * wrote them. */
-        if (r > 0 && r < bufsiz && *(char *)a2 == '/' &&
-            rl_may_fdlink(a0, gp)) {
+        if (r > 0 && r < bufsiz && rl_may_fdlink(a0, gp)) {
             char canon[CNG_PATH_MAX];
             if (at_canon(a0, gp, canon, sizeof canon) == 0) {
                 size_t pl = proc_pid_prefix(canon, 0);
                 if (pl && (!strncmp(canon + pl, "fd/", 3) ||
                            !strncmp(canon + pl, "map_files/", 10))) {
                     char tgt[CNG_PATH_MAX], guest[CNG_PATH_MAX];
-                    if ((size_t)r < sizeof tgt) {
-                        memcpy(tgt, (const char *)a2, (size_t)r);
+                    /* The kernel wrote this buffer, but that says nothing about
+                     * reading it back a syscall later: the guest owns it and can
+                     * unmap it in between, so it is taken like any other guest
+                     * range rather than dereferenced. */
+                    if ((size_t)r < sizeof tgt &&
+                        cng_user_copyin(tgt, (const char *)a2, (size_t)r) == 0 &&
+                        tgt[0] == '/') {
                         tgt[r] = '\0';
                         if (cng_fs_untranslate(cng_g_fs, tgt, guest,
                                                sizeof guest) == 0) {
@@ -2061,11 +2292,9 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                                 gl = (size_t)bufsiz;
                             /* A bind can make the guest spelling longer than
                              * the host one, so this may write past what the
-                             * kernel validated — ask before it does. */
-                            if (gl > (size_t)r &&
-                                !cng_user_writable((char *)a2, gl))
+                             * kernel validated — the copy asks as it goes. */
+                            if (cng_user_copyout((char *)a2, guest, gl) < 0)
                                 return -EFAULT;
-                            memcpy((char *)a2, guest, gl);
                             r = (long)gl;
                         }
                     }
@@ -2101,127 +2330,26 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * st_nlink must reflect the live group count (tar/rsync/ls stat open
      * fds). Trapped only under -l; the fake-id remap rides along. */
     case __NR_fstat: {
-        long r = reissue(a0, a1, a2, a3, a4, a5, __NR_fstat);
-        if (r == 0 && a1) {
+        /* Bounced whenever anything here is going to edit the answer — see
+         * newfstatat above for why the guest's buffer is not the place to do
+         * that. With nothing to edit, the kernel fills it directly. */
+        int bounce = a1 && (cng_g_l2s || cng_g_fake_id);
+        char sb[STAT_BUF_SIZE];
+        long r = reissue(a0, bounce ? (long)sb : a1, a2, a3, a4, a5,
+                         __NR_fstat);
+        if (r == 0 && bounce) {
             if (cng_g_l2s)
-                cng_l2s_fix_fd(a0, (void *)a1);
+                cng_l2s_fix_fd(a0, sb);
             if (cng_g_fake_id)
-                stat_remap((void *)a1);
+                stat_remap(sb);
+            if (cng_user_copyout((void *)a1, sb, sizeof sb) < 0)
+                return -EFAULT;
         }
         return r;
     }
 
-    /* getdents64: hide the l2s machinery from directory listings — backing
-     * data/marker names anywhere, and the ".l2s" store dir in the rootfs
-     * root. Filtered in place in the guest buffer; when a whole batch is
-     * ours, re-read so a filtered 0 isn't mistaken for end-of-directory.
-     * Then splice in the entries that exist only as resolution overlays (bind
-     * mount points, /dev nodes) and so have no physical dirent to return. */
-    case __NR_getdents64: {
-        /* Injection belongs at the start of the stream and only there, so the
-         * decision is taken before the read: lseek(SEEK_CUR) == 0 means nothing
-         * has been read from this fd yet. Deciding it up front also means an
-         * empty directory still gets its overlay entries.
-         *
-         * They go in *ahead* of the kernel's own, which is what guarantees they
-         * go in at all. Appended to a batch the kernel had already filled, they
-         * had nowhere to fit and were simply dropped — and since injection
-         * happens only on the first read of the stream, dropped meant the guest
-         * never saw them. Whether that happened came down to the guest libc's
-         * readdir buffer: musl reads 2 KiB at a time where glibc reads 32 KiB,
-         * so a bind mount point in a directory of any size was listed on a
-         * Debian rootfs and invisible on an Alpine one. */
-        char injdir[CNG_PATH_MAX];
-        int inject = a1 && sys_lseek((int)a0, 0, CNG_SEEK_CUR) == 0 &&
-                     dirfd_guest_dir(a0, injdir, sizeof injdir) == 0;
-
-        /* ...and the room left over has to admit at least one of the kernel's
-         * own records, or the stream never moves. put_dent stops only when the
-         * *next* record does not fit, so what remains was routinely below the
-         * smallest possible dirent (24 bytes, for "."); filldir64 then refuses
-         * the whole batch with EINVAL and iterate_dir writes back an *unchanged*
-         * f_pos (measured). Reporting our records as a short batch left the
-         * position at 0, so the next read decided "first read" all over again
-         * and injected the identical entries — forever. `ls /dev` through a raw
-         * getdents64 of 184..407 bytes never reached the real dirents at all;
-         * only the 32 KiB/2 KiB/4 KiB readdir buffers of glibc, musl and bionic
-         * kept every guest that has been tried out of it.
-         *
-         * So hand a record back and re-ask until the kernel can make progress.
-         * inject_dents fills greedily from the two lists, so a cap one byte
-         * under what it just produced yields strictly fewer records: the loop
-         * shrinks monotonically and ends at worst with pre == 0, which is the
-         * guest's own buffer being too small — the kernel's answer to give.
-         *
-         * Keyed on "it refused", not on one errno: the refusal is EINVAL on a
-         * real kernel, but where we left it exactly nothing qemu-user answers
-         * ENOMEM instead (its bounce buffer for a zero-length read), and both
-         * mean the same thing here. Both measured.
-         *
-         * A record dropped this way is not seen again (injection happens once,
-         * at the start of the stream). That bound is the buffer's, not ours: at
-         * 408 bytes the whole /dev overlay plus a kernel record fits and nothing
-         * is dropped, and no real readdir asks for less. */
-        long pre = 0, n, injcap = (long)a2;
-        for (;;) {
-            pre = inject ? inject_dents(a0, injdir, (char *)a1, 0, injcap) : 0;
-            n = reissue(a0, (long)a1 + pre, (long)a2 - pre, a3, a4, a5,
-                        __NR_getdents64);
-            if (n >= 0 || pre == 0)
-                break;
-            injcap = pre - 1;
-        }
-        char *buf = (char *)a1 + pre;
-        long cap = (long)a2 - pre;
-
-        /* A refusal is the guest's to see: the position did not move, so
-         * answering with the spliced-in bytes would repeat them next time. */
-        if (n < 0)
-            return n;
-        /* End of stream on the very first read means a directory that emitted
-         * neither "." nor "..", which no filesystem does; the overlay records
-         * are the whole answer. */
-        if (n == 0 || !a1)
-            return pre ? pre : n;
-        /* Hidden-process view, listing side: the path layer makes a host
-         * process's /proc entry unreachable, but `ls /proc` and `ps` read the
-         * directory, so the numeric entries have to go as well. Deciding that
-         * costs a readlink of the fd, so it is asked only when this batch
-         * actually holds a numeric name — outside /proc almost nothing does. */
-        int at_proc = !cng_g_no_proc && dents_have_pid(buf, n) &&
-                      fd_is_host_proc(a0);
-        if (!cng_g_l2s && !at_proc)
-            return pre + n;
-        int at_root = cng_g_l2s && fd_is_rootfs_root(a0);
-        for (;;) {
-            /* linux_dirent64: d_reclen u16 @16, d_name @19. d_off cookies are
-             * directory-stream positions, so compaction is seek-safe. */
-            long w = 0, o = 0;
-            while (o + 19 <= n) {
-                unsigned short reclen;
-                memcpy(&reclen, buf + o + 16, 2);
-                if (reclen == 0 || o + reclen > n)
-                    break;
-                const char *nm = buf + o + 19;
-                int hide = (cng_g_l2s && (cng_l2s_hidden(nm) ||
-                                          (at_root && !strcmp(nm, ".l2s")))) ||
-                           (at_proc && !proc_name_visible(nm));
-                if (!hide) {
-                    if (w != o)
-                        memmove(buf + w, buf + o, reclen);
-                    w += reclen;
-                }
-                o += reclen;
-            }
-            if (w > 0)
-                return pre + w;
-            /* A whole batch of ours: re-read, so a filtered 0 is not mistaken
-             * for end-of-directory. */
-            n = reissue(a0, (long)buf, cap, a3, a4, a5, __NR_getdents64);
-            if (n <= 0)
-                return pre ? pre : n;
-        }
-    }
+    case __NR_getdents64:
+        return do_getdents64(a0, a1, a2, a3, a4, a5);
 
     /* clone with CLONE_VFORK (only these are trapped; see seccomp.c): a
      * vfork-style spawn shares the parent's address space and suspends the
@@ -2527,38 +2655,33 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * copied to swap that pointer — the guest's own struct is never written. */
     case __NR_sendmsg: {
         /* The msghdr is read here, ahead of any kernel call that would have
-         * validated it, so a bad one must answer -EFAULT rather than fault. */
-        if (a1 && !cng_user_readable((void *)a1, sizeof(struct cng_msghdr)))
+         * validated it, so a bad one must answer -EFAULT rather than fault —
+         * and it is taken as a copy, once, so every field below names what was
+         * validated rather than whatever the guest has put there since. */
+        struct cng_msghdr mh;
+        if (a1 && cng_user_copyin(&mh, (void *)a1, sizeof mh) < 0)
             return -EFAULT;
         if (cng_nl_is_fake((int)a0)) {
             /* The payload is the first iovec; netlink requests are single-iov
              * in every library that builds them. */
             long out = 0;
-            const char *m = (const char *)a1;
-            if (m) {
-                struct cng_iovec *iov = *(struct cng_iovec **)(m + 16);
-                unsigned long nio = *(unsigned long *)(m + 24);
-                if (iov && nio > 0 &&
-                    !cng_user_readable(iov, sizeof *iov))
+            if (a1 && mh.iov && mh.iovlen > 0) {
+                struct cng_iovec io0;
+                if (cng_user_copyin(&io0, mh.iov, sizeof io0) < 0)
                     return -EFAULT;
-                if (iov && nio > 0)
-                    cng_nl_send((int)a0, iov[0].base, (long)iov[0].len, &out);
+                cng_nl_send((int)a0, io0.base, (long)io0.len, &out);
             }
             return out;
         }
         struct cng_sun_xlate x;
-        char mh[56];
         long r;
         x.dirfd = -1; /* a NULL msghdr never reaches cng_sun_in, and cng_sun_done
                        * must not then close whatever the stack held */
-        int sx = a1 ? cng_sun_in(&x, *(void **)(char *)a1,
-                                 (long)*(unsigned *)((char *)a1 + 8), 1)
-                    : 0;
+        int sx = a1 ? cng_sun_in(&x, mh.name, (long)mh.namelen, 1) : 0;
         if (sx > 0) {
-            memcpy(mh, (const void *)a1, sizeof mh);
-            *(void **)mh = x.buf;
-            *(unsigned *)(mh + 8) = (unsigned)x.len;
-            r = reissue(a0, (long)mh, a2, a3, a4, a5, nr);
+            mh.name = x.buf;
+            mh.namelen = (unsigned)x.len;
+            r = reissue(a0, (long)&mh, a2, a3, a4, a5, nr);
         } else if (sx < 0) {
             r = sx;
         } else {
@@ -2600,51 +2723,63 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                     &dlen, 0) == 0 &&
             dom != CNG_AF_UNIX)
             return reissue(a0, a1, a2, a3, a4, a5, nr);
-        /* One probe for the whole array where it is all readable, which is the
-         * usual case; per element otherwise, since the kernel stops at the first
-         * unreadable one rather than refusing the batch. */
-        int whole = cng_user_readable(v, vlen * sizeof *v);
+        /* A window of the array at a time (mmsg_take), so the scan costs a
+         * syscall per MMSG_WIN messages rather than one per message — and every
+         * header below is our copy, never the guest's live struct. */
+        struct cng_mmsghdr win[MMSG_WIN];
         int any = 0;
-        for (unsigned long i = 0; i < vlen; i++) {
-            if (!whole && !cng_user_readable(&v[i], sizeof v[i]))
+        for (unsigned long i = 0; i < vlen && !any;) {
+            unsigned long k = vlen - i < MMSG_WIN ? vlen - i : MMSG_WIN;
+            unsigned long got = mmsg_take(win, v + i, k);
+            for (unsigned long j = 0; j < got; j++)
+                if (cng_sun_needed(win[j].hdr.name, (long)win[j].hdr.namelen)) {
+                    any = 1;
+                    break;
+                }
+            if (got < k)
                 break; /* the kernel never gets past here either */
-            if (cng_sun_needed(v[i].hdr.name, (long)v[i].hdr.namelen)) {
-                any = 1;
-                break;
-            }
+            i += k;
         }
         if (!any)
             return reissue(a0, a1, a2, a3, a4, a5, nr);
 
         unsigned long sent = 0;
         long r = 0;
-        for (unsigned long i = 0; i < vlen; i++) {
-            if (!whole && !cng_user_readable(&v[i], sizeof v[i])) {
-                r = -EFAULT;
-                break;
+        for (unsigned long i = 0; i < vlen;) {
+            unsigned long k = vlen - i < MMSG_WIN ? vlen - i : MMSG_WIN;
+            unsigned long got = mmsg_take(win, v + i, k);
+            unsigned long j = 0;
+            for (; j < got; j++) {
+                struct cng_msghdr mh = win[j].hdr;
+                struct cng_sun_xlate x;
+                int sx = cng_sun_in(&x, mh.name, (long)mh.namelen, 1);
+                if (sx > 0) {
+                    mh.name = x.buf;
+                    mh.namelen = (unsigned)x.len;
+                }
+                if (sx < 0)
+                    r = sx;
+                else
+                    r = reissue(a0, (long)&mh, a3, 0, 0, 0, __NR_sendmsg);
+                cng_sun_done(&x);
+                if (r < 0)
+                    break;
+                /* The kernel does not count a message whose length writeback
+                 * faults, even though it has already gone out. Neither do we. */
+                unsigned wlen = (unsigned)r;
+                if (cng_user_copyout(&v[i + j].len, &wlen, sizeof wlen) < 0) {
+                    r = -EFAULT;
+                    break;
+                }
+                sent++;
             }
-            struct cng_msghdr mh = v[i].hdr;
-            struct cng_sun_xlate x;
-            int sx = cng_sun_in(&x, mh.name, (long)mh.namelen, 1);
-            if (sx > 0) {
-                mh.name = x.buf;
-                mh.namelen = (unsigned)x.len;
-            }
-            if (sx < 0)
-                r = sx;
-            else
-                r = reissue(a0, (long)&mh, a3, 0, 0, 0, __NR_sendmsg);
-            cng_sun_done(&x);
             if (r < 0)
                 break;
-            /* The kernel does not count a message whose length writeback
-             * faults, even though it has already gone out. Neither do we. */
-            if (!cng_user_writable(&v[i].len, sizeof v[i].len)) {
+            if (got < k) {
                 r = -EFAULT;
                 break;
             }
-            v[i].len = (unsigned)r;
-            sent++;
+            i += k;
         }
         return sent ? (long)sent : r;
     }
@@ -2704,19 +2839,18 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_recvmsg: {
         if (cng_nl_is_fake((int)a0)) {
             long out = 0;
-            char *m = (char *)a1;
-            if (m && !cng_user_readable(m, sizeof(struct cng_msghdr)))
-                return -EFAULT;
+            struct cng_msghdr *m = (struct cng_msghdr *)a1;
             if (m) {
-                struct cng_iovec *iov = *(struct cng_iovec **)(m + 16);
-                unsigned long nio = *(unsigned long *)(m + 24);
-                if (iov && nio > 0 && !cng_user_readable(iov, sizeof *iov))
+                struct cng_msghdr h;
+                if (cng_user_copyin(&h, m, sizeof h) < 0)
                     return -EFAULT;
-                if (iov && nio > 0)
-                    cng_nl_recv((int)a0, iov[0].base, (long)iov[0].len, a2,
-                                &out);
-                void *name = *(void **)m;
-                long e = cng_nl_srcaddr((int)a0, name, (unsigned *)(m + 8));
+                if (h.iov && h.iovlen > 0) {
+                    struct cng_iovec io0;
+                    if (cng_user_copyin(&io0, h.iov, sizeof io0) < 0)
+                        return -EFAULT;
+                    cng_nl_recv((int)a0, io0.base, (long)io0.len, a2, &out);
+                }
+                long e = cng_nl_srcaddr((int)a0, h.name, &m->namelen);
                 if (e)
                     return e;
             }
@@ -2729,9 +2863,9 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * over to the guest's own, or a caller loses MSG_TRUNC/MSG_CTRUNC and
          * the length of the control data it is about to walk. */
         struct cng_msghdr *g = (struct cng_msghdr *)a1;
-        if (!a1 || !cng_user_readable(g, sizeof *g))
+        struct cng_msghdr snap; /* our copy of the guest's header, taken once */
+        if (!a1 || cng_user_copyin(&snap, g, sizeof snap) < 0)
             return reissue(a0, a1, a2, a3, a4, a5, nr);
-        struct cng_msghdr snap = *g; /* the guest's header, before any probe */
         if (!snap.name || !snap.namelen)
             return reissue(a0, a1, a2, a3, a4, a5, nr);
         char ab[CNG_SOCKADDR_MAX];
@@ -2741,14 +2875,14 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         long r = reissue(a0, (long)&mh, a2, a3, a4, a5, nr);
         if (r < 0)
             return r;
-        /* Restored whole rather than field by field: the writability probe
-         * zeroes what it validates, so a partial update would leave the rest of
-         * the guest's header zeroed. */
-        if (!cng_user_writable(g, sizeof *g))
+        /* Written back whole rather than field by field: the guest's header is
+         * ours to restore in full, and the copy that carries it also validates
+         * it, so there is no zeroed remainder to worry about either. */
+        struct cng_msghdr back = snap;
+        back.controllen = mh.controllen;
+        back.flags = mh.flags;
+        if (cng_user_copyout(g, &back, sizeof back) < 0)
             return -EFAULT;
-        *g = snap;
-        g->controllen = mh.controllen;
-        g->flags = mh.flags;
         long e = sun_deliver(ab, mh.namelen, (long)snap.name, (long)&g->namelen);
         return e ? e : r;
     }
@@ -2778,13 +2912,14 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             long r = 0;
             for (; got < vlen; got++) {
                 struct cng_mmsghdr *m = &v[got];
-                if (!cng_user_readable(m, sizeof *m)) {
+                struct cng_mmsghdr h;
+                if (cng_user_copyin(&h, m, sizeof h) < 0) {
                     r = -EFAULT;
                     break;
                 }
-                struct cng_iovec *iov = m->hdr.iov;
-                if (!iov || !m->hdr.iovlen ||
-                    !cng_user_readable(iov, sizeof *iov)) {
+                struct cng_iovec io0;
+                if (!h.hdr.iov || !h.hdr.iovlen ||
+                    cng_user_copyin(&io0, h.hdr.iov, sizeof io0) < 0) {
                     r = -EFAULT;
                     break;
                 }
@@ -2792,17 +2927,17 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 if (got && (a3 & CNG_MSG_WAITFORONE))
                     fl |= CNG_MSG_DONTWAIT;
                 long out = 0;
-                cng_nl_recv((int)a0, iov[0].base, (long)iov[0].len, fl, &out);
+                cng_nl_recv((int)a0, io0.base, (long)io0.len, fl, &out);
                 if (out < 0) {
                     r = out;
                     break;
                 }
-                if (!cng_user_writable(&m->len, sizeof m->len)) {
+                unsigned wlen = (unsigned)out;
+                if (cng_user_copyout(&m->len, &wlen, sizeof wlen) < 0) {
                     r = -EFAULT;
                     break;
                 }
-                m->len = (unsigned)out;
-                long e = cng_nl_srcaddr((int)a0, m->hdr.name, &m->hdr.namelen);
+                long e = cng_nl_srcaddr((int)a0, h.hdr.name, &m->hdr.namelen);
                 if (e) {
                     r = e;
                     break;
@@ -2832,12 +2967,13 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         long r = 0;
         for (; got < vlen; got++) {
             struct cng_mmsghdr *m = &v[got];
-            if (!cng_user_readable(m, sizeof *m)) {
+            struct cng_mmsghdr h;
+            if (cng_user_copyin(&h, m, sizeof h) < 0) {
                 r = -EFAULT;
                 break;
             }
             char ab[CNG_SOCKADDR_MAX];
-            struct cng_msghdr snap = m->hdr; /* before any probe zeroes it */
+            struct cng_msghdr snap = h.hdr; /* our copy, not the guest's live one */
             struct cng_msghdr mh = snap;
             if (snap.name) {
                 mh.name = ab;
@@ -2851,14 +2987,14 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 r = n;
                 break;
             }
-            if (!cng_user_writable(m, sizeof *m)) {
+            h.hdr = snap;
+            h.hdr.controllen = mh.controllen;
+            h.hdr.flags = mh.flags;
+            h.len = (unsigned)n;
+            if (cng_user_copyout(m, &h, sizeof h) < 0) {
                 r = -EFAULT;
                 break;
             }
-            m->hdr = snap; /* the probe zeroed it: restore, then update */
-            m->hdr.controllen = mh.controllen;
-            m->hdr.flags = mh.flags;
-            m->len = (unsigned)n;
             if (snap.name) {
                 long e = sun_deliver(ab, mh.namelen, (long)snap.name,
                                      (long)&m->hdr.namelen);
@@ -2882,11 +3018,19 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_getsockopt: {
         long r = reissue(a0, a1, a2, a3, a4, a5, nr);
         if (r == 0 && cng_g_fake_id && a1 == CNG_SOL_SOCKET &&
-            a2 == CNG_SO_PEERCRED && a3 && a4 &&
-            *(unsigned *)a4 >= 12) { /* struct ucred: pid,uid,gid */
-            unsigned *uc = (unsigned *)a3;
-            uc[1] = cng_remap_uid(uc[1]);
-            uc[2] = cng_remap_gid(uc[2]);
+            a2 == CNG_SO_PEERCRED && a3 && a4) {
+            /* Read back and rewritten in a copy of ours: the kernel filled
+             * these twelve bytes, which says nothing about them still being
+             * there now (see uaccess.c). */
+            unsigned len, uc[3]; /* struct ucred: pid,uid,gid */
+            if (cng_user_copyin(&len, (void *)a4, sizeof len) == 0 &&
+                len >= sizeof uc &&
+                cng_user_copyin(uc, (void *)a3, sizeof uc) == 0) {
+                uc[1] = cng_remap_uid(uc[1]);
+                uc[2] = cng_remap_gid(uc[2]);
+                if (cng_user_copyout((void *)a3, uc, sizeof uc) < 0)
+                    return -EFAULT;
+            }
         }
         return r;
     }
@@ -2994,9 +3138,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * runs immediately before the copy that overwrites it. */
         if (len > size)
             return -ERANGE;
-        if (!cng_user_writable(buf, len))
+        if (cng_user_copyout(buf, cng_g_fs->cwd, len) < 0)
             return -EFAULT;
-        memcpy(buf, cng_g_fs->cwd, len);
         return (long)len;
     }
 
@@ -3057,9 +3200,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             return ptr;
         if (a1) {
             unsigned char act[32];
-            if (!cng_user_readable((void *)a1, sizeof act))
+            if (cng_user_copyin(act, (void *)a1, sizeof act) < 0)
                 return -EFAULT;
-            memcpy(act, (void *)a1, sizeof act);
             *(unsigned long *)(act + 24) &= ~(1UL << (CNG_SIGSYS - 1));
             return cng_syscall6(a0, (long)act, a2, a3, a4, a5,
                                 __NR_rt_sigaction);
@@ -3137,9 +3279,10 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * to end a mapping. Handed straight over, the kernel refuses it. */
         if ((how == 0 /*BLOCK*/ || how == 2 /*SETMASK*/) && a1 &&
             (unsigned long)a3 == sizeof(unsigned long)) {
-            if (!cng_user_readable((void *)a1, sizeof(unsigned long)))
+            unsigned long set;
+            if (cng_user_copyin(&set, (void *)a1, sizeof set) < 0)
                 return -EFAULT;
-            unsigned long set = *(unsigned long *)a1 & ~(1UL << (CNG_SIGSYS - 1));
+            set &= ~(1UL << (CNG_SIGSYS - 1));
             return cng_syscall6(a0, (long)&set, a2, a3, a4, a5,
                                 __NR_rt_sigprocmask);
         }
@@ -3187,8 +3330,9 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * process's timers, so the ids are recorded as they are handed out. */
     case __NR_timer_create: {
         long r = reissue(a0, a1, a2, a3, a4, a5, nr);
-        if (r == 0 && a2)
-            cng_timer_note(*(int *)a2); /* the kernel just validated a2 */
+        int id;
+        if (r == 0 && a2 && cng_user_copyin(&id, (void *)a2, sizeof id) == 0)
+            cng_timer_note(id);
         return r;
     }
     case __NR_timer_delete: {

@@ -267,19 +267,29 @@ int cng_user_writable(void *p, unsigned long n);
  * a refused syscall would need nested delivery to be survivable. */
 int cng_uaccess_probe_setup(void);
 
+/* Test aid only (see uaccess.c): the identity of this process's staging
+ * descriptor, which a forked child must not share with its parent. */
+unsigned long cng_uaccess_scratch_ino(void);
+
 /* Length of a guest string / entry count of a guest pointer vector, measured
- * without ever reading past accessible memory. Returns the count, -EFAULT when
- * it runs off readable memory, or -E2BIG when `max` passes with no terminator —
- * the same two answers execve(2) gives for the same inputs. */
+ * out of a copy so that neither the walk nor its answer can be raced. Returns
+ * the count, -EFAULT when it runs off readable memory, or -E2BIG when `max`
+ * passes with no terminator — the same two answers execve(2) gives for the same
+ * inputs. A caller that then wants the bytes must take its own copy
+ * (cng_user_strcopyin); the length alone says nothing about what is there now. */
 long cng_user_strlen(const char *s, unsigned long max);
 long cng_user_veclen(char *const *v, unsigned long max);
 
-/* Take guest bytes rather than probe-then-touch them: where the pair above only
- * answers whether a range can be read, these copy it in, so nothing is read
- * twice and a range that goes away mid-copy is -EFAULT instead of a fault (see
- * uaccess.c). cng_user_strcopyin returns the string length excluding the
- * terminator, or -E2BIG when `cap` bytes hold none. */
+/* Move guest bytes rather than probe-then-touch them: where the probes above
+ * only answer whether a range can be reached, these carry it, so nothing is
+ * touched twice and a range that goes away mid-copy is -EFAULT instead of a
+ * fault inside the handler (see uaccess.c). copyin takes guest memory into
+ * ours, copyout puts ours into the guest's; both return 0 or -EFAULT.
+ * cng_user_strcopyin returns the string length excluding the terminator, or
+ * -E2BIG when `cap` bytes hold none. Prefer these to the probes wherever the
+ * bytes are actually going to move. */
 long cng_user_copyin(void *dst, const void *src, unsigned long n);
+long cng_user_copyout(void *dst, const void *src, unsigned long n);
 long cng_user_strcopyin(char *dst, const char *src, unsigned long cap);
 
 /* Ambient-seccomp block-list: cng_blocked[nr] != 0 means Android blocks that

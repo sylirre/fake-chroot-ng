@@ -4,12 +4,15 @@
  *
  * Ported from arm64chroot's src/sys_ipc.c. The emulator there copied every
  * argument in and out of a synthetic guest address space; here the guest's
- * memory is simply ours, so a struct is read where it lies — after a probe, since
- * this runs inside the SIGSYS handler with SIGSEGV masked and a fault there is
- * the death of the process, not an -EFAULT (see uaccess.c). The one thing to
- * keep in mind throughout: cng_user_writable() validates a range by ZEROING it,
- * so nothing may be probed for writing until everything that had to be read out
- * of it has been.
+ * memory is simply ours — but that does not make it ours to dereference. This
+ * runs inside the SIGSYS handler with SIGSEGV masked, where a fault is the
+ * death of the process rather than an -EFAULT, and a guest thread is free to
+ * unmap or rewrite a struct between the moment it is validated and the moment
+ * it is read. So every argument crosses through cng_user_copyin/copyout, which
+ * does both in one act (see uaccess.c). The ordering rule that came with the
+ * probes still holds where one is left: cng_user_writable() validates a range
+ * by ZEROING it, so nothing may be probed for writing until everything that had
+ * to be read out of it has been.
  *
  * The other difference is that there is no allocator here. Operation vectors and
  * messages are bounded by SEMOPM and MSGMAX and ride on the handler's scratch
@@ -137,10 +140,9 @@ static long do_semop(s32 semid, const void *sops_p, u64 nsops, s64 timeout_ns) {
         return -EINVAL;
     if (nsops > CNG_SEMOPM)
         return -E2BIG;
-    if (!cng_user_readable(sops_p, nsops * sizeof(struct cng_sembuf)))
-        return -EFAULT;
     struct cng_sembuf sops[CNG_SEMOPM];
-    memcpy(sops, sops_p, (size_t)nsops * sizeof *sops);
+    if (cng_user_copyin(sops, sops_p, nsops * sizeof *sops) < 0)
+        return -EFAULT;
     struct cng_breq q;
     memset(&q, 0, sizeof q);
     q.op = CNG_REQ_SEMOP;
@@ -155,10 +157,9 @@ static long do_semtimedop(s32 semid, const void *sops, u64 nsops,
                           const void *ts_p) {
     s64 timeout_ns = -1;
     if (ts_p) {
-        if (!cng_user_readable(ts_p, sizeof(struct cng_timespec)))
-            return -EFAULT;
         struct cng_timespec ts;
-        memcpy(&ts, ts_p, sizeof ts);
+        if (cng_user_copyin(&ts, ts_p, sizeof ts) < 0)
+            return -EFAULT;
         if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000)
             return -EINVAL;
         /* Saturate a >292-year timeout rather than overflowing it. */
@@ -223,7 +224,10 @@ static long sem_getall(s32 semid, void *out) {
             ret = -EINVAL;
             break;
         }
-        memcpy(dst + done, win, (size_t)k * sizeof *win);
+        if (cng_user_copyout(dst + done, win, k * sizeof *win) < 0) {
+            ret = -EFAULT;
+            break;
+        }
         done += k;
     }
 out:
@@ -261,7 +265,10 @@ static long sem_setall(s32 semid, const void *in) {
     u16 win[SEM_STREAM];
     for (long done = 0; done < n;) {
         long k = n - done < SEM_STREAM ? n - done : SEM_STREAM;
-        memcpy(win, src + done, (size_t)k * sizeof *win);
+        if (cng_user_copyin(win, src + done, (u64)k * sizeof *win) < 0) {
+            ret = -EFAULT;
+            goto out;
+        }
         if (cng_broker_write_full(s, win, (unsigned)(k * sizeof *win)) != 0)
             goto out;
         done += k;
@@ -292,12 +299,12 @@ static long do_semctl(s32 semid, s32 semnum, int cmd, u64 arg) {
     if (cmd == CNG_SETVAL)
         q.val = (s32)arg;
     if (cmd == CNG_IPC_SET) {
-        const struct cng_semid64_ds *in = (const struct cng_semid64_ds *)arg;
-        if (!cng_user_readable(in, sizeof *in))
+        struct cng_semid64_ds in;
+        if (cng_user_copyin(&in, (const void *)arg, sizeof in) < 0)
             return -EFAULT;
-        q.set_mode = in->sem_perm.mode;
-        q.set_uid = in->sem_perm.uid;
-        q.set_gid = in->sem_perm.gid;
+        q.set_mode = in.sem_perm.mode;
+        q.set_uid = in.sem_perm.uid;
+        q.set_gid = in.sem_perm.gid;
     }
 
     struct cng_bresp r;
@@ -310,8 +317,6 @@ static long do_semctl(s32 semid, s32 semnum, int cmd, u64 arg) {
      * write their struct and clamp before the sign check below. */
     if (cmd == CNG_IPC_INFO || cmd == CNG_SEM_INFO) {
         struct cng_seminfo si;
-        if (!cng_user_writable((void *)arg, sizeof si))
-            return -EFAULT;
         memset(&si, 0, sizeof si);
         si.semmni = CNG_SEMMNI;
         si.semmsl = CNG_SEMMSL;
@@ -328,7 +333,8 @@ static long do_semctl(s32 semid, s32 semnum, int cmd, u64 arg) {
             si.semusz = 20; /* SEMUSZ */
             si.semaem = CNG_SEMAEM;
         }
-        memcpy((void *)arg, &si, sizeof si);
+        if (cng_user_copyout((void *)arg, &si, sizeof si) < 0)
+            return -EFAULT;
         return r.ret < 0 ? 0 : r.ret;
     }
 
@@ -336,10 +342,9 @@ static long do_semctl(s32 semid, s32 semnum, int cmd, u64 arg) {
         return r.ret;
     if (cmd == CNG_IPC_STAT || cmd == CNG_SEM_STAT || cmd == CNG_SEM_STAT_ANY) {
         struct cng_semid64_ds ds;
-        if (!cng_user_writable((void *)arg, sizeof ds))
-            return -EFAULT;
         sem_fill_ds(&ds, &r);
-        memcpy((void *)arg, &ds, sizeof ds);
+        if (cng_user_copyout((void *)arg, &ds, sizeof ds) < 0)
+            return -EFAULT;
     }
     return r.ret;
 }
@@ -371,19 +376,17 @@ static long do_msgsnd(s32 msqid, const void *msgp, u64 msgsz, s32 msgflg) {
      *
      * (and the two that already agreed: a valid mtype with mtext off the mapping
      * is EFAULT, and the same with an oversize msgsz is EINVAL.) */
-    if (!cng_user_readable(msgp, sizeof(s64)))
-        return -EFAULT;
     s64 mtype;
-    memcpy(&mtype, msgp, sizeof mtype);
+    if (cng_user_copyin(&mtype, msgp, sizeof mtype) < 0)
+        return -EFAULT;
     if ((s64)msgsz < 0 || msgsz > CNG_MSGMAX)
         return -EINVAL;
     if (mtype < 1)
         return -EINVAL;
-    if (msgsz && !cng_user_readable((const char *)msgp + sizeof(s64), msgsz))
-        return -EFAULT;
     char data[CNG_MSGMAX];
-    if (msgsz)
-        memcpy(data, (const char *)msgp + sizeof(s64), (size_t)msgsz);
+    if (msgsz &&
+        cng_user_copyin(data, (const char *)msgp + sizeof(s64), msgsz) < 0)
+        return -EFAULT;
     struct cng_breq q;
     memset(&q, 0, sizeof q);
     q.op = CNG_REQ_MSGSND;
@@ -419,11 +422,10 @@ static long do_msgrcv(s32 msqid, void *msgp, u64 msgsz, s64 msgtyp, s32 msgflg) 
         return n;
     /* The message is consumed whether or not the writeback lands, which is what
      * the kernel does too — it has already dequeued by the time it copies. */
-    if (!cng_user_writable(msgp, sizeof(s64) + (u64)n))
+    if (cng_user_copyout(msgp, &r.mtype, sizeof r.mtype) < 0)
         return -EFAULT;
-    memcpy(msgp, &r.mtype, sizeof r.mtype);
-    if (n)
-        memcpy((char *)msgp + sizeof(s64), data, (size_t)n);
+    if (n && cng_user_copyout((char *)msgp + sizeof(s64), data, (u64)n) < 0)
+        return -EFAULT;
     return n;
 }
 
@@ -454,13 +456,13 @@ static long do_msgctl(s32 msqid, int cmd, void *buf) {
     q.id = msqid; /* a queue id, or an array index for MSG_STAT */
     q.arg = cmd;
     if (cmd == CNG_IPC_SET) {
-        const struct cng_msqid64_ds *in = (const struct cng_msqid64_ds *)buf;
-        if (!cng_user_readable(in, sizeof *in))
+        struct cng_msqid64_ds in;
+        if (cng_user_copyin(&in, buf, sizeof in) < 0)
             return -EFAULT;
-        q.set_mode = in->msg_perm.mode;
-        q.set_uid = in->msg_perm.uid;
-        q.set_gid = in->msg_perm.gid;
-        q.size = in->msg_qbytes; /* 64 bits wide: not the 32-bit `val` slot */
+        q.set_mode = in.msg_perm.mode;
+        q.set_uid = in.msg_perm.uid;
+        q.set_gid = in.msg_perm.gid;
+        q.size = in.msg_qbytes; /* 64 bits wide: not the 32-bit `val` slot */
     }
 
     struct cng_bresp r;
@@ -469,8 +471,6 @@ static long do_msgctl(s32 msqid, int cmd, void *buf) {
 
     if (cmd == CNG_IPC_INFO || cmd == CNG_MSG_INFO) {
         struct cng_msginfo mi;
-        if (!cng_user_writable(buf, sizeof mi))
-            return -EFAULT;
         memset(&mi, 0, sizeof mi);
         mi.msgmni = CNG_MSGMNI;
         mi.msgmax = CNG_MSGMAX;
@@ -490,7 +490,8 @@ static long do_msgctl(s32 msqid, int cmd, void *buf) {
             mi.msgmap = CNG_MSGMNB;
             mi.msgtql = CNG_MSGMNB;
         }
-        memcpy(buf, &mi, sizeof mi);
+        if (cng_user_copyout(buf, &mi, sizeof mi) < 0)
+            return -EFAULT;
         return r.ret < 0 ? 0 : r.ret;
     }
 
@@ -498,10 +499,9 @@ static long do_msgctl(s32 msqid, int cmd, void *buf) {
         return r.ret;
     if (cmd == CNG_IPC_STAT || cmd == CNG_MSG_STAT || cmd == CNG_MSG_STAT_ANY) {
         struct cng_msqid64_ds ds;
-        if (!cng_user_writable(buf, sizeof ds))
-            return -EFAULT;
         msg_fill_ds(&ds, &r);
-        memcpy(buf, &ds, sizeof ds);
+        if (cng_user_copyout(buf, &ds, sizeof ds) < 0)
+            return -EFAULT;
     }
     return r.ret;
 }

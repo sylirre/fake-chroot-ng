@@ -322,13 +322,12 @@ int cng_pt_sigaction(int sig, u64 act, u64 oact, u64 sz, long *out) {
 
     struct pt_ksigaction nd;
     if (act) {
-        if (!cng_user_readable((void *)act, sizeof nd)) {
+        if (cng_user_copyin(&nd, (void *)act, sizeof nd) < 0) {
             if (!mine)
                 return 0; /* let the re-issue produce the EFAULT */
             *out = -EFAULT;
             return 1;
         }
-        memcpy(&nd, (void *)act, sizeof nd);
         /* SIGCHLD changes hands with its own disposition, so the decision
          * trace_enter made once is remade on every sigaction: take the signal
          * back the moment the guest asks for something we can mirror. */
@@ -390,15 +389,14 @@ int cng_pt_sigaction(int sig, u64 act, u64 oact, u64 sz, long *out) {
         }
     }
     if (oact) {
-        if (!cng_user_writable((void *)oact, sizeof(struct pt_ksigaction))) {
-            *out = -EFAULT;
-            return 1;
-        }
         struct pt_ksigaction o;
         memset(&o, 0, sizeof o);
         if (had)
             o = old;
-        memcpy((void *)oact, &o, sizeof o);
+        if (cng_user_copyout((void *)oact, &o, sizeof o) < 0) {
+            *out = -EFAULT;
+            return 1;
+        }
     }
     *out = 0;
     return 1;

@@ -682,11 +682,10 @@ static int pt_prot_of(u64 addr) {
  * write-protected mapping (a breakpoint lands in read-only text), and coherent
  * with the instruction stream afterwards. Returns 0 or -EIO. */
 long cng_pt_poke_text(u64 addr, const void *src, unsigned len) {
-    if (!cng_user_readable(src, len))
+    unsigned char word[8];
+    if (len > sizeof word || cng_user_copyin(word, src, len) < 0)
         return -EIO;
-    if (cng_user_writable((void *)addr, len)) {
-        /* Already writable: the probe zeroed it, so copy immediately. */
-        memcpy((void *)addr, src, len);
+    if (cng_user_copyout((void *)addr, word, len) == 0) {
         cng_flush_icache((void *)addr, (void *)(addr + len));
         return 0;
     }
@@ -698,33 +697,31 @@ long cng_pt_poke_text(u64 addr, const void *src, unsigned len) {
     if (sys_mprotect((void *)page, (size_t)(end - page),
                      prot | CNG_PROT_READ | CNG_PROT_WRITE) < 0)
         return -EIO;
-    memcpy((void *)addr, src, len);
+    long w = cng_user_copyout((void *)addr, word, len);
     cng_flush_icache((void *)addr, (void *)(addr + len));
     sys_mprotect((void *)page, (size_t)(end - page), prot);
-    return 0;
+    return w < 0 ? -EIO : 0;
 }
 
 /* Copy as much of [addr, addr+len) as is accessible, the way process_vm_readv
  * reports a partial transfer. Returns the byte count. */
 static u32 pt_copy_out(u64 addr, u8 *dst, u32 len) {
-    if (cng_user_readable((const void *)addr, len)) {
-        memcpy(dst, (const void *)addr, len);
+    if (cng_user_copyin(dst, (const void *)addr, len) == 0)
         return len;
-    }
     u32 done = 0;
-    while (done < len && cng_user_readable((const void *)(addr + done), 1))
-        dst[done] = *(const u8 *)(addr + done), done++;
+    while (done < len &&
+           cng_user_copyin(dst + done, (const void *)(addr + done), 1) == 0)
+        done++;
     return done;
 }
 
 static u32 pt_copy_in(u64 addr, const u8 *src, u32 len) {
-    if (cng_user_writable((void *)addr, len)) {
-        memcpy((void *)addr, src, len);
+    if (cng_user_copyout((void *)addr, src, len) == 0)
         return len;
-    }
     u32 done = 0;
-    while (done < len && cng_user_writable((void *)(addr + done), 1))
-        *(u8 *)(addr + done) = src[done], done++;
+    while (done < len &&
+           cng_user_copyout((void *)(addr + done), src + done, 1) == 0)
+        done++;
     return done;
 }
 
@@ -1412,15 +1409,12 @@ long cng_pt_syscall(long req, long pid, u64 addr, u64 data) {
         return 0;
     case CNG_PTRACE_GETEVENTMSG: {
         u64 msg = e->eventmsg;
-        if (!cng_user_writable((void *)data, 8))
+        if (cng_user_copyout((void *)data, &msg, sizeof msg) < 0)
             return -EFAULT;
-        memcpy((void *)data, &msg, 8);
         return 0;
     }
     case CNG_PTRACE_GETSIGINFO: {
         u8 si[128];
-        if (!cng_user_writable((void *)data, sizeof si))
-            return -EFAULT;
         memset(si, 0, sizeof si);
         s32 *w = (s32 *)si;
         w[0] = e->si_signo;
@@ -1434,7 +1428,8 @@ long cng_pt_syscall(long req, long pid, u64 addr, u64 data) {
             memcpy(si + 16, &e->fault_addr, 8);
             break;
         }
-        memcpy((void *)data, si, sizeof si);
+        if (cng_user_copyout((void *)data, si, sizeof si) < 0)
+            return -EFAULT;
         return 0;
     }
     case CNG_PTRACE_GET_SYSCALL_INFO: {
@@ -1469,11 +1464,8 @@ long cng_pt_syscall(long req, long pid, u64 addr, u64 data) {
             actual = 33;
         }
         u64 n = addr < actual ? addr : actual;
-        if (n) {
-            if (!cng_user_writable((void *)data, (unsigned long)n))
-                return -EFAULT;
-            memcpy((void *)data, info, (size_t)n);
-        }
+        if (n && cng_user_copyout((void *)data, info, (unsigned long)n) < 0)
+            return -EFAULT;
         return (long)actual;
     }
     }
@@ -1505,9 +1497,8 @@ long cng_pt_syscall(long req, long pid, u64 addr, u64 data) {
         pt_cmd(e, PT_CMD_PEEK, addr, 0);
         if (e->result < 0)
             return -EIO;
-        if (!cng_user_writable((void *)data, 8))
+        if (cng_user_copyout((void *)data, e->data, 8) < 0)
             return -EFAULT;
-        memcpy((void *)data, e->data, 8);
         return 0;
     case CNG_PTRACE_POKETEXT:
     case CNG_PTRACE_POKEDATA:
@@ -1518,37 +1509,28 @@ long cng_pt_syscall(long req, long pid, u64 addr, u64 data) {
         return -EIO; /* arm64 has no user area; the kernel answers this too */
     case CNG_PTRACE_GETREGSET: {
         u64 iov[2]; /* {base, len} */
-        if (!cng_user_readable((void *)data, sizeof iov))
+        if (cng_user_copyin(iov, (void *)data, sizeof iov) < 0)
             return -EFAULT;
-        memcpy(iov, (void *)data, sizeof iov);
         pt_cmd(e, PT_CMD_GETREGS, addr, 0);
         if (e->result < 0)
             return -EINVAL;
         u32 n = e->rlen;
         if (iov[1] < n)
             n = (u32)iov[1];
-        if (n) {
-            if (!cng_user_writable((void *)iov[0], n))
-                return -EFAULT;
-            memcpy((void *)iov[0], e->data, n);
-        }
-        iov[1] = e->rlen;
-        if (!cng_user_writable((void *)data, sizeof iov))
+        if (n && cng_user_copyout((void *)iov[0], e->data, n) < 0)
             return -EFAULT;
-        memcpy((void *)data, iov, sizeof iov);
+        iov[1] = e->rlen;
+        if (cng_user_copyout((void *)data, iov, sizeof iov) < 0)
+            return -EFAULT;
         return 0;
     }
     case CNG_PTRACE_SETREGSET: {
         u64 iov[2];
-        if (!cng_user_readable((void *)data, sizeof iov))
+        if (cng_user_copyin(iov, (void *)data, sizeof iov) < 0)
             return -EFAULT;
-        memcpy(iov, (void *)data, sizeof iov);
         u32 n = (u32)(iov[1] > PT_MBOX ? PT_MBOX : iov[1]);
-        if (n) {
-            if (!cng_user_readable((void *)iov[0], n))
-                return -EFAULT;
-            memcpy(e->data, (void *)iov[0], n);
-        }
+        if (n && cng_user_copyin(e->data, (void *)iov[0], n) < 0)
+            return -EFAULT;
         e->rlen = n;
         pt_cmd(e, PT_CMD_SETREGS, addr, 0);
         return e->result < 0 ? (long)e->result : 0;
@@ -1744,11 +1726,8 @@ long cng_pt_wait4(long pid, u64 status, long options, u64 rusage,
         int st = 0;
         s32 t = pt_collect((s32)pid, &st, PT_COLLECT_STOPS | PT_COLLECT_EXITS);
         if (t > 0) {
-            if (status) {
-                if (!cng_user_writable((void *)status, 4))
-                    return -EFAULT;
-                *(int *)status = st;
-            }
+            if (status && cng_user_copyout((void *)status, &st, sizeof st) < 0)
+                return -EFAULT;
             return t;
         }
         long r = CNG_SYS(__NR_wait4, pid, status, options | PT_WNOHANG, rusage,
@@ -1765,11 +1744,8 @@ long cng_pt_wait4(long pid, u64 status, long options, u64 rusage,
         if (options & PT_WNOHANG)
             return r == -ECHILD ? 0 : r;
         if ((t = pt_reap_dead((s32)pid, &st)) > 0) {
-            if (status) {
-                if (!cng_user_writable((void *)status, 4))
-                    return -EFAULT;
-                *(int *)status = st;
-            }
+            if (status && cng_user_copyout((void *)status, &st, sizeof st) < 0)
+                return -EFAULT;
             return t;
         }
         if (pt_signal_pending(uc))
@@ -1807,8 +1783,6 @@ long cng_pt_waitid(long idtype, long id, u64 infop, long options, u64 rusage,
                    ((options & PT_WEXITED) ? PT_COLLECT_EXITS : 0);
         if (wpid && want && (t = pt_collect(wpid, &st, want)) > 0) {
             if (infop) {
-                if (!cng_user_writable((void *)infop, 128))
-                    return -EFAULT;
                 u8 si[128];
                 memset(si, 0, sizeof si);
                 s32 *w = (s32 *)si;
@@ -1821,20 +1795,26 @@ long cng_pt_waitid(long idtype, long id, u64 infop, long options, u64 rusage,
                 w[6] = (st & 0xff) == 0x7f ? (st >> 8) & 0xff
                        : ((st & 0x7f) == 0) ? (st >> 8) & 0xff
                                             : (st & 0x7f); /* si_status */
-                memcpy((void *)infop, si, sizeof si);
+                if (cng_user_copyout((void *)infop, si, sizeof si) < 0)
+                    return -EFAULT;
             }
             return 0;
         }
-        if (infop && cng_user_writable((void *)infop, 128))
-            memset((void *)infop, 0, 128);
+        if (infop) {
+            u8 zero[128];
+            memset(zero, 0, sizeof zero);
+            cng_user_copyout((void *)infop, zero, sizeof zero);
+        }
         long r = CNG_SYS(__NR_waitid, idtype, id, infop, options | PT_WNOHANG,
                          rusage, 0);
         if (r == 0) {
             /* WNOHANG semantics: si_pid == 0 means nothing was ready — which is
              * only readable because the buffer was zeroed just above. */
             int got = 1;
-            if (infop && cng_user_readable((void *)infop, 128))
-                got = *(int *)((char *)infop + 16) != 0;
+            int si_pid;
+            if (infop &&
+                cng_user_copyin(&si_pid, (char *)infop + 16, sizeof si_pid) == 0)
+                got = si_pid != 0;
             if (got || (options & PT_WNOHANG))
                 return 0;
         } else if (!(r == -ECHILD && pt_have_tracee(wpid))) {
@@ -1902,9 +1882,8 @@ int cng_pt_vm_rw(long nr, long pid, u64 lvec, u64 lcnt, u64 rvec, u64 rcnt,
         if (n > PT_MBOX)
             n = PT_MBOX;
         if (write) {
-            if (!cng_user_readable((void *)lbase, (unsigned long)n))
+            if (cng_user_copyin(e->data, (void *)lbase, (unsigned long)n) < 0)
                 break;
-            memcpy(e->data, (void *)lbase, (size_t)n);
             pt_cmd(e, PT_CMD_WRITE, rbase, n);
         } else {
             pt_cmd(e, PT_CMD_READ, rbase, n);
@@ -1912,11 +1891,9 @@ int cng_pt_vm_rw(long nr, long pid, u64 lvec, u64 lcnt, u64 rvec, u64 rcnt,
         if (e->result < 0)
             break;
         u64 got = (u64)e->result;
-        if (!write && got) {
-            if (!cng_user_writable((void *)lbase, (unsigned long)got))
-                break;
-            memcpy((void *)lbase, e->data, (size_t)got);
-        }
+        if (!write && got &&
+            cng_user_copyout((void *)lbase, e->data, (unsigned long)got) < 0)
+            break;
         total += got;
         loff += got;
         roff += got;

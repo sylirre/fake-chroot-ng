@@ -223,17 +223,33 @@ static void exec_args_free(struct exec_args *a) {
 /* Measure one vector, validating as it goes. argv/envp are guest memory the
  * kernel never gets to check for us — walking them with a bare strlen is how a
  * wild pointer became a fatal SIGSEGV inside the handler instead of the -EFAULT
- * execve(2) promises. Returns the total bytes of its strings, or -errno. */
+ * execve(2) promises.
+ *
+ * The slots are taken a window at a time rather than read where they lie: a
+ * validated vector is not a frozen one, and another thread of the exec'ing
+ * process can put a wild pointer into a slot the count pass already blessed.
+ * The strings themselves are measured out of a copy too (cng_user_strlen), and
+ * neither measurement is trusted afterwards — copy_vec re-takes both. What this
+ * pass is for is the arena size and the -E2BIG the kernel would give.
+ * Returns the total bytes of its strings, or -errno. */
+#define VEC_WIN 64
 static long vec_bytes(char **v, int *count) {
     long n = cng_user_veclen(v, EXEC_MAX_STRINGS);
     if (n < 0)
         return n;
     unsigned long bytes = 0;
-    for (long i = 0; i < n; i++) {
-        long len = cng_user_strlen(v[i], EXEC_MAX_STRLEN);
-        if (len < 0)
-            return len;
-        bytes += (unsigned long)len + 1;
+    char *win[VEC_WIN];
+    for (long i = 0; i < n;) {
+        long k = n - i < VEC_WIN ? n - i : VEC_WIN;
+        if (cng_user_copyin(win, v + i, (unsigned long)k * sizeof *win) < 0)
+            return -EFAULT;
+        for (long j = 0; j < k; j++) {
+            long len = cng_user_strlen(win[j], EXEC_MAX_STRLEN);
+            if (len < 0)
+                return len;
+            bytes += (unsigned long)len + 1;
+        }
+        i += k;
     }
     *count = (int)n;
     return (long)bytes;

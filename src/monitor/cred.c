@@ -233,10 +233,14 @@ static long do_setgroups(struct cng_cred *c, int n, const unsigned *g) {
         return -EPERM;
     if (n < 0 || n > CNG_NGROUPS_MAX)
         return -EINVAL;
-    if (n && !cng_user_readable(g, (unsigned long)n * sizeof *g))
+    /* Into a buffer of ours first: a copy that fails partway must leave the
+     * credential exactly as it was, and the kernel's own setgroups does the
+     * same (groups_from_user runs before the set is installed). */
+    unsigned got[CNG_NGROUPS_MAX];
+    if (n && cng_user_copyin(got, g, (unsigned long)n * sizeof *got) < 0)
         return -EFAULT;
     for (int i = 0; i < n; i++)
-        c->groups[i] = g[i];
+        c->groups[i] = got[i];
     c->ngroups = n;
     return 0;
 }
@@ -246,17 +250,17 @@ static long do_getgroups(const struct cng_cred *c, int size, unsigned *g) {
         return n;
     if (size < n)
         return -EINVAL;
-    if (n && !cng_user_writable(g, (unsigned long)n * sizeof *g))
+    if (n && cng_user_copyout(g, c->groups, (unsigned long)n * sizeof *g) < 0)
         return -EFAULT;
-    for (int i = 0; i < n; i++)
-        g[i] = c->groups[i];
     return n;
 }
 
 /* capget/capset: the guest's own capability view. Under fake-root the full set
  * is reported and any change accepted; otherwise none / EPERM, like the host.
- * The header selects v1 (one 32-bit data block) or v2/v3 (two). Pointers are
- * this process's own memory, so they are read/written directly. */
+ * The header selects v1 (one 32-bit data block) or v2/v3 (two). The pointers
+ * are the guest's, so header and payload cross through cng_user_copyin/copyout
+ * — read where they lie, the version that selects the block count need not
+ * still be the version when the blocks are written (see uaccess.c). */
 struct cap_header {
     unsigned version;
     int pid;
@@ -276,10 +280,11 @@ struct cap_data {
  * believing its own version was supported, and then took the two-block branch
  * for it: a capget writing 24 bytes into the 12-byte buffer a v1 caller
  * allocated. */
-static long cap_magic(struct cap_header *hdr, int *nblocks) {
-    if (!cng_user_readable(hdr, sizeof *hdr))
+static long cap_magic(struct cap_header *hdr, struct cap_header *out,
+                      int *nblocks) {
+    if (cng_user_copyin(out, hdr, sizeof *out) < 0)
         return -EFAULT;
-    switch (hdr->version) {
+    switch (out->version) {
     case CAP_VER_1:
         *nblocks = 1;
         return 0;
@@ -288,42 +293,46 @@ static long cap_magic(struct cap_header *hdr, int *nblocks) {
         *nblocks = 2;
         return 0;
     }
-    if (!cng_user_writable(&hdr->version, sizeof hdr->version))
+    unsigned ver = CAP_VER_3;
+    if (cng_user_copyout(&hdr->version, &ver, sizeof ver) < 0)
         return -EFAULT;
-    hdr->version = CAP_VER_3;
     return -EINVAL;
 }
 
 static long do_capget(struct cap_header *hdr, struct cap_data *data) {
     int n = 0;
-    long r = cap_magic(hdr, &n);
+    struct cap_header h;
+    long r = cap_magic(hdr, &h, &n);
     /* A probe with no data buffer is the negotiation itself, and the kernel
      * calls it a success once the version has been written back. */
     if (r != 0 || !data)
         return (!data && r == -EINVAL) ? 0 : r;
-    if (hdr->pid < 0)
+    if (h.pid < 0)
         return -EINVAL;
     unsigned all = cng_fake_root() ? 0xffffffffu : 0u;
-    if (!cng_user_writable(data, (unsigned long)n * sizeof *data))
-        return -EFAULT;
+    struct cap_data blocks[2];
     for (int i = 0; i < n; i++) {
-        data[i].effective = all;
-        data[i].permitted = all;
-        data[i].inheritable = 0;
+        blocks[i].effective = all;
+        blocks[i].permitted = all;
+        blocks[i].inheritable = 0;
     }
+    if (cng_user_copyout(data, blocks, (unsigned long)n * sizeof *blocks) < 0)
+        return -EFAULT;
     return 0;
 }
 
 static long do_capset(struct cap_header *hdr, const struct cap_data *data) {
     int n = 0;
-    long r = cap_magic(hdr, &n);
+    struct cap_header h;
+    long r = cap_magic(hdr, &h, &n);
     if (r != 0)
         return r;
-    if (hdr->pid != 0 && hdr->pid != (int)sys_getpid())
+    if (h.pid != 0 && h.pid != (int)sys_getpid())
         return -EPERM; /* "may only affect current", as the kernel puts it */
     /* The payload is copied in before any decision is taken, so a bad one is
      * -EFAULT whatever the caller's privilege would have been. */
-    if (!cng_user_readable(data, (unsigned long)n * sizeof *data))
+    struct cap_data blocks[2];
+    if (cng_user_copyin(blocks, data, (unsigned long)n * sizeof *blocks) < 0)
         return -EFAULT;
     return cng_fake_root() ? 0 : -EPERM;
 }
@@ -385,9 +394,12 @@ long cng_cred_handle(long nr, long a0, long a1, long a2, long a3, long a4,
             !cng_user_writable((void *)a2, sizeof(unsigned)))
             return -EFAULT;
         int u = (nr == __NR_getresuid);
-        *(unsigned *)a0 = u ? c->ruid : c->rgid;
-        *(unsigned *)a1 = u ? c->euid : c->egid;
-        *(unsigned *)a2 = u ? c->suid : c->sgid;
+        unsigned r_ = u ? c->ruid : c->rgid, e_ = u ? c->euid : c->egid,
+                 s_ = u ? c->suid : c->sgid;
+        if (cng_user_copyout((void *)a0, &r_, sizeof r_) < 0 ||
+            cng_user_copyout((void *)a1, &e_, sizeof e_) < 0 ||
+            cng_user_copyout((void *)a2, &s_, sizeof s_) < 0)
+            return -EFAULT;
         return 0;
     }
     case __NR_setuid:

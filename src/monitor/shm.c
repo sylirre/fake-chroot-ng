@@ -274,14 +274,16 @@ static long do_shmctl(s32 shmid, int cmd, void *buf) {
     q.id = shmid; /* a segment id, or an array index for SHM_STAT */
     q.arg = cmd;
     if (cmd == CNG_IPC_SET) {
-        const struct cng_shmid64_ds *in = (const struct cng_shmid64_ds *)buf;
         /* `buf` is guest memory and this runs with SIGSEGV masked, so a bad
-         * pointer has to be reported, not dereferenced (see uaccess.c). */
-        if (!cng_user_readable(in, sizeof *in))
+         * pointer has to be reported, not dereferenced — and taken as a copy,
+         * so the fields applied are the ones that were validated
+         * (see uaccess.c). */
+        struct cng_shmid64_ds in;
+        if (cng_user_copyin(&in, buf, sizeof in) < 0)
             return -EFAULT;
-        q.set_mode = in->shm_perm.mode;
-        q.set_uid = in->shm_perm.uid;
-        q.set_gid = in->shm_perm.gid;
+        q.set_mode = in.shm_perm.mode;
+        q.set_uid = in.shm_perm.uid;
+        q.set_gid = in.shm_perm.gid;
     }
 
     struct cng_bresp r;
@@ -298,25 +300,23 @@ static long do_shmctl(s32 shmid, int cmd, void *buf) {
      * an empty list. The sem/msg siblings clamp the same way. */
     if (cmd == CNG_SHM_INFO) {
         struct cng_shm_info si;
-        if (!cng_user_writable(buf, sizeof si))
-            return -EFAULT;
         memset(&si, 0, sizeof si);
         si.used_ids = r.info_used;
         si.shm_tot = r.info_tot;
         si.shm_rss = r.info_tot; /* no separate RSS accounting: report total */
-        memcpy(buf, &si, sizeof si);
+        if (cng_user_copyout(buf, &si, sizeof si) < 0)
+            return -EFAULT;
         return r.ret < 0 ? 0 : r.ret;
     }
     if (cmd == CNG_IPC_INFO) {
         struct cng_shminfo64 li;
-        if (!cng_user_writable(buf, sizeof li))
-            return -EFAULT;
         memset(&li, 0, sizeof li);
         li.shmmax = 0x7fffffffffffffffULL; /* effectively host-RAM bounded */
         li.shmmin = 1;
         li.shmmni = li.shmseg = 1024;      /* the broker's segment table */
         li.shmall = 0x7fffffffffffffffULL >> 12;
-        memcpy(buf, &li, sizeof li);
+        if (cng_user_copyout(buf, &li, sizeof li) < 0)
+            return -EFAULT;
         return r.ret < 0 ? 0 : r.ret;
     }
 
@@ -325,10 +325,9 @@ static long do_shmctl(s32 shmid, int cmd, void *buf) {
 
     if (cmd == CNG_IPC_STAT || cmd == CNG_SHM_STAT || cmd == CNG_SHM_STAT_ANY) {
         struct cng_shmid64_ds ds;
-        if (!cng_user_writable(buf, sizeof ds))
-            return -EFAULT;
         fill_ds(&ds, &r);
-        memcpy(buf, &ds, sizeof ds);
+        if (cng_user_copyout(buf, &ds, sizeof ds) < 0)
+            return -EFAULT;
     }
     return r.ret;
 }

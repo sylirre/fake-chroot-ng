@@ -69,9 +69,9 @@ static u64 reg(const struct cng_uregs *r, unsigned n) {
 
 u64 cng_pt_next_pc(const struct cng_uregs *r) {
     u64 pc = r->pc;
-    if (!cng_user_readable((const void *)pc, 4))
+    u32 insn;
+    if (cng_user_copyin(&insn, (const void *)pc, sizeof insn) < 0)
         return 0;
-    u32 insn = *(const u32 *)pc;
 
     /* B / BL: imm26 << 2 from PC. */
     if ((insn & 0xFC000000u) == 0x14000000u ||
@@ -124,9 +124,9 @@ u64 cng_pt_next_pc(const struct cng_uregs *r) {
 int cng_pt_step_plant(struct cng_uregs *r) {
     cng_pt_step_clear();
     u64 next = cng_pt_next_pc(r);
-    if (!next || !cng_user_readable((const void *)next, 4))
+    if (!next ||
+        cng_user_copyin(&g_step_orig, (const void *)next, sizeof g_step_orig) < 0)
         return -1;
-    g_step_orig = *(const u32 *)next;
     if (g_step_orig == PT_STEP_BRK)
         return -1; /* already ours: refuse rather than lose the original */
     u32 brk = PT_STEP_BRK;

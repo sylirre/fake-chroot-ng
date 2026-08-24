@@ -72,6 +72,27 @@ case "$out" in
     check_contains "...on the memfd tier too" \
         "faulttest copyin: str=3 over=-14 cap=-7 half=-14 fits=0 bad=-14 -> OK" \
         "$memfd_out"
+    # The two measurements ride on the same apparatus. They answer out of a
+    # copy now: probing a page and then walking the guest's own bytes had the
+    # same gap, and the walk is the half that faults. A string or a vector
+    # ending inside the live page is measured; one running into the hole past
+    # it is EFAULT rather than an over-read.
+    for _o in "$out" "$memfd_out"; do
+        check_contains "a guest string and vector are measured out of a copy" \
+            "faulttest measure: str=3 over=-14 cap=-7 vec=1 vecover=-14 -> OK" \
+            "$_o"
+        # And the write direction: cng_user_writable followed by a store has
+        # the identical gap, and the store cannot be taken back.
+        check_contains "bytes go out to the guest in one act" \
+            "faulttest copyout: fits=0 over=-14 bad=-14 -> OK" "$_o"
+        # A fork brings the staging descriptor across with the address space,
+        # and the file behind it: two processes writing into the same bytes of
+        # one memfd read each other's back. It surfaced as a guest command
+        # failing with EFAULT about one run in thirty — a shell pipeline forks
+        # two children and both translate a path at once.
+        check_contains "a forked child stages through a descriptor of its own" \
+            "faulttest fork: parent=1 child=1 -> OK" "$_o"
+    done
     check_contains "valid pointers still work" \
         "faulttest valid getresuid=0" "$out"
     ;;

@@ -102,8 +102,9 @@ static int sigsys_syscall(struct cng_ucontext *uc, long nr) {
          * the old-mask pointer before reading the new mask out of the same
          * address handed us a zeroed set, so SIG_UNBLOCK cleared the guest's
          * whole mask and SIG_BLOCK became a silent no-op. */
+        unsigned long set;
         if (pset) {
-            if (!cng_user_readable(pset, sizeof *pset)) {
+            if (cng_user_copyin(&set, pset, sizeof set) < 0) {
                 r[0] = (unsigned long long)(long)-EFAULT;
                 return 1;
             }
@@ -115,18 +116,14 @@ static int sigsys_syscall(struct cng_ucontext *uc, long nr) {
                 r[0] = (unsigned long long)(long)-EINVAL;
                 return 1;
             }
-            unsigned long set = *pset;
             unsigned long neu = (how == 0)   ? (cur | set)   /* SIG_BLOCK */
                                 : (how == 1) ? (cur & ~set)  /* SIG_UNBLOCK */
                                              : set;          /* SIG_SETMASK */
             uc->uc_sigmask.sig[0] = neu & ~(1UL << (CNG_SIGSYS - 1));
         }
-        if (pold) {
-            if (!cng_user_writable(pold, sizeof *pold)) {
-                r[0] = (unsigned long long)(long)-EFAULT;
-                return 1;
-            }
-            *pold = cur;
+        if (pold && cng_user_copyout(pold, &cur, sizeof cur) < 0) {
+            r[0] = (unsigned long long)(long)-EFAULT;
+            return 1;
         }
         r[0] = 0;
         return 1;

@@ -1398,8 +1398,111 @@ int cng_cmd_faulttest(int argc, char **argv, char **envp, unsigned long *auxv) {
                         (int)whole, (int)over, (int)cap, (int)half, (int)fits,
                         (int)none, ok ? "OK" : "FAIL");
             fails += !ok;
+
+            /* The two measurements, on the same apparatus. They answer about a
+             * copy now rather than about the guest's own bytes — a probe
+             * followed by a walk had the gap this whole file is about, and the
+             * walk is the half that faults. What is asserted is the property
+             * that survives whatever a racing thread does: a string or a vector
+             * that ends inside the live page is measured, and one that runs
+             * into the hole is -EFAULT rather than an over-read. */
+            long slen = cng_user_strlen(str, 64);
+            long sover = cng_user_strlen(nonul, 64);
+            long scap = cng_user_strlen(str, 2);
+            char **vec = (char **)(m + pg - 16); /* one entry, then the NUL */
+            vec[0] = str;
+            vec[1] = 0;
+            long vlen = cng_user_veclen(vec, 8);
+            char **vover = (char **)(m + pg - 8); /* one entry, then the hole */
+            vover[0] = str;
+            long vover_r = cng_user_veclen(vover, 8);
+            int mok = slen == 3 && sover == -EFAULT && scap == -E2BIG &&
+                      vlen == 1 && vover_r == -EFAULT;
+            cng_dprintf(1,
+                        "faulttest measure: str=%d over=%d cap=%d vec=%d "
+                        "vecover=%d -> %s\n",
+                        (int)slen, (int)sover, (int)scap, (int)vlen,
+                        (int)vover_r, mok ? "OK" : "FAIL");
+            fails += !mok;
+
+            /* And the write direction. cng_user_writable followed by a store
+             * has the same gap as a probe followed by a memcpy, and the store
+             * is the half that cannot be taken back. */
+            char src[8];
+            memset(src, 'z', sizeof src);
+            long wfits = cng_user_copyout(m + pg - 8, src, 8);
+            long wover = cng_user_copyout(m + pg - 4, src, 8);
+            long wnone = cng_user_copyout(bad, src, 8);
+            int ook = wfits == 0 && wover == -EFAULT && wnone == -EFAULT &&
+                      m[pg - 8] == 'z' && m[pg - 1] == 'z';
+            cng_dprintf(1,
+                        "faulttest copyout: fits=%d over=%d bad=%d -> %s\n",
+                        (int)wfits, (int)wover, (int)wnone, ook ? "OK" : "FAIL");
+            fails += !ook;
             sys_munmap(m, pg);
         }
+    }
+
+    /* Two processes must not stage their copies through the same descriptor.
+     *
+     * fork brings the descriptor across with the address space, and the file
+     * behind it: parent and child would go on writing into the same bytes of
+     * the same memfd and reading each other's back. The probes never cared —
+     * nothing is ever read back out of their regions — so it only became a
+     * question once the descriptor started carrying data, and then it showed
+     * up as a guest command failing with EFAULT about one run in thirty (a
+     * shell pipeline forks two children, and both translate a path at once).
+     *
+     * Driven rather than raced: each side copies a pattern of its own in a
+     * tight loop and checks what comes back. One shared staging area fails
+     * that within a few hundred iterations; a descriptor per process cannot
+     * fail at all. Only the memfd tier stages anything, so where
+     * process_vm_readv exists this passes for free — which is the other reason
+     * the suite runs the whole set again with CNG_UACCESS_MEMFD=1. */
+    {
+        /* The identity is what is asserted, not a race won: the child reports
+         * whether the descriptor it stages through is a different file from
+         * the one its parent had, which it knows because `pino` came across
+         * the fork with the rest of the stack. Racing the two and waiting for
+         * corruption catches this only when their two ring positions happen to
+         * meet — one run in three, measured, which is no way to hold a fix
+         * down. */
+        unsigned long pino = cng_uaccess_scratch_ino();
+        char csrc[256], cdst[256];
+        long kid = sys_fork();
+        if (kid == 0) {
+            unsigned long cino = cng_uaccess_scratch_ino();
+            if (!pino || !cino || cino == pino)
+                sys_exit_group(1);
+            /* ...and both sides go on copying at once, which is the thing the
+             * separation is for. */
+            memset(csrc, 0x5a, sizeof csrc);
+            for (int i = 0; i < 500; i++) {
+                memset(cdst, 0, sizeof cdst);
+                if (cng_user_copyin(cdst, csrc, sizeof csrc) != 0 ||
+                    memcmp(cdst, csrc, sizeof csrc) != 0)
+                    sys_exit_group(2);
+            }
+            sys_exit_group(0);
+        }
+        int mine = 1;
+        memset(csrc, 0xa5, sizeof csrc);
+        for (int i = 0; i < 500; i++) {
+            memset(cdst, 0, sizeof cdst);
+            if (cng_user_copyin(cdst, csrc, sizeof csrc) != 0 ||
+                memcmp(cdst, csrc, sizeof csrc) != 0) {
+                mine = 0;
+                break;
+            }
+        }
+        int st = 0;
+        if (kid > 0)
+            sys_wait4((int)kid, &st, 0, 0);
+        int child = kid > 0 && (st & 0x7f) == 0 && ((st >> 8) & 0xff) == 0;
+        int ok = kid > 0 && mine && child;
+        cng_dprintf(1, "faulttest fork: parent=%d child=%d -> %s\n", mine,
+                    child, ok ? "OK" : "FAIL");
+        fails += !ok;
     }
 
     /* getgroups writes only what it has: with no supplementary groups the bad

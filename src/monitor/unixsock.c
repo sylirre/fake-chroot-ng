@@ -96,9 +96,8 @@ int cng_sun_needed(const void *addr, long alen) {
     if (!addr || alen < SUN_HDR + 1 || alen > (long)sizeof probe.buf)
         return 0;
     unsigned short fam;
-    if (!cng_user_readable(addr, sizeof fam))
+    if (cng_user_copyin(&fam, addr, sizeof fam) < 0)
         return 0;
-    memcpy(&fam, addr, sizeof fam);
     return fam == CNG_AF_UNIX;
 }
 
@@ -161,15 +160,21 @@ int cng_sun_in(struct cng_sun_xlate *x, const void *addr, long alen,
     /* The address is read here, ahead of the kernel call that would have
      * validated it, and a fault inside the handler is unblockable. An
      * unreadable one is passed through untouched so the kernel answers the
-     * guest's own pointer with -EFAULT, which is what it would have done. */
-    if (!cng_user_readable(addr, (unsigned long)alen))
+     * guest's own pointer with -EFAULT, which is what it would have done.
+     *
+     * Taken as a copy, once: the name decides which of two very different
+     * things happens to it (a rootfs translation, or the abstract tag), and
+     * reading it again afterwards would let a guest thread pick one path and
+     * hand over the name for the other. */
+    char in[sizeof x->buf];
+    if (cng_user_copyin(in, addr, (unsigned long)alen) < 0)
         return 0;
     unsigned short fam;
-    memcpy(&fam, addr, sizeof fam);
+    memcpy(&fam, in, sizeof fam);
     if (fam != CNG_AF_UNIX)
         return 0;
 
-    const char *gp = (const char *)addr + SUN_HDR;
+    const char *gp = in + SUN_HDR;
     long plen = alen - SUN_HDR;
 
     /* Abstract namespace: no filesystem node, so tag rather than translate. A
