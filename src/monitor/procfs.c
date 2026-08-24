@@ -160,6 +160,49 @@ static const char *rootfs_fstype(const char *root) {
  * its row. */
 #define MNT_DEV "/dev/root"
 
+/* A mount table escapes the four characters that would otherwise make its
+ * whitespace-separated fields ambiguous — space, tab, newline, and the
+ * backslash that spells them — as octal, which is what fs/proc_namespace.c does
+ * for every path and every device name it prints (mangle(), and seq_path with
+ * " \t\n\\"). Every other field in these tables is a constant of ours; a bind's
+ * guest mount point is the one a caller chooses, and `-b /data/rootfs:/mnt/my
+ * disk` put a raw space in the middle of the row. Everything that reads these
+ * files splits on whitespace — libmount, busybox df and mount, findmnt,
+ * /proc/mounts parsers of every kind — so the row named a mount point nobody
+ * asked for and gave the next field, the filesystem type, to whatever followed
+ * the space. Returns `out`, and stops rather than truncating a multi-byte
+ * escape. */
+static const char *mnt_esc(const char *p, char *out, size_t sz) {
+    size_t o = 0;
+    for (; *p; p++) {
+        const char *e = 0;
+        switch (*p) {
+        case ' ':
+            e = "\\040";
+            break;
+        case '\t':
+            e = "\\011";
+            break;
+        case '\n':
+            e = "\\012";
+            break;
+        case '\\':
+            e = "\\134";
+            break;
+        }
+        size_t k = e ? 4 : 1;
+        if (o + k >= sz)
+            break;
+        if (e)
+            memcpy(out + o, e, 4);
+        else
+            out[o] = *p;
+        o += k;
+    }
+    out[o] = '\0';
+    return out;
+}
+
 /* The guest mount table: the rootfs, the /proc and /dev passthrough zones, and
  * one row per -b bind. Mount IDs are handed out by a running counter because the
  * zone rows are conditional (--no-proc / --no-dev), so a bind's id depends on
@@ -175,6 +218,9 @@ static void put_mounts(int fd, int fmt) {
         maj = dev_major(dev);
         min = dev_minor(dev);
     }
+    /* Room for the worst case: a guest path of nothing but characters that
+     * escape to four bytes each. */
+    char esc[4 * CNG_PATH_MAX];
     int nb = cng_g_fs->nbinds;
     int proc_row = !cng_g_no_proc;
     int dev_row = !cng_g_no_dev;
@@ -205,8 +251,9 @@ static void put_mounts(int fd, int fmt) {
             }
             const char *rw = cng_g_fs->binds[i].ro ? "ro" : "rw";
             cng_dprintf(fd, "%d 1 %lu:%lu / %s %s,relatime - %s " MNT_DEV " %s\n",
-                        id++, bmaj, bmin, cng_g_fs->binds[i].guest, rw, fstype,
-                        rw);
+                        id++, bmaj, bmin,
+                        mnt_esc(cng_g_fs->binds[i].guest, esc, sizeof esc), rw,
+                        fstype, rw);
         }
     } else if (fmt == MNT_MOUNTSTATS) {
         /* No NFS per-op stats: every mount here is a local filesystem. */
@@ -224,7 +271,8 @@ static void put_mounts(int fd, int fmt) {
         }
         for (int i = 0; i < nb; i++)
             cng_dprintf(fd, "device " MNT_DEV " mounted on %s with fstype %s\n",
-                        cng_g_fs->binds[i].guest, fstype);
+                        mnt_esc(cng_g_fs->binds[i].guest, esc, sizeof esc),
+                        fstype);
     } else {
         cng_dprintf(fd, MNT_DEV " / %s rw,relatime 0 0\n", fstype);
         if (proc_row)
@@ -238,8 +286,8 @@ static void put_mounts(int fd, int fmt) {
         }
         for (int i = 0; i < nb; i++)
             cng_dprintf(fd, MNT_DEV " %s %s %s,relatime 0 0\n",
-                        cng_g_fs->binds[i].guest, fstype,
-                        cng_g_fs->binds[i].ro ? "ro" : "rw");
+                        mnt_esc(cng_g_fs->binds[i].guest, esc, sizeof esc),
+                        fstype, cng_g_fs->binds[i].ro ? "ro" : "rw");
     }
 }
 

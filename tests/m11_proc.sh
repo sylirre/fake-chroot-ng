@@ -197,9 +197,11 @@ fi
 M11TMP=$(mktemp -d)
 
 # m11_sh <desc> <expected> <script>: run the script in an Alpine guest under -R
-# and compare its (whitespace-trimmed) stdout.
+# and compare its (whitespace-trimmed) stdout. $M11BIND is the -b spec, so a leg
+# that needs a different mount point can set it around itself.
+M11BIND="$M11TMP:/tmp"
 m11_sh() {
-    got=$(run -R -b "$M11TMP":/tmp "$M11_ALPINE" /bin/busybox sh -c "$3" 2>/dev/null)
+    got=$(run -R -b "$M11BIND" "$M11_ALPINE" /bin/busybox sh -c "$3" 2>/dev/null)
     if [ "$got" = "$2" ]; then
         pass=$((pass + 1)); echo "  ok   m11 $1"
     else
@@ -228,6 +230,24 @@ if [ "$m11_ready" -eq 1 ]; then
          grep -c '$M11TMP'"
     m11_sh "...and the bind is still a row of the guest's own device" "1" \
         'grep -c "^/dev/root /tmp " /proc/mounts'
+
+    # A guest mount point with whitespace in it. Every one of these tables is
+    # whitespace-separated and everything that reads one splits on that —
+    # libmount, busybox df and mount, findmnt — so a real kernel escapes space,
+    # tab, newline and backslash as octal in every path and device name it
+    # prints (fs/proc_namespace.c). Printed raw, the row named "/tmp/my" and
+    # handed the field after it, the filesystem type, to "dir".
+    M11BIND="$M11TMP:/tmp/my dir"
+    m11_sh "a mount point with a space is escaped in all three tables" "3" \
+        "cat /proc/mounts /proc/self/mountinfo /proc/self/mountstats |
+         grep -cF '/tmp/my\040dir'"
+    m11_sh "...and appears raw in none of them" "0" \
+        "cat /proc/mounts /proc/self/mountinfo /proc/self/mountstats |
+         grep -cF '/tmp/my dir'"
+    # ...and it is still the mount point the guest can reach by that name.
+    m11_sh "...and the guest still finds it under that name" "ok" \
+        '[ -d "/tmp/my dir" ] && echo ok'
+    M11BIND="$M11TMP:/tmp"
 
     # No host path may appear in the guest's view of its own mappings.
     m11_sh "maps leaks no rootfs host path" "0" \
