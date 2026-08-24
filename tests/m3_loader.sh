@@ -79,6 +79,20 @@ check_contains "...and every byte of it arrived" "rc=0 tail=1" \
 check_contains "a PT_LOAD span that cannot carry the trampoline pool is refused" \
     "elfspan wrap: plain=-2 rewrite=-2 -> OK" "$(run -t elfspan 2>&1)"
 
+# A PT_INTERP the loader cannot honor has to be refused, not dropped. Ignoring
+# one — because the path did not fit the buffer, or the file was too short to
+# hold it — loaded a dynamic object as if it were static and entered it at its
+# own e_entry, where the guest died on the first GOT reference with no errno
+# anywhere. `-t elfinterp` builds the headers (no toolchain emits them) and
+# judges them in the pass that maps nothing.
+run -t elfinterp >/dev/null 2>&1
+check "a PT_INTERP the loader cannot honor is refused, never ignored" 0 $?
+check_contains "...and a well-formed one still arrives whole" \
+    "elfinterp: rc=0 has_interp=1 path=1 -> OK" "$(run -t elfinterp 2>&1)"
+check_contains "...each refusal being the errno the kernel gives" \
+    "elfinterp refusals: too-long=-5 too-short=-5 past-eof=-9 unterminated=-2 -> OK" \
+    "$(run -t elfinterp 2>&1)"
+
 # An ET_EXEC goes down MAP_FIXED at its link-time vaddr, and the monitor lives
 # in the same address space: a vaddr reaching chroot-ng's own image maps the
 # guest over the loader that is running. That is the 0x400000/cc1 crash the

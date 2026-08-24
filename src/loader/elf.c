@@ -212,13 +212,32 @@ static int elf_read_headers(int fd, struct cng_elf_plan *plan,
     unsigned long lo = ~0UL, hi = 0;
     int nload = 0;
     for (int i = 0; i < eh->e_phnum; i++) {
-        if (ph[i].p_type == PT_INTERP && ph[i].p_filesz > 0 &&
-            ph[i].p_filesz < sizeof out->interp) {
+        if (ph[i].p_type == PT_INTERP) {
+            /* PT_INTERP decides which of two entry points the guest starts at,
+             * so a header that names an interpreter and a load that ignores it
+             * are two different programs. It was ignored silently whenever the
+             * path did not fit this buffer or the read came up short: has_interp
+             * stayed 0, the image loaded as if it were static, and control went
+             * to e_entry — which in a dynamic object is the _start that expects
+             * ld.so to have relocated it, so the guest died on the first GOT
+             * reference instead of being told its interpreter could not be had.
+             *
+             * Refuse instead, and refuse where fs/binfmt_elf.c does: a p_filesz
+             * under 2 or past what can hold a path is ENOEXEC, a string not
+             * ending in a NUL is ENOEXEC, and a short read is EIO — for the
+             * program too, since the kernel reads this one with elf_read()
+             * rather than out of the header buffer that makes a truncated file
+             * ENOEXEC. The terminator is part of p_filesz, so the 256 bytes
+             * here hold a 255-character path — the bound SHEB_WORD already puts
+             * on a #! word, and past anything a real interpreter is named. */
+            if (ph[i].p_filesz < 2 || ph[i].p_filesz > sizeof out->interp)
+                return CNG_LOAD_ETOOBIG;
             if (read_exact(fd, out->interp, ph[i].p_filesz,
-                           (long)ph[i].p_offset) == (long)ph[i].p_filesz) {
-                out->interp[ph[i].p_filesz] = '\0';
-                out->has_interp = 1;
-            }
+                           (long)ph[i].p_offset) != (long)ph[i].p_filesz)
+                return CNG_LOAD_EINTERP;
+            if (out->interp[ph[i].p_filesz - 1] != '\0')
+                return CNG_LOAD_EFORMAT;
+            out->has_interp = 1;
         }
         if (ph[i].p_type != PT_LOAD)
             continue;

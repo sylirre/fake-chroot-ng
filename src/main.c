@@ -54,6 +54,7 @@ int cng_cmd_stackswtest(int argc, char **argv, char **envp, unsigned long *auxv)
 int cng_cmd_nesttest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_argvtest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_elfspan(int argc, char **argv, char **envp, unsigned long *auxv);
+int cng_cmd_elfinterp(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_imgtest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_o2test(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_sharedtest(int argc, char **argv, char **envp,
@@ -87,6 +88,7 @@ static const struct test_entry g_tests[] = {
     {"stackswtest", cng_cmd_stackswtest}, {"argvtest", cng_cmd_argvtest},
     {"nesttest", cng_cmd_nesttest},
     {"elfspan", cng_cmd_elfspan},
+    {"elfinterp", cng_cmd_elfinterp},
     {"imgtest", cng_cmd_imgtest},
     {"o2test", cng_cmd_o2test},
     {"sharedtest", cng_cmd_sharedtest},

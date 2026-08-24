@@ -1966,6 +1966,29 @@ vfork/`posix_spawn` child-stack handling.
   leg that builds exactly that object and asserts the refusal with `-R` off and
   on alike (with it on there would be nothing left to report the failure with).
 
+- [x] **M27 — a `PT_INTERP` too long to hold was dropped, and the object called
+  static**
+  `elf_read_headers` took the interpreter path only when `p_filesz` fit
+  `out->interp` and the pread came back whole. Everything else — a path past 255
+  characters, a `p_filesz` of 0 or 1, a file too short to hold the bytes the
+  header points at — left `has_interp` at 0 and returned `CNG_LOAD_OK`, so the
+  caller loaded a dynamic object as if it were static and entered it at its own
+  `e_entry`: the `_start` `ld.so` was supposed to have relocated, which dies on
+  the first GOT reference with no errno anywhere. The header file already
+  documented `CNG_LOAD_ETOOBIG` as "too many phdrs / interp too long"; nothing
+  ever returned it for the second half.
+  Refused now where `fs/binfmt_elf.c` refuses: `p_filesz` under 2 or past what
+  the buffer holds is `ENOEXEC` (`ELIBBAD` in the interpreter role), a string
+  whose last byte is not a NUL is `ENOEXEC`, and a short read is `EIO` — that one
+  through a code of its own (`CNG_LOAD_EINTERP`), because the kernel reads this
+  string with `elf_read()` rather than out of the 256-byte header buffer, so it
+  is `EIO` for the program role too. The 256-byte bound stays and is a refusal
+  rather than a silent reclassification (the same bound `SHEB_WORD` puts on a
+  `#!` word; glibc's and musl's loaders carry no `PT_INTERP` of their own, so the
+  interpreter role loses nothing by being judged the same way). Gated by
+  `-t elfinterp`, which builds five headers no toolchain emits and judges them in
+  the pass that maps nothing.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

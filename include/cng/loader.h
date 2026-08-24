@@ -45,6 +45,7 @@ struct cng_loaded {
 #define CNG_LOAD_EEXEC    -6  /* anon mprotect(RX) denied — retry file-backed */
 #define CNG_LOAD_EACCES   -7  /* not a regular file, or no execute bit at all */
 #define CNG_LOAD_ECLOBBER -8  /* ET_EXEC span covers chroot-ng's own image */
+#define CNG_LOAD_EINTERP  -9  /* PT_INTERP names a path the file does not hold */
 
 /* Force file-backed segment mapping (mmap PROT_EXEC from the file) instead of
  * anon copy+mprotect. Set automatically after the first anon-exec denial (e.g.

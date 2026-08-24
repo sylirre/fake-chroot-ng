@@ -58,6 +58,8 @@ static const char *load_err(int rc) {
         return "not a regular file, or not executable";
     case CNG_LOAD_ECLOBBER:
         return "fixed load address overlaps chroot-ng's own image";
+    case CNG_LOAD_EINTERP:
+        return "PT_INTERP names a path the file does not hold";
     default:
         return "unknown error";
     }

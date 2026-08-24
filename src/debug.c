@@ -2851,6 +2851,114 @@ int cng_cmd_elfspan(int argc, char **argv, char **envp, unsigned long *auxv) {
     return ok && wok ? 0 : 1;
 }
 
+/* _elfinterp — a PT_INTERP the loader cannot honor has to be refused, never
+ * dropped.
+ *
+ * The path used to be taken only when it fit the buffer and the read came back
+ * whole; anything else left has_interp at 0, and a dynamic object then loaded as
+ * if it were static and was entered at its own e_entry — the _start that expects
+ * ld.so to have relocated it. The guest died on the first GOT reference with no
+ * errno anywhere, where the kernel refuses the exec outright and the caller
+ * lives to read why. Four headers no toolchain emits, all judged in the pass
+ * that maps nothing (cng_elf_plan_fd), plus a well-formed one to show the path
+ * still arrives. */
+#define SYNTH_INTERP_HDRSZ (64 + 2 * 56) /* Ehdr + PT_LOAD + PT_INTERP */
+
+/* A memfd holding an ELF64 with those two headers, where `claim` is the
+ * p_filesz PT_INTERP advertises and str/slen what the file actually holds at
+ * p_offset. The two differ on purpose: that is how a file too short for the path
+ * it names gets built. */
+static long synth_interp_memfd(unsigned long claim, const char *str,
+                               unsigned long slen) {
+    long fd = sys_memfd_create("cng-synth-interp", 0);
+    if (fd < 0)
+        return fd;
+    unsigned char hdr[SYNTH_INTERP_HDRSZ];
+    memset(hdr, 0, sizeof hdr);
+    hdr[0] = 0x7f;
+    hdr[1] = 'E';
+    hdr[2] = 'L';
+    hdr[3] = 'F';
+    hdr[4] = 2; /* ELFCLASS64 */
+    hdr[5] = 1; /* ELFDATA2LSB */
+    hdr[6] = 1; /* EV_CURRENT */
+    *(unsigned short *)(hdr + 16) = 3;   /* e_type = ET_DYN */
+    *(unsigned short *)(hdr + 18) = 183; /* e_machine = EM_AARCH64 */
+    *(unsigned *)(hdr + 20) = 1;         /* e_version */
+    *(unsigned long *)(hdr + 32) = 0x40; /* e_phoff */
+    *(unsigned short *)(hdr + 52) = 64;  /* e_ehsize */
+    *(unsigned short *)(hdr + 54) = 56;  /* e_phentsize */
+    *(unsigned short *)(hdr + 56) = 2;   /* e_phnum */
+    unsigned char *p = hdr + 0x40;       /* PT_LOAD over the header itself */
+    *(unsigned *)(p + 0) = 1;            /* p_type */
+    *(unsigned *)(p + 4) = 6;            /* p_flags = PF_R|PF_W */
+    *(unsigned long *)(p + 32) = SYNTH_INTERP_HDRSZ; /* p_filesz */
+    *(unsigned long *)(p + 40) = 0x1000;             /* p_memsz */
+    *(unsigned long *)(p + 48) = 0x1000;             /* p_align */
+    p = hdr + 0x40 + 56;                 /* PT_INTERP, right behind it */
+    *(unsigned *)(p + 0) = 3;            /* p_type = PT_INTERP */
+    *(unsigned *)(p + 4) = 4;            /* p_flags = PF_R */
+    *(unsigned long *)(p + 8) = SYNTH_INTERP_HDRSZ; /* p_offset */
+    *(unsigned long *)(p + 32) = claim;             /* p_filesz */
+    *(unsigned long *)(p + 40) = claim;             /* p_memsz */
+    *(unsigned long *)(p + 48) = 1;                 /* p_align */
+    if (cng_write_all((int)fd, hdr, sizeof hdr) != (long)sizeof hdr ||
+        (slen && cng_write_all((int)fd, str, slen) != (long)slen)) {
+        sys_close((int)fd);
+        return -EIO;
+    }
+    return fd;
+}
+
+int cng_cmd_elfinterp(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    static const char want[] = "/lib/ld-cng-test.so.1";
+    /* The terminator is part of p_filesz, so `sizeof want` is the whole
+     * string — and 257 is one past what this buffer can hold. */
+    static const struct {
+        unsigned long claim, slen;
+        const char *str;
+        int want;
+    } leg[] = {
+        {sizeof want, sizeof want, want, CNG_LOAD_OK},
+        {257, sizeof want, want, CNG_LOAD_ETOOBIG},  /* longer than we hold */
+        {1, sizeof want, want, CNG_LOAD_ETOOBIG},    /* no room for a NUL */
+        {64, sizeof want, want, CNG_LOAD_EINTERP},   /* names bytes past EOF */
+        {4, 4, "abcd", CNG_LOAD_EFORMAT},            /* never terminated */
+    };
+    enum { NLEG = sizeof leg / sizeof leg[0] };
+    int rc[NLEG], ok = 1, has = 0, path = 0;
+    for (int i = 0; i < NLEG; i++) {
+        long fd = synth_interp_memfd(leg[i].claim, leg[i].str, leg[i].slen);
+        if (fd < 0) {
+            cng_dprintf(1, "elfinterp: memfd_create errno=%d -> SKIP\n",
+                        (int)-fd);
+            return 0;
+        }
+        struct cng_elf_plan plan;
+        struct cng_loaded out;
+        rc[i] = cng_elf_plan_fd((int)fd, &plan, &out);
+        cng_elf_plan_release(&plan); /* borrowed fd: ours to close */
+        sys_close((int)fd);
+        if (i == 0) {
+            has = out.has_interp;
+            path = !strcmp(out.interp, want);
+        }
+        ok &= rc[i] == leg[i].want;
+    }
+    int good = rc[0] == CNG_LOAD_OK && has && path;
+    cng_dprintf(1, "elfinterp: rc=%d has_interp=%d path=%d -> %s\n", rc[0], has,
+                path, good ? "OK" : "FAIL");
+    cng_dprintf(1,
+                "elfinterp refusals: too-long=%d too-short=%d past-eof=%d "
+                "unterminated=%d -> %s\n",
+                rc[1], rc[2], rc[3], rc[4], ok ? "OK" : "FAIL");
+    return ok && good ? 0 : 1;
+}
+
 /* _o2test ROOT — openat2's open_how.resolve.
  *
  * Two halves, both reachable without the syscall itself, which matters: no

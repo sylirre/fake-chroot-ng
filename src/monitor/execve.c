@@ -380,12 +380,15 @@ static _Noreturn void exec_fatal(const char *path, const char *what, long err) {
  *   not executable      EACCES       EACCES
  *   shorter than a hdr  ENOEXEC      EIO
  *   not an ELF for us   ENOEXEC      ELIBBAD
+ *   PT_INTERP past EOF  EIO          EIO
  *
  * The split is in fs/binfmt_elf.c: the program's header arrives in the 256-byte
  * buffer bprm_execve already read, so a short file is simply a header that does
  * not check out and every format declines it — ENOEXEC — while the interpreter
  * is read on its own with elf_read(), which turns a short read into EIO and a
- * failed check into ELIBBAD.
+ * failed check into ELIBBAD. The last row is that same elf_read() reached from
+ * the *program* side: the PT_INTERP string lives past the header buffer, so a
+ * file too short to hold it answers EIO whichever of the two roles it was in.
  *
  * This mattered less when it could not be observed: an interpreter that failed
  * to load did so after the program had been mapped over the caller, so the
@@ -399,6 +402,8 @@ static long exec_load_errno(int rc, const struct cng_elf_plan *plan, int interp)
         return -EACCES;
     case CNG_LOAD_EIO:
         return interp ? -EIO : -ENOEXEC;
+    case CNG_LOAD_EINTERP:
+        return -EIO;
     default: /* EFORMAT, ETOOBIG, ECLOBBER: a header that does not check out */
         return interp ? -ELIBBAD : -ENOEXEC;
     }
