@@ -2044,6 +2044,24 @@ vfork/`posix_spawn` child-stack handling.
   Gated by three `selfproc` legs that publish a well-formed stack at the edge of
   a mapping and then rewrite it the three ways that used to walk off the end.
 
+- [x] **M30 — the mount table named the directory each bind came from**
+  `/proc/mounts`, `/proc/self/mountinfo` and `/proc/self/mountstats` are
+  synthesized from the rootfs and the `-b` binds, and every bind row put
+  `cng_g_fs->binds[i].host` in the source field: the host directory the bind was
+  taken from, spelled out in the three files `df`, `mount`, `findmnt` and every
+  container runtime read — inside a view whose whole purpose is that the guest
+  cannot name a host path. It is the same leak already closed in `maps`, the fd
+  links, `/proc/self/exe` and the AF_UNIX readback, left open in the one place
+  that describes the mounts themselves.
+  It was not the faithful rendering either: a real table names a **device** in
+  that field — `/proc/mounts` has nothing else, and mountinfo puts the source
+  filesystem in field 10 with the bound subtree in field 4, which for us is
+  already `/`. Every row now says `/dev/root`, the name the rootfs row has always
+  carried and the only device name the guest is ever shown; several mounts off
+  one device name is a shape real tables have. The per-bind major:minor stays
+  real, so anything cross-referencing `stat().st_dev` — which is what actually
+  identifies a filesystem — still finds its row.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

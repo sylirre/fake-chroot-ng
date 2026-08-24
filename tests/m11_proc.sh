@@ -218,6 +218,17 @@ if [ "$m11_ready" -eq 1 ]; then
     m11_sh "mounts shows rootfs + proc + bind" "3" \
         'grep -c -e "^/dev/root / " -e "^proc /proc proc " -e " /tmp " /proc/mounts'
 
+    # ...and it names a device as the source of every row, as a real one does.
+    # The directory a bind came from is a host path: `df`, `mount` and findmnt
+    # print that field, and it used to spell out where the rootfs lives on the
+    # device — in the one namespace whose whole point is that the guest cannot
+    # name a host path (the maps leg above is the same assertion one file over).
+    m11_sh "no mount table leaks the bind's source path" "0" \
+        "cat /proc/mounts /proc/self/mountinfo /proc/self/mountstats |
+         grep -c '$M11TMP'"
+    m11_sh "...and the bind is still a row of the guest's own device" "1" \
+        'grep -c "^/dev/root /tmp " /proc/mounts'
+
     # No host path may appear in the guest's view of its own mappings.
     m11_sh "maps leaks no rootfs host path" "0" \
         "grep -c '$M11_ALPINE' /proc/self/maps"

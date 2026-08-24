@@ -3989,8 +3989,12 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
         long fd = pt_open("/proc/mounts");
         long n = pt_slurp(fd, buf, sizeof buf);
         int ok = n > 0 && pt_has(buf, "/dev/root / ") && pt_has(buf, "proc /proc proc ");
+        /* A bind is one row, named by where the guest mounted it — and never by
+         * where it came from: a real table names a device in that field, and the
+         * directory it was bound from is a host path, which is the one thing the
+         * path layer exists to keep out of the guest's hands. */
         if (bind_spec)
-            ok &= pt_has(buf, fs.binds[0].guest);
+            ok &= pt_has(buf, fs.binds[0].guest) && !pt_has(buf, fs.binds[0].host);
         if (fd >= 0)
             sys_close((int)fd);
         cng_dprintf(1, "proctest mounts: %ld bytes -> %s\n", n,

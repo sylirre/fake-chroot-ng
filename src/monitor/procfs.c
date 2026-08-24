@@ -144,6 +144,22 @@ static const char *rootfs_fstype(const char *root) {
     return "ext4";
 }
 
+/* The one device name the guest is ever shown. A real mount table names a
+ * *device* (or a pseudo-filesystem) as the source of every row — /proc/mounts
+ * has nothing else, and mountinfo puts the source filesystem in field 10 and the
+ * subtree it was bound from in field 4 — so this is both the faithful rendering
+ * and the one that says nothing about the host. A bind's rows used to carry
+ * cng_g_fs->binds[i].host there: the directory on the device the rootfs was
+ * assembled from, spelled out in a file that `df`, `mount`, findmnt and every
+ * container runtime read, in a namespace whose whole purpose is that the guest
+ * cannot name a host path. The rootfs row has always been "/dev/root"; the binds
+ * are rows of the same invented device now, which is a shape real tables have
+ * (several mounts off one device name) and no shape a tool can trip over. The
+ * per-bind major:minor is still the real one, so anything cross-referencing
+ * stat().st_dev — which is what actually identifies a filesystem — still finds
+ * its row. */
+#define MNT_DEV "/dev/root"
+
 /* The guest mount table: the rootfs, the /proc and /dev passthrough zones, and
  * one row per -b bind. Mount IDs are handed out by a running counter because the
  * zone rows are conditional (--no-proc / --no-dev), so a bind's id depends on
@@ -165,8 +181,8 @@ static void put_mounts(int fd, int fmt) {
     int id = 2; /* 1 is the root */
 
     if (fmt == MNT_MOUNTINFO) {
-        cng_dprintf(fd, "1 1 %lu:%lu / / rw,relatime - %s /dev/root rw\n", maj,
-                    min, fstype);
+        cng_dprintf(fd, "1 1 %lu:%lu / / rw,relatime - %s " MNT_DEV " rw\n",
+                    maj, min, fstype);
         if (proc_row)
             cng_dprintf(fd, "%d 1 0:5 / /proc rw,nosuid,nodev,noexec,relatime - "
                             "proc proc rw\n", id++);
@@ -188,13 +204,13 @@ static void put_mounts(int fd, int fmt) {
                 bmin = dev_minor(d);
             }
             const char *rw = cng_g_fs->binds[i].ro ? "ro" : "rw";
-            cng_dprintf(fd, "%d 1 %lu:%lu / %s %s,relatime - %s %s %s\n", id++,
-                        bmaj, bmin, cng_g_fs->binds[i].guest, rw, fstype,
-                        cng_g_fs->binds[i].host, rw);
+            cng_dprintf(fd, "%d 1 %lu:%lu / %s %s,relatime - %s " MNT_DEV " %s\n",
+                        id++, bmaj, bmin, cng_g_fs->binds[i].guest, rw, fstype,
+                        rw);
         }
     } else if (fmt == MNT_MOUNTSTATS) {
         /* No NFS per-op stats: every mount here is a local filesystem. */
-        cng_dprintf(fd, "device /dev/root mounted on / with fstype %s\n",
+        cng_dprintf(fd, "device " MNT_DEV " mounted on / with fstype %s\n",
                     fstype);
         if (proc_row)
             cng_dprintf(fd, "device proc mounted on /proc with fstype proc\n");
@@ -207,11 +223,10 @@ static void put_mounts(int fd, int fmt) {
                         "device tmpfs mounted on /dev/shm with fstype tmpfs\n");
         }
         for (int i = 0; i < nb; i++)
-            cng_dprintf(fd, "device %s mounted on %s with fstype %s\n",
-                        cng_g_fs->binds[i].host, cng_g_fs->binds[i].guest,
-                        fstype);
+            cng_dprintf(fd, "device " MNT_DEV " mounted on %s with fstype %s\n",
+                        cng_g_fs->binds[i].guest, fstype);
     } else {
-        cng_dprintf(fd, "/dev/root / %s rw,relatime 0 0\n", fstype);
+        cng_dprintf(fd, MNT_DEV " / %s rw,relatime 0 0\n", fstype);
         if (proc_row)
             cng_dprintf(fd,
                         "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n");
@@ -222,9 +237,9 @@ static void put_mounts(int fd, int fmt) {
             cng_dprintf(fd, "tmpfs /dev/shm tmpfs rw,nosuid,nodev,relatime 0 0\n");
         }
         for (int i = 0; i < nb; i++)
-            cng_dprintf(fd, "%s %s %s %s,relatime 0 0\n",
-                        cng_g_fs->binds[i].host, cng_g_fs->binds[i].guest,
-                        fstype, cng_g_fs->binds[i].ro ? "ro" : "rw");
+            cng_dprintf(fd, MNT_DEV " %s %s %s,relatime 0 0\n",
+                        cng_g_fs->binds[i].guest, fstype,
+                        cng_g_fs->binds[i].ro ? "ro" : "rw");
     }
 }
 
