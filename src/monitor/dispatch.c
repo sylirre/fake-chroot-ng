@@ -10,6 +10,7 @@
  */
 #include "cng/execmap.h"
 #include "cng/l2s.h"
+#include "cng/loader.h"
 #include "cng/monitor.h"
 #include "cng/path.h"
 #include "cng/procfs.h"
@@ -1545,13 +1546,22 @@ static long openat2_scoped(long a0, long a1, long a2, long a3, long a4, long a5,
 
 /* Read the guest's `struct open_how`, applying the kernel's own ABI rules for
  * `size` before anything else looks at the contents: below the struct is
- * EINVAL, above it every trailing byte must be zero (E2BIG otherwise) — which
- * is also what makes an oversized call identical to one sized exactly, and so
- * safe to re-issue as one. Returns 0, or the errno to answer with. */
+ * EINVAL, past a page is E2BIG, and in between every trailing byte must be zero
+ * (E2BIG again) — which is also what makes an oversized call identical to one
+ * sized exactly, and so safe to re-issue as one. Returns 0, or the errno to
+ * answer with. */
 static long read_open_how(long a2, unsigned long size, struct cng_open_how *out) {
     memset(out, 0, sizeof *out);
     if (size < sizeof *out)
         return -EINVAL;
+    /* ...and the bound openat2 puts on the other end of `size`, before it looks
+     * at the pointer at all: copy_struct_from_user is asked for at most a page,
+     * and anything longer is -E2BIG whatever its tail holds. Without it the
+     * scan below was the guest's to size — a mapped zero range as long as it
+     * liked, walked a byte at a time inside the handler, where nothing can
+     * interrupt us. */
+    if (size > cng_page_size)
+        return -E2BIG;
     if (!a2 || cng_user_copyin(out, (void *)a2, sizeof *out) < 0)
         return -EFAULT;
     unsigned long extra = size - sizeof *out;

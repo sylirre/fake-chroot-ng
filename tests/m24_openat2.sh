@@ -33,7 +33,7 @@ check_contains "RESOLVE_NO_XDEV is judged against the guest's mount table" \
     "o2test noxdev into-bind=-18 same-mount=0 out-of-bind=-18 unconstrained=0 -> OK" \
     "$out"
 check_contains "the open_how size rules are the kernel's (EINVAL/E2BIG/EFAULT)" \
-    "o2test abi small=-22 tail=-7 null=-14" "$out"
+    "o2test abi small=-22 tail=-7 null=-14 over=-7" "$out"
 rm -rf "$O2R"
 
 # --- differential: the same program, once with no emulation at all -----------

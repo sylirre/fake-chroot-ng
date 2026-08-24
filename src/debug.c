@@ -3318,17 +3318,33 @@ int cng_cmd_o2test(int argc, char **argv, char **envp, unsigned long *auxv) {
                                  (long)&big, (long)sizeof big, 0, 0, 0);
         long bad = cng_dispatch(__NR_openat2, CNG_AT_FDCWD, (long)"/w/file", 0,
                                 (long)sizeof big.how, 0, 0, 0);
+        /* ...and the page bound on the other end of `size`, which openat2
+         * answers before it looks at the pointer at all. The struct here is
+         * real and its tail genuinely zero, so only the bound can be refusing
+         * it — and without one the tail scan was the guest's to size. */
+        unsigned long pg = cng_page_size;
+        long over = 0;
+        char *hm = sys_mmap(0, 2 * pg, CNG_PROT_READ | CNG_PROT_WRITE,
+                            CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+        if (hm != CNG_MAP_FAILED && !cng_is_err((long)hm)) {
+            memset(hm, 0, 2 * pg);
+            memcpy(hm, &big.how, sizeof big.how);
+            over = cng_dispatch(__NR_openat2, CNG_AT_FDCWD, (long)"/w/file",
+                                (long)hm, (long)pg + 1, 0, 0, 0);
+            sys_munmap(hm, 2 * pg);
+        }
         /* A zero tail is the same call as a sized one, so it must NOT be
          * refused by either rule; whether it then opens depends on the host
          * (qemu-user has no openat2 and answers ENOSYS). */
         int ok = small == -EINVAL && e2big == -E2BIG && bad == -EFAULT &&
-                 zero != -EINVAL && zero != -E2BIG && zero != -EFAULT;
+                 over == -E2BIG && zero != -EINVAL && zero != -E2BIG &&
+                 zero != -EFAULT;
         if (zero >= 0)
             sys_close((int)zero);
         cng_dprintf(1,
-                    "o2test abi small=%ld tail=%ld null=%ld zero-tail=%ld"
-                    " -> %s\n",
-                    small, e2big, bad, zero, ok ? "OK" : "FAIL");
+                    "o2test abi small=%ld tail=%ld null=%ld over=%ld"
+                    " zero-tail=%ld -> %s\n",
+                    small, e2big, bad, over, zero, ok ? "OK" : "FAIL");
         fails += !ok;
     }
 #endif
