@@ -57,6 +57,21 @@ case "$out" in
     # handler, which is unblockable: the whole `-t faulttest` run died here.
     check_contains "a netlink send with a bad buffer answers EFAULT" \
         "faulttest netlink sendto=-14 sendmsg=-14 want=-14 -> OK" "$out"
+    # The copy-in pair execve's second pass takes argv/envp with. A probe
+    # followed by a memcpy is two acts, and a guest thread can unmap the strings
+    # in the gap between them — the memcpy then faults in the handler, which is
+    # what the probes exist to prevent. That race cannot be scheduled here, so
+    # what is asserted is the property that holds whatever the race does: a
+    # string ending inside the live page arrives (str=3), one running into the
+    # hole past it is EFAULT rather than an over-read (over=-14), a cap with no
+    # terminator under it is E2BIG (cap=-7), and a range half in the hole comes
+    # back whole or not at all (half=-14, fits=0).
+    check_contains "a guest string is measured and taken in one act" \
+        "faulttest copyin: str=3 over=-14 cap=-7 half=-14 fits=0 bad=-14 -> OK" \
+        "$out"
+    check_contains "...on the memfd tier too" \
+        "faulttest copyin: str=3 over=-14 cap=-7 half=-14 fits=0 bad=-14 -> OK" \
+        "$memfd_out"
     check_contains "valid pointers still work" \
         "faulttest valid getresuid=0" "$out"
     ;;

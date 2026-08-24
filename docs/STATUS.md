@@ -1989,6 +1989,33 @@ vfork/`posix_spawn` child-stack handling.
   `-t elfinterp`, which builds five headers no toolchain emits and judges them in
   the pass that maps nothing.
 
+- [x] **M28 — the arguments were validated in one pass and read again in the
+  next**
+  `exec_args_take` measures `argv`/`envp` with the probes and `copy_vec` then
+  walked the same guest memory a second time with a bare `strlen`/`memcpy` — one
+  pass asking the kernel whether the bytes are there, the next assuming the
+  answer still holds. It does not have to: `execve` is called by one thread while
+  the rest of the process keeps running, so a thread that unmaps the strings
+  between the passes turns the `-EFAULT` `execve(2)` promises into a `SIGSEGV`
+  inside the `SIGSYS` handler, where every signal but `SIGSYS` is masked and the
+  fault is unblockable. The vector itself was walked a slot at a time with the
+  same exposure.
+  Two primitives in `uaccess.c` close it. `cng_user_copyin` takes a range through
+  `process_vm_readv`, where the kernel does the copy and reports the fault
+  instead of raising it — check and copy in one act, no gap to race (the memfd
+  fallback has no such form, since staging through the descriptor would need a
+  landing area private to the call, so there it stays probe-then-copy as before).
+  `cng_user_strcopyin` measures and takes a string together, searching for the
+  terminator in *our* copy: a `strlen` that finds the NUL and a `memcpy` that
+  trusts it are two readings of a string that can change in between.
+  `copy_vec` now takes the whole pointer array in one act, into the very slots
+  the strings' own pointers replace as it goes, and holds the entry count to the
+  sizing pass's — which is how `fs/exec.c` holds it too (`count()` fixes
+  `bprm->argc`, `copy_strings()` copies exactly that many). A race answers
+  `-E2BIG` or `-EFAULT` now, which is what `execve(2)` answers for those inputs.
+  Gated by a `faulttest` leg driving both primitives against two pages with the
+  second unmapped, on the `process_vm` and memfd tiers alike.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

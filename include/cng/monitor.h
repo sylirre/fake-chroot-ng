@@ -274,6 +274,14 @@ int cng_uaccess_probe_setup(void);
 long cng_user_strlen(const char *s, unsigned long max);
 long cng_user_veclen(char *const *v, unsigned long max);
 
+/* Take guest bytes rather than probe-then-touch them: where the pair above only
+ * answers whether a range can be read, these copy it in, so nothing is read
+ * twice and a range that goes away mid-copy is -EFAULT instead of a fault (see
+ * uaccess.c). cng_user_strcopyin returns the string length excluding the
+ * terminator, or -E2BIG when `cap` bytes hold none. */
+long cng_user_copyin(void *dst, const void *src, unsigned long n);
+long cng_user_strcopyin(char *dst, const char *src, unsigned long cap);
+
 /* Ambient-seccomp block-list: cng_blocked[nr] != 0 means Android blocks that
  * syscall, so dispatch emulates ENOSYS instead of re-issuing it. Populated by
  * cng_probe_blocked() at monitor install (a no-op result off Android). */

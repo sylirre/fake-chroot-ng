@@ -171,27 +171,47 @@ static unsigned long exec_arg_max(void) {
 }
 
 /* Copy one NULL-terminated string vector in: pointers into dst_vec, strings out
- * of *pool. Both bounds are enforced rather than trusted — src is guest memory,
- * and another thread of the exec'ing process can grow it between the sizing pass
- * and this one. Returns the slot after the terminator, or NULL if it would not
- * fit (the caller answers -E2BIG, as the kernel does). */
-static char **copy_vec(char **src, char **dst_vec, int slots, char **pool,
-                       char *end) {
+ * of *pool. Nothing here is trusted twice — src is guest memory, and another
+ * thread of the exec'ing process is free to change it between the sizing pass
+ * and this one. Two ways it used to bite:
+ *
+ *  - a strlen/memcpy straight off src[i] read guest memory the sizing pass had
+ *    validated some syscalls ago. A thread that unmapped the strings in the gap
+ *    turned execve's -EFAULT into a SIGSEGV inside the handler, where every
+ *    signal but SIGSYS is masked and the fault is fatal. So the bytes are taken
+ *    with cng_user_strcopyin, which measures and copies in one act and answers
+ *    -EFAULT for what will not come across.
+ *  - the vector itself is guest memory too, and it was walked a slot at a time
+ *    with the same exposure. It comes across in one act now, into the very slots
+ *    the strings' own pointers then replace — the entry count staying the sizing
+ *    pass's, which is also how fs/exec.c holds it (count() fixes bprm->argc and
+ *    copy_strings() copies exactly that many).
+ *
+ * Writes the slot after the terminator through *next. Returns 0, or -E2BIG /
+ * -EFAULT, which is what execve(2) answers for the same two inputs. */
+static long copy_vec(char **src, char **dst_vec, int slots, char **pool,
+                     char *end, char ***next) {
     int i = 0;
-    for (; src && src[i]; i++) {
-        if (i + 1 >= slots) /* +1: the terminator needs a slot too */
-            return 0;
-        size_t n = strlen(src[i]) + 1;
-        if (n > (size_t)(end - *pool))
-            return 0;
-        memcpy(*pool, src[i], n);
-        dst_vec[i] = *pool;
-        *pool += n;
+    if (src && slots > 1) {
+        long r = cng_user_copyin(dst_vec, src, (unsigned long)slots * sizeof *src);
+        if (r < 0)
+            return r;
+        for (; i < slots - 1 && dst_vec[i]; i++) {
+            /* Whichever bites first: the room left in the pool, or the per-string
+             * bound the sizing pass held this string to (MAX_ARG_STRLEN). */
+            unsigned long cap = (unsigned long)(end - *pool);
+            if (cap > EXEC_MAX_STRLEN)
+                cap = EXEC_MAX_STRLEN;
+            long n = cng_user_strcopyin(*pool, dst_vec[i], cap);
+            if (n < 0)
+                return n;
+            dst_vec[i] = *pool;
+            *pool += n + 1;
+        }
     }
-    if (i >= slots)
-        return 0;
-    dst_vec[i] = 0;
-    return dst_vec + i + 1;
+    dst_vec[i] = 0; /* slots >= 1 always: the terminator has a slot of its own */
+    *next = dst_vec + i + 1;
+    return 0;
 }
 
 static void exec_args_free(struct exec_args *a) {
@@ -252,13 +272,22 @@ static long exec_args_take(struct exec_args *a, const char *path, char **argv,
     char *pool = (char *)a->mem + vecs;
     char *end = (char *)a->mem + a->len;
     a->argv = (char **)a->mem + SHEB_RESERVE;
-    a->envp = copy_vec(argv, a->argv, argc + 1, &pool, end);
-    if (!a->envp || !copy_vec(envp, a->envp, envc + 1, &pool, end) ||
-        (size_t)pn + 1 > (size_t)(end - pool)) {
-        exec_args_free(a);
-        return -E2BIG; /* raced its own measurement: treat as too big */
+    char **envslot = 0, **after = 0;
+    long rc = copy_vec(argv, a->argv, argc + 1, &pool, end, &envslot);
+    a->envp = envslot;
+    if (rc == 0)
+        rc = copy_vec(envp, a->envp, envc + 1, &pool, end, &after);
+    /* The path last, into what the two vectors left. It is re-measured as it is
+     * taken, like every other string here: `pn` sized the arena, it does not
+     * decide what gets copied out of memory the guest may since have changed. */
+    if (rc == 0) {
+        long pl = cng_user_strcopyin(pool, path, (unsigned long)(end - pool));
+        rc = pl < 0 ? pl : 0;
     }
-    memcpy(pool, path, (size_t)pn + 1);
+    if (rc < 0) { /* raced its own measurement, or ran off it: -E2BIG/-EFAULT */
+        exec_args_free(a);
+        return rc;
+    }
     a->path = pool;
     return 0;
 }

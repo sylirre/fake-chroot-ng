@@ -1357,6 +1357,51 @@ int cng_cmd_faulttest(int argc, char **argv, char **envp, unsigned long *auxv) {
         fails += !ok;
     }
 
+    /* The copy-in pair, which is how execve's second pass takes argv/envp now.
+     * A probe followed by a memcpy is two acts with a gap, and another thread of
+     * the exec'ing guest is free to unmap the strings inside it — the memcpy
+     * then faults in the handler, which is the death the probes exist to
+     * prevent. That race cannot be scheduled from a test, so what is driven here
+     * is the property that makes the second pass safe whatever the race does:
+     * a range that will not come across whole is -EFAULT, and the walk stops at
+     * the grain boundary rather than reading into the hole past it.
+     *
+     * Two pages with the second one unmapped is the whole apparatus: a string
+     * ending inside the first must still arrive, one running up to the boundary
+     * must not. */
+    {
+        unsigned long pg = cng_page_size;
+        char *m = sys_mmap(0, 2 * pg, CNG_PROT_READ | CNG_PROT_WRITE,
+                           CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+        if (m == CNG_MAP_FAILED || cng_is_err((long)m)) {
+            cng_dprintf(1, "faulttest copyin: no mapping -> SKIP\n");
+        } else {
+            sys_munmap(m + pg, pg);
+            char *str = m + pg - 8; /* "abc" and its NUL, near the edge */
+            memcpy(str, "abc", 4);
+            char *nonul = m + pg - 4; /* four bytes, then the hole */
+            memset(nonul, 'x', 4);
+            char dst[64];
+            long whole = cng_user_strcopyin(dst, str, sizeof dst);
+            int wok = whole == 3 && !strcmp(dst, "abc");
+            long over = cng_user_strcopyin(dst, nonul, sizeof dst);
+            long cap = cng_user_strcopyin(dst, str, 2);
+            long half = cng_user_copyin(dst, nonul, 8);
+            long fits = cng_user_copyin(dst, str, 4);
+            long none = cng_user_copyin(dst, bad, 8);
+            int ok = wok && over == -EFAULT && cap == -E2BIG &&
+                     half == -EFAULT && fits == 0 && none == -EFAULT &&
+                     !strcmp(dst, "abc");
+            cng_dprintf(1,
+                        "faulttest copyin: str=%d over=%d cap=%d half=%d "
+                        "fits=%d bad=%d -> %s\n",
+                        (int)whole, (int)over, (int)cap, (int)half, (int)fits,
+                        (int)none, ok ? "OK" : "FAIL");
+            fails += !ok;
+            sys_munmap(m, pg);
+        }
+    }
+
     /* getgroups writes only what it has: with no supplementary groups the bad
      * pointer is never touched, so seed one and ask again. */
     cng_g_cred.ngroups = 1;

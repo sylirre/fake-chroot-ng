@@ -219,6 +219,65 @@ long cng_user_strlen(const char *s, unsigned long max) {
     return -E2BIG;
 }
 
+/* Copy a guest range into our own memory, answering -EFAULT rather than
+ * faulting on it.
+ *
+ * cng_user_readable followed by memcpy is two acts with a gap between them, and
+ * a guest is free to use that gap: another thread of the process calling execve
+ * can munmap the argv it just had validated, and the memcpy then faults inside
+ * the handler — the death the probes exist to prevent, arrived at through them.
+ * process_vm_readv has no gap: the kernel does the copy and reports the fault
+ * instead of raising it, so the check and the copy are one act.
+ *
+ * The memfd fallback has no such form — staging the bytes through the
+ * descriptor would need a landing area private to this call, and the one
+ * scratch region is shared by every thread on purpose (nothing reads it back) —
+ * so there it stays probe-then-copy, which is what every caller did before.
+ * Returns 0, or -EFAULT for a range that would not come across whole. */
+long cng_user_copyin(void *dst, const void *src, unsigned long n) {
+    if (!n)
+        return 0;
+    if (!src)
+        return -EFAULT;
+    if (cng_uaccess_probe_setup()) {
+        struct cng_iovec local = {dst, n};
+        struct cng_iovec remote = {(void *)src, n};
+        long r = CNG_SYS(__NR_process_vm_readv, sys_getpid(), &local, 1, &remote,
+                         1, 0);
+        return r == (long)n ? 0 : -EFAULT;
+    }
+    if (!cng_user_readable(src, n))
+        return -EFAULT;
+    memcpy(dst, src, n);
+    return 0;
+}
+
+/* A guest string, measured and taken in the same act: each grain is copied in
+ * and then searched for the terminator *in our copy*, so what is delivered is
+ * what was measured. Walking the guest's bytes to find the NUL and copying them
+ * afterwards reads them twice, and between the two reads they can change — the
+ * string that fit the budget when it was measured is not the one memcpy then
+ * takes. Returns the length excluding the terminator, -E2BIG when `cap` bytes
+ * pass without one (cap counts the terminator), or -EFAULT. */
+long cng_user_strcopyin(char *dst, const char *src, unsigned long cap) {
+    if (!src)
+        return -EFAULT;
+    unsigned long done = 0;
+    while (done < cap) {
+        unsigned long k = UA_GRAIN - ((unsigned long)(src + done) & (UA_GRAIN - 1));
+        if (k > cap - done)
+            k = cap - done;
+        long r = cng_user_copyin(dst + done, src + done, k);
+        if (r < 0)
+            return r;
+        for (unsigned long i = 0; i < k; i++)
+            if (!dst[done + i])
+                return (long)(done + i);
+        done += k;
+    }
+    return -E2BIG;
+}
+
 long cng_user_veclen(char *const *v, unsigned long max) {
     if (!v)
         return 0; /* a NULL argv/envp is an empty one, as the kernel takes it */
