@@ -2016,6 +2016,34 @@ vfork/`posix_spawn` child-stack handling.
   Gated by a `faulttest` leg driving both primitives against two pages with the
   second unmapped, on the `process_vm` and memfd tiers alike.
 
+- [x] **M29 — the `/proc` self-snapshot walked a stack the guest owns**
+  When the registry cannot answer (never mapped, or its table full),
+  `/proc/self/{cmdline,environ,auxv}` are answered from the live guest stack —
+  we are the process being described, so no shared table is needed. But that
+  stack is the guest's: `argc`, both vectors and every string they name are the
+  program's to rewrite (`setproctitle` does exactly that), and it is read long
+  after it was built. The walk was raw — a dereference of `*(long *)sp`, an
+  unbounded `while (*p) p++` over the environment and another over the auxv pairs
+  — so a stack that had been rewritten to run off the end of its mapping faulted
+  inside the `SIGSYS` handler, where `SIGSEGV` is masked and the process dies
+  instead of answering a file it opened on itself.
+  Every step goes through the probes now: `argc` is copied in, the environment is
+  counted with `cng_user_veclen`, the auxv is copied pair by pair to its
+  `AT_NULL` and dropped whole if it runs past what an entry holds (half a vector
+  is not one), and `flatten_vec` takes each slot and each string with the
+  copy-in pair rather than a `strlen`/`memcpy` over memory that can change
+  between the two. What will not come across ends the vector where it stands, and
+  only an unreadable `argc` — with which nothing below can be located — declines
+  the snapshot: everything else is answered from what the stack does hold, since
+  declining hands the question to the host file, which for a guest process is the
+  chroot-ng invocation and the reason any of this exists.
+  `cng_procfs_publish_stack` keeps its raw
+  walk: it runs in the one moment the stack is certainly ours, on the vector we
+  have just built and no guest instruction has yet touched, and the registry
+  publish it feeds is deliberately syscall-free inside its seqlock window.
+  Gated by three `selfproc` legs that publish a well-formed stack at the edge of
+  a mapping and then rewrite it the three ways that used to walk off the end.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

@@ -714,19 +714,26 @@ static int per_pid_kind(const char *leaf) {
 static unsigned long g_self_sp;
 
 /* Flatten a NUL-terminated vector into NUL-joined bytes, the way the kernel
- * stores cmdline and environ. Every string is validated first: this reads the
- * guest's own stack long after it was built, and a program that has since
- * rewritten its argv (setproctitle) must not be able to fault us. */
+ * stores cmdline and environ. Nothing here is dereferenced unchecked: this reads
+ * the guest's own stack long after it was built, and a program that has since
+ * rewritten its argv (setproctitle) or unmapped it must not be able to fault us
+ * — the fault would land in the SIGSYS handler, where it is unblockable. Both
+ * the slot and the string it names are taken with the copy-in pair, so the
+ * bytes that are measured are the bytes that are stored; a strlen followed by a
+ * memcpy reads the same string twice, and between the two reads it can change.
+ * Whatever will not come across ends the vector where it stands, which is also
+ * what the kernel shows for a process rewriting its own argv. */
 static unsigned flatten_vec(char *dst, unsigned cap, char **v) {
     unsigned n = 0;
     long cnt = cng_user_veclen(v, 4096);
     for (long i = 0; i < cnt; i++) {
-        long len = cng_user_strlen(v[i], cap);
-        if (len < 0 || n + (unsigned)len + 1 > cap)
+        char *s;
+        if (cng_user_copyin(&s, &v[i], sizeof s) < 0)
             break;
-        memcpy(dst + n, v[i], (size_t)len);
-        n += (unsigned)len;
-        dst[n++] = '\0';
+        long len = cng_user_strcopyin(dst + n, s, cap - n);
+        if (len < 0)
+            break; /* -EFAULT, or no terminator in the room that is left */
+        n += (unsigned)len + 1;
     }
     return n;
 }
@@ -743,25 +750,55 @@ static unsigned flatten_vec(char *dst, unsigned cap, char **v) {
 static int self_snapshot(struct cng_procsnap *out) {
     if (!g_self_sp)
         return 0;
-    long argc = *(long *)g_self_sp;
+    /* The stack this walks is the guest's, not ours: we built it, but the
+     * program living on it owns every byte since. It can rewrite argc, run its
+     * environment off the end of the mapping, or unmap the whole region — and
+     * this used to be a raw dereference, an unbounded `while (*p) p++` over the
+     * environment and another over the auxv pairs, all inside the SIGSYS handler
+     * where a SIGSEGV cannot be blocked and kills the process. A /proc file the
+     * guest opens on itself is not a place to die: every step goes through the
+     * probes now, and what will not come across shortens the answer instead of
+     * ending the process. */
+    memset(out, 0, sizeof *out);
+    long argc;
+    if (cng_user_copyin(&argc, (void *)g_self_sp, sizeof argc) < 0)
+        return 0;
     if (argc < 0 || argc > 4096)
         return 0;
+    /* Past this point a stack that does not read is answered with what it does
+     * hold, not declined: declining hands the question back to the host file,
+     * and for a guest process that file is the chroot-ng invocation — the one
+     * answer that is certainly wrong, and the reason any of this exists. So a
+     * cmdline the guest has scribbled over comes back short or empty rather
+     * than coming back as ours. Only the word `argc` itself is fatal, because
+     * without it nothing below can even be located. */
     char **argv = (char **)(g_self_sp + 8);
     char **envp = argv + argc + 1;
-    char **p = envp;
-    while (*p)
-        p++;
-    unsigned long *auxv = (unsigned long *)(p + 1);
-    unsigned long *end = auxv;
-    while (end[0])
-        end += 2;
-    end += 2;
-    memset(out, 0, sizeof *out);
     out->cmd_len = flatten_vec(out->cmd, CNG_PROCREG_CMDLINE, argv);
     out->env_len = flatten_vec(out->env, CNG_PROCREG_ENVIRON, envp);
-    unsigned alen = (unsigned)((char *)end - (char *)auxv);
-    if (alen && alen <= CNG_PROCREG_AUXV) {
-        memcpy(out->auxv, auxv, alen);
+    /* The auxv lies behind the environment's terminator, so it can be found at
+     * all only where the environment can be counted — the same 4096-entry bound
+     * flatten_vec holds it to, well past what an entry could store anyway. It is
+     * pairs to an AT_NULL one, copied as it is walked, and one that runs past
+     * what the entry holds is dropped whole rather than truncated: half a vector
+     * is not one, and its readers (`cat /proc/self/auxv`, a libc re-reading
+     * AT_HWCAP) parse to the terminator. */
+    long envc = cng_user_veclen(envp, 4096);
+    if (envc >= 0) {
+        const char *pairs = (const char *)(envp + envc + 1);
+        unsigned alen = 0;
+        for (;;) {
+            if (alen + 16 > CNG_PROCREG_AUXV ||
+                cng_user_copyin(out->auxv + alen, pairs + alen, 16) < 0) {
+                alen = 0;
+                break;
+            }
+            unsigned long tag;
+            memcpy(&tag, out->auxv + alen, sizeof tag);
+            alen += 16;
+            if (!tag)
+                break;
+        }
         out->auxv_len = alen;
     }
     return 1;

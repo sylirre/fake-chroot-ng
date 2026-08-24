@@ -61,6 +61,22 @@ check_contains "cmdline still answers from the live stack" \
     "selfproc /proc/self/cmdline: 22 bytes [/bin/guestprog] -> OK" "$sout"
 check_contains "environ still answers from the live stack" \
     "selfproc /proc/self/environ: 13 bytes [GUESTVAR=yes] -> OK" "$sout"
+# That stack is the guest's own, and it is read long after it was built: argc,
+# the vectors and the strings they name are all the program's to rewrite
+# (setproctitle does exactly that), while the file is one the guest opens on
+# itself. The walk used to be raw — an unbounded `while (*p) p++` over the
+# environment and another over the auxv pairs — so a stack that ran off the end
+# of its mapping faulted inside the SIGSYS handler, where SIGSEGV is masked and
+# the process dies rather than answering. Three rewrites of one stack that ends
+# at the edge of a mapping: an unreadable string ends the cmdline (0 bytes,
+# environ and auxv intact), an unterminated environment empties the environ while
+# the cmdline still answers, and an unterminated auxv is dropped whole rather
+# than half-walked. What is never done is declining the snapshot and letting the
+# host file answer, since for a guest process that file is the chroot-ng
+# invocation — the one answer that is certainly wrong.
+check_contains "a stack the guest has since rewritten answers, never faults" \
+    "selfproc hostile-stack: bad-string=0,13,16 bad-envp=15,0,0 bad-auxv=15,13,0 -> OK" \
+    "$sout"
 check_contains "environ is the guest environment" \
     "proctest environ: 30 bytes -> OK" "$out"
 check_contains "another guest process is described from the registry" \

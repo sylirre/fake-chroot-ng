@@ -1611,6 +1611,95 @@ int cng_cmd_selfproc(int argc, char **argv, char **envp, unsigned long *auxv) {
                     n > 0 ? buf : "", ok ? "OK" : "FAIL");
         fails += !ok;
     }
+    /* A guest stack that no longer describes a stack.
+     *
+     * The legs above read the stack we built, in the moment after we built it.
+     * This one reads it the way every later question does: after the program
+     * living on it has had its way with it. argc, the vectors and the strings
+     * they point at are all the guest's to rewrite (setproctitle does exactly
+     * that), and the file being answered is one the guest opens on itself — so a
+     * walk that runs off the mapping faults inside the SIGSYS handler, where
+     * SIGSEGV is masked and the process simply dies.
+     *
+     * One well-formed stack ending exactly at the edge of a mapping whose next
+     * page is unmapped, published while it is still well-formed — publishing is
+     * the one moment the stack is certainly ours — and then rewritten under
+     * three shapes, each of which used to walk off the end:
+     *
+     *   A  a string pointer into the hole: that entry ends the cmdline, and
+     *      environ/auxv are untouched;
+     *   B  an environment with no terminator before the hole (the old
+     *      `while (*p) p++`): an empty environ, while the cmdline — which does
+     *      not depend on it — still answers, rather than the whole snapshot
+     *      being declined and the host file (chroot-ng's own argv) taking the
+     *      question;
+     *   C  an auxv with no AT_NULL before the hole (the old `while (end[0])`):
+     *      cmdline still answers and the auxv is dropped whole, never handed
+     *      over half-walked.
+     *
+     * Only with no registry: with one, /proc/<self> is answered from the table
+     * and the live stack is never read at all. */
+    if (cng_g_procreg_backing != CNG_PROCREG_B_NONE) {
+        cng_dprintf(1, "selfproc hostile-stack: registry answers instead"
+                       " -> SKIP\n");
+    } else {
+        unsigned long pg = cng_page_size;
+        char *m = sys_mmap(0, 2 * pg, CNG_PROT_READ | CNG_PROT_WRITE,
+                           CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+        if (m == CNG_MAP_FAILED || cng_is_err((long)m)) {
+            cng_dprintf(1, "selfproc hostile-stack: no mapping -> SKIP\n");
+        } else {
+            sys_munmap(m + pg, pg);
+            unsigned long hole = (unsigned long)(m + pg); /* unmapped */
+            unsigned long *sp = (unsigned long *)(m + pg) - 7;
+            sp[0] = 1;                          /* argc */
+            sp[1] = (unsigned long)gargv[0];    /* argv[0] */
+            sp[2] = 0;                          /* argv terminator */
+            sp[3] = (unsigned long)genvp[0];    /* envp[0] */
+            sp[4] = 0;                          /* envp terminator */
+            sp[5] = 0;                          /* auxv: AT_NULL... */
+            sp[6] = 0;                          /* ...and its value */
+            cng_procfs_publish_stack((unsigned long)sp);
+
+            static const char *const names[] = {"/proc/self/cmdline",
+                                                "/proc/self/environ",
+                                                "/proc/self/auxv"};
+            long n[9];
+            for (int layout = 0, k = 0; layout < 3; layout++) {
+                if (layout == 0) {
+                    sp[1] = hole; /* a string nobody can read */
+                } else if (layout == 1) {
+                    sp[1] = (unsigned long)gargv[0];
+                    sp[4] = sp[5] = sp[6] = (unsigned long)genvp[0];
+                } else {
+                    sp[4] = 0;
+                    sp[5] = 3; /* an auxv pair, and then the hole */
+                    sp[6] = 7;
+                }
+                for (unsigned f = 0; f < 3; f++, k++) {
+                    long fd = cng_dispatch(__NR_openat, CNG_AT_FDCWD,
+                                           (long)names[f], CNG_O_RDONLY, 0, 0, 0,
+                                           /*trapped=*/0);
+                    n[k] = fd < 0 ? -1 : sys_read((int)fd, buf, sizeof buf);
+                    if (fd >= 0)
+                        sys_close((int)fd);
+                }
+            }
+            int a = n[0] == 0 && n[1] == 13 && n[2] == 16;
+            int b = n[3] == 15 && n[4] == 0 && n[5] == 0;
+            int c = n[6] == 15 && n[7] == 13 && n[8] == 0;
+            int ok = a && b && c;
+            cng_dprintf(1,
+                        "selfproc hostile-stack: bad-string=%ld,%ld,%ld"
+                        " bad-envp=%ld,%ld,%ld bad-auxv=%ld,%ld,%ld -> %s\n",
+                        n[0], n[1], n[2], n[3], n[4], n[5], n[6], n[7], n[8],
+                        ok ? "OK" : "FAIL");
+            fails += !ok;
+            sys_munmap(m, pg);
+            cng_procfs_publish_stack((unsigned long)stk); /* put it back */
+        }
+    }
+
     cng_dprintf(1, "selfproc registry=%d: %d failure(s)\n",
                 cng_g_procreg_backing, fails);
     return fails ? 1 : 0;
