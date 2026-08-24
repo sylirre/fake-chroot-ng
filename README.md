@@ -106,7 +106,10 @@ rootfs prefix pushes the name past `sun_path`'s 108 bytes, the socket is bound
 relative to a `/proc/self/fd` directory handle instead, so only the basename has
 to fit. Abstract names have no filesystem node to contain, so they are isolated
 per rootfs by a short spliced tag (invisible to the guest, stripped on readback);
-`--share-abstract-sockets` opts out into the host's global namespace.
+a name with no room left under 108 bytes to carry the tag as well is stood in for
+by a digest of itself, which keeps the isolation and still lets two guests of one
+rootfs meet on it. `--share-abstract-sockets` opts out into the host's global
+namespace.
 
 **rtnetlink** is emulated where the host denies it, which Android does to app
 domains — and everything that asks the kernel about interfaces goes through it:

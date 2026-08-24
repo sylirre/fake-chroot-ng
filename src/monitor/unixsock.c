@@ -46,10 +46,22 @@ int cng_g_share_abstract = 0;
 
 /* The per-rootfs abstract tag: NUL is already there, then 0x01 (so a collision
  * with a real host name is effectively impossible — host software does not put
- * a control byte first) then "cng" and 8 hex digits of the rootfs hash. */
+ * a control byte first) then "cn", a byte saying which of the two forms below
+ * this is, and 8 hex digits of the rootfs hash.
+ *
+ *   'g'  the name follows the tag, unchanged. What almost every abstract name
+ *        gets, and what makes the readback a plain matter of taking 12 bytes
+ *        back off the front.
+ *   'H'  the tag is followed by 16 hex digits of a hash of the name, and the
+ *        name itself is not on the wire at all. For a name with no room left
+ *        under 108 bytes to carry the tag as well.
+ *
+ * Two spellings so the readback can tell them apart: a tagged name is otherwise
+ * free to begin with 16 hex digits of its own. */
 #define ABS_TAG_LEN 12
+#define ABS_DIG_LEN (ABS_TAG_LEN + 16)
 
-static int abs_tag(char *out) {
+static int abs_tag_kind(char *out, char kind) {
     static const char hex[] = "0123456789abcdef";
     u32 h = cng_broker_key_hash(cng_g_fs && cng_g_fs->rootfs[0]
                                     ? cng_g_fs->rootfs
@@ -57,10 +69,37 @@ static int abs_tag(char *out) {
     out[0] = 0x01;
     out[1] = 'c';
     out[2] = 'n';
-    out[3] = 'g';
+    out[3] = kind;
     for (int i = 0; i < 8; i++)
         out[4 + i] = hex[(h >> ((7 - i) * 4)) & 0xf];
     return ABS_TAG_LEN;
+}
+
+static int abs_tag(char *out) {
+    return abs_tag_kind(out, 'g');
+}
+
+/* FNV-1a over the name's bytes — a name may carry NULs, so it is taken by
+ * length rather than as a C string. */
+static u64 abs_hash(const char *p, unsigned long n) {
+    u64 h = 1469598103934665603ULL;
+    for (unsigned long i = 0; i < n; i++) {
+        h ^= (unsigned char)p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+/* The 'H' form: the rootfs tag, then the name reduced to 16 hex digits. Both
+ * halves are deterministic, so a bind and a connect on the same name from the
+ * same rootfs still meet — which is what makes this a containment and not a
+ * refusal. Writes ABS_DIG_LEN bytes. */
+static void abs_digest(char *out, const char *name, unsigned long n) {
+    static const char hex[] = "0123456789abcdef";
+    abs_tag_kind(out, 'H');
+    u64 h = abs_hash(name, n);
+    for (int i = 0; i < 16; i++)
+        out[ABS_TAG_LEN + i] = hex[(h >> ((15 - i) * 4)) & 0xf];
 }
 
 /* "/proc/self/fd/<n>/" into out. Returns the length written. */
@@ -101,53 +140,71 @@ int cng_sun_needed(const void *addr, long alen) {
     return fam == CNG_AF_UNIX;
 }
 
-/* What a socket bound through the over-long-path fallback reads back as.
+/* What a socket bound through one of the two irreversible fallbacks reads back
+ * as — the over-long pathname, which is bound through /proc/self/fd, and the
+ * over-long abstract name, which is bound through its digest.
  *
  * The kernel stores sun_path exactly as it was handed in — measured: bind
  * through "/proc/self/fd/3/s.sock" and getsockname returns that same string,
- * before and after fd 3 is closed. So a socket bound through the fallback read
- * back as our own internal spelling: not the name the guest asked for, naming
- * nothing by the time the guest can look (cng_sun_done closed the fd), and the
- * one thing in this module that cng_fs_untranslate cannot map, since it matches
- * neither a bind's host prefix nor the rootfs. That breaks what this module is
- * for and what README.md promises of it — "a program comparing the readback
- * against what it bound still agrees".
+ * before and after fd 3 is closed. So a socket bound either way reads back as
+ * our own internal spelling: not the name the guest asked for, naming nothing by
+ * the time the guest can look (cng_sun_done closed the fd), and the one thing in
+ * this module that cng_fs_untranslate cannot map, since it matches neither a
+ * bind's host prefix nor the rootfs. That breaks what this module is for and
+ * what README.md promises of it — "a program comparing the readback against what
+ * it bound still agrees".
  *
  * The guest's own name always fits in sun_path, having arrived in one, so the
  * answer is simply to remember it. Recorded as the fallback is applied, and
  * consulted on the way back out.
  *
- * Keyed on the stored spelling, which is all the readback carries. Two sockets
- * bound through the fallback with the same basename, in different directories,
- * landing on the same fd number would collide — and the fd is closed right after
- * the bind, so consecutive fallbacks do tend to reuse the number, which leaves
- * the basename doing the work. The answer is then one plausible guest path
- * instead of another, where before it was our /proc/self/fd spelling either way.
+ * Keyed on the stored spelling, which is all the readback carries, and by
+ * length rather than as a C string: an abstract name begins with a NUL and may
+ * carry more. Two pathname sockets bound through the fallback with the same
+ * basename, in different directories, landing on the same fd number would
+ * collide — and the fd is closed right after the bind, so consecutive fallbacks
+ * do tend to reuse the number, which leaves the basename doing the work. The
+ * answer is then one plausible guest path instead of another, where before it
+ * was our /proc/self/fd spelling either way. Two abstract names cannot collide
+ * unless their 64-bit hashes do.
  *
- * Written guest-first and stored-last: a reader either fails to match a
- * half-written key or matches one whose guest name is already there. Every
- * buffer is one byte longer than the most that is copied into it, so a
- * concurrent read is always NUL-terminated. */
+ * `slen` is the entry's validity flag and is written last: a reader either sees
+ * an entry whose guest name is already there, or does not match it at all. */
 #define SUN_FB_MAX 8
 static struct {
-    char stored[SUN_PATH_MAX + 1];
-    char guest[SUN_PATH_MAX + 1];
+    char stored[SUN_PATH_MAX];
+    char guest[SUN_PATH_MAX];
+    unsigned glen;
+    unsigned slen; /* 0 while the entry is unused or half-written */
 } g_sun_fb[SUN_FB_MAX];
 static unsigned g_sun_fb_next;
 
-static void sun_fb_note(const char *stored, const char *guest) {
+static void sun_fb_note(const void *stored, unsigned slen, const void *guest,
+                        unsigned glen) {
+    if (!slen || slen > SUN_PATH_MAX || glen > SUN_PATH_MAX)
+        return;
     unsigned i = __atomic_fetch_add(&g_sun_fb_next, 1, __ATOMIC_RELAXED) %
                  SUN_FB_MAX;
-    memset(&g_sun_fb[i], 0, sizeof g_sun_fb[i]);
-    cng_strlcpy(g_sun_fb[i].guest, guest, sizeof g_sun_fb[i].guest);
-    cng_strlcpy(g_sun_fb[i].stored, stored, sizeof g_sun_fb[i].stored);
+    __atomic_store_n(&g_sun_fb[i].slen, 0u, __ATOMIC_RELEASE);
+    memcpy(g_sun_fb[i].guest, guest, glen);
+    g_sun_fb[i].glen = glen;
+    memcpy(g_sun_fb[i].stored, stored, slen);
+    __atomic_store_n(&g_sun_fb[i].slen, slen, __ATOMIC_RELEASE);
 }
 
-static const char *sun_fb_lookup(const char *stored) {
-    for (int i = 0; i < SUN_FB_MAX; i++)
-        if (g_sun_fb[i].stored[0] && !strcmp(g_sun_fb[i].stored, stored))
-            return g_sun_fb[i].guest;
-    return 0;
+/* The guest name for a stored spelling, into `out` (SUN_PATH_MAX bytes), or -1
+ * when this is not one of ours. */
+static int sun_fb_lookup(const void *stored, unsigned slen, void *out) {
+    for (int i = 0; i < SUN_FB_MAX; i++) {
+        if (__atomic_load_n(&g_sun_fb[i].slen, __ATOMIC_ACQUIRE) != slen)
+            continue;
+        if (memcmp(g_sun_fb[i].stored, stored, slen) != 0)
+            continue;
+        unsigned n = g_sun_fb[i].glen;
+        memcpy(out, g_sun_fb[i].guest, n);
+        return (int)n;
+    }
+    return -1;
 }
 
 int cng_sun_in(struct cng_sun_xlate *x, const void *addr, long alen,
@@ -155,7 +212,12 @@ int cng_sun_in(struct cng_sun_xlate *x, const void *addr, long alen,
     x->applied = 0;
     x->dirfd = -1;
     x->len = alen;
-    if (!addr || alen < SUN_HDR + 1 || alen > (long)sizeof x->buf)
+    /* unix_validate_addr()'s own bounds: past sun_family and no longer than a
+     * whole sockaddr_un. Anything else is -EINVAL and is passed through for the
+     * kernel to say so — which matters here and not only for tidiness, since
+     * the abstract branch below would otherwise take an over-long address and
+     * hand the kernel a short one it accepts. */
+    if (!addr || alen < SUN_HDR + 1 || alen > SUN_HDR + SUN_PATH_MAX)
         return 0;
     /* The address is read here, ahead of the kernel call that would have
      * validated it, and a fault inside the handler is unblockable. An
@@ -177,9 +239,7 @@ int cng_sun_in(struct cng_sun_xlate *x, const void *addr, long alen,
     const char *gp = in + SUN_HDR;
     long plen = alen - SUN_HDR;
 
-    /* Abstract namespace: no filesystem node, so tag rather than translate. A
-     * name that will not fit the tag under 108 bytes passes through untagged
-     * (as does an unnamed/autobind address, which has no name at all). */
+    /* Abstract namespace: no filesystem node, so tag rather than translate. */
     if (gp[0] == '\0') {
         /* plen is at least 1 here (the leading NUL), and 1 exactly is the
          * zero-length abstract name — a real name two processes can meet on, so
@@ -188,15 +248,39 @@ int cng_sun_in(struct cng_sun_xlate *x, const void *addr, long alen,
          * stops at sun_family and the caller returned above. */
         if (cng_g_share_abstract)
             return 0;
-        if (plen + ABS_TAG_LEN > SUN_PATH_MAX)
-            return 0;
         char *out = x->buf;
         memcpy(out, &fam, sizeof fam);
         out[SUN_HDR] = '\0';
-        abs_tag(out + SUN_HDR + 1);
-        memcpy(out + SUN_HDR + 1 + ABS_TAG_LEN, gp + 1, (size_t)plen - 1);
-        x->len = alen + ABS_TAG_LEN;
+        if (plen + ABS_TAG_LEN <= SUN_PATH_MAX) {
+            abs_tag(out + SUN_HDR + 1);
+            memcpy(out + SUN_HDR + 1 + ABS_TAG_LEN, gp + 1, (size_t)plen - 1);
+            x->len = alen + ABS_TAG_LEN;
+            x->applied = 1;
+            return 1;
+        }
+        /* No room left under 108 bytes to carry the tag as well. This used to
+         * pass through untagged, which put the guest's own name straight into
+         * the HOST's global abstract namespace — the one escape the tag exists
+         * to close, available to any guest willing to spell its name with 96
+         * bytes or more: two rootfs collide on it, and a host service listening
+         * on such a name is reachable. It was not even a visible limitation,
+         * since a name that long simply worked.
+         *
+         * Contained by standing in for the name rather than refusing it. The
+         * digest is a function of the name and the rootfs alone, so a bind and
+         * a connect on the same name from the same rootfs still meet and two
+         * rootfs still cannot; what is lost is the readback, which is what the
+         * fallback table below is for. Refusing instead would have been the
+         * simpler containment and a worse one: a long abstract name is a legal
+         * address that every kernel accepts. */
+        abs_digest(out + SUN_HDR + 1, gp + 1, (unsigned long)plen - 1);
+        x->len = SUN_HDR + 1 + ABS_DIG_LEN;
         x->applied = 1;
+        /* Only where the name is being created (bind), as for the pathname
+         * fallback: a connect names something someone else bound. */
+        if (!follow)
+            sun_fb_note(out + SUN_HDR, (unsigned)(x->len - SUN_HDR), gp,
+                        (unsigned)plen);
         return 1;
     }
 
@@ -271,7 +355,8 @@ int cng_sun_in(struct cng_sun_xlate *x, const void *addr, long alen,
      * or a sendto names something someone else bound, and its readback is that
      * binding's to answer. */
     if (!follow)
-        sun_fb_note(out + SUN_HDR, guest);
+        sun_fb_note(out + SUN_HDR, (unsigned)(pl + bl), guest,
+                    (unsigned)strlen(guest));
     return 1;
 }
 
@@ -292,11 +377,26 @@ void cng_sun_out(void *addr, long *alen) {
             return;
         char tag[ABS_TAG_LEN];
         abs_tag(tag);
-        if (memcmp(p + 1, tag, ABS_TAG_LEN) != 0)
+        if (memcmp(p + 1, tag, ABS_TAG_LEN) == 0) {
+            long rest = plen - 1 - ABS_TAG_LEN;
+            memmove(p + 1, p + 1 + ABS_TAG_LEN, (size_t)rest);
+            *alen -= ABS_TAG_LEN;
             return;
-        long rest = plen - 1 - ABS_TAG_LEN;
-        memmove(p + 1, p + 1 + ABS_TAG_LEN, (size_t)rest);
-        *alen -= ABS_TAG_LEN;
+        }
+        /* The digest form carries no name to strip, so the only way back is the
+         * one this process recorded when it bound it. A digest someone else
+         * bound is left as it stands: our own spelling, which is not the guest's
+         * name — but it is at least not another rootfs's, and there is nothing
+         * here that could reconstruct it. */
+        abs_tag_kind(tag, 'H');
+        if (plen == 1 + ABS_DIG_LEN && memcmp(p + 1, tag, ABS_TAG_LEN) == 0) {
+            char g[SUN_PATH_MAX];
+            int n = sun_fb_lookup(p, (unsigned)plen, g);
+            if (n > 0) {
+                memcpy(p, g, (size_t)n);
+                *alen = SUN_HDR + n;
+            }
+        }
         return;
     }
 
@@ -310,10 +410,12 @@ void cng_sun_out(void *addr, long *alen) {
     if (cng_fs_untranslate(cng_g_fs, hostp, guest, sizeof guest) != 0) {
         /* ...unless it is one of our own fallback spellings, which no prefix
          * matches and which the guest must never be shown (see sun_fb_note). */
-        const char *g = sun_fb_lookup(hostp);
-        if (!g)
+        char fb[SUN_PATH_MAX];
+        int gl = sun_fb_lookup(hostp, (unsigned)strlen(hostp), fb);
+        if (gl < 0)
             return; /* outside the guest view: leave it alone */
-        cng_strlcpy(guest, g, sizeof guest);
+        memcpy(guest, fb, (size_t)gl);
+        guest[gl] = '\0';
     }
     size_t gl = strlen(guest);
     if (gl + 1 > SUN_PATH_MAX)

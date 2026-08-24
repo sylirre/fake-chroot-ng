@@ -124,6 +124,51 @@ else
     check_contains "m15 --share-abstract-sockets shares the host namespace" \
         "Address already in use" "$out"
 
+    # An abstract name with no room left under 108 bytes to carry the tag as
+    # well used to be passed through untagged — the guest's own name straight
+    # into the HOST's global abstract namespace, which is the one escape the tag
+    # exists to close, and available to any guest willing to spell its name with
+    # 96 bytes or more. A digest of the name stands in for it now, so the
+    # containment holds and the name still works; the binder records what it
+    # bound, so the readback is unchanged.
+    M15LONG=
+    while [ ${#M15LONG} -lt 100 ]; do M15LONG="${M15LONG}L"; done
+    out=$(m15run -R "$R1" /bin/uxsock "$M15LONG" abstract 2>&1)
+    check_contains "m15 an abstract name too long to tag still binds" \
+        "bind: ok" "$out"
+    check_contains "m15 ...and reads back as the name the guest bound" \
+        "getsockname: @$M15LONG" "$out"
+
+    # The two halves of the containment: the guest's name is not on the wire at
+    # all, and a second rootfs can still take it.
+    m15run -R "$R1" /bin/uxsock "$M15LONG" abstract 4 >/dev/null 2>&1 &
+    m15bg=$!
+    sleep 2
+    hostview=$(grep -ac "$M15LONG" /proc/net/unix 2>/dev/null)
+    out=$(m15run -R "$R2" /bin/uxsock "$M15LONG" abstract 2>&1)
+    wait $m15bg 2>/dev/null
+    check_contains "m15 ...and a second rootfs can still take it" "bind: ok" \
+        "$out"
+    case "$hostview" in
+    0) pass=$((pass + 1))
+        echo "  ok   m15 ...and the name itself never reaches the wire" ;;
+    "") skip "untaggable-abstract-name-on-the-wire leg: /proc/net/unix unreadable" ;;
+    *) fail=$((fail + 1))
+        echo "  FAIL m15 the untaggable abstract name is on the wire ($hostview)" ;;
+    esac
+
+    # ...and the stand-in is a function of the name, not a fresh identity per
+    # bind: two guests of the SAME rootfs must still meet on it, or the
+    # isolation above would be nothing more than every bind getting a name
+    # nobody else can guess.
+    m15run -R "$R1" /bin/uxsock "$M15LONG" abstract 4 >/dev/null 2>&1 &
+    m15bg=$!
+    sleep 2
+    out=$(m15run -R "$R1" /bin/uxsock "$M15LONG" abstract 2>&1)
+    wait $m15bg 2>/dev/null
+    check_contains "m15 ...and two guests of one rootfs still meet on it" \
+        "Address already in use" "$out"
+
     # --- the array forms (sendmmsg/recvmmsg) -----------------------------
     # One address per message, so the containment is per element and a loop that
     # only looked at the first would leak every message after it. The proof is
