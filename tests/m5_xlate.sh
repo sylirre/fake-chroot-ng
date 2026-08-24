@@ -168,3 +168,25 @@ run_t 20 -t dtest -r "$XL" open "$_g" >"$CNG_TMP/toolong.out" 2>&1
 check_contains "...and the syscall answers ENAMETOOLONG, not the wrong file" \
     "open: errno 36" "$(cat "$CNG_TMP/toolong.out")"
 rm -rf "$(dirname "$XL")"
+
+# The same rule one join earlier: a relative name appended to a cwd that already
+# fills the buffer. cng_fs_abscanon ignored what cng_strlcpy reported, so the
+# name did not fit and what came back was the CWD — under an identity root a
+# 4094-byte cwd made "x" name the directory the guest was standing in, and an
+# unlink or an O_CREAT then acted on that. The boundary is exact, so both sides
+# of it are pinned: 4093 bytes still has room for "/x", 4094 does not.
+_a=aaaaaaaaaa
+_a="$_a$_a$_a$_a$_a"       # 50
+_a="$_a$_a$_a$_a"          # 200
+_cwd=""
+_i=0
+while [ $_i -lt 20 ]; do   # 20 * 201 = 4020
+    _cwd="$_cwd/$_a"
+    _i=$((_i + 1))
+done
+check_contains "a relative name with no room left in the cwd is refused" \
+    "x -> <overflow>" \
+    "$(run_t 20 -t xlate -r / -C "$_cwd/$(printf '%.73s' "$_a")" x 2>&1)"
+check_absent "...and the longest cwd that still has room is not" \
+    "<overflow>" \
+    "$(run_t 20 -t xlate -r / -C "$_cwd/$(printf '%.72s' "$_a")" x 2>&1)"

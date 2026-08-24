@@ -324,16 +324,32 @@ int cng_path_canon(const char *abs, char *out, size_t outsz) {
 
 int cng_fs_abscanon(const struct cng_fs *fs, const char *path, char *out,
                     size_t outsz) {
+    /* Every copy here is checked, because a cut path is a different path — the
+     * same reason cng_fs_translate_mnt refuses one rather than shortening it.
+     * The joins were unchecked, and cng_strlcpy truncates: a cwd within a
+     * component's length of CNG_PATH_MAX had "x" appended to a buffer with no
+     * room for it, and what came back was the cwd itself. Under an identity
+     * root a 4095-byte cwd made open("x") name the DIRECTORY the guest was
+     * standing in — an unlink or an O_CREAT aimed at whatever the cwd is, not
+     * at the file that was asked for. Nothing fits and no answer is right, so
+     * -1, which every caller already turns into the -ENAMETOOLONG a kernel
+     * whose PATH_MAX the name exceeded would have given. */
     char tmp[CNG_PATH_MAX];
     if (path[0] == '/') {
-        cng_strlcpy(tmp, path, sizeof tmp);
+        if (cng_strlcpy(tmp, path, sizeof tmp) >= sizeof tmp)
+            return -1;
     } else {
         size_t n = cng_strlcpy(tmp, fs->cwd, sizeof tmp);
-        if (n && tmp[n - 1] != '/' && n + 1 < sizeof tmp) {
+        if (n >= sizeof tmp)
+            return -1;
+        if (n && tmp[n - 1] != '/') {
+            if (n + 1 >= sizeof tmp)
+                return -1; /* no room for the separator, let alone the name */
             tmp[n++] = '/';
             tmp[n] = '\0';
         }
-        cng_strlcpy(tmp + n, path, sizeof tmp - n);
+        if (cng_strlcpy(tmp + n, path, sizeof tmp - n) >= sizeof tmp - n)
+            return -1;
     }
     return cng_path_canon(tmp, out, outsz);
 }

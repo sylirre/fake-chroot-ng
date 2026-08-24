@@ -2062,6 +2062,23 @@ vfork/`posix_spawn` child-stack handling.
   real, so anything cross-referencing `stat().st_dev` — which is what actually
   identifies a filesystem — still finds its row.
 
+- [x] **M31 — a relative name appended to a cwd with no room left for it**
+  `cng_fs_abscanon` joins `fs->cwd` and a relative path with `cng_strlcpy` and
+  ignored what it reported, and `cng_strlcpy` truncates. A cwd within a
+  component's length of `CNG_PATH_MAX` had the name appended to a buffer with no
+  room for it, and what came back was **the cwd itself**: under an identity root
+  a 4094-byte cwd made `open("x")` name the directory the guest was standing in.
+  It is guest-reachable through the ordinary syscall path — `xlate_lim` falls
+  back to `cng_fs_translate` on the raw guest name when `cng_resolve_lim`
+  declines, and that is the join — so an `unlink` or an `O_CREAT` acted on the
+  cwd instead of answering `ENAMETOOLONG`. Exactly the failure the comment in
+  `cng_fs_translate_mnt` already forbids one join later, where a rootfs prefix
+  that does not fit is a refusal rather than a shorter name.
+  Both joins are checked now, absolute names included, and return -1 — which
+  every caller already turns into the `-ENAMETOOLONG` a kernel whose `PATH_MAX`
+  the name exceeded would have given. Pinned on both sides of the boundary: 4093
+  bytes of cwd still has room for `/x`, 4094 does not.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes
