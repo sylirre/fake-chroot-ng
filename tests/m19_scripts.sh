@@ -150,6 +150,25 @@ elif guest_cc_report "$GDIR/scriptprobe" tests/guests/scriptprobe.c; then
     check_absent "no host path reaches the guest through the symlink" \
         "$M19" "$out"
 
+    # ...and once more with a space in the RESOLVED name, which is the same
+    # reverse-lookup failure reached a different way. The kernel spells a
+    # deleted directory "<path> (deleted)", and what used to stand in for
+    # telling that apart was refusing any /proc/self/fd readback containing a
+    # space at all — so a rootfs whose real path has one kept the caller's
+    # spelling while getcwd went on reporting the resolved one, and nothing
+    # matched on the way back. `/sdcard/My Files/alpine` is not an exotic place
+    # to keep a rootfs.
+    mkdir -p "$M19/sp ace/lib/apk/exec" "$M19/sp ace/root"
+    cp "$GDIR/scriptprobe" "$M19/sp ace/scriptprobe"
+    cp "$GDIR/scriptprobe" "$M19/sp ace/lib/apk/exec/scriptprobe"
+    ln -s "sp ace" "$M19/spacelink"
+    out=$(m19_run -w /root "$M19/spacelink" /scriptprobe \
+        lib/apk/exec/scriptprobe 2>/dev/null)
+    check_absent "a rootfs whose real name has a space tracks fchdir too" \
+        "fchdir-cwd=/root" "$out"
+    check_contains "and a relative execve under that one resolves" \
+        "relexec=SCRIPT-OK" "$out"
+
     # --- differential against arm64chroot -----------------------------------
     # The oracle is a whole-instruction emulator with a purely virtual cwd, so
     # it never had either bug; its answers are the reference for ours.

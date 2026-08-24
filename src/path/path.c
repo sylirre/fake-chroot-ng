@@ -146,6 +146,23 @@ static int normalize_root(char *dst, size_t dstsz, const char *src) {
     return 0;
 }
 
+/* Does `fd` still name the file at `path`?
+ *
+ * A /proc/self/fd readback is not a usable name on its own. The kernel spells
+ * an unlinked directory "<path> (deleted)" and answers "pipe:[N]" and its kin
+ * for what has no path at all, and neither is a prefix that can be matched
+ * against host paths. Asking the inode settles it exactly, and it settles the
+ * one case no suffix test can: a directory whose own name really does end in
+ * " (deleted)" is a legal name that reads back identically. */
+static int fd_names(int fd, const char *path) {
+    /* AArch64 struct stat: st_dev at 0 and st_ino at 8, adjacent. */
+    char a[128], b[128];
+    if (sys_fstat(fd, a) != 0 ||
+        CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, (long)path, (long)b, 0, 0, 0) != 0)
+        return 0;
+    return memcmp(a, b, 16) == 0;
+}
+
 /* Store a host prefix (the rootfs, a bind source) the way the kernel spells it:
  * symlink-free. These prefixes are not only prepended to guest paths, they are
  * matched against host paths the kernel *produced* — getcwd() after the guest
@@ -162,7 +179,15 @@ static int normalize_root(char *dst, size_t dstsz, const char *src) {
  * Resolved by opening the directory and reading back the kernel's own name for
  * it. Anything that does not resolve (a nonexistent path — diagnosed by the
  * caller — or the synthetic roots the self-tests use, which have no host inode)
- * is kept verbatim, exactly as before. */
+ * is kept verbatim, exactly as before.
+ *
+ * What used to stand in for "is this readback a name at all" was refusing any
+ * that contained a space, on the grounds that " (deleted)" has one. So did
+ * every rootfs and every bind source with a space anywhere in its path — a
+ * `/sdcard/My Files/alpine`, a `~/Downloads/debian rootfs` — and those kept the
+ * caller's spelling while the kernel went on producing the resolved one. That
+ * is the same reverse-lookup failure the symlink case above describes, reached
+ * a different way, and on the same paths a phone hands out. */
 static int canon_host_root(char *dst, size_t dstsz, const char *src) {
     long fd = sys_openat(CNG_AT_FDCWD, src,
                          CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
@@ -170,15 +195,14 @@ static int canon_host_root(char *dst, size_t dstsz, const char *src) {
         char link[40], real[CNG_PATH_MAX];
         cng_snprintf(link, sizeof link, "/proc/self/fd/%d", (int)fd);
         long n = sys_readlinkat(CNG_AT_FDCWD, link, real, sizeof real - 1);
-        sys_close((int)fd);
-        /* A deleted or otherwise unnamed directory reads back as something
-         * that is not an absolute path ("... (deleted)", "pipe:[N]"); only a
-         * plain absolute name is a prefix we can match against. */
+        int named = 0;
         if (n > 0 && (size_t)n < sizeof real && real[0] == '/') {
             real[n] = '\0';
-            if (!strchr(real, ' '))
-                return normalize_root(dst, dstsz, real);
+            named = fd_names((int)fd, real);
         }
+        sys_close((int)fd);
+        if (named)
+            return normalize_root(dst, dstsz, real);
     }
     return normalize_root(dst, dstsz, src);
 }
