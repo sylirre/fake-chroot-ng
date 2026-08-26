@@ -7,6 +7,7 @@
  * svc. We emulate the syscall (translating paths) and write the result into x0;
  * on return the restorer runs rt_sigreturn and the guest continues.
  */
+#include "cng/broker.h" /* cng_broker_env: no getenv in a freestanding build */
 #include "cng/loader.h"
 #include "cng/monitor.h"
 #include "cng/procreg.h"
@@ -309,12 +310,20 @@ static int cng_claim_slot(volatile long *p, long want, long tid) {
     return fail == 0;
 }
 
+/* One stack, straight from the kernel. Returns the base, or 0. */
+static unsigned long scr_mmap(void) {
+    void *base = sys_mmap(0, CNG_SCR_SZ, CNG_PROT_READ | CNG_PROT_WRITE,
+                          CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (base == CNG_MAP_FAILED || cng_is_err((long)base))
+        return 0;
+    return (unsigned long)base;
+}
+
 /* Map a stack into a slot this thread has just claimed. 0, or -1 with the slot
  * given back. `hi` is what publishes it: see the re-entry note below. */
 static int scr_map(unsigned i) {
-    void *base = sys_mmap(0, CNG_SCR_SZ, CNG_PROT_READ | CNG_PROT_WRITE,
-                          CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
-    if (base == CNG_MAP_FAILED || cng_is_err((long)base)) {
+    unsigned long base = scr_mmap();
+    if (!base) {
         cng_scr[i].tid = 0;
         return -1;
     }
@@ -331,9 +340,18 @@ static int scr_tid_live(long tid) {
     return CNG_SYS(__NR_tgkill, sys_getpid(), tid, 0, 0, 0, 0) == 0;
 }
 
+/* CNG_SCRATCH_NONE=1: answer as a process whose table has no slot to give —
+ * 256 live threads already holding one, or an mmap the host refused. A working
+ * host does not reach that on its own, and what happens when it does is the
+ * whole question here, so it is settled once at monitor install rather than
+ * read per dispatch. Same testing convention as CNG_PROCREG_NONE. */
+static int cng_g_scratch_none;
+
 /* Find this thread's scratch slot (allocating one on first use). Returns the
  * slot index, or -1 if the table is full of live threads or mmap failed. */
 static int cng_scratch_slot(long tid) {
+    if (cng_g_scratch_none)
+        return -1;
     unsigned h = (unsigned)((unsigned long)tid * 2654435761u) % CNG_SCR_N;
     for (unsigned k = 0; k < CNG_SCR_N; k++) {
         unsigned i = (h + k) % CNG_SCR_N;
@@ -423,10 +441,29 @@ static void sigsys_on_scratch(void *ucv, void *si) {
     cng_sigsys_body(uc, si);
 }
 
-/* Run the dispatcher on this thread's scratch stack. A nested trap (the outer
- * invocation's slot is already busy) runs on the current stack instead — that
- * is the shallow gate-net path, which does not touch the deep buffers, so it
- * fits wherever the kernel delivered it. The busy flag (not an SP-range test) is
+/* A stack for a call that cannot have this thread's slot: the table is full of
+ * live threads, its mmap failed, or an outer dispatch on this thread is on it
+ * already (a nested trap). Mapped for the one call and given back after it.
+ *
+ * The alternative was the interrupted stack, and that is not a fallback but the
+ * failure itself: cng_dispatch's own frame is ~24 KiB and a translated openat
+ * runs ~66 KiB deep, against Go's ~8 KiB goroutine stacks, musl's 128 KiB
+ * thread stacks and whatever size a guest hands sigaltstack — and because the
+ * frame is bigger than a guard page it steps clean over the guard into ordinary
+ * guest memory, where nothing faults and nothing is reported. Two mmap
+ * syscalls, on a path taken at most once per blocked syscall number (the
+ * gate-net records it) or by the 257th live thread, buy that away.
+ *
+ * If even this mmap fails there is no stack to be had anywhere and the caller
+ * runs where it stands, which is where it always ran. */
+static unsigned long scr_temp(void) { return scr_mmap(); }
+
+static void scr_temp_free(unsigned long base) {
+    sys_munmap((void *)base, CNG_SCR_SZ);
+}
+
+/* Run the dispatcher on this thread's scratch stack, or on a stack taken for
+ * the call when the slot cannot be had. The busy flag (not an SP-range test) is
  * what detects nesting: with SA_ONSTACK the nested signal is delivered on the
  * alt-stack, not on the scratch stack, so a range test would miss it and wrongly
  * re-switch, clobbering the outer dispatcher frame. */
@@ -437,7 +474,14 @@ static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {
     if (i < 0 || cng_scr[i].busy) {
         if (cng_g_sigsys_frame[0]) /* the test above: this is the nested one */
             cng_g_sigsys_frame[1] = (unsigned long)ucv;
-        cng_sigsys_body((struct cng_ucontext *)ucv, si);
+        unsigned long base = scr_temp();
+        if (!base) {
+            cng_sigsys_body((struct cng_ucontext *)ucv, si);
+            return;
+        }
+        cng_run_on_stack((void *)(base + CNG_SCR_SZ),
+                         (void *)sigsys_on_scratch, ucv, si);
+        scr_temp_free(base);
         return;
     }
     cng_scr[i].busy = 1;
@@ -447,8 +491,8 @@ static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {
     cng_scr[i].busy = 0;
 }
 
-/* Run `fn(arg)` on this thread's scratch stack; 0 when there was none to switch
- * to and the caller has to run it where it stands.
+/* Run `fn(arg)` on a stack of ours; 0 only when none could be had at all and the
+ * caller has to run it where it stands.
  *
  * The SIGSYS handler is not the only way into the path dispatcher. The -R
  * trampoline tier reaches the very same code from an ordinary call, on whatever
@@ -466,17 +510,31 @@ static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {
  * rewritten `svc` from there. SP is then the guest's alt-stack, nowhere near
  * the scratch stack an outer invocation is still using, and switching onto it
  * again overwrites those frames. The SP test is kept alongside for the direct
- * re-entry it does catch. */
+ * re-entry it does catch. Either way the nested call gets a stack of its own
+ * rather than the guest's, which is the one thing the guest's cannot survive. */
 int cng_run_scratch(void (*fn)(void *), void *arg) {
     int i = cng_scratch_slot(sys_gettid());
-    if (i < 0)
-        return 0;
     unsigned long sp = (unsigned long)&i;
-    if (cng_scr[i].busy || (sp >= cng_scr[i].lo && sp < cng_scr[i].hi))
-        return 0; /* already in use: run in place, as a nested trap does */
-    cng_scr[i].busy = 1;
-    cng_run_on_stack((void *)cng_scr[i].hi, (void *)fn, arg, 0);
-    cng_scr[i].busy = 0;
+    if (i >= 0 && !cng_scr[i].busy &&
+        !(sp >= cng_scr[i].lo && sp < cng_scr[i].hi)) {
+        cng_scr[i].busy = 1;
+        cng_run_on_stack((void *)cng_scr[i].hi, (void *)fn, arg, 0);
+        cng_scr[i].busy = 0;
+        return 1;
+    }
+    /* No slot, or an outer dispatch is on it. Running in place is what the
+     * guest's own alt-stack cannot survive, so take a stack for this call.
+     *
+     * `fn` need not come back: the -R tier's emulated execve enters the new
+     * program from inside it (cng_scratch_leave), and then this mapping is
+     * never given back. That is 256 KiB against an exec that already keeps the
+     * whole of the previous program's address space, on a path reached only by
+     * an exec from inside a nested dispatch. */
+    unsigned long base = scr_temp();
+    if (!base)
+        return 0;
+    cng_run_on_stack((void *)(base + CNG_SCR_SZ), (void *)fn, arg, 0);
+    scr_temp_free(base);
     return 1;
 }
 
@@ -565,6 +623,7 @@ int cng_install_monitor(struct cng_fs *fs) {
      * demand (the ptrace roles) must not do so before this point: a
      * SECCOMP_RET_TRAP with no handler for the signal kills the process. */
     cng_g_sigsys_ready = 1;
+    cng_g_scratch_none = cng_broker_env("CNG_SCRATCH_NONE") != 0;
     /* The ptrace kick signal is answered by every guest process, whether or not
      * it ever traces anything: it is how a tracer reaches a running task
      * (PTRACE_ATTACH), and how a process is told its child asked to be traced. */

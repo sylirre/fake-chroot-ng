@@ -146,5 +146,20 @@ if guest_xlate_ready "small-stack syscall leg" &&
         check "a syscall on a ${_k} KiB guest stack writes nothing below it" \
             "clobbered=0" "$out"
     done
+    # ...and again with no slot in the scratch table to be had: 256 live threads
+    # already holding one, an mmap the host refused, or an outer dispatch on this
+    # thread that is on the slot already (a nested trap, which a guest with its
+    # own sigaltstack reaches from inside its own signal handler). All three used
+    # to fall back to the interrupted stack, which is not a fallback but the very
+    # failure the legs above measure. CNG_SCRATCH_NONE forces the case, since a
+    # working host does not reach it on its own: before the fix this clobbers
+    # 1970 bytes at 8 KiB, 220 at 64 KiB, and dies outright at 16.
+    for _k in 8 16 64; do
+        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
+        out=$(CNG_SCRATCH_NONE=1 run_t 60 -R $GUEST_BINDS "$SSR" /smallstack $_k \
+            2>/dev/null)
+        check "...and still nothing with no scratch slot to be had (${_k} KiB)" \
+            "clobbered=0" "$out"
+    done
 fi
 rm -rf "$SSR"
