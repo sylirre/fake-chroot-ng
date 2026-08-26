@@ -110,7 +110,7 @@ static unsigned ipc_addr(struct cng_sockaddr_un *a) {
     return cng_broker_self_addr(a);
 }
 
-/* Is the process on the other end of this connection us?
+/* Who is the process on the other end of this connection?
  *
  * The rendezvous is an ABSTRACT socket: it has no inode, so no directory
  * permission stands between the name and anyone else on the machine, and the
@@ -128,17 +128,39 @@ static unsigned ipc_addr(struct cng_sockaddr_un *a) {
  * environment lets it (Android denies the credential setters outright, and
  * --fake-id emulates them), and a refusal is the safe direction.
  *
- * Returns 1 for a peer we accept. A kernel that cannot answer (SO_PEERCRED is
- * ancient, but a sandbox may still refuse the getsockopt) leaves the check
- * unmade rather than closing every connection. */
-static int peer_is_ours(int sock) {
+ * That the boundary is the uid and nothing finer is deliberate: every process of
+ * one invocation is a fork of one program and there is no kernel boundary
+ * between them to appeal to (docs/DESIGN.md, "containment, not a sandbox"). The
+ * request's uid/gid are the guest's possibly-faked identity and can only ever be
+ * asserted by the client; its PID cannot, and is taken from here instead — see
+ * ipc_serve's caller.
+ *
+ * Returns the peer's pid, or -1 for a peer we will not serve. An unanswerable
+ * SO_PEERCRED is one of those: it is as old as AF_UNIX, so if the getsockopt is
+ * refused (a sandbox, an outer filter) the answer is that we cannot tell who is
+ * there — and "cannot tell" has to close the connection, not open it. What that
+ * costs is System V IPC failing loud and --shared-proc degrading to its file
+ * tier, both of which are paths that already exist; what accepting cost was the
+ * check itself. A pid of 0 is the same answer in a different shape: the kernel
+ * writes it when the peer is in a pid namespace of ours, and a request we cannot
+ * attribute to a process is one whose attachments, undo rows and death reclaim
+ * we cannot get right. */
+static int peer_pid(int sock) {
+    /* CNG_BROKER_NO_PEERCRED=1: answer as a host whose kernel will not say who
+     * is there. Nothing on a working host reaches that, and it is the direction
+     * that used to be open, so there is no other way to exercise the refusal.
+     * Same testing convention as CNG_SHM_FORCE_FILE and CNG_PROCREG_NONE. */
+    if (cng_broker_env("CNG_BROKER_NO_PEERCRED"))
+        return -1;
     unsigned uc[3] = {0, 0, 0}; /* struct ucred: pid, uid, gid */
     unsigned len = sizeof uc;
     if (CNG_SYS(__NR_getsockopt, sock, CNG_SOL_SOCKET, CNG_SO_PEERCRED, uc,
                 &len, 0) != 0 ||
         len < sizeof uc)
-        return 1;
-    return uc[1] == (unsigned)sys_getuid() || uc[1] == (unsigned)sys_geteuid();
+        return -1;
+    if (uc[1] != (unsigned)sys_getuid() && uc[1] != (unsigned)sys_geteuid())
+        return -1;
+    return uc[0] > 0 && uc[0] <= 0x7fffffffu ? (int)uc[0] : -1;
 }
 
 /* ---- transport ---------------------------------------------------------- */
@@ -886,7 +908,8 @@ static _Noreturn void broker_main(struct cng_sockaddr_un *a, unsigned al) {
             cng_ipc_poll_ready(pf, 1, nfds);
             if (pf[0].revents & CNG_POLLIN) {
                 long c = CNG_SYS(__NR_accept4, ls, 0, 0, CNG_SOCK_CLOEXEC, 0, 0);
-                if (c >= 0 && !peer_is_ours((int)c)) {
+                int cpid = c >= 0 ? peer_pid((int)c) : -1;
+                if (c >= 0 && cpid < 0) {
                     sys_close((int)c); /* somebody else's process: not a client */
                     c = -1;
                 }
@@ -896,8 +919,18 @@ static _Noreturn void broker_main(struct cng_sockaddr_un *a, unsigned al) {
                             &tv, sizeof tv, 0);
                     struct cng_breq q;
                     int parked = 0;
-                    if (cng_broker_recv((int)c, &q, sizeof q, 0) == 0)
+                    if (cng_broker_recv((int)c, &q, sizeof q, 0) == 0) {
+                        /* The kernel's answer replaces the client's claim. Every
+                         * legitimate client stamps exactly this (cng_broker_open
+                         * calls getpid), and it is the field the registries key
+                         * their bookkeeping on: which process an attachment,
+                         * a semaphore's undo row or a parked waiter belongs to,
+                         * and whose death reclaims it. Left as sent, one process
+                         * could name another and detach its segments, inherit
+                         * its undo, or have its own rows reclaimed under it. */
+                        q.pid = (s32)cpid;
                         parked = ipc_serve((int)c, &q, &tab);
+                    }
                     if (!parked)
                         sys_close((int)c);
                 }
@@ -1066,7 +1099,7 @@ static int broker_connect(struct cng_sockaddr_un *a, unsigned al) {
                 sizeof tv, 0);
         long cr = CNG_SYS(__NR_connect, s, a, al, 0, 0, 0);
         if (cr == 0) {
-            if (peer_is_ours((int)s))
+            if (peer_pid((int)s) > 0)
                 return (int)s;
             /* Somebody else holds the name. They will keep holding it, so
              * there is nothing to retry and nothing to spawn: the caller fails

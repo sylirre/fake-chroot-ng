@@ -60,6 +60,13 @@ check_contains "the retryable broker failure is told from the others" \
 # Callers turned that into a fabricated ENOSPC/EIDRM instead of trying again.
 check_contains "a daemon on its way out does not fail the caller's request" \
     "shmtest a daemon on its way out is retried past: OK" "$out"
+# The rendezvous is an abstract name anyone on the machine can compute, so the
+# daemon has to take the caller's identity from the kernel rather than from the
+# request — and refuse a peer the kernel will not identify at all.
+check_contains "a request cannot name a process other than its sender" \
+    "shmtest a forged caller pid is not believed -> OK" "$out"
+check_contains "an unidentifiable peer is refused by both ends" \
+    "shmtest an unidentifiable peer is refused client=-28 daemon=-28 -> OK" "$out"
 check_contains "IPC_SET writes the permission triad back" \
     "shmtest ipc_set -> OK" "$out"
 check_contains "execve detaches every attachment" \

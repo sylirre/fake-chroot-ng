@@ -5619,6 +5619,83 @@ int cng_cmd_shmtest(int argc, char **argv, char **envp, unsigned long *auxv) {
         fails += !ok;
     }
 
+    /* 15) the caller's pid in a request is the kernel's answer about the peer,
+     *     not the number the client put in the field.
+     *
+     *     Every registry the daemon keeps is keyed on that pid: which process an
+     *     attachment belongs to, whose semaphore undo rows apply, which parked
+     *     waiter to wake, and whose death reclaims all of it. A client that
+     *     names another process therefore detaches its segments, inherits its
+     *     undo and has its own rows reclaimed under it — and the socket is
+     *     abstract, so "a client" is anything on the machine that can reach the
+     *     name. The uid and gid cannot be taken from the kernel (they are the
+     *     guest's faked identity, which is the whole point of --fake-id), but
+     *     the pid can, and now is.
+     *
+     *     Driven at the protocol rather than through shm.c, because no client of
+     *     ours will send anything but its own pid: connect the ordinary way,
+     *     then overwrite the field before the request goes out. shm_cpid is the
+     *     daemon's record of who created the segment, so IPC_STAT reads it back. */
+    {
+        struct cng_breq q;
+        memset(&q, 0, sizeof q);
+        q.op = CNG_REQ_SHMGET;
+        q.size = SHMT_SZ;
+        q.arg = CNG_IPC_CREAT | 0600;
+        int s = cng_broker_open(&q); /* stamps pid/uid/gid, then connects */
+        q.pid = 0x7ffffff0;          /* the lie */
+        struct cng_bresp r;
+        memset(&r, 0, sizeof r);
+        int got = s >= 0 && cng_broker_send(s, &q, sizeof q, -1) == 0 &&
+                  cng_broker_recv(s, &r, sizeof r, 0) == 0;
+        if (s >= 0)
+            sys_close(s);
+        long fid = got ? r.ret : -1;
+        struct cng_shmid64_ds ds;
+        int ok = fid > 0 && shmt_stat(fid, &ds) == 0 && ds.shm_cpid == self;
+        if (fid > 0)
+            shm_call(__NR_shmctl, fid, CNG_IPC_RMID, 0);
+        cng_dprintf(1, "shmtest a forged caller pid is not believed -> %s\n",
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 16) a peer the kernel will not identify is refused, in both directions.
+     *
+     *     SO_PEERCRED is the only thing standing between an abstract name
+     *     anybody can compute and a namespace of ours, so failing to read it has
+     *     to close the connection rather than leave the check unmade. Nothing on
+     *     a working host reaches that, hence CNG_BROKER_NO_PEERCRED.
+     *
+     *     Both sides in one sequence, on a namespace of its own. The first call
+     *     runs with the knob set: it finds nobody serving the name, starts a
+     *     daemon — which inherits the knob — and then refuses that daemon
+     *     itself, which is the client half. The second runs with the knob gone,
+     *     so the client is satisfied and the daemon now standing on the name is
+     *     the one that refuses, which is the daemon half. The leg can only pass
+     *     if a daemon really was left there: had the first call not started one,
+     *     the second would have started a clean one and been served. */
+    {
+        static char *noc_env[2];
+        noc_env[0] = (char *)"CNG_BROKER_NO_PEERCRED=1";
+        noc_env[1] = 0;
+        char **saved = cng_g_host_envp;
+        cng_broker_seed_session(); /* a name nobody is bound to yet */
+        cng_g_host_envp = noc_env;
+        long e1 = shm_call(__NR_shmget, 0 /*IPC_PRIVATE*/, SHMT_SZ,
+                           CNG_IPC_CREAT | 0600);
+        cng_g_host_envp = saved;
+        long e2 = shm_call(__NR_shmget, 0 /*IPC_PRIVATE*/, SHMT_SZ,
+                           CNG_IPC_CREAT | 0600);
+        int ok = e1 == -ENOSPC && e2 == -ENOSPC;
+        cng_dprintf(1,
+                    "shmtest an unidentifiable peer is refused client=%ld "
+                    "daemon=%ld -> %s\n",
+                    e1, e2, ok ? "OK" : "FAIL");
+        fails += !ok;
+        cng_broker_seed_session(); /* leave the poisoned namespace behind */
+    }
+
     cng_dprintf(1, "shmtest: %d failure(s)\n", fails);
     return fails ? 1 : 0;
 }

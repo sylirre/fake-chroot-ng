@@ -458,6 +458,11 @@ static void help(char **envp) {
         {"CNG_PROCREG_FORCE_FILE", "With --shared-proc: skip the broker and use "
                       "the named-file registry tier. Test aid: that tier is "
                       "otherwise reached only without memfd_create."},
+        {"CNG_BROKER_NO_PEERCRED", "Behave as if the kernel would not say who "
+                      "is on the other end of the IPC broker's rendezvous "
+                      "socket, which refuses the connection. Test aid: a "
+                      "working host always answers, so the refusal has no "
+                      "other way to be exercised."},
     };
     static const char *const examples[] = {
         "chroot-ng --probe",
