@@ -1706,6 +1706,98 @@ static long sun_deliver(char *ab, unsigned al, long aa, long alp) {
     return addr_out(ab, got, aa, alp);
 }
 
+/* ---- recvmmsg's timeout ------------------------------------------------- */
+
+/* It is not a bound on the wait, and a decomposed batch must not treat it as
+ * one. The kernel (net/socket.c, do_recvmmsg) turns the argument into an
+ * absolute deadline and then consults it only *between* datagrams: each receive
+ * — the first one included — blocks with no deadline of its own, so a socket
+ * that never speaks again blocks forever even with a timeout set, and one that
+ * speaks slowly is read until the deadline has already passed. recvmmsg(2) says
+ * so under BUGS; measured against this host's kernel, an idle socket with a 1 s
+ * timeout is still blocked at 5 s, and a feed of one datagram every 300 ms with
+ * the same timeout returns 4 of them at 1.2 s.
+ *
+ * What the deadline does do is stop the loop from asking for the NEXT message
+ * once it has passed, and the time left over is written back to the caller's
+ * own timespec when at least one datagram arrived. Taking a non-NULL timeout to
+ * mean "first only" instead cut every such batch short at one message.
+ *
+ * The clock is CLOCK_MONOTONIC (ktime_get_ts64), so setting the wall clock
+ * mid-batch moves nothing. */
+struct mmsg_deadline {
+    int on;                   /* a timeout argument was supplied */
+    struct cng_timespec end;  /* absolute; {0,0} for a zero timeout, i.e. past */
+    struct cng_timespec left; /* what the caller gets back */
+};
+
+#define CNG_NSEC_PER_SEC 1000000000L
+
+static void ts_norm(struct cng_timespec *t) {
+    while (t->tv_nsec < 0) {
+        t->tv_nsec += CNG_NSEC_PER_SEC;
+        t->tv_sec--;
+    }
+    while (t->tv_nsec >= CNG_NSEC_PER_SEC) {
+        t->tv_nsec -= CNG_NSEC_PER_SEC;
+        t->tv_sec++;
+    }
+}
+
+/* Read and validate the timeout, and set the deadline from it. Returns 0, or
+ * the errno the kernel answers before it so much as looks the socket up:
+ * -EFAULT for a timespec it cannot read, -EINVAL for one that is not a valid
+ * relative time (poll_select_set_timeout -> timespec64_valid). */
+static long mmsg_deadline_init(struct mmsg_deadline *d, long tp) {
+    d->on = tp != 0;
+    d->end.tv_sec = d->end.tv_nsec = 0;
+    d->left.tv_sec = d->left.tv_nsec = 0;
+    if (!d->on)
+        return 0;
+    struct cng_timespec ts;
+    if (cng_user_copyin(&ts, (void *)tp, sizeof ts) < 0)
+        return -EFAULT;
+    if (ts.tv_sec < 0 || (unsigned long)ts.tv_nsec >= (unsigned long)CNG_NSEC_PER_SEC)
+        return -EINVAL;
+    d->left = ts;
+    if (!ts.tv_sec && !ts.tv_nsec)
+        return 0; /* the kernel's zero-timeout shortcut: a deadline in the past */
+    struct cng_timespec now = {0, 0};
+    sys_clock_gettime(CNG_CLOCK_MONOTONIC, &now);
+    d->end.tv_sec = now.tv_sec + ts.tv_sec;
+    d->end.tv_nsec = now.tv_nsec + ts.tv_nsec;
+    if (d->end.tv_sec < now.tv_sec) /* timespec64_add_safe saturates */
+        d->end.tv_sec = 0x7fffffffffffffffL;
+    ts_norm(&d->end);
+    return 0;
+}
+
+/* Called once per delivered datagram: 1 when the loop must stop asking for
+ * another. Also refreshes what the writeback will report. */
+static int mmsg_deadline_hit(struct mmsg_deadline *d) {
+    if (!d->on)
+        return 0;
+    struct cng_timespec now = {0, 0};
+    sys_clock_gettime(CNG_CLOCK_MONOTONIC, &now);
+    d->left.tv_sec = d->end.tv_sec - now.tv_sec;
+    d->left.tv_nsec = d->end.tv_nsec - now.tv_nsec;
+    ts_norm(&d->left);
+    if (d->left.tv_sec < 0) {
+        d->left.tv_sec = d->left.tv_nsec = 0;
+        return 1;
+    }
+    return !d->left.tv_sec && !d->left.tv_nsec;
+}
+
+/* The kernel writes the remaining time back only when the batch delivered
+ * something, and turns a failure to write it into the call's whole answer. */
+static long mmsg_deadline_report(struct mmsg_deadline *d, long tp,
+                                 unsigned long got) {
+    if (d->on && got && cng_user_copyout((void *)tp, &d->left, sizeof d->left) < 0)
+        return -EFAULT;
+    return 0;
+}
+
 long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                   int trapped) {
     char b1[CNG_PATH_MAX], b2[CNG_PATH_MAX];
@@ -2913,14 +3005,20 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * its replies are built on demand, and a client discards any whose
          * source address is not the kernel's — which means msg_name must be
          * filled by cng_nl_srcaddr from the guest's own buffer length, not
-         * overwritten by the socketpair's AF_UNIX answer first. The timeout is
-         * not honored (a reply is already waiting or is never coming); the
-         * MSG_WAITFORONE rule is, since without it a batch larger than the
-         * pending replies would block on a socket nothing else will feed. */
+         * overwritten by the socketpair's AF_UNIX answer first. The
+         * MSG_WAITFORONE rule applies, since without it a batch larger than the
+         * pending replies would block on a socket nothing else will feed, and
+         * so does the timeout — a deadline consulted between messages, with the
+         * remainder written back, exactly as the kernel applies it (see
+         * struct mmsg_deadline). */
         if (cng_nl_is_fake((int)a0) && v && vlen) {
+            struct mmsg_deadline dl;
+            long te = mmsg_deadline_init(&dl, a4);
+            if (te)
+                return te;
             unsigned long got = 0;
             long r = 0;
-            for (; got < vlen; got++) {
+            while (got < vlen) {
                 struct cng_mmsghdr *m = &v[got];
                 struct cng_mmsghdr h;
                 if (cng_user_copyin(&h, m, sizeof h) < 0) {
@@ -2952,7 +3050,13 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                     r = e;
                     break;
                 }
+                got++;
+                if (mmsg_deadline_hit(&dl))
+                    break;
             }
+            long te2 = mmsg_deadline_report(&dl, a4, got);
+            if (te2)
+                return te2;
             return got ? (long)got : r;
         }
 
@@ -2967,15 +3071,19 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
              dom != CNG_AF_UNIX))
             return reissue(a0, a1, a2, a3, a4, a5, nr);
 
-        /* Per message from here. The kernel blocks for the whole batch unless
-         * MSG_WAITFORONE, and bounds that with the timeout argument; a loop of
-         * recvmsg calls has no timeout to give, so a batch that carries one
-         * behaves as if it had asked for MSG_WAITFORONE — returning early, never
-         * blocking past where the kernel would have stopped. */
-        int first_only = (a3 & CNG_MSG_WAITFORONE) != 0 || a4 != 0;
+        /* Per message from here. A loop of recvmsg calls has no timeout to give,
+         * but it does not need one: the kernel's timeout is a deadline it looks
+         * at between messages and nothing more (see struct mmsg_deadline), so
+         * this loop applies it in exactly the same place. MSG_WAITFORONE is the
+         * flag that really does bound the wait, and it is passed on. */
+        struct mmsg_deadline dl;
+        long te = mmsg_deadline_init(&dl, a4);
+        if (te)
+            return te;
+        int first_only = (a3 & CNG_MSG_WAITFORONE) != 0;
         unsigned long got = 0;
         long r = 0;
-        for (; got < vlen; got++) {
+        while (got < vlen) {
             struct cng_mmsghdr *m = &v[got];
             struct cng_mmsghdr h;
             if (cng_user_copyin(&h, m, sizeof h) < 0) {
@@ -3014,7 +3122,16 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                     break;
                 }
             }
+            got++;
+            if (mmsg_deadline_hit(&dl))
+                break;
+            /* Out-of-band data ends the batch where the kernel ends it. */
+            if (mh.flags & CNG_MSG_OOB)
+                break;
         }
+        long te2 = mmsg_deadline_report(&dl, a4, got);
+        if (te2)
+            return te2;
         /* Whatever arrived is reported; the error only if nothing did. */
         return got ? (long)got : r;
     }

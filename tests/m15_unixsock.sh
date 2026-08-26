@@ -268,6 +268,59 @@ else
             "recvmsg: n=2 namelen=0 controllen=0 flags=0 poison=1" "$out"
     fi
 
+    # --- recvmmsg's timeout on the decomposed path (M21) ------------------
+    # An AF_UNIX batch is taken apart into per-message recvmsg calls, which
+    # leaves the timeout argument the emulation's own to apply -- and the
+    # kernel's rule for it is not the obvious one. It is a deadline consulted
+    # only BETWEEN datagrams, never a bound on a wait, and the remainder is
+    # written back; taking a non-NULL timeout to mean "first message only" cut
+    # every such batch short and never read the timespec at all, so an invalid
+    # one was not refused either.
+    #
+    # qemu-user is not an oracle here -- its own recvmmsg loop drops the timeout
+    # argument on the floor -- so the reference side is a host-native build, as
+    # M18's ptrace oracle and M22's msgsnd ordering are. Every leg runs on a
+    # socketpair, so the two builds have identical output to compare.
+    UT_ORACLE=$M15D/uxtimeo
+    ut_ready=1
+    if ! guest_cc "$M15D/uxtimeo" tests/guests/uxtimeo.c; then
+        ut_ready=0
+        skip "m15 recvmmsg timeout: the guest program does not build here"
+    elif [ -n "$QEMU" ]; then
+        ut_ready=0
+        for _c in ${HOSTCC:-} cc gcc clang; do
+            have "$_c" || continue
+            if "$_c" -O2 -o "$M15D/ut_host" tests/guests/uxtimeo.c 2>/dev/null
+            then
+                UT_ORACLE=$M15D/ut_host
+                ut_ready=1
+                break
+            fi
+        done
+        [ "$ut_ready" = 1 ] ||
+            skip "m15 recvmmsg timeout: no host compiler for the differential oracle"
+    fi
+    if [ "$ut_ready" = 1 ]; then
+        cp "$M15D/uxtimeo" "$R1/bin/uxtimeo"
+        if [ -n "$TIMEOUT" ]; then
+            ut_k=$("$TIMEOUT" 60 "$UT_ORACLE" 2>/dev/null)
+        else
+            ut_k=$("$UT_ORACLE" 2>/dev/null)
+        fi
+        ut_e=$(m15run -R "$R1" /bin/uxtimeo 2>/dev/null)
+        if [ -z "$ut_k" ]; then
+            skip "m15 recvmmsg timeout: no reference run"
+        elif [ "$ut_k" = "$ut_e" ]; then
+            pass=$((pass + 1))
+            echo "  ok   m15 recvmmsg applies its timeout as the kernel does"
+        else
+            fail=$((fail + 1))
+            echo "  FAIL m15 recvmmsg's timeout diverges from the kernel"
+            printf '    kernel: %s\n' "$(echo "$ut_k" | tr '\n' '|')"
+            printf '    cng   : %s\n' "$(echo "$ut_e" | tr '\n' '|')"
+        fi
+    fi
+
     # --- a name the containment cannot express ----------------------------
     # sun_path holds 108 bytes, so a long enough rootfs pushes the translated
     # name out of it. The fallback binds relative to the parent directory's fd

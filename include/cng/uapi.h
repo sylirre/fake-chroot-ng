@@ -149,6 +149,7 @@ struct cng_open_how {
 #define CNG_SCM_RIGHTS   1
 #define CNG_MSG_NOSIGNAL 0x4000
 #define CNG_MSG_DONTWAIT 0x40
+#define CNG_MSG_OOB      0x1  /* msg_flags: out-of-band data, which ends a batch */
 #define CNG_MSG_WAITFORONE 0x10000 /* recvmmsg: return once one message is in */
 #define CNG_POLLIN       1
 
