@@ -162,6 +162,31 @@ static inline long sys_wait4(int pid, int *wstatus, int options, void *rusage) {
 static inline long sys_fork(void) {
     return CNG_SYS(__NR_clone, 17 /*SIGCHLD*/, 0, 0, 0, 0, 0);
 }
+
+/* __WALL: match a child whatever its exit signal is. sys_wait4 needs it for a
+ * child of sys_fork_quiet's, which has none. */
+#define CNG_WALL 0x40000000
+
+/* fork() for a child of ours started from inside a guest process — one the
+ * guest must not be able to see.
+ *
+ * The child of a plain fork is a child of the GUEST's process: its death sends
+ * the guest a SIGCHLD it never armed for, and a guest thread sitting in wait()
+ * can reap it and be handed the exit status of a process it never started.
+ * A clone whose flags carry no exit signal (flags & CSIGNAL == 0) has neither
+ * property: do_notify_parent() sends nothing, and eligible_child() classes it as
+ * a "clone child", which a plain wait4(-1) / waitid(P_ALL) does not match at all
+ * — only one that asks for __WCLONE or __WALL, which is to say a debugger.
+ * Measured against the host kernel: no SIGCHLD delivered, wait4(-1, WNOHANG) and
+ * waitid(P_ALL, WEXITED|WNOHANG) both ECHILD, and wait4(pid, __WCLONE) reaps it
+ * with the status intact.
+ *
+ * Everything else about it is fork: no address space, no fd table and no signal
+ * handlers are shared, and newsp = 0 gives the child a copy-on-write image of
+ * the parent's stack. */
+static inline long sys_fork_quiet(void) {
+    return CNG_SYS(__NR_clone, 0 /*no exit signal*/, 0, 0, 0, 0, 0);
+}
 static inline _Noreturn void sys_exit_group(int code) {
     CNG_SYS(__NR_exit_group, code, 0, 0, 0, 0, 0);
     __builtin_unreachable();

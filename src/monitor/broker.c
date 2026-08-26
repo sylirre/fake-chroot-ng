@@ -990,15 +990,48 @@ static void broker_close_inherited(void) {
  *
  * The shm side reaches this from inside the SIGSYS handler of a guest that may
  * be multithreaded: fork clones only the calling thread, and everything the
- * daemon then runs is our own gate-issued syscalls, so it is safe there. The
- * one wart is the wait4 for the middle child — a guest sitting in wait4(-1) on
- * another thread can reap it first and see an exit status it never spawned. */
+ * daemon then runs is our own gate-issued syscalls, so it is safe there.
+ *
+ * The middle child is nevertheless a child of the GUEST's process for as long as
+ * it takes to fork the daemon and exit, and for that moment the guest owned a
+ * process it had never started: its exit sent the guest a SIGCHLD (which
+ * interrupts a blocking call, and reaches whatever handler the guest has armed
+ * for its own children), and a guest thread in wait4(-1) on another thread could
+ * reap it and be handed an exit status belonging to nobody it spawned. Neither
+ * is a race we can win — the reap below is one syscall, but the window is real.
+ *
+ * So the middle child is cloned with no exit signal instead (sys_fork_quiet):
+ * the kernel then sends nothing on its death and hides it from every wait that
+ * does not explicitly ask for clone children. Ours has to ask, hence __WALL. */
+
+/* ...where the host will have it. qemu-user's clone implements exactly one
+ * fork — `clone(SIGCHLD)` — and answers EINVAL to every other flag word,
+ * including the empty one (measured, qemu 8.2). That is an emulator, not a
+ * target, but a broker that could not start there would take the whole System V
+ * IPC and --shared-proc side of the suite with it, so the plain fork stays as
+ * the fallback and the visibility comes back with it. Asked once: a kernel does
+ * not change its mind about a flag word. */
+static long broker_fork(void) {
+    static int no_quiet;
+    if (!no_quiet) {
+        long p = sys_fork_quiet();
+        if (p != -EINVAL)
+            return p;
+        no_quiet = 1;
+    }
+    return sys_fork();
+}
+
 static void broker_spawn(struct cng_sockaddr_un *a, unsigned al) {
-    long p = sys_fork();
+    long p = broker_fork();
     if (p < 0)
         return;
     if (p > 0) {
-        sys_wait4((int)p, 0, 0, 0); /* reap the middle child */
+        /* Reap the middle child. Retried on EINTR: left a zombie, it would be
+         * one the guest cannot see and cannot reap either, held until the whole
+         * process exits. */
+        while (sys_wait4((int)p, 0, CNG_WALL, 0) == -EINTR)
+            ;
         return;
     }
     CNG_SYS(__NR_setsid, 0, 0, 0, 0, 0, 0);

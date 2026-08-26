@@ -90,6 +90,36 @@ check_contains "the backing file's name is unguessable and exclusively created" 
 SG=$(mktemp -d)
 # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
 m12run() { run $GUEST_BINDS "$@"; }
+
+# --- what the guest can see of the broker's own startup ---------------------
+# The daemon is started by a double fork from whichever guest process makes the
+# first SysV IPC call, and the middle child of that fork is a child of the
+# guest's process. Its exit used to send the guest a SIGCHLD for a process the
+# guest never started (and could be reaped by a wait() on another thread). It is
+# cloned with no exit signal now, which the kernel neither signals nor shows to
+# an ordinary wait. Needs no host SysV shm — the emulation is the whole
+# subject — so it sits outside the differential block below.
+if ! guest_xlate_ready "broker spawn visibility"; then
+    :
+elif ! guest_cc_report "$SG/brokerchld" tests/guests/brokerchld.c; then
+    :
+else
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+    bc_out=$(run_t 60 $GUEST_BINDS -R "$SG" /brokerchld 2>/dev/null)
+    # The control: this run can see a SIGCHLD and reap a child at all.
+    check_contains "m12 a guest's own child is still its own" \
+        "own: chld=1 reaped=1 status=3" "$bc_out"
+    check_contains "m12 the first SysV call starts the broker" \
+        "broker: got=1" "$bc_out"
+    case "$bc_out" in
+    *"quiet: 1"*)
+        check_contains "m12 starting the broker leaves the guest nothing to see" \
+            "broker: got=1 chld=0 wait=-1 e=10" "$bc_out" ;;
+    *)
+        skip "m12 broker spawn visibility: no exit-signal-less clone here (qemu-user implements clone(SIGCHLD) and nothing else)" ;;
+    esac
+fi
+
 m12_kbase=
 m12_ready=0
 if guest_xlate_ready "SysV shm differential"; then
