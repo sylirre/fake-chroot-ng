@@ -967,8 +967,9 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
     return 0;
 }
 
-/* Shared emulation core: the checks that need only the guest's own pointers,
- * then the snapshot (see exec_args_take) around the part that maps the image. */
+/* Shared emulation core: the checks that need nothing but the arguments as they
+ * arrive, then the snapshot (see exec_args_take), and from there on every check
+ * reads the snapshot rather than the guest's own memory. */
 static long execve_core(int dirfd, const char *path, char **argv, char **envp,
                         int flags, unsigned long *out_sp,
                         unsigned long *out_entry) {
@@ -981,9 +982,10 @@ static long execve_core(int dirfd, const char *path, char **argv, char **envp,
      * undefined bit, which the kernel refuses. */
     if (flags & ~(CNG_AT_EMPTY_PATH | CNG_AT_SYMLINK_NOFOLLOW))
         return -EINVAL;
-    /* The path is guest memory and everything below reads it — the l2s check,
-     * the resolver, the snapshot — so it is validated once, here, before the
-     * first dereference (`path[0]` was one). */
+    /* The path is guest memory, and it is measured out of a copy (`path[0]` was
+     * a bare dereference once) because its length is what decides AT_EMPTY_PATH
+     * below. Only the length is kept: the bytes themselves are taken again by
+     * the snapshot, and every check past that point reads the snapshot. */
     long plen = cng_user_strlen(path, EXEC_MAX_STRLEN);
     if (plen < 0)
         return plen;
@@ -1004,15 +1006,6 @@ static long execve_core(int dirfd, const char *path, char **argv, char **envp,
         flags &= ~CNG_AT_SYMLINK_NOFOLLOW; /* nothing left to follow */
     }
 
-    /* l2s machinery is invisible to the guest — not executable either. Both
-     * tiers (SIGSYS cng_emulate_execve, -R cng_execve_tramp) come through
-     * here, so this covers every exec path. */
-    if (cng_g_l2s && cng_l2s_deny(dirfd, path)) {
-        if (cng_g_debug)
-            cng_dprintf(2, "[cng] execve %s -> l2s-hidden\n", path);
-        return -ENOENT;
-    }
-
     struct exec_args a;
     long rc = exec_args_take(&a, path, argv, envp);
     if (rc < 0) {
@@ -1021,6 +1014,29 @@ static long execve_core(int dirfd, const char *path, char **argv, char **envp,
                         -rc);
         return rc;
     }
+
+    /* l2s machinery is invisible to the guest — not executable either. Both
+     * tiers (SIGSYS cng_emulate_execve, -R cng_execve_tramp) come through
+     * here, so this covers every exec path.
+     *
+     * Judged on the snapshot, never on the guest's own pointer. The string this
+     * reads has to be the string that then gets loaded, and between the check
+     * and the copy the memory belongs to the exec'ing process: another of its
+     * threads can put a hidden name there once the check has passed on an
+     * innocent one, and can unmap it outright — which inside the handler, where
+     * SIGSEGV is masked, is not an -ENOENT but the death of the guest.
+     * cng_l2s_deny walks the path itself (basename, and a canonicalization for
+     * "/.l2s"), so it is exactly the kind of caller dispatch.c already hands a
+     * copy to. Being after the snapshot also puts the answer in the order the
+     * rest of this path already gives it: a name that does not resolve is
+     * -ENOENT from execve_load, likewise after -E2BIG/-EFAULT. */
+    if (cng_g_l2s && cng_l2s_deny(dirfd, a.path)) {
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] execve %s -> l2s-hidden\n", a.path);
+        exec_args_free(&a);
+        return -ENOENT;
+    }
+
     rc = execve_load(dirfd, a.path, a.argv, a.envp, flags, out_sp, out_entry);
     /* The new stack owns its own copy of everything by now (on the failure paths
      * nothing was consumed at all), so the snapshot goes either way. */
