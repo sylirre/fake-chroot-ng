@@ -3443,18 +3443,31 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * refuses to start on a release below its build-time minimum whatever else
      * is true. nodename and domainname are the host's: they name the machine
      * the guest really is on, which is what a guest expects to see and what
-     * `hostname` reports either way. The buffer is six 65-byte fields
-     * (__NEW_UTS_LEN + 1); the kernel filled and validated it just now. */
+     * `hostname` reports either way.
+     *
+     * The buffer is six 65-byte fields (__NEW_UTS_LEN + 1), and it is ours, not
+     * the guest's: the kernel fills a copy of ours, the four fields are set
+     * there, and the whole struct goes out in one cng_user_copyout. Patching
+     * the guest's buffer in place — which is what "the kernel validated this
+     * pointer just now" invites — is a store into memory the guest owns, made
+     * some syscalls after the kernel last looked at it, and another thread of
+     * the guest is free to unmap it inside that gap. The store then faults in
+     * the SIGSYS handler, where SIGSEGV is masked and a fault is fatal, in
+     * place of the -EFAULT uname(2) answers. Filling our own buffer also keeps
+     * the host's release out of the guest's memory entirely, rather than
+     * putting it there and overwriting it an instant later. */
     case __NR_uname: {
-        long r = reissue(a0, a1, a2, a3, a4, a5, nr);
-        if (r != 0 || !a0)
+        char u[6 * 65];
+        long r = reissue((long)u, a1, a2, a3, a4, a5, nr);
+        if (r != 0)
             return r;
-        char *u = (char *)a0;
         uts_set(u + 0 * 65, "Linux");
         uts_set(u + 2 * 65, CNG_KREL);
         uts_set(u + 3 * 65, CNG_KVER);
         uts_set(u + 4 * 65, "aarch64");
-        return 0;
+        /* A NULL or unmapped buffer is the -EFAULT the kernel would have given
+         * for it, raised here rather than there. */
+        return cng_user_copyout((void *)a0, u, sizeof u);
     }
 
     /* POSIX timers do not survive an execve, and ours is emulated — the address

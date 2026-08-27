@@ -1328,6 +1328,10 @@ int cng_cmd_faulttest(int argc, char **argv, char **envp, unsigned long *auxv) {
         {"shmctl",
          cng_dispatch(__NR_shmctl, 0, CNG_IPC_SET, (long)bad, 0, 0, 0, 1)},
         {"sendmsg", cng_dispatch(__NR_sendmsg, 0, (long)bad, 0, 0, 0, 0, 1)},
+        /* uname is re-issued, but into a buffer of ours — the identity fields
+         * are faked there and the struct is handed over afterwards, so the
+         * guest's pointer is one we write to ourselves. */
+        {"uname", cng_dispatch(__NR_uname, (long)bad, 0, 0, 0, 0, 0, 1)},
         /* A /proc magic link is answered from our own bookkeeping, so this
          * buffer is one the kernel never validates either. */
         {"readlinkat",

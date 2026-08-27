@@ -37,7 +37,8 @@ case "$out" in
     # CNG_DEBUG=1 turned that -EFAULT into a SIGSEGV inside the handler, where
     # it is masked and fatal. CNG_DEBUG must never change what the guest gets.
     for _c in rt_sigaction rt_sigprocmask getcwd getresuid getresgid \
-        setgroups getgroups capget shmctl sendmsg readlinkat "openat path" \
+        setgroups getgroups capget shmctl sendmsg uname readlinkat \
+        "openat path" \
         "renameat path2" "execve path" "execve argv" "execve argv string" \
         "execve path (CNG_DEBUG)"; do
         check_contains "$_c answers EFAULT" "faulttest $_c=-14 want=-14 -> OK" \
