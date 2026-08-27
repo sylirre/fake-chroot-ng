@@ -30,17 +30,46 @@
  * uses the 64-bit ipc structs, which on arm64 is the only layout there is. */
 #define IPC_64 0x100
 
-#define ATT_MAX 128 /* attachments one process can track */
-
-/* va == 0 is a free slot; ATT_CLAIMING reserves one while the payload is
- * written, so a scan never sees a half-filled entry. */
+/* Attachments this process holds. va == 0 is a free entry; ATT_CLAIMING
+ * reserves one while the payload is written, so a scan never sees a half-filled
+ * one.
+ *
+ * A fixed table was the wrong shape for it. Linux enforces no per-process attach
+ * limit — shminfo's SHMSEG is reported and never applied — so an attachment past
+ * the end of one was recorded nowhere, and the two things this table exists for
+ * both went wrong for it: shmdt(addr) answered EINVAL for an address the kernel
+ * would have detached, and an exec left it attached with its count on the
+ * broker's nattch. Measured against the host kernel, 200 attaches of one
+ * segment: 200 detached there, 128 here.
+ *
+ * So it grows instead, one page-sized block at a time, chained and never freed.
+ * The first block is ordinary .bss, which keeps the common case allocation-free,
+ * and every later one is private anonymous memory of this process — so a fork
+ * child inherits the whole chain at the same addresses, exactly as it inherited
+ * the first block alone. */
+#define ATT_BLK      128 /* entries per block */
 #define ATT_CLAIMING (~(u64)0)
 
-static struct {
+struct att_ent {
     u64 va;
     u64 size;
     s32 shmid;
-} g_att[ATT_MAX];
+};
+
+struct att_blk {
+    struct att_blk *next;
+    struct att_ent e[ATT_BLK];
+};
+
+static struct att_blk g_att0;
+
+/* Every entry of every block. `next` is published with a release store and read
+ * with an acquire load, so a block is either not seen at all or seen with its
+ * entries (all zero, i.e. free) already visible. */
+#define ATT_FOR(e)                                                             \
+    for (struct att_blk *_b = &g_att0; _b;                                     \
+         _b = __atomic_load_n(&_b->next, __ATOMIC_ACQUIRE))                    \
+        for (struct att_ent *e = _b->e; e < _b->e + ATT_BLK; e++)
 
 /* ---- broker calls ------------------------------------------------------- */
 
@@ -91,21 +120,50 @@ static void shm_dt(s32 shmid) {
 
 /* ---- the attach list ---------------------------------------------------- */
 
-/* Record an attachment already mapped at `va`. Returns 0 if the list is full,
- * in which case (as in arm64chroot) the attach is simply untracked: shmdt of it
- * answers EINVAL and execve will not detach it, and the broker reclaims the
- * leaked nattch when this process dies. Refusing the attach outright would be
- * the worse lie — a real shmat has no such limit. */
+/* Append a block after `tail`. 1 when the chain has grown — by this call or by
+ * another thread that got there first, which serves just as well — 0 when the
+ * host would not give us the page. */
+static int att_grow(struct att_blk *tail) {
+    unsigned long sz = cng_page_up(sizeof(struct att_blk));
+    void *p = sys_mmap(0, sz, CNG_PROT_READ | CNG_PROT_WRITE,
+                       CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (p == CNG_MAP_FAILED || cng_is_err((long)p))
+        return 0;
+    struct att_blk *none = 0;
+    if (!__atomic_compare_exchange_n(&tail->next, &none, (struct att_blk *)p, 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+        sys_munmap(p, sz); /* lost the append: theirs is the block we scan */
+    return 1;
+}
+
+/* Record an attachment already mapped at `va`. Returns 0 only when no memory
+ * for another block could be had at all, in which case the attach is untracked:
+ * shmdt of it answers EINVAL and execve will not detach it, and the broker
+ * reclaims the leaked nattch when this process dies. Refusing the attach
+ * outright would be the worse lie — a real shmat has no such limit. */
 static int att_add(s32 shmid, u64 va, u64 size) {
-    for (int i = 0; i < ATT_MAX; i++) {
-        u64 expect = 0;
-        if (!__atomic_compare_exchange_n(&g_att[i].va, &expect, ATT_CLAIMING, 0,
-                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
-            continue;
-        g_att[i].shmid = shmid;
-        g_att[i].size = size;
-        __atomic_store_n(&g_att[i].va, va, __ATOMIC_RELEASE); /* now findable */
-        return 1;
+    /* Each round either takes an entry or lengthens the chain, so the bound is
+     * only there to keep a pathological interleave from spinning for ever. */
+    for (int round = 0; round < 64; round++) {
+        struct att_blk *tail = &g_att0;
+        for (struct att_blk *b = &g_att0; b;
+             b = __atomic_load_n(&b->next, __ATOMIC_ACQUIRE)) {
+            tail = b;
+            for (int i = 0; i < ATT_BLK; i++) {
+                u64 expect = 0;
+                if (!__atomic_compare_exchange_n(&b->e[i].va, &expect,
+                                                 ATT_CLAIMING, 0,
+                                                 __ATOMIC_ACQ_REL,
+                                                 __ATOMIC_RELAXED))
+                    continue;
+                b->e[i].shmid = shmid;
+                b->e[i].size = size;
+                __atomic_store_n(&b->e[i].va, va, __ATOMIC_RELEASE); /* findable */
+                return 1;
+            }
+        }
+        if (!att_grow(tail))
+            return 0;
     }
     return 0;
 }
@@ -132,14 +190,14 @@ static int att_add(s32 shmid, u64 va, u64 size) {
  * leaves its nattch and its address: the split it models is not one this table
  * can express. */
 static void att_retire_covered(u64 p, u64 len) {
-    for (int i = 0; i < ATT_MAX; i++) {
-        u64 va = __atomic_load_n(&g_att[i].va, __ATOMIC_ACQUIRE);
+    ATT_FOR(e) {
+        u64 va = __atomic_load_n(&e->va, __ATOMIC_ACQUIRE);
         if (!va || va == ATT_CLAIMING || va < p || va >= p + len)
             continue;
-        s32 shmid = g_att[i].shmid; /* before the CAS: see do_shmdt */
-        u64 size = g_att[i].size;
+        s32 shmid = e->shmid; /* before the CAS: see do_shmdt */
+        u64 size = e->size;
         u64 expect = va;
-        if (!__atomic_compare_exchange_n(&g_att[i].va, &expect, 0, 0,
+        if (!__atomic_compare_exchange_n(&e->va, &expect, 0, 0,
                                          __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
             continue;
         if (va + size <= p + len)
@@ -228,18 +286,18 @@ static long do_shmat(s32 shmid, u64 shmaddr, s32 shmflg) {
 static long do_shmdt(u64 addr) {
     if (!addr)
         return -EINVAL;
-    for (int i = 0; i < ATT_MAX; i++) {
-        if (__atomic_load_n(&g_att[i].va, __ATOMIC_ACQUIRE) != addr)
+    ATT_FOR(e) {
+        if (__atomic_load_n(&e->va, __ATOMIC_ACQUIRE) != addr)
             continue;
-        s32 shmid = g_att[i].shmid;
-        u64 len = g_att[i].size;
-        /* Release the slot before unmapping so a concurrent shmdt of the same
-         * address cannot double-count the detach; the loser sees no slot and
+        s32 shmid = e->shmid;
+        u64 len = e->size;
+        /* Release the entry before unmapping so a concurrent shmdt of the same
+         * address cannot double-count the detach; the loser sees no entry and
          * answers EINVAL, exactly as a second shmdt should. */
         u64 expect = addr;
-        if (!__atomic_compare_exchange_n(&g_att[i].va, &expect, 0, 0,
+        if (!__atomic_compare_exchange_n(&e->va, &expect, 0, 0,
                                          __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
-            break;
+            return -EINVAL;
         sys_munmap((void *)addr, len);
         shm_dt(shmid);
         return 0;
@@ -358,22 +416,22 @@ long cng_shm_handle(long nr, long a0, long a1, long a2) {
 /* ---- fork / execve bookkeeping ------------------------------------------ */
 
 void cng_shm_fork_child(void) {
-    for (int i = 0; i < ATT_MAX; i++) {
-        u64 va = __atomic_load_n(&g_att[i].va, __ATOMIC_ACQUIRE);
+    ATT_FOR(e) {
+        u64 va = __atomic_load_n(&e->va, __ATOMIC_ACQUIRE);
         if (!va || va == ATT_CLAIMING)
             continue;
         struct cng_breq q;
         memset(&q, 0, sizeof q);
         q.op = CNG_REQ_SHMFORK; /* stamped with our pid: the child's */
-        q.id = g_att[i].shmid;
+        q.id = e->shmid;
         struct cng_bresp r;
         cng_broker_rpc(&q, &r, 0);
     }
 }
 
 void cng_shm_detach_all(void) {
-    for (int i = 0; i < ATT_MAX; i++) {
-        u64 va = __atomic_load_n(&g_att[i].va, __ATOMIC_ACQUIRE);
+    ATT_FOR(e) {
+        u64 va = __atomic_load_n(&e->va, __ATOMIC_ACQUIRE);
         if (!va || va == ATT_CLAIMING)
             continue;
         /* Copied out before the CAS, as do_shmdt does and for the same reason:
@@ -382,10 +440,10 @@ void cng_shm_detach_all(void) {
          * Read afterwards, the length belonged to that segment and this
          * unmapped the old address for the new one's size, then charged the
          * detach against the wrong shmid. */
-        s32 shmid = g_att[i].shmid;
-        u64 len = g_att[i].size;
+        s32 shmid = e->shmid;
+        u64 len = e->size;
         u64 expect = va;
-        if (!__atomic_compare_exchange_n(&g_att[i].va, &expect, 0, 0,
+        if (!__atomic_compare_exchange_n(&e->va, &expect, 0, 0,
                                          __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
             continue;
         sys_munmap((void *)va, len);

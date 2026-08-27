@@ -218,6 +218,51 @@ if [ "$m12_ready" = 1 ]; then
         fi
     fi
 
+    # Both tables the emulation tracks attachments in used to be fixed-size, and
+    # neither limit exists in the kernel: 128 attachments per process (past which
+    # shmdt answered EINVAL for an address the kernel detaches) and 32 attaching
+    # processes per segment (past which a dead attacher's count stayed on nattch
+    # for good). qemu-aarch64 cannot referee this — its own shm bookkeeping is 32
+    # regions wide — so the reference side is a host build, as SHM_REMAP's leg
+    # above and M22's msgsnd ordering are.
+    MANY_ORACLE=$SG/shm_many
+    many_ready=1
+    if ! guest_cc "$SG/shm_many" tests/guests/shm_many.c; then
+        many_ready=0
+        skip "m12 attachment tables: the guest program does not build here"
+    elif [ -n "$QEMU" ]; then
+        many_ready=0
+        for _c in ${HOSTCC:-} cc gcc clang; do
+            have "$_c" || continue
+            if "$_c" -O2 -o "$SG/many_host" tests/guests/shm_many.c 2>/dev/null
+            then
+                MANY_ORACLE=$SG/many_host
+                many_ready=1
+                break
+            fi
+        done
+        [ "$many_ready" = 1 ] ||
+            skip "m12 attachment tables: no host compiler for the differential oracle"
+    fi
+    if [ "$many_ready" = 1 ]; then
+        if [ -n "$TIMEOUT" ]; then
+            many_k=$("$TIMEOUT" 120 "$MANY_ORACLE" 2>/dev/null)
+        else
+            many_k=$("$MANY_ORACLE" 2>/dev/null)
+        fi
+        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
+        many_e=$(run_t 120 $GUEST_BINDS -R "$SG" /shm_many 2>/dev/null)
+        if [ "$many_k" = "$many_e" ]; then
+            pass=$((pass + 1))
+            printf '  ok   m12 attachment tracking has no limit the kernel does not\n'
+        else
+            fail=$((fail + 1))
+            printf '  FAIL m12 attachment tracking runs out where the kernel does not\n'
+            printf '    kernel: %s\n' "$(echo "$many_k" | tr '\n' '|')"
+            printf '    cng   : %s\n' "$(echo "$many_e" | tr '\n' '|')"
+        fi
+    fi
+
     # ...and again over the file-backed tier, which must be indistinguishable
     # from the memfd one (only the broker's backing differs).
     out_k=$m12_kbase

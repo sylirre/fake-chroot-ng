@@ -332,7 +332,7 @@ const char *cng_broker_shared_dir(void) {
 /* ---- daemon: the System V shm registry ---------------------------------- */
 
 #define SHM_SEG_MAX   1024 /* concurrent segments in one namespace */
-#define SHM_ATT_TRACK 32   /* per-segment attacher slots (death reclaim) */
+#define SHM_ATT_TRACK 32   /* per-segment attacher rows the first block holds */
 
 struct seg_att {
     s32 pid;
@@ -352,8 +352,17 @@ struct seg {
     char path[128]; /* file-tier backing path to unlink, else "" */
     u64 nattch;
     int rmid; /* IPC_RMID pending: free at the last detach */
-    struct seg_att att[SHM_ATT_TRACK];
-    int natt;
+    /* Who is attached, so an attach held by a process that dies without
+     * detaching can be taken off nattch. The kernel keeps this in the VMAs
+     * themselves and has no table to run out of; a fixed one here meant that
+     * past the 32nd distinct attacher the count stayed on nattch for good, and
+     * a guest reading nattch after waitpid() was shown attachments belonging to
+     * processes that no longer exist (measured against the host kernel, one
+     * segment and 40 attaching processes: nattch 1 there, 91 here). Grown by
+     * doubling instead — a page at a time, which is 170 rows to start with. */
+    struct seg_att *att;
+    int natt, attcap;
+    u64 attmap; /* bytes mapped at `att`, for the munmap */
 };
 
 static struct seg *g_seg; /* SHM_SEG_MAX entries, mmap'd by the daemon */
@@ -373,6 +382,8 @@ static void shm_free(struct seg *s) {
         sys_close(s->memfd);
     if (s->path[0])
         CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, s->path, 0, 0, 0, 0);
+    if (s->att)
+        sys_munmap(s->att, s->attmap);
     memset(s, 0, sizeof *s); /* used = 0 */
 }
 
@@ -405,21 +416,41 @@ static int shm_owner(const struct seg *s, u32 uid) {
     return uid == 0 || uid == s->uid || uid == s->cuid;
 }
 
+/* Room for one more attacher row. The daemon is single-threaded, so nothing
+ * here needs to be atomic. 0 only when the host would give no memory at all. */
+static int shm_att_reserve(struct seg *s) {
+    if (s->natt < s->attcap)
+        return 1;
+    int want = s->attcap ? s->attcap * 2 : SHM_ATT_TRACK;
+    u64 sz = cng_page_up((u64)want * sizeof(struct seg_att));
+    void *p = sys_mmap(0, sz, CNG_PROT_READ | CNG_PROT_WRITE,
+                       CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (p == CNG_MAP_FAILED || cng_is_err((long)p))
+        return 0;
+    if (s->att) {
+        memcpy(p, s->att, (unsigned long)s->natt * sizeof(struct seg_att));
+        sys_munmap(s->att, s->attmap);
+    }
+    s->att = (struct seg_att *)p;
+    s->attcap = (int)(sz / sizeof(struct seg_att));
+    s->attmap = sz;
+    return 1;
+}
+
 static void shm_att_add(struct seg *s, s32 pid) {
     for (int i = 0; i < s->natt; i++)
         if (s->att[i].pid == pid) {
             s->att[i].n++;
             return;
         }
-    if (s->natt < SHM_ATT_TRACK) {
-        s->att[s->natt].pid = pid;
-        s->att[s->natt].start = cng_proc_starttime(pid, 0);
-        s->att[s->natt].n = 1;
-        s->natt++;
-    }
-    /* overflow (> SHM_ATT_TRACK distinct attachers): untracked — nattch still
-     * counts it, but this attacher's death is not reclaimed precisely; the
-     * segment is freed at namespace-idle GC instead. */
+    if (!shm_att_reserve(s))
+        return; /* no memory for a row: untracked — nattch still counts it, but
+                 * this attacher's death is not reclaimed precisely and the
+                 * segment is freed at namespace-idle GC instead. */
+    s->att[s->natt].pid = pid;
+    s->att[s->natt].start = cng_proc_starttime(pid, 0);
+    s->att[s->natt].n = 1;
+    s->natt++;
 }
 
 static void shm_att_del(struct seg *s, s32 pid) {
