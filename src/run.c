@@ -34,6 +34,7 @@
 #include "cng/netlink.h"
 #include "cng/path.h"
 #include "cng/procfs.h"
+#include "cng/procreg.h" /* cng_g_shared_proc */
 #include "cng/ptrace.h"
 #include "cng/rewrite.h"
 #include "cng/rt.h"
@@ -392,9 +393,24 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
     cng_pt_init();
 
     /* Install the monitor last, after all of our own path syscalls are done.
-     * Only when translation was actually requested; identity needs none. */
+     * Only when it has something to do: an identity view needs no translation.
+     *
+     * Two options need a trap of ours whatever the view is, and were inert
+     * without this. --no-ptrace has to *refuse* ptrace(2), which takes the trap
+     * that would otherwise emulate it — left out, the guest's ptrace went
+     * straight to the host kernel and worked, which is the opposite of what was
+     * asked for. --shared-proc has to publish this invocation's processes into
+     * the shared registry as they fork, and that hook hangs off the trapped
+     * clone; without it a --shared-proc invocation over `/` published its root
+     * process and nothing else, so another invocation's `ps` saw one process
+     * where there were dozens.
+     *
+     * --no-proc, --no-dev and --share-abstract-sockets are the opposite case:
+     * each turns an emulation of ours off, and with no monitor installed there
+     * is none to turn off, so they are already honored by not being here. */
     int want_xlate = (strcmp(rootfs, "/") != 0) || nb > 0 || cng_g_fake_id ||
-                     cng_g_rewrite || cng_g_l2s;
+                     cng_g_rewrite || cng_g_l2s || cng_g_no_ptrace ||
+                     cng_g_shared_proc;
     if (want_xlate) {
         int mrc = cng_install_monitor(&g_fs);
         if (mrc < 0)

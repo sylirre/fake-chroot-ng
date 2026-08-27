@@ -198,6 +198,43 @@ else
     # misinterpreting.
     out=$(run_t 60 --no-ptrace -R / "$PT_GUEST" basic 2>&1)
     check_contains "--no-ptrace refuses the guest tracer" "bad first stop" "$out"
+
+    # ...and without -R, which is the case the option was inert in: the monitor
+    # was installed only when there was a path to translate, so over an identity
+    # rootfs with nothing else asked for, --no-ptrace set its flag and no trap
+    # ever consulted it. The guest's ptrace went to the host kernel and worked.
+    # Only a live seccomp tier can show that: without one and without -R nothing
+    # is intercepted at all, which is what the following leg asks instead.
+    if [ "$CNG_SECCOMP_LIVE" = 1 ]; then
+        out=$(run_t 60 --no-ptrace / "$PT_GUEST" basic 2>&1)
+        check_contains "--no-ptrace refuses over the SIGSYS tier too" \
+            "bad first stop" "$out"
+    else
+        skip "m18 --no-ptrace without -R: the seccomp tier is inert here"
+    fi
+fi
+
+# Which options are worth installing a monitor for, over a rootfs that needs no
+# translation at all. An option that turns an emulation of ours OFF is already
+# honoured by there being no monitor; one whose whole effect is a trap of ours is
+# not — --no-ptrace has a ptrace to refuse, and --shared-proc has to publish each
+# forked guest process into the shared registry, which hangs off the trapped
+# clone. Asked through PR_SET_NO_NEW_PRIVS, which installing the monitor sets and
+# /proc/self/status reports: on a host whose seccomp tier is inert that is the
+# only thing about an installed monitor a guest can still see.
+if guest_cc_report "$PT_DIR/nnprivs" tests/guests/nnprivs.c; then
+    out=$(run_t 60 / "$PT_DIR/nnprivs" 2>/dev/null)
+    check_contains "an identity view with nothing to translate installs no monitor" \
+        "nnp=0" "$out"
+    out=$(run_t 60 --no-proc / "$PT_DIR/nnprivs" 2>/dev/null)
+    check_contains "...nor does an option that only turns an emulation off" \
+        "nnp=0" "$out"
+    out=$(run_t 60 --no-ptrace / "$PT_DIR/nnprivs" 2>/dev/null)
+    check_contains "--no-ptrace installs one: it has a ptrace to refuse" \
+        "nnp=1" "$out"
+    out=$(run_t 60 --shared-proc / "$PT_DIR/nnprivs" 2>/dev/null)
+    check_contains "--shared-proc installs one: forks must reach the registry" \
+        "nnp=1" "$out"
 fi
 
 rm -rf "$PT_DIR"
