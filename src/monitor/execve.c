@@ -148,8 +148,14 @@ struct exec_args {
  * 32 pages, and the entry count is capped well above anything real (the kernel's
  * MAX_ARG_STRINGS is 0x7FFFFFFF, but the byte budget below bites long before
  * that, and a bounded walk is what keeps a bogus vector from costing a probe
- * per entry forever). Both answer -E2BIG, as the kernel does. */
-#define EXEC_MAX_STRLEN  (32u * 4096u)
+ * per entry forever). Both answer -E2BIG, as the kernel does.
+ *
+ * 32 *pages*, which is not 32 * 4096 everywhere: the Android devices this
+ * exists for run 16 KiB pages, where the kernel's own MAX_ARG_STRLEN is 512 KiB
+ * and a hard-coded 128 KiB refused, with an -E2BIG of our own invention,
+ * strings a real execve there takes. exec_arg_max() below reads the page size
+ * for the same reason. */
+static unsigned long exec_max_strlen(void) { return 32 * cng_page_size; }
 #define EXEC_MAX_STRINGS 0x40000u
 
 /* What a real execve accepts: a quarter of RLIMIT_STACK, floored at 32 pages
@@ -201,8 +207,8 @@ static long copy_vec(char **src, char **dst_vec, int slots, char **pool,
             /* Whichever bites first: the room left in the pool, or the per-string
              * bound the sizing pass held this string to (MAX_ARG_STRLEN). */
             unsigned long cap = (unsigned long)(end - *pool);
-            if (cap > EXEC_MAX_STRLEN)
-                cap = EXEC_MAX_STRLEN;
+            if (cap > exec_max_strlen())
+                cap = exec_max_strlen();
             long n = cng_user_strcopyin(*pool, dst_vec[i], cap);
             if (n < 0)
                 return n;
@@ -245,7 +251,7 @@ static long vec_bytes(char **v, int *count) {
         if (cng_user_copyin(win, v + i, (unsigned long)k * sizeof *win) < 0)
             return -EFAULT;
         for (long j = 0; j < k; j++) {
-            long len = cng_user_strlen(win[j], EXEC_MAX_STRLEN);
+            long len = cng_user_strlen(win[j], exec_max_strlen());
             if (len < 0)
                 return len;
             bytes += (unsigned long)len + 1;
@@ -259,7 +265,7 @@ static long vec_bytes(char **v, int *count) {
 static long exec_args_take(struct exec_args *a, const char *path, char **argv,
                            char **envp) {
     int argc = 0, envc = 0;
-    long pn = cng_user_strlen(path, EXEC_MAX_STRLEN);
+    long pn = cng_user_strlen(path, exec_max_strlen());
     if (pn < 0)
         return pn;
     long ab = vec_bytes(argv, &argc);
@@ -1008,7 +1014,7 @@ static long execve_core(int dirfd, const char *path, char **argv, char **envp,
      * a bare dereference once) because its length is what decides AT_EMPTY_PATH
      * below. Only the length is kept: the bytes themselves are taken again by
      * the snapshot, and every check past that point reads the snapshot. */
-    long plen = cng_user_strlen(path, EXEC_MAX_STRLEN);
+    long plen = cng_user_strlen(path, exec_max_strlen());
     if (plen < 0)
         return plen;
 

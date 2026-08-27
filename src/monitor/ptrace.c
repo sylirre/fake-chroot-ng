@@ -19,6 +19,7 @@
  * not for speed — it is because all of this runs inside the SIGSYS handler,
  * where a sleeping lock could deadlock against the thread it interrupted.
  */
+#include "cng/loader.h"
 #include "cng/monitor.h"
 #include "cng/procreg.h"
 #include "cng/ptrace.h"
@@ -689,8 +690,12 @@ long cng_pt_poke_text(u64 addr, const void *src, unsigned len) {
         cng_flush_icache((void *)addr, (void *)(addr + len));
         return 0;
     }
-    u64 page = addr & ~4095ULL;
-    u64 end = (addr + len + 4095) & ~4095ULL;
+    /* The page this lands in, at whatever the page size is here: mprotect takes
+     * a page-aligned address, so rounding to 4 KiB on a 16 KiB kernel — which
+     * is what the Android devices this targets run — refuses the call with
+     * EINVAL and a breakpoint into read-only text comes back -EIO. */
+    unsigned long page = cng_page_down((unsigned long)addr);
+    unsigned long end = cng_page_up((unsigned long)addr + len);
     int prot = pt_prot_of(addr);
     if (prot < 0)
         prot = CNG_PROT_READ | CNG_PROT_EXEC;

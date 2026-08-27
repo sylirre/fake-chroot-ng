@@ -349,6 +349,40 @@ fi
 rm -rf "$EED"
 
 
+# --- how long a single argv string may be -----------------------------------
+# fs/exec.c bounds each argv/envp string at MAX_ARG_STRLEN, which is 32 *pages*:
+# 128 KiB where a page is 4 KiB and 512 KiB on the 16 KiB kernels the Android
+# devices run. The emulation walks argv itself — the kernel never sees it — so
+# the bound is ours to get right, and a constant 32 * 4096 refused strings a
+# real execve on such a device takes, with an -E2BIG of our own invention.
+#
+# Referenced against the same binary with no chroot-ng under it, so the number
+# is the running kernel's rather than one written down here: on an AArch64 host
+# or device that is the kernel directly, and under qemu-user it agrees with the
+# host kernel (measured, both boundaries).
+AMD=$(mktemp -d)
+if ! guest_xlate_ready "argv string bound"; then
+    :
+elif ! guest_cc_report "$AMD/argmax" tests/guests/argmax.c; then
+    :
+elif [ "$CNG_SECCOMP_LIVE" != 1 ] && [ "$CNG_EXECMEM" != 1 ]; then
+    skip "argv string bound: no filter is live and -R cannot rewrite without execmem"
+else
+    am_k=$(emu_t 90 "$AMD/argmax" "$AMD/argmax" 2>/dev/null)
+    am_g=$(run_t 90 -R / "$AMD/argmax" "$AMD/argmax" 2>/dev/null)
+    if [ -n "$am_k" ] && [ "$am_k" = "$am_g" ]; then
+        pass=$((pass + 1))
+        printf '  ok   a single argv string is bounded where the kernel bounds it (%s)\n' \
+            "$(echo "$am_k" | tr '\n' '|')"
+    else
+        fail=$((fail + 1))
+        printf '  FAIL the argv string bound is not the one the kernel keeps\n'
+        printf '       kernel: %s\n' "$(echo "$am_k" | tr '\n' '|')"
+        printf '       cng   : %s\n' "$(echo "$am_g" | tr '\n' '|')"
+    fi
+fi
+rm -rf "$AMD"
+
 # --- what an exec chain costs the address space -----------------------------
 # A real execve throws the whole mm away. The emulated one cannot — the monitor
 # lives in that address space — so what it can give back is what its own loader
