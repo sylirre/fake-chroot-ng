@@ -748,6 +748,9 @@ static const char *vmres(ssize_t n) {
     }
 }
 
+/* 36 distinct bytes in the tracee, read back through several iovec entries. */
+static const char g_vecsrc[36] = "0123456789abcdefghijklmnopqrstuvwxyz";
+
 static int sc_vmrw(void) {
     pid_t pid = fork();
     if (pid == 0) {
@@ -778,6 +781,22 @@ static int sc_vmrw(void) {
     errno = 0;
     n = process_vm_readv(pid, &liov, 2048, &riov, 1, 0);
     printf("vmrw overmax %s\n", vmres(n));
+
+    /* Several entries a side, of different lengths, with an empty one among
+     * them: the two lists are walked in lockstep and neither index moves with
+     * the other, so this is the case where the walk leaves an entry behind and
+     * has to pick up the next one. 8 + 0 + 28 local against 30 + 6 remote —
+     * every boundary falling somewhere the other side has no boundary. */
+    char m0[8], m1[28];
+    memset(m0, 0, sizeof m0);
+    memset(m1, 0, sizeof m1);
+    struct iovec lmulti[3] = {{m0, sizeof m0}, {m0, 0}, {m1, sizeof m1}};
+    struct iovec rmulti[2] = {{(void *)g_vecsrc, 30}, {(void *)(g_vecsrc + 30), 6}};
+    errno = 0;
+    n = process_vm_readv(pid, lmulti, 3, rmulti, 2, 0);
+    printf("vmrw multi %s whole=%d\n", vmres(n),
+           n == (ssize_t)sizeof g_vecsrc && !memcmp(m0, g_vecsrc, sizeof m0) &&
+               !memcmp(m1, g_vecsrc + sizeof m0, sizeof m1));
 
     ptrace(PTRACE_CONT, pid, 0, 0);
     int st;

@@ -1871,11 +1871,40 @@ int cng_pt_vm_rw(long nr, long pid, u64 lvec, u64 lcnt, u64 rvec, u64 rcnt,
         *out = -EFAULT;
         return 1;
     }
-    /* Walk the two iovec lists in lockstep, as the kernel does. */
+    /* Walk the two iovec lists in lockstep, as the kernel does — but out of our
+     * own copy of each entry, taken the first time that entry is used.
+     *
+     * The probe above says the arrays were readable when it ran, which is
+     * neither a promise that they stay readable nor that they stay what they
+     * were: the guest owns this memory for the whole walk. A thread of it that
+     * unmaps a page the probe just blessed turns the -EFAULT this returns into
+     * a fault inside the handler, where SIGSEGV is masked and the fault is
+     * fatal; one that rewrites a slot the walk has not reached yet has the
+     * transfer running on a base and a length nothing ever checked. The kernel
+     * has no such gap — import_iovec copies both arrays before anything looks
+     * at them — and this closes it the same way. Cached by index, so it costs
+     * one copy per entry rather than one per PT_MBOX chunk. */
     unsigned long li = 0, ri = 0, loff = 0, roff = 0, total = 0;
+    u64 lent[2] = {0, 0}, rent[2] = {0, 0};
+    unsigned long lhave = ~0UL, rhave = ~0UL; /* which entry each copy holds */
+    int gone = 0;
     while (li < lc && ri < rc) {
-        u64 lbase = lv[li * 2] + loff, llen = lv[li * 2 + 1] - loff;
-        u64 rbase = rv[ri * 2] + roff, rlen = rv[ri * 2 + 1] - roff;
+        if (lhave != li) {
+            if (cng_user_copyin(lent, lv + li * 2, sizeof lent) < 0) {
+                gone = 1;
+                break;
+            }
+            lhave = li;
+        }
+        if (rhave != ri) {
+            if (cng_user_copyin(rent, rv + ri * 2, sizeof rent) < 0) {
+                gone = 1;
+                break;
+            }
+            rhave = ri;
+        }
+        u64 lbase = lent[0] + loff, llen = lent[1] - loff;
+        u64 rbase = rent[0] + roff, rlen = rent[1] - roff;
         if (!llen) { li++, loff = 0; continue; }
         if (!rlen) { ri++, roff = 0; continue; }
         u64 n = llen < rlen ? llen : rlen;
@@ -1899,6 +1928,14 @@ int cng_pt_vm_rw(long nr, long pid, u64 lvec, u64 lcnt, u64 rvec, u64 rcnt,
         roff += got;
         if (got < n)
             break; /* a fault on the tracee side: short, as the kernel reports */
+    }
+    /* An array that went away under the walk, with nothing transferred yet: the
+     * -EFAULT the probe would have given had it run a moment later. Once bytes
+     * have moved the count is the answer, as it is for a fault on the tracee's
+     * side. */
+    if (gone && !total) {
+        *out = -EFAULT;
+        return 1;
     }
     *out = (long)total;
     return 1;

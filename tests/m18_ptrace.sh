@@ -146,7 +146,11 @@ else
     # `unsigned` before refusing it above UIO_MAXIOV, which makes 1<<60 read as
     # zero segments rather than an error. Taking that count at face value both
     # wrapped the length validation to nothing (1<<60 entries of 16 bytes is
-    # exactly 2^64) and then walked the array off the end of guest memory.
+    # exactly 2^64) and then walked the array off the end of guest memory. The
+    # multi-entry leg walks both lists past their first entry, with the two
+    # sides' boundaries deliberately not lining up — the emulation reads each
+    # entry out of a copy of its own, so this is what moves it from one to the
+    # next.
     pt_case vmrw
     # Signals the emulation does not take over must still reach the kernel while
     # the task is traced. It hooks every catchable signal to route delivery
