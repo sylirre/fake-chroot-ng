@@ -458,6 +458,11 @@ static void help(char **envp) {
         {"CNG_PROCREG_FORCE_FILE", "With --shared-proc: skip the broker and use "
                       "the named-file registry tier. Test aid: that tier is "
                       "otherwise reached only without memfd_create."},
+        {"CNG_EXEC_RECLAIM_FORCE", "Treat the process as single-threaded when "
+                      "an emulated execve gives the replaced program's mappings "
+                      "back. Test aid for qemu-user, which runs a thread of its "
+                      "own beside the guest's; against a genuinely multithreaded "
+                      "guest it unmaps memory those threads are running on."},
         {"CNG_SCRATCH_NONE", "Behave as if the monitor's per-thread scratch "
                       "stack table had no slot to give, so every dispatch runs "
                       "on a stack mapped for the call. Test aid: a working host "

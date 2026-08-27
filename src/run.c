@@ -348,6 +348,7 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
     }
 
     unsigned long sp, entry;
+    struct cng_loaded interp;
     if (prog.has_interp) {
         char ipath[CNG_PATH_MAX];
         const char *ip;
@@ -358,7 +359,6 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
         else
             ip = prog.interp;
 
-        struct cng_loaded interp;
         int rc2 = cng_load_elf(ip, 0, &interp);
         if (rc2 != CNG_LOAD_OK) {
             cng_dprintf(2, "chroot-ng: cannot load interpreter %s: %s\n", ip,
@@ -376,6 +376,10 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
         cng_dprintf(2, "chroot-ng: argument list too long\n");
         return 1;
     }
+    /* The first generation. Nothing is retired here — there is no program being
+     * replaced — but an exec has to have something to retire when it comes. */
+    cng_exec_generation(&prog, prog.has_interp ? &interp : 0, cng_g_stack_lo,
+                        cng_g_stack_len);
     /* (svc rewriting + its pool are handled inside the loader, per object.) */
 
     /* /proc emulation: bring up the PID registry and reserve the synthesized fd

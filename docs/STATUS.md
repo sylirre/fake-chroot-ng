@@ -87,9 +87,11 @@ vfork/`posix_spawn` child-stack handling.
   handler resident (a real execve would wipe the handler). Load failures set
   -errno for normal execve semantics. Validated: the redirect resume via
   `-t jmptest`; the load+stack half is the M3/M4 path. Real trap needs HW.
-  Caveat: old program mappings are not torn down (leak across repeated execve);
-  the emulation runs on the main thread's large stack (multi-threaded execve
-  would want a sigaltstack — tracked with the M5 signal-stack hazard).
+  Caveat: the emulation runs on the main thread's large stack (multi-threaded
+  execve would want a sigaltstack — tracked with the M5 signal-stack hazard).
+  The old program's mappings were kept too, at 66.8 MB of address space per
+  generation; what the loader itself mapped for it — its image, its
+  interpreter's, and its 64 MiB stack — is given back now (see M32 below).
 
 - [x] **M7 — fidelity: fake user identity, /proc self-path fixups, link2symlink**
   - `-u`/`--fake-id[=uid[:gid]]` fake user identity (default `0:0` root): the
@@ -2078,6 +2080,30 @@ vfork/`posix_spawn` child-stack handling.
   every caller already turns into the `-ENAMETOOLONG` a kernel whose `PATH_MAX`
   the name exceeded would have given. Pinned on both sides of the boundary: 4093
   bytes of cwd still has room for `/x`, 4094 does not.
+
+- [x] **M32 — an exec chain kept every program it had already replaced**
+  A real `execve` throws the whole mm away. The emulated one cannot — the
+  monitor's code, its gate and its state are pages of the same address space —
+  so the previous program's mappings were simply left behind: measured, a static
+  guest exec'ing itself, **66.8 MB of address space per generation**, 64 MiB of
+  it the stack the loader builds. A wrapper-script chain paid it per level.
+  What is given back is exactly what the loader itself mapped for the program
+  being replaced — its image, its interpreter's image (each one reservation with
+  a recorded extent, so nothing is inferred from `/proc/self/maps`) and its
+  stack. What is not is what the previous program mapped for itself: the
+  libraries its `ld.so` loaded, its arenas, its thread stacks. Following those
+  would mean a VMA table of our own maintained on every `mmap`/`munmap`/`mremap`,
+  which is the per-syscall cost the `-R` tier exists to avoid; the brk heap, the
+  one such region with a handle on it, was already wound back.
+  Two conditions hold it up. The process must be single-threaded — a real execve
+  kills the other threads and ours cannot, so they go on running the old code on
+  the old stacks; `fork()` clones one thread, so the ordinary fork+exec arrives
+  here alone. And the outgoing stack cannot be freed at the exec itself, because
+  the SIGSYS tier returns into the new program through a signal frame that lives
+  on it: a generation is retired and handed back at the new program's first
+  dispatched syscall. An ET_EXEC image lands at its link-time vaddr, so a range
+  the incoming program already occupies is dropped rather than unmapped.
+  Measured after: 516 kB over eight execs, against the kernel's own 0.
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 

@@ -61,8 +61,10 @@ void cng_loader_check_execmem(void) {
  * the caller can retry file-backed. Supports M8 svc rewriting. */
 static int map_anon(int fd, const Elf64_Ehdr *eh, const Elf64_Phdr *ph,
                     int is_dyn, unsigned long lo, unsigned long span,
-                    unsigned long base_hint, unsigned long *bias_out) {
+                    unsigned long base_hint, unsigned long *bias_out,
+                    unsigned long *maplen_out) {
     unsigned long pool_extra = cng_g_rewrite ? CNG_TRAMP_POOL : 0;
+    *maplen_out = span + pool_extra;
     int mflags = CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS;
     void *want = is_dyn ? (void *)base_hint : (void *)lo;
     if (!is_dyn)
@@ -126,8 +128,10 @@ static int map_anon(int fd, const Elf64_Ehdr *eh, const Elf64_Phdr *ph,
  * mount. No M8 rewriting (code pages aren't writable). */
 static int map_file(int fd, const Elf64_Ehdr *eh, const Elf64_Phdr *ph,
                     int is_dyn, unsigned long lo, unsigned long span,
-                    unsigned long base_hint, unsigned long *bias_out) {
+                    unsigned long base_hint, unsigned long *bias_out,
+                    unsigned long *maplen_out) {
     int rflags = CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS;
+    *maplen_out = span;
     void *want = is_dyn ? (void *)base_hint : (void *)lo;
     if (!is_dyn)
         rflags |= CNG_MAP_FIXED;
@@ -362,18 +366,19 @@ int cng_elf_map(const struct cng_elf_plan *plan, unsigned long base_hint,
     const Elf64_Ehdr *eh = &plan->eh;
     const Elf64_Phdr *ph = plan->ph;
     unsigned long lo = plan->lo, hi = plan->hi, span = hi - lo, bias = 0;
+    unsigned long maplen = 0;
 
     int rc = cng_g_loader_file ? map_file(plan->fd, eh, ph, plan->is_dyn, lo,
-                                          span, base_hint, &bias)
+                                          span, base_hint, &bias, &maplen)
                                : map_anon(plan->fd, eh, ph, plan->is_dyn, lo,
-                                          span, base_hint, &bias);
+                                          span, base_hint, &bias, &maplen);
     if (rc == CNG_LOAD_EEXEC) {
         /* Anonymous executable memory was denied (e.g. NO_NEW_PRIVS revoking
          * execmem on Android). Fall back to file-backed exec mapping, which
          * works on an exec-permitted mount, and remember it for next time. */
         cng_g_loader_file = 1;
-        rc = map_file(plan->fd, eh, ph, plan->is_dyn, lo, span, base_hint,
-                      &bias);
+        rc = map_file(plan->fd, eh, ph, plan->is_dyn, lo, span, base_hint, &bias,
+                      &maplen);
     }
     if (rc != CNG_LOAD_OK)
         return rc;
@@ -396,6 +401,8 @@ int cng_elf_map(const struct cng_elf_plan *plan, unsigned long base_hint,
     out->base = bias;
     out->load_lo = bias + lo;
     out->load_hi = bias + hi;
+    out->map_lo = bias + lo;
+    out->map_len = maplen;
     out->is_dyn = plan->is_dyn;
     return CNG_LOAD_OK;
 }

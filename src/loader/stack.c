@@ -21,6 +21,8 @@
  * way the kernel derives ARG_MAX from RLIMIT_STACK.) */
 #define GUEST_STACK_SIZE CNG_GUEST_STACK_SIZE
 
+unsigned long cng_g_stack_lo, cng_g_stack_len;
+
 static unsigned long auxval(unsigned long *av, unsigned long t) {
     if (!av)
         return 0;
@@ -43,6 +45,12 @@ unsigned long cng_build_stack(int argc, char **argv, char **envp,
                          CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
     if (stk == CNG_MAP_FAILED || cng_is_err((long)stk))
         cng_die("guest stack mmap", (long)stk);
+    /* The region, not the sp inside it: an emulated execve gives the previous
+     * program's back (see cng_exec_generation), and it is by far the largest
+     * thing it can give back. Published only once everything below has
+     * succeeded — the one failure path here unmaps it again. */
+    cng_g_stack_lo = 0;
+    cng_g_stack_len = 0;
     unsigned long top = (unsigned long)stk + GUEST_STACK_SIZE;
 
     /* Where the address of each pushed string is collected until the vector
@@ -199,5 +207,7 @@ unsigned long cng_build_stack(int argc, char **argv, char **envp,
         w[idx++] = aux[i * 2 + 1];
     }
 
+    cng_g_stack_lo = (unsigned long)stk;
+    cng_g_stack_len = GUEST_STACK_SIZE;
     return sp;
 }

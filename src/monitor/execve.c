@@ -13,6 +13,7 @@
  * fresh stack and a kernel-chosen load base, so they don't collide. Repeated
  * execve leaks the old images (acceptable for now; noted in STATUS).
  */
+#include "cng/broker.h" /* cng_broker_env: no getenv in a freestanding build */
 #include "cng/l2s.h"
 #include "cng/loader.h"
 #include "cng/monitor.h"
@@ -346,6 +347,160 @@ void cng_timer_forget(int id) {
         }
 }
 
+/* ---- the address space of the program being replaced --------------------
+ *
+ * A real execve throws the whole mm away. Ours cannot: the monitor's code, its
+ * gate and its state are pages of the same address space, so the previous
+ * program's mappings were simply left behind and an exec chain accumulated all
+ * of them. Measured, a static guest exec'ing itself eight times: 66.8 MB of
+ * address space per generation — 64 MiB of it the stack, the rest the image.
+ *
+ * What can be given back is exactly what the loader mapped for the program
+ * being replaced: its image, its interpreter's, and the stack built for it.
+ * Each is one reservation with a recorded extent (cng_loaded.map_lo/map_len,
+ * cng_g_stack_lo/len), so nothing has to be inferred from /proc/self/maps and
+ * no mapping of ours can be caught up in it by accident.
+ *
+ * What cannot is what the previous program mapped itself — the libraries its
+ * ld.so loaded, its arenas, its thread stacks. Following those would mean a VMA
+ * table of our own maintained on every mmap/munmap/mremap, which is the
+ * per-syscall cost the -R tier exists to avoid. The brk heap, the one such
+ * region with a handle on it, is already wound back in cng_exec_reset.
+ *
+ * Two conditions, both of them load-bearing:
+ *
+ *  - The process must be single-threaded. A real execve kills the other threads
+ *    (de_thread); ours cannot, so they go on running the old program's code on
+ *    the old program's stacks, and unmapping either would fault them where today
+ *    they merely keep running. fork() clones one thread, so the ordinary
+ *    fork+exec — which is how nearly every exec happens — arrives here alone.
+ *
+ *  - The old stack cannot be handed back at the exec itself. The SIGSYS tier
+ *    returns into the new program through rt_sigreturn, and the frame that
+ *    reads is on the stack the guest was interrupted on — that same stack,
+ *    whenever the guest has no sigaltstack. So a generation is *retired* rather
+ *    than freed, and given back at the next dispatched syscall, which is the new
+ *    program's first and is long past that sigreturn.
+ *
+ * The reap also refuses to unmap anything overlapping the live generation. An
+ * ET_EXEC guest is MAP_FIXED at its link-time vaddr, so a program that execs
+ * another one built the same way has the new image standing exactly where the
+ * old one did — and there the old range is not memory to give back, it is the
+ * new program. */
+#define EXEC_GEN_MAX 3 /* program, interpreter, stack */
+
+struct exec_range {
+    unsigned long lo, len;
+};
+
+static struct exec_range g_gen_live[EXEC_GEN_MAX];
+static struct exec_range g_gen_dead[EXEC_GEN_MAX];
+static int g_gen_have_dead;
+
+static int range_overlap(const struct exec_range *a, const struct exec_range *b) {
+    return a->len && b->len && a->lo < b->lo + b->len && b->lo < a->lo + a->len;
+}
+
+/* Is this the only thread of the process? /proc/self/task is the kernel's own
+ * answer rather than a count of ours, and it is two syscalls. A directory we
+ * cannot read answers "no", which costs the reclaim and not correctness. */
+static int exec_single_threaded(void) {
+    /* CNG_EXEC_RECLAIM_FORCE=1: take the answer as yes. It is meant for
+     * qemu-user, which runs a thread of its own (call_rcu) beside the guest's
+     * one and so never reads as single-threaded from inside — the emulator's
+     * thread touches no guest mapping, but nothing here can tell it from a
+     * guest's. Everything the reclaim then does is exercised as it is on a
+     * device. Same testing convention as CNG_SCRATCH_NONE and CNG_PROCREG_NONE;
+     * setting it against a genuinely multithreaded guest unmaps memory those
+     * threads are running on. */
+    if (cng_broker_env("CNG_EXEC_RECLAIM_FORCE"))
+        return 1;
+    long fd = sys_openat(CNG_AT_FDCWD, "/proc/self/task",
+                         CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
+    if (fd < 0)
+        return 0;
+    int tids = 0;
+    char buf[1024];
+    for (;;) {
+        long n = CNG_SYS(__NR_getdents64, fd, buf, sizeof buf, 0, 0, 0);
+        if (n <= 0)
+            break;
+        for (long o = 0; o + 19 <= n;) {
+            unsigned short reclen;
+            memcpy(&reclen, buf + o + 16, 2);
+            if (reclen == 0 || o + reclen > n) {
+                tids = 2; /* a record we cannot walk: do not claim to know */
+                break;
+            }
+            if (buf[o + 19] >= '1' && buf[o + 19] <= '9') /* skip . and .. */
+                tids++;
+            o += reclen;
+        }
+        if (tids > 1)
+            break;
+    }
+    sys_close((int)fd);
+    return tids == 1;
+}
+
+void cng_exec_reap(void) {
+    if (!g_gen_have_dead)
+        return;
+    g_gen_have_dead = 0;
+    unsigned long sp = (unsigned long)&sp;
+    for (int i = 0; i < EXEC_GEN_MAX; i++) {
+        struct exec_range d = g_gen_dead[i];
+        g_gen_dead[i].lo = g_gen_dead[i].len = 0;
+        if (!d.len)
+            continue;
+        if (sp >= d.lo && sp < d.lo + d.len)
+            continue; /* we are standing on it; leave it to the kernel */
+        int clash = 0;
+        for (int j = 0; j < EXEC_GEN_MAX; j++)
+            if (range_overlap(&d, &g_gen_live[j]))
+                clash = 1;
+        if (!clash)
+            sys_munmap((void *)d.lo, d.len);
+    }
+}
+
+void cng_exec_generation(const struct cng_loaded *prog,
+                         const struct cng_loaded *interp,
+                         unsigned long stack_lo, unsigned long stack_len) {
+    struct exec_range neu[EXEC_GEN_MAX];
+    memset(neu, 0, sizeof neu);
+    if (prog) {
+        neu[0].lo = prog->map_lo;
+        neu[0].len = prog->map_len;
+    }
+    if (interp) {
+        neu[1].lo = interp->map_lo;
+        neu[1].len = interp->map_len;
+    }
+    neu[2].lo = stack_lo;
+    neu[2].len = stack_len;
+
+    /* Retire the outgoing generation, unless another thread may still be in it.
+     * A range the incoming one has already taken over is dropped rather than
+     * retired: unmapping it would unmap the new program. (The thread count is
+     * a /proc read, so it is only asked when there is something to retire —
+     * which the first program of an invocation, registering itself, has not.) */
+    int outgoing = 0;
+    for (int i = 0; i < EXEC_GEN_MAX; i++)
+        outgoing |= g_gen_live[i].len != 0;
+    if (outgoing && exec_single_threaded()) {
+        for (int i = 0; i < EXEC_GEN_MAX; i++) {
+            g_gen_dead[i] = g_gen_live[i];
+            for (int j = 0; j < EXEC_GEN_MAX; j++)
+                if (range_overlap(&g_gen_dead[i], &neu[j]))
+                    g_gen_dead[i].lo = g_gen_dead[i].len = 0;
+            if (g_gen_dead[i].len)
+                g_gen_have_dead = 1;
+        }
+    }
+    memcpy(g_gen_live, neu, sizeof g_gen_live);
+}
+
 /* State a real execve drops with the address space, and ours does not.
  *
  * We keep the address space — that is the whole point of the in-process model —
@@ -372,9 +527,14 @@ static void cng_exec_reset(void) {
      * Android 13), and a syscall we know is refused is not one to issue — the
      * trap would be answered by the gate-net, i.e. by the nested SIGSYS delivery
      * the design does not want to depend on, and where no handler is installed
-     * at all (the direct-drive `-t exectest` driver) it is simply fatal. The
-     * list is then the old program's to leave behind: nothing we can do about
-     * it on a kernel that will not let us say so. */
+     * at all (the direct-drive `-t exectest` driver) it is simply fatal.
+     *
+     * Nothing is left behind by skipping it, either. The filter that refuses it
+     * is one ambient filter over the whole process — which is what cng_blocked
+     * measures — so it refused the old program's own set_robust_list too, and a
+     * program that could never register a list has none for the kernel to walk
+     * at exit. The reset matters exactly where the call works, which is where
+     * it is made. */
     if (!cng_blocked[__NR_set_robust_list])
         CNG_SYS(__NR_set_robust_list, 0,
                 24 /* sizeof(struct robust_list_head) */, 0, 0, 0, 0);
@@ -464,6 +624,14 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
     int gfd = -1;           /* an open fd for the image, when we have one */
     int nofollow = (flags & CNG_AT_SYMLINK_NOFOLLOW) != 0;
     int depth = 0;          /* how many #! levels were followed */
+
+    /* Whatever the last exec retired, before this one maps anything. It cannot
+     * be given back after: an ET_EXEC image goes down at its link-time vaddr,
+     * so a retired range may be exactly where the incoming program is about to
+     * land, and the range would then be the new program. Safe here — the frame
+     * that stood on the retired stack belonged to the exec before this one, and
+     * its sigreturn is what put the caller here. */
+    cng_exec_reap();
 
     for (;; depth++) {
         if (depth > SHEB_MAX) {
@@ -787,6 +955,12 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
      * auxv and comm, and this is where those change for us too. */
     if (!cng_g_no_proc)
         cng_procfs_publish_stack(sp);
+
+    /* ...and the address space itself: the images and stack just mapped are the
+     * generation now running, and the one they replace is retired. After the
+     * republish above, which is the last reader of the outgoing stack. */
+    cng_exec_generation(&prog, have_interp ? &interp : 0, cng_g_stack_lo,
+                        cng_g_stack_len);
 
     *out_sp = sp;
     *out_entry = entry;

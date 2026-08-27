@@ -349,6 +349,56 @@ fi
 rm -rf "$EED"
 
 
+# --- what an exec chain costs the address space -----------------------------
+# A real execve throws the whole mm away. The emulated one cannot — the monitor
+# lives in that address space — so what it can give back is what its own loader
+# mapped for the program being replaced: the image, the interpreter's image, and
+# the stack built for it. Left behind, those accumulated: 66.8 MB of address
+# space per generation, measured, 64 MiB of it the stack.
+#
+# Compared against the same chain with no emulation under it rather than against
+# a constant, since VmSize is whatever the host underneath happens to need. The
+# slack covers what a generation genuinely does keep — the emulator's own
+# per-image bookkeeping, and anything the guest's libc maps for itself — while
+# leaving no room for a whole leaked generation.
+#
+# Static guests only: a dynamic one's ld.so maps its libraries itself, and those
+# are not ours to give back (the block comment in src/monitor/execve.c says why).
+ECD=$(mktemp -d)
+if ! guest_xlate_ready "exec-chain address space"; then
+    :
+elif ! guest_cc_report "$ECD/execchain" tests/guests/execchain.c; then
+    :
+elif elf_has_interp "$ECD/execchain"; then
+    skip "exec-chain address space: this guest links dynamically, and an ld.so's own library mappings are not ours to reclaim"
+else
+    # CNG_EXEC_RECLAIM_FORCE: qemu-user runs a thread of its own (call_rcu)
+    # beside the guest's, so the process never reads as single-threaded from
+    # inside it and the reclaim would sit out. On a host that runs AArch64
+    # directly the flag changes nothing — there really is one thread.
+    ec_k=$(emu_t 90 "$ECD/execchain" 8 2>/dev/null)
+    ec_g=$(CNG_EXEC_RECLAIM_FORCE=1 run_t 90 -R "$ECD" /execchain 8 2>/dev/null)
+    case "$ec_k$ec_g" in
+    *growth_kb=*growth_kb=*)
+        ec_kn=${ec_k##*growth_kb=}
+        ec_gn=${ec_g##*growth_kb=}
+        if [ "$ec_gn" -le $((ec_kn + 8192)) ]; then
+            pass=$((pass + 1))
+            printf '  ok   an exec chain gives the address space back (%s kB over 8, kernel %s kB)\n' \
+                "$ec_gn" "$ec_kn"
+        else
+            fail=$((fail + 1))
+            printf '  FAIL an exec chain leaks address space: %s kB over 8 execs, kernel %s kB\n' \
+                "$ec_gn" "$ec_kn"
+        fi
+        ;;
+    *)
+        skip "exec-chain address space: no reference run ($(echo "$ec_k$ec_g" | tr '\n' '|'))"
+        ;;
+    esac
+fi
+rm -rf "$ECD"
+
 # emulated execve must close FD_CLOEXEC fds like a real execve, or fork/exec
 # launchers (git run-command, posix_spawn) block on their O_CLOEXEC notify pipe.
 out=$(run -t cloexectest 2>&1); rc=$?

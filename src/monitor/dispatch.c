@@ -1802,6 +1802,12 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                   int trapped) {
     char b1[CNG_PATH_MAX], b2[CNG_PATH_MAX];
 
+    /* The address space an emulated execve retired, given back at the first
+     * syscall of the program that replaced it — which is the first moment the
+     * signal frame the SIGSYS tier returned through is certainly gone. A load
+     * and a branch until an exec has actually retired something. */
+    cng_exec_reap();
+
     struct path_args pa;
     path_args_of(nr, a0, a1, a2, a3, &pa);
 

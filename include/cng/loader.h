@@ -30,6 +30,12 @@ struct cng_loaded {
     unsigned long base;    /* load bias (0 for ET_EXEC) */
     unsigned long load_lo; /* lowest mapped page (absolute) */
     unsigned long load_hi; /* highest mapped page end (absolute) */
+    /* The one mapping the loader made for this object, which is what gives it
+     * back: both strategies reserve the whole span up front and place every
+     * segment inside it, and the anonymous one reserves the -R trampoline pool
+     * on top. load_hi is where the object's own pages end; this is where the
+     * reservation does. */
+    unsigned long map_lo, map_len;
     int is_dyn;            /* ET_DYN vs ET_EXEC */
     int has_interp;        /* PT_INTERP present */
     char interp[256];      /* interpreter path if has_interp */
@@ -46,6 +52,12 @@ struct cng_loaded {
 #define CNG_LOAD_EACCES   -7  /* not a regular file, or no execute bit at all */
 #define CNG_LOAD_ECLOBBER -8  /* ET_EXEC span covers chroot-ng's own image */
 #define CNG_LOAD_EINTERP  -9  /* PT_INTERP names a path the file does not hold */
+
+/* The stack region the last successful cng_build_stack mapped — the whole
+ * mapping, not the sp it returned. An emulated execve keeps the address space,
+ * so this is what it has to give back for the program it replaces, and at
+ * CNG_GUEST_STACK_SIZE it is the largest single thing there is to give. */
+extern unsigned long cng_g_stack_lo, cng_g_stack_len;
 
 /* Force file-backed segment mapping (mmap PROT_EXEC from the file) instead of
  * anon copy+mprotect. Set automatically after the first anon-exec denial (e.g.

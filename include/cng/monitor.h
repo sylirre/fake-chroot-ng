@@ -163,6 +163,22 @@ void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
 long cng_execve_tramp(int dirfd, const char *path, char **argv, char **envp,
                       int flags);
 
+struct cng_loaded; /* cng/loader.h */
+
+/* The address space of the program an emulated execve replaces.
+ *
+ * cng_exec_generation names the mappings the loader has just made for the
+ * program now entering — its image, its interpreter's, and its stack — and
+ * retires the outgoing generation's. cng_exec_reap hands the retired ones back;
+ * it is deferred to the next dispatched syscall because the SIGSYS tier returns
+ * into the new program through a signal frame that lives on the outgoing stack.
+ * Both are no-ops until an exec has actually retired something. See the block
+ * comment in src/monitor/execve.c for what this does and does not cover. */
+void cng_exec_generation(const struct cng_loaded *prog,
+                         const struct cng_loaded *interp,
+                         unsigned long stack_lo, unsigned long stack_len);
+void cng_exec_reap(void);
+
 /* The program break before the first guest program ran. A real execve drops the
  * heap with the address space; ours keeps the address space, so the break is
  * wound back to this at each exec. 0 = never recorded, and nothing is done. */
