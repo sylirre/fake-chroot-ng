@@ -32,9 +32,14 @@ case "$out" in
         "mech=memfd" "$memfd_out"
     check_absent "no case faulted on the fallback" "FAIL" "$memfd_out"
     check_absent "no case faulted" "FAIL" "$out"
+    # The last of these is the same wild path as "execve path", with the trace
+    # turned on: the entry line printed the guest's own pointer with %s, so
+    # CNG_DEBUG=1 turned that -EFAULT into a SIGSEGV inside the handler, where
+    # it is masked and fatal. CNG_DEBUG must never change what the guest gets.
     for _c in rt_sigaction rt_sigprocmask getcwd getresuid getresgid \
         setgroups getgroups capget shmctl sendmsg readlinkat "openat path" \
-        "renameat path2" "execve path" "execve argv" "execve argv string"; do
+        "renameat path2" "execve path" "execve argv" "execve argv string" \
+        "execve path (CNG_DEBUG)"; do
         check_contains "$_c answers EFAULT" "faulttest $_c=-14 want=-14 -> OK" \
             "$out"
     done

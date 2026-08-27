@@ -967,15 +967,37 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
     return 0;
 }
 
+/* A guest string for the debug log, taken into `buf` rather than printed where
+ * it lies. CNG_DEBUG must never change what the guest gets, and %s on a guest
+ * pointer does exactly that: the print walks memory the guest owns, so a wild
+ * path — the very -EFAULT case the line below is tracing — faulted inside the
+ * SIGSYS handler, where every signal but SIGSYS is masked and the fault is the
+ * death of the guest. dispatch.c's dbg_path takes the same copy for the same
+ * reason. A string too long for the window is shown as far as it fits: a
+ * truncated path says more in a log than a placeholder does. */
+static const char *dbg_str(const char *s, char *buf, unsigned long sz) {
+    if (!s)
+        return "(null)";
+    long n = cng_user_strcopyin(buf, s, sz);
+    if (n >= 0)
+        return buf;
+    if (n != -E2BIG)
+        return "(unreadable)";
+    buf[sz - 1] = '\0';
+    return buf;
+}
+
 /* Shared emulation core: the checks that need nothing but the arguments as they
  * arrive, then the snapshot (see exec_args_take), and from there on every check
  * reads the snapshot rather than the guest's own memory. */
 static long execve_core(int dirfd, const char *path, char **argv, char **envp,
                         int flags, unsigned long *out_sp,
                         unsigned long *out_entry) {
-    if (cng_g_debug)
+    if (cng_g_debug) {
+        char pb[CNG_PATH_MAX];
         cng_dprintf(2, "[cng] execve enter path=%s flags=%x\n",
-                    path ? path : "(null)", (unsigned)flags);
+                    dbg_str(path, pb, sizeof pb), (unsigned)flags);
+    }
 
     /* execveat's flags word was never read, so AT_EMPTY_PATH and
      * AT_SYMLINK_NOFOLLOW were both silently ignored — and so was every
@@ -1009,9 +1031,14 @@ static long execve_core(int dirfd, const char *path, char **argv, char **envp,
     struct exec_args a;
     long rc = exec_args_take(&a, path, argv, envp);
     if (rc < 0) {
-        if (cng_g_debug)
-            cng_dprintf(2, "[cng] execve %s -> args snapshot errno=%ld\n", path,
-                        -rc);
+        if (cng_g_debug) {
+            /* `path` measured clean a moment ago, which is not the same as
+             * still being there: the snapshot failing is itself a sign the
+             * guest's memory moved under us. */
+            char pb[CNG_PATH_MAX];
+            cng_dprintf(2, "[cng] execve %s -> args snapshot errno=%ld\n",
+                        dbg_str(path, pb, sizeof pb), -rc);
+        }
         return rc;
     }
 

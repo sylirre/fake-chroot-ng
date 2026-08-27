@@ -1357,6 +1357,23 @@ int cng_cmd_faulttest(int argc, char **argv, char **envp, unsigned long *auxv) {
         fails += !ok;
     }
 
+    /* And the same case with the trace on. CNG_DEBUG must never change what the
+     * guest gets, but execve's entry line printed the guest's own path pointer
+     * with %s — so the wild path right above, which answers -EFAULT with the
+     * log off, walked unmapped memory inside the handler the moment the log was
+     * on, and there SIGSEGV is masked and the walk is fatal. Reaching the print
+     * below at all is the pass; the errno has to be the same one either way. */
+    {
+        int save = cng_g_debug;
+        cng_g_debug = 1;
+        long rd = cng_dispatch(__NR_execve, (long)bad, 0, 0, 0, 0, 0, 1);
+        cng_g_debug = save;
+        int ok = rd == -EFAULT;
+        cng_dprintf(1, "faulttest execve path (CNG_DEBUG)=%d want=%d -> %s\n",
+                    (int)rd, (int)-EFAULT, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
     /* The copy-in pair, which is how execve's second pass takes argv/envp now.
      * A probe followed by a memcpy is two acts with a gap, and another thread of
      * the exec'ing guest is free to unmap the strings inside it — the memcpy
