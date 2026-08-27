@@ -52,6 +52,10 @@ struct cng_loaded {
 #define CNG_LOAD_EACCES   -7  /* not a regular file, or no execute bit at all */
 #define CNG_LOAD_ECLOBBER -8  /* ET_EXEC span covers chroot-ng's own image */
 #define CNG_LOAD_EINTERP  -9  /* PT_INTERP names a path the file does not hold */
+#define CNG_LOAD_EINVAL  -10  /* a PT_LOAD the kernel refuses with -EINVAL: a
+                               * file part longer than its memory part, or one
+                               * that cannot be file-mapped where that is the
+                               * only strategy left */
 
 /* The stack region the last successful cng_build_stack mapped — the whole
  * mapping, not the sp it returned. An emulated execve keeps the address space,

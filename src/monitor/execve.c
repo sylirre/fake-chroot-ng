@@ -615,6 +615,17 @@ static long exec_load_errno(int rc, const struct cng_elf_plan *plan, int interp)
         return interp ? -EIO : -ENOEXEC;
     case CNG_LOAD_EINTERP:
         return -EIO;
+    case CNG_LOAD_EINVAL:
+        /* fs/binfmt_elf.c answers -EINVAL for a PT_LOAD it cannot make sense
+         * of — a file part longer than its memory part, a segment mmap refuses
+         * — and answers it past its own point of no return, so a real caller
+         * never lives to read it (measured: execve reports EINVAL and the
+         * process is killed with SIGSEGV). Ours is refused in the pass that
+         * maps nothing, so the caller is still there. For an ELF interpreter
+         * the kernel's answer is unreachable in its own way — load_elf_interp
+         * reports into a process it is about to kill — so it joins the other
+         * malformed-interpreter cases at -ELIBBAD, which a caller can act on. */
+        return interp ? -ELIBBAD : -EINVAL;
     default: /* EFORMAT, ETOOBIG, ECLOBBER: a header that does not check out */
         return interp ? -ELIBBAD : -ENOEXEC;
     }

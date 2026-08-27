@@ -2966,17 +2966,26 @@ int cng_cmd_argvtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     return ok ? 0 : 1;
 }
 
-/* _elfspan — the span the loader reserves has to cover every byte it then
- * writes into that reserve.
+/* _elfspan — a PT_LOAD whose file part reaches past its memory part, and the
+ * well-formed object it has to be told apart from.
  *
- * The kernel maps each PT_LOAD on its own, so a p_filesz reaching past p_memsz
- * costs it nothing; here there is one reservation and everything is pread into
- * it, so a span sized from p_memsz alone left the file part writing past the
- * end. Build exactly that object — one PT_LOAD, 128 KiB of file behind a 4 KiB
- * memory image — load it, and check the last file byte arrived. Before the fix
- * the reserve was a single page and the pread ran off it: -EFAULT partway
- * through and a short read (CNG_LOAD_EIO), or, with something mapped after, no
- * error at all and that mapping quietly overwritten.
+ * "p_filesz must always be <= p_memsz", says fs/binfmt_elf.c, and it refuses a
+ * header claiming otherwise with -EINVAL (measured on the host: the exec fails
+ * and takes the caller with it, the kernel being past its own point of no
+ * return). Here it was accepted, and everything lands in one reservation: sized
+ * from p_memsz alone the pread ran off the end of it — -EFAULT partway through
+ * and a short read (CNG_LOAD_EIO), or, with something mapped after, no error at
+ * all and that mapping quietly overwritten — and sized from the larger of the
+ * two it stayed inside, but the protections cover the p_memsz range, so the
+ * bytes past it kept the reserve's read-write instead of the segment's own.
+ * Refused in the pass that maps nothing now, which is the answer the kernel
+ * gives without being able to leave a caller alive to hear it.
+ *
+ * Both objects are built here — one PT_LOAD and 128 KiB of file, behind a 4 KiB
+ * memory image and behind one that covers it — because the malformed one is a
+ * header no toolchain emits, and the well-formed one is what says the refusal
+ * is the geometry and not the size: it must still load, with its last byte in
+ * place, which is the reserve covering every byte written into it.
  *
  * A memfd rather than a path: the object never has to exist in a rootfs, and
  * the fd form is the one the emulated execve uses for /proc/self/fd targets. */
@@ -2995,7 +3004,9 @@ int cng_cmd_argvtest(int argc, char **argv, char **envp, unsigned long *auxv) {
 
 struct synth_seg {
     unsigned long vaddr, filesz, memsz;
-    unsigned flags; /* p_flags; PF_X is the caller's call, see below */
+    unsigned flags;         /* p_flags; PF_X is the caller's call, see below */
+    unsigned long offset;   /* p_offset; last, so the callers that want 0
+                             * (all but the page-offset leg) say nothing */
 };
 
 static long synth_elf_memfd(unsigned short type, const struct synth_seg *segs,
@@ -3025,7 +3036,7 @@ static long synth_elf_memfd(unsigned short type, const struct synth_seg *segs,
         unsigned char *p = hdr + 0x40 + (size_t)i * 56;
         *(unsigned *)(p + 0) = 1;              /* p_type = PT_LOAD */
         *(unsigned *)(p + 4) = segs[i].flags;  /* p_flags */
-        *(unsigned long *)(p + 8) = 0;         /* p_offset */
+        *(unsigned long *)(p + 8) = segs[i].offset;
         *(unsigned long *)(p + 16) = segs[i].vaddr;
         *(unsigned long *)(p + 24) = segs[i].vaddr;
         *(unsigned long *)(p + 32) = segs[i].filesz;
@@ -3039,46 +3050,94 @@ static long synth_elf_memfd(unsigned short type, const struct synth_seg *segs,
     return fd;
 }
 
-int cng_cmd_elfspan(int argc, char **argv, char **envp, unsigned long *auxv) {
-    (void)argc;
-    (void)argv;
-    (void)envp;
-    (void)auxv;
-    /* p_flags = PF_R|PF_W, never PF_X: an executable segment would draw the -R
-     * trampoline pool in after the span and hide the overrun. */
-    struct synth_seg one = {0, ELFSPAN_FILESZ, ELFSPAN_MEMSZ, 6 /*PF_R|PF_W*/};
+/* One PT_LOAD at p_offset `offset` (0 or SYNTH_ELF_HDRSZ, so the arithmetic
+ * below is one expression), ELFSPAN_FILESZ of file behind `memsz` of memory,
+ * the file padded out behind it and ending in a byte the caller can look for
+ * once it is in memory. p_flags = PF_R|PF_W, never PF_X: an executable segment
+ * would draw the -R trampoline pool in after the span and hide an overrun.
+ * Returns the fd or -errno. */
+static long elfspan_memfd(unsigned long memsz, unsigned long offset) {
+    struct synth_seg one = {0, ELFSPAN_FILESZ, memsz, 6 /*PF_R|PF_W*/, offset};
     long fd = synth_elf_memfd(3 /*ET_DYN*/, &one, 1);
-    if (fd < 0) {
-        cng_dprintf(1, "elfspan: memfd_create errno=%d -> SKIP\n", (int)-fd);
-        return 0;
-    }
-    /* Pad out to p_filesz, ending in a byte we can look for in memory. */
+    if (fd < 0)
+        return fd;
     static unsigned char pad[4096];
     memset(pad, 0, sizeof pad);
-    unsigned long left = ELFSPAN_FILESZ - SYNTH_ELF_HDRSZ;
+    unsigned long left = offset + ELFSPAN_FILESZ - SYNTH_ELF_HDRSZ;
     while (left) {
         unsigned long k = left > sizeof pad ? sizeof pad : left;
         if (k == left)
             pad[k - 1] = ELFSPAN_MARK;
         if (cng_write_all((int)fd, pad, k) != (long)k) {
-            cng_dprintf(1, "elfspan: short pad write -> FAIL\n");
             sys_close((int)fd);
-            return 1;
+            return -EIO;
         }
         left -= k;
     }
+    return fd;
+}
 
+int cng_cmd_elfspan(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    long fd = elfspan_memfd(ELFSPAN_MEMSZ, 0);
+    if (fd < 0) {
+        cng_dprintf(1, "elfspan: build errno=%d -> SKIP\n", (int)-fd);
+        return 0;
+    }
     struct cng_loaded prog;
-    int rc = cng_load_elf_fd((int)fd, 0, &prog);
+    int over = cng_load_elf_fd((int)fd, 0, &prog);
     sys_close((int)fd);
 
+    /* The same file behind a memory image that covers it: this one loads, and
+     * its last byte is in place. */
+    fd = elfspan_memfd(ELFSPAN_FILESZ, 0);
+    int rc = fd < 0 ? (int)fd : cng_load_elf_fd((int)fd, 0, &prog);
+    if (fd >= 0)
+        sys_close((int)fd);
     int tail = 0;
     if (rc == CNG_LOAD_OK)
         tail = *(unsigned char *)(prog.base + ELFSPAN_FILESZ - 1) ==
                ELFSPAN_MARK;
-    int ok = rc == CNG_LOAD_OK && tail;
-    cng_dprintf(1, "elfspan: rc=%d tail=%d -> %s\n", rc, tail,
+    int ok = over == CNG_LOAD_EINVAL && rc == CNG_LOAD_OK && tail;
+    cng_dprintf(1, "elfspan: over=%d rc=%d tail=%d -> %s\n", over, rc, tail,
                 ok ? "OK" : "FAIL");
+
+    /* The other malformed geometry, and the one the two strategies answer
+     * differently on purpose: a p_offset that does not share the page offset of
+     * its p_vaddr. mmap can only put a page-aligned file offset at a
+     * page-aligned address, so there is no such mapping to make and the
+     * file-backed strategy has to refuse — where it used to round p_offset down
+     * and map the wrong bytes at the right address, silently, leaving the guest
+     * running whatever was there. The anonymous strategy preads at any offset
+     * and does not care, which is exactly what runs a 4 KiB-aligned binary on a
+     * 16 KiB kernel, so it must still load and be right byte for byte. Both
+     * halves are asserted, since either one alone would pass by doing nothing.
+     *
+     * cng_g_loader_file is what picks the strategy, so it is forced for the
+     * first half and put back afterwards. */
+    int save_file = cng_g_loader_file;
+    fd = elfspan_memfd(ELFSPAN_FILESZ, SYNTH_ELF_HDRSZ);
+    cng_g_loader_file = 1;
+    int skew_file = fd < 0 ? (int)fd : cng_load_elf_fd((int)fd, 0, &prog);
+    cng_g_loader_file = save_file;
+    if (fd >= 0)
+        sys_close((int)fd);
+
+    fd = elfspan_memfd(ELFSPAN_FILESZ, SYNTH_ELF_HDRSZ);
+    int skew_anon = fd < 0 ? (int)fd : cng_load_elf_fd((int)fd, 0, &prog);
+    if (fd >= 0)
+        sys_close((int)fd);
+    int skew_tail = skew_anon == CNG_LOAD_OK &&
+                    *(unsigned char *)(prog.base + ELFSPAN_FILESZ - 1) ==
+                        ELFSPAN_MARK;
+    int sok = skew_file == CNG_LOAD_EINVAL && skew_anon == CNG_LOAD_OK &&
+              skew_tail;
+    cng_dprintf(1, "elfspan pgoff: file=%d anon=%d tail=%d -> %s\n", skew_file,
+                skew_anon, skew_tail, sok ? "OK" : "FAIL");
+    ok = ok && sok;
 
     /* ...and the same arithmetic one step out. What gets reserved is the span
      * plus, under -R, a trampoline pool on top of it, and that sum is a mapping

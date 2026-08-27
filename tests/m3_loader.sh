@@ -58,18 +58,35 @@ else
     skip "ET_EXEC leg: no -static -no-pie AArch64 toolchain"
 fi
 
-# The reserved span has to cover every byte the loader then writes into it.
-# A PT_LOAD may name more file bytes than memory bytes; the kernel maps each
-# segment separately so that costs it nothing, but here one reservation is sized
-# from the segment list and everything is pread into it — sized from p_memsz
-# alone, the file part ran off the end, into whatever the kernel had placed
-# after. Answered by the loader directly (`-t elfspan` builds the object in a
-# memfd), since no toolchain emits one and no rootfs need hold it.
+# A PT_LOAD whose file part reaches past its memory part is malformed, and
+# fs/binfmt_elf.c refuses it outright: "p_filesz must always be <= p_memsz", and
+# -EINVAL for a header saying otherwise (measured on the host — the exec fails
+# and takes the caller with it, the kernel being past its own point of no return
+# by then). Here it was accepted, and everything lands in one reservation: sized
+# from p_memsz the pread ran off the end of that reserve, and sized from the
+# larger of the two it stayed inside but kept the reserve's own read-write past
+# p_memsz rather than the protections the segment asks for. Refused in the pass
+# that maps nothing now, so the caller lives to read the errno.
+#
+# The well-formed object beside it — the same 128 KiB of file behind a memory
+# image that covers it — must still load with its last byte in place, which is
+# what says the refusal is the geometry and not the size. Answered by the loader
+# directly (`-t elfspan` builds both in a memfd), since no toolchain emits such
+# a header and no rootfs need hold one.
 run -t elfspan >/dev/null 2>&1
-check "a PT_LOAD whose file part exceeds its memory part stays in its reserve" \
-    0 $?
-check_contains "...and every byte of it arrived" "rc=0 tail=1" \
-    "$(run -t elfspan 2>&1)"
+check "a PT_LOAD whose file part exceeds its memory part is refused" 0 $?
+check_contains "...and a well-formed one still arrives whole" \
+    "elfspan: over=-10 rc=0 tail=1 -> OK" "$(run -t elfspan 2>&1)"
+# The other malformed geometry, and the one the two strategies answer
+# differently on purpose. mmap can only put a page-aligned file offset at a
+# page-aligned address, so a p_offset that does not share the page offset of its
+# p_vaddr cannot be file-mapped at all — it used to be rounded down and mapped
+# anyway, putting the wrong bytes at the right address with nothing said. The
+# anonymous strategy preads at any offset and does not care, which is what runs
+# a 4 KiB-aligned binary on a 16 KiB kernel, so it still loads and is right byte
+# for byte.
+check_contains "a segment that cannot be file-mapped is refused, not misplaced" \
+    "elfspan pgoff: file=-10 anon=0 tail=1 -> OK" "$(run -t elfspan 2>&1)"
 # The same arithmetic one step out: what gets reserved is that span plus, under
 # -R, a trampoline pool on top of it, and the sum is a mapping length. A span
 # within a pool's distance of the top of the address space wraps it, the mmap

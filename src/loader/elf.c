@@ -149,10 +149,27 @@ static int map_file(int fd, const Elf64_Ehdr *eh, const Elf64_Phdr *ph,
         unsigned long fileend = vstart + ph[i].p_filesz;
 
         if (ph[i].p_filesz) {
+            /* The file offset that puts p_offset's byte at vstart, computed the
+             * way elf_map() computes it. Rounding p_offset down instead put the
+             * wrong bytes at the right address whenever p_offset and p_vaddr
+             * did not agree modulo the page size, silently: the mapping
+             * succeeded and the guest ran whatever was there. The header pass
+             * refuses such an object where this strategy is already in force;
+             * what reaches here is the one route it cannot judge, the fall back
+             * from map_anon's EEXEC, which is decided after it has run. */
+            if ((ph[i].p_offset ^ vstart) & (cng_page_size - 1)) {
+                cng_dprintf(2, "chroot-ng: load: file mmap(%lx): p_offset %lx"
+                               " does not share the page offset of p_vaddr %lx"
+                               " (page %lu)\n",
+                            vpage, (unsigned long)ph[i].p_offset,
+                            (unsigned long)ph[i].p_vaddr, cng_page_size);
+                sys_munmap(base, span);
+                return CNG_LOAD_EMAP;
+            }
             unsigned long map_len = cng_page_up(fileend) - vpage;
             void *m = sys_mmap((void *)vpage, map_len, prot,
                                CNG_MAP_PRIVATE | CNG_MAP_FIXED, fd,
-                               (long)cng_page_down(ph[i].p_offset));
+                               (long)(ph[i].p_offset - (vstart - vpage)));
             if (m == CNG_MAP_FAILED || cng_is_err((long)m)) {
                 cng_dprintf(2, "chroot-ng: load: file mmap(%lx len=%lu prot=%d)"
                                " errno=%d\n",
@@ -246,26 +263,52 @@ static int elf_read_headers(int fd, struct cng_elf_plan *plan,
         if (ph[i].p_type != PT_LOAD)
             continue;
         nload++;
-        /* The span has to cover every byte that gets written into it, and what
-         * is written is p_filesz — the kernel maps each segment on its own, so
-         * a p_filesz past p_memsz costs it nothing, while here it is the one
-         * reserve everything lands in. Sized from p_memsz alone, a header
-         * claiming filesz=2 MiB and memsz=4 KiB reserved a page and then had
-         * read_exact pread 2 MiB of file into it, straight through whatever the
-         * kernel had placed after. Take the larger of the two: no real object
-         * has filesz above memsz (0 of 16515 in a Debian + Alpine tree), so
-         * this refuses nothing that ever loaded, and a malformed one is now
-         * merely wrong rather than out of bounds.
+        /* "p_filesz must always be <= p_memsz", says fs/binfmt_elf.c, and it
+         * refuses a header claiming otherwise with -EINVAL. Measured on the
+         * host: such an object fails to exec, and takes the caller with it,
+         * the kernel being past its own point of no return by then.
          *
-         * Overflow is the same question one step out: p_vaddr and the sizes are
-         * attacker-chosen 64-bit values, and a sum that wraps yields an `e`
-         * below `lo` and a span that is not the range we then write into. */
-        unsigned long fill = ph[i].p_filesz > ph[i].p_memsz ? ph[i].p_filesz
-                                                            : ph[i].p_memsz;
-        if (ph[i].p_vaddr + fill < ph[i].p_vaddr)
+         * Refusing it is not only fidelity. The kernel maps each segment on its
+         * own, so a filesz past memsz costs it nothing; here every segment is
+         * pread into one reserve, and that reserve is sized from the segment
+         * list. Sized from p_memsz alone, a header claiming filesz=2 MiB and
+         * memsz=4 KiB reserved a page and then had read_exact pread 2 MiB of
+         * file into it, straight through whatever the kernel had placed after.
+         * Sized from the larger of the two it stayed inside its reserve, but
+         * the protections below cover the p_memsz range, so the bytes past it
+         * kept the reserve's own read-write rather than what the segment asks
+         * for. Neither is a thing to get right when the answer is that the
+         * object is malformed — and refusing here, in the pass that maps
+         * nothing, leaves the caller alive to be told, which is the one part
+         * the kernel cannot manage. */
+        if (ph[i].p_filesz > ph[i].p_memsz)
+            return CNG_LOAD_EINVAL;
+        /* mmap can only put a page-aligned file offset at a page-aligned
+         * address, so a segment is file-mappable only where p_offset and
+         * p_vaddr agree modulo the page size. Every object a linker emits does
+         * — it has to be demand-pageable — but "the page size" is the running
+         * kernel's, and a binary linked with a 4 KiB max-page-size does not
+         * agree on a 16 KiB one. That is the whole of Android's 16 KiB
+         * migration, and the anonymous strategy preads and does not care, which
+         * is how such a binary runs here at all. So it is only refused where
+         * the file-backed strategy is already the one in force (execmem denied,
+         * or -F), where there is nothing else to load it with. The kernel
+         * refuses it as well: elf_map() subtracts the page offset of p_vaddr
+         * from p_offset and hands mmap what is left, which is -EINVAL unless
+         * the two agree (measured). A segment with no file part is not mapped
+         * from the file at all — by either strategy, or by the kernel — so its
+         * p_offset is nobody's business. */
+        if (cng_g_loader_file && ph[i].p_filesz &&
+            ((ph[i].p_offset ^ ph[i].p_vaddr) & (cng_page_size - 1)))
+            return CNG_LOAD_EINVAL;
+        /* Overflow, which is the span question one step out: p_vaddr and
+         * p_memsz are attacker-chosen 64-bit values, and a sum that wraps
+         * yields an `e` below `lo` and a span that is not the range we then
+         * write into. */
+        if (ph[i].p_vaddr + ph[i].p_memsz < ph[i].p_vaddr)
             return CNG_LOAD_EFORMAT;
         unsigned long s = cng_page_down(ph[i].p_vaddr);
-        unsigned long e = cng_page_up(ph[i].p_vaddr + fill);
+        unsigned long e = cng_page_up(ph[i].p_vaddr + ph[i].p_memsz);
         if (e < s) /* cng_page_up wrapped at the top of the address space */
             return CNG_LOAD_EFORMAT;
         if (s < lo)

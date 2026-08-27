@@ -61,6 +61,9 @@ static const char *load_err(int rc) {
         return "fixed load address overlaps chroot-ng's own image";
     case CNG_LOAD_EINTERP:
         return "PT_INTERP names a path the file does not hold";
+    case CNG_LOAD_EINVAL:
+        return "a PT_LOAD the kernel refuses too (file part past its memory "
+               "part, or unmappable at this page size)";
     default:
         return "unknown error";
     }
