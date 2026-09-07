@@ -19,6 +19,7 @@
 #include "cng/broker.h"
 #include "cng/loader.h"
 #include "cng/monitor.h"
+#include "cng/ownmap.h"
 #include "cng/rt.h"
 #include "cng/shm.h"
 #include "cng/syscall.h"
@@ -125,8 +126,9 @@ static void shm_dt(s32 shmid) {
  * host would not give us the page. */
 static int att_grow(struct att_blk *tail) {
     unsigned long sz = cng_page_up(sizeof(struct att_blk));
-    void *p = sys_mmap(0, sz, CNG_PROT_READ | CNG_PROT_WRITE,
-                       CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    void *p = cng_own_map(sys_mmap(0, sz, CNG_PROT_READ | CNG_PROT_WRITE,
+                                   CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0),
+                          sz);
     if (p == CNG_MAP_FAILED || cng_is_err((long)p))
         return 0;
     struct att_blk *none = 0;

@@ -345,6 +345,37 @@ static int scr_map(unsigned i) {
     return 0;
 }
 
+/* Does [lo, hi) hold anything a dispatch on a scratch stack is standing on?
+ * The exec reclaim asks, and there are two such things.
+ *
+ * The stack itself is the monitor's memory, not the outgoing program's, and it
+ * is the one region of ours that appears after the floor is taken and is not
+ * in the own-map registry — this table already records every slot's bounds, so
+ * asking it cannot drift out of step the way a second record would.
+ *
+ * The signal frame is the guest's. The SIGSYS tier returns into the new program
+ * through rt_sigreturn, and what that reads is the frame the kernel built when
+ * it delivered the trap — which sits on the guest's alternate signal stack
+ * whenever the guest registered one. bionic registers one for every thread, so
+ * an emulated execve by an Android guest returned through a frame the sweep had
+ * just unmapped: SIGSEGV on the first exec, measured. The frame is dead one
+ * generation later, when the next trap's frame is somewhere else, so keeping
+ * the mapping it lies in costs one alternate stack and not a chain of them. */
+int cng_scr_hit(unsigned long lo, unsigned long hi) {
+    for (int i = 0; i < CNG_SCR_N; i++) {
+        if (!__atomic_load_n(&cng_scr[i].hi, __ATOMIC_ACQUIRE))
+            continue; /* never mapped, or not published yet */
+        unsigned long b = cng_scr[i].lo;
+        if (lo < b + CNG_SCR_SZ && b < hi)
+            return 1;
+        unsigned long f = (unsigned long)__atomic_load_n(&cng_scr[i].uc,
+                                                         __ATOMIC_ACQUIRE);
+        if (f && f >= lo && f < hi)
+            return 1;
+    }
+    return 0;
+}
+
 /* Is `tid` still a thread of this process? tgkill with signal 0 does the
  * existence check and delivers nothing — one syscall, where a /proc read would
  * be several, and this runs inside the handler. */

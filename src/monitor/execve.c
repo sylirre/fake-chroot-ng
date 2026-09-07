@@ -17,6 +17,7 @@
 #include "cng/l2s.h"
 #include "cng/loader.h"
 #include "cng/monitor.h"
+#include "cng/ownmap.h"
 #include "cng/path.h"
 #include "cng/procfs.h"
 #include "cng/ptrace.h"
@@ -223,8 +224,10 @@ static long copy_vec(char **src, char **dst_vec, int slots, char **pool,
 }
 
 static void exec_args_free(struct exec_args *a) {
-    if (a->mem)
+    if (a->mem) {
+        cng_own_drop(a->mem, a->len);
         sys_munmap(a->mem, a->len);
+    }
     a->mem = 0;
 }
 
@@ -286,8 +289,9 @@ static long exec_args_take(struct exec_args *a, const char *path, char **argv,
         return -E2BIG;
 
     a->len = cng_page_up(vecs + bytes);
-    a->mem = sys_mmap(0, a->len, CNG_PROT_READ | CNG_PROT_WRITE,
-                      CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    a->mem = cng_own_map(sys_mmap(0, a->len, CNG_PROT_READ | CNG_PROT_WRITE,
+                                  CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0),
+                         a->len);
     if (a->mem == CNG_MAP_FAILED || cng_is_err((long)a->mem)) {
         a->mem = 0;
         return -ENOMEM;
@@ -368,11 +372,13 @@ void cng_timer_forget(int id) {
  * cng_g_stack_lo/len), so nothing has to be inferred from /proc/self/maps and
  * no mapping of ours can be caught up in it by accident.
  *
- * What cannot is what the previous program mapped itself — the libraries its
- * ld.so loaded, its arenas, its thread stacks. Following those would mean a VMA
- * table of our own maintained on every mmap/munmap/mremap, which is the
- * per-syscall cost the -R tier exists to avoid. The brk heap, the one such
- * region with a handle on it, is already wound back in cng_exec_reset.
+ * What the program mapped for ITSELF — the libraries its ld.so loaded, its
+ * arenas, its allocator's reservations — has no such extent, and following it
+ * would mean a VMA table of our own maintained on every mmap/munmap/mremap,
+ * which is the per-syscall cost the -R tier exists to avoid. That memory is
+ * given back by exec_sweep() below, which asks the question the other way
+ * round and needs no table at all. (The brk heap, the one such region with a
+ * handle on it, is wound back in cng_exec_reset instead.)
  *
  * Two conditions, both of them load-bearing:
  *
@@ -471,6 +477,126 @@ void cng_exec_reap(void) {
     }
 }
 
+/* ---- everything the outgoing program mapped for itself -------------------
+ *
+ * The reap above gives back what our loader mapped, which is one reservation
+ * per image plus the stack, each with a recorded extent. It is not what a real
+ * execve does: that throws the whole mm away, and a program's own mappings —
+ * the libraries its ld.so loaded, its arenas, its allocator's reservations —
+ * go with it. Ours kept them, and an exec chain accumulated every generation's.
+ *
+ * The cost is not academic. Measured on an Android 13 device, a static bionic
+ * guest exec'ing itself: 8,667,232 kB per generation, almost all of it one
+ * `mmap(NULL, 8858370048, PROT_NONE, MAP_NORESERVE)` that scudo makes at libc
+ * init and that the next generation makes again. Sixty-four execs exhausted the
+ * address space outright — "Scudo ERROR: internal map failure (error desc=Out
+ * of memory) requesting 8650752KB", SIGABRT. A musl guest, which reserves
+ * nothing like it, cost 20 kB a generation and hid the whole thing.
+ *
+ * So the question is answered the other way round: not "what did our loader
+ * map", which cannot see a guest's own mmap, but "what in this address space
+ * was never the guest's". ownmap.c holds that — the floor taken before the
+ * first guest instruction ran, plus every long-lived region the monitor has
+ * mapped since — and sigsys.c holds the scratch stacks. What is left over is
+ * the outgoing program's, and this is where it goes back.
+ *
+ * Three things keep it honest:
+ *
+ *  - it runs inside the single-threaded gate below, for the same reason the
+ *    retirement does: another thread is still executing the old program on the
+ *    old program's stack, and this would unmap it out from under them;
+ *  - it runs here, after the new image and stack are mapped and before the new
+ *    program has executed a single instruction, so there is nothing of the
+ *    incoming generation to mistake for the outgoing one. Deferring it the way
+ *    the reap is deferred would not have that property: by the new program's
+ *    first dispatched syscall its ld.so has already mapped libraries, and on
+ *    the seccomp tier an anonymous mmap does not trap, so we would not have
+ *    seen them appear;
+ *  - it is fail-closed. cng_own_ready() is false until the floor is taken and
+ *    false forever after a record is lost, and a maps read that fails means
+ *    nothing is known rather than nothing is there. In all three cases the
+ *    address space is left exactly as it was, which is what every build before
+ *    this one did.
+ *
+ * The victims are collected first and unmapped after, rather than unmapped as
+ * the walk finds them: /proc/self/maps is a seq_file over the live VMA tree,
+ * and editing that tree mid-iteration is not something to ask of it. */
+#define SWEEP_MAX  48 /* victims per pass */
+#define SWEEP_PASS 8  /* passes before we stop, however much is left */
+
+struct sweep_ctx {
+    unsigned long sp;
+    struct exec_range hit[SWEEP_MAX];
+    int n;
+};
+
+/* The kernel's own pseudo-mappings, which are not memory we mapped and not
+ * memory to give back. The list is a prefix match on purpose: [vvar_vclock]
+ * appeared beside [vvar] in 6.13, and [stack:<tid>] is how older kernels
+ * spelled a thread stack.
+ *
+ * "[anon:" is deliberately NOT here. Android names ordinary anonymous
+ * mappings through PR_SET_VMA — [anon:libc_malloc], [anon:scudo:primary],
+ * [anon:.bss] — and those are exactly the guest's memory this exists to
+ * reclaim. */
+static int sweep_kernel_vma(const char *p) {
+    static const char *const keep[] = {"[heap]",  "[stack",    "[vdso]",
+                                       "[vvar",   "[sigpage]", "[vectors]",
+                                       "[uprobes]"};
+    if (*p != '[')
+        return 0;
+    for (unsigned i = 0; i < sizeof keep / sizeof keep[0]; i++)
+        if (!strncmp(p, keep[i], strlen(keep[i])))
+            return 1;
+    return 0;
+}
+
+static int sweep_seen(unsigned long lo, unsigned long hi, const char *path,
+                      void *ctx) {
+    struct sweep_ctx *s = ctx;
+    if (s->sp >= lo && s->sp < hi)
+        return 0; /* the stack this call is standing on */
+    if (sweep_kernel_vma(path))
+        return 0;
+    if (cng_own_hit(lo, hi) || cng_scr_hit(lo, hi) || cng_hits_image(lo, hi - lo))
+        return 0;
+    struct exec_range r = {lo, hi - lo};
+    for (int i = 0; i < EXEC_GEN_MAX; i++)
+        if (range_overlap(&r, &g_gen_live[i]) || range_overlap(&r, &g_gen_dead[i]))
+            return 0; /* the incoming generation, or one the reap still owes */
+    if (s->n == SWEEP_MAX)
+        return 1; /* full: unmap these and walk again */
+    s->hit[s->n++] = r;
+    return 0;
+}
+
+static void exec_sweep(void) {
+    if (!cng_own_ready()) {
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] exec: sweep disarmed (no floor)\n");
+        return;
+    }
+    struct sweep_ctx s;
+    s.sp = (unsigned long)&s;
+    int total = 0;
+    unsigned long bytes = 0;
+    for (int pass = 0; pass < SWEEP_PASS; pass++) {
+        s.n = 0;
+        if (cng_maps_walk(sweep_seen, &s) < 0)
+            break; /* no maps: nothing is known, so nothing is unmapped */
+        for (int i = 0; i < s.n; i++) {
+            sys_munmap((void *)s.hit[i].lo, s.hit[i].len);
+            bytes += s.hit[i].len;
+        }
+        total += s.n;
+        if (s.n < SWEEP_MAX)
+            break; /* the walk ran to the end: there is nothing more */
+    }
+    if (cng_g_debug && total)
+        cng_dprintf(2, "[cng] exec: swept %d mapping(s), %lu kB\n", total,
+                    bytes >> 10);
+}
+
 void cng_exec_generation(const struct cng_loaded *prog,
                          const struct cng_loaded *interp,
                          unsigned long stack_lo, unsigned long stack_len) {
@@ -504,6 +630,12 @@ void cng_exec_generation(const struct cng_loaded *prog,
             if (g_gen_dead[i].len)
                 g_gen_have_dead = 1;
         }
+        /* ...and everything the outgoing program mapped itself, which the
+         * ranges above cannot describe. Both live and dead are settled by now,
+         * so the sweep can tell them from what it is here to reclaim. */
+        memcpy(g_gen_live, neu, sizeof g_gen_live);
+        exec_sweep();
+        return;
     }
     memcpy(g_gen_live, neu, sizeof g_gen_live);
 }

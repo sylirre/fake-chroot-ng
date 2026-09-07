@@ -351,6 +351,9 @@ void cng_scratch_leave(void);
  * of threads, and what happens then — a slot whose thread has exited is taken
  * over — has no other way to be reached. */
 int cng_scratch_slot_for(long tid, unsigned long *hi_out);
+/* Does [lo, hi) touch a scratch stack? Asked by the exec reclaim, which
+ * must not give a slot back as if it were the outgoing program's. */
+int cng_scr_hit(unsigned long lo, unsigned long hi);
 
 /* Install the SIGSYS handler alone (no filter, no probes): testing. */
 int cng_sigsys_install_only(void);

@@ -5,6 +5,7 @@
  * the payload. */
 #include "cng/broker.h"
 #include "cng/monitor.h"
+#include "cng/ownmap.h"
 #include "cng/procreg.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
@@ -166,8 +167,9 @@ static int open_broker(const char *key, unsigned long size) {
     int memfd = cng_broker_table_fd(key);
     if (memfd < 0)
         return 0;
-    void *p = sys_mmap(0, size, CNG_PROT_READ | CNG_PROT_WRITE, CNG_MAP_SHARED,
-                       memfd, 0);
+    void *p = cng_own_map(sys_mmap(0, size, CNG_PROT_READ | CNG_PROT_WRITE,
+                                   CNG_MAP_SHARED, memfd, 0),
+                          size);
     sys_close(memfd);
     if (p == CNG_MAP_FAILED || cng_is_err((long)p))
         return 0;
@@ -227,8 +229,9 @@ static int open_shared_file(const char *key, unsigned long size) {
         sys_close((int)fd);
         return 0;
     }
-    void *p = sys_mmap(0, size, CNG_PROT_READ | CNG_PROT_WRITE, CNG_MAP_SHARED,
-                       (int)fd, 0);
+    void *p = cng_own_map(sys_mmap(0, size, CNG_PROT_READ | CNG_PROT_WRITE,
+                                   CNG_MAP_SHARED, (int)fd, 0),
+                          size);
     sys_close((int)fd);
     if (p == CNG_MAP_FAILED || cng_is_err((long)p))
         return 0;
@@ -263,8 +266,9 @@ void cng_procreg_init(const char *shared_key) {
             return;
         }
     }
-    void *p = sys_mmap(0, sz, CNG_PROT_READ | CNG_PROT_WRITE,
-                       CNG_MAP_SHARED | CNG_MAP_ANONYMOUS, -1, 0);
+    void *p = cng_own_map(sys_mmap(0, sz, CNG_PROT_READ | CNG_PROT_WRITE,
+                                   CNG_MAP_SHARED | CNG_MAP_ANONYMOUS, -1, 0),
+                          sz);
     if (p == CNG_MAP_FAILED || cng_is_err((long)p))
         return; /* no registry: procfs.c degrades to host passthrough */
     g_tab = (struct proc_tab *)p;

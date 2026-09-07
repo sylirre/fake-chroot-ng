@@ -32,6 +32,7 @@
 #include "cng/loader.h"
 #include "cng/monitor.h"
 #include "cng/netlink.h"
+#include "cng/ownmap.h"
 #include "cng/path.h"
 #include "cng/procfs.h"
 #include "cng/procreg.h" /* cng_g_shared_proc */
@@ -341,6 +342,21 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
     /* setuid/setgid-on-exec for the initial program (e.g. running /bin/su
      * directly), mirroring the emulated-execve path. */
     cng_cred_exec(host_prog);
+
+    /* The floor: every mapping that exists at this moment is ours or the
+     * kernel's, because nothing of the guest has been mapped yet. An emulated
+     * execve gives back what is NOT in it (the sweep in execve.c), so where
+     * this stands is the whole of its accuracy — and it has to stand HERE,
+     * in front of the first program, not merely in front of the first guest
+     * instruction. Taken after the load, the floor would claim that program's
+     * image and its 64 MiB stack, and once those are given back the kernel
+     * hands the same addresses to the next generation's allocator, which the
+     * sweep would then read as ours and keep. Measured that way: the reclaim
+     * held on to 16 MB per generation and could not say why.
+     *
+     * Everything the monitor maps after this point records itself
+     * (cng_own_map); everything the loader maps is a generation range. */
+    cng_own_floor();
 
     struct cng_loaded prog;
     int rc = cng_load_elf(host_prog, 0, &prog);

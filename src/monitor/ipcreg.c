@@ -25,6 +25,7 @@
 #include "cng/broker.h"
 #include "cng/ipcreg.h"
 #include "cng/monitor.h"
+#include "cng/ownmap.h"
 #include "cng/procreg.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
@@ -108,8 +109,9 @@ static void *arena_alloc(u64 n) {
     if (chunk < ARENA_CHUNK)
         chunk = ARENA_CHUNK;
     chunk = (chunk + 4095) & ~(u64)4095;
-    void *p = sys_mmap(0, chunk, CNG_PROT_READ | CNG_PROT_WRITE,
-                       CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    void *p = cng_own_map(sys_mmap(0, chunk, CNG_PROT_READ | CNG_PROT_WRITE,
+                                   CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0),
+                          chunk);
     if (p == CNG_MAP_FAILED || cng_is_err((long)p))
         return 0;
     struct blk *b = (struct blk *)p;
@@ -226,8 +228,9 @@ static int tables(void) {
                       (unsigned long)SEM_UNDO_MAX * sizeof *g_undo +
                       (unsigned long)MSG_QUEUE_MAX * sizeof *g_msq +
                       (unsigned long)IPC_WAITER_MAX * sizeof *g_wait;
-    void *p = sys_mmap(0, n, CNG_PROT_READ | CNG_PROT_WRITE,
-                       CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    void *p = cng_own_map(sys_mmap(0, n, CNG_PROT_READ | CNG_PROT_WRITE,
+                                   CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0),
+                          n);
     if (p == CNG_MAP_FAILED || cng_is_err((long)p))
         return 0;
     g_sem = (struct sem_set *)p;

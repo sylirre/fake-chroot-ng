@@ -21,6 +21,7 @@
  */
 #include "cng/loader.h"
 #include "cng/monitor.h"
+#include "cng/ownmap.h"
 #include "cng/procreg.h"
 #include "cng/ptrace.h"
 #include "cng/rt.h"
@@ -177,8 +178,10 @@ static void fx_wait(volatile u32 *a, u32 val, int ms) {
 void cng_pt_init(void) {
     if (g_tab || cng_g_no_ptrace)
         return;
-    void *p = sys_mmap(0, sizeof(struct pt_tab), CNG_PROT_READ | CNG_PROT_WRITE,
-                       CNG_MAP_SHARED | CNG_MAP_ANONYMOUS, -1, 0);
+    void *p = cng_own_map(sys_mmap(0, sizeof(struct pt_tab),
+                                   CNG_PROT_READ | CNG_PROT_WRITE,
+                                   CNG_MAP_SHARED | CNG_MAP_ANONYMOUS, -1, 0),
+                          sizeof(struct pt_tab));
     if (p == CNG_MAP_FAILED || cng_is_err((long)p))
         return; /* no registry: ptrace answers -EPERM, as with --no-ptrace */
     g_tab = (struct pt_tab *)p;

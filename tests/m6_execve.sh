@@ -396,26 +396,27 @@ rm -rf "$AMD"
 
 # --- what an exec chain costs the address space -----------------------------
 # A real execve throws the whole mm away. The emulated one cannot — the monitor
-# lives in that address space — so what it can give back is what its own loader
-# mapped for the program being replaced: the image, the interpreter's image, and
-# the stack built for it. Left behind, those accumulated: 66.8 MB of address
-# space per generation, measured, 64 MiB of it the stack.
+# lives in that address space — so it gives back what its own loader mapped for
+# the program being replaced (the image, the interpreter's image, the stack
+# built for it), and then sweeps whatever else in the address space was never
+# the monitor's. Left behind, those accumulated: 66.8 MB of address space per
+# generation, measured, 64 MiB of it the stack.
 #
 # Compared against the same chain with no emulation under it rather than against
 # a constant, since VmSize is whatever the host underneath happens to need. The
 # slack covers what a generation genuinely does keep — the emulator's own
-# per-image bookkeeping, and anything the guest's libc maps for itself — while
-# leaving no room for a whole leaked generation.
+# per-image bookkeeping — while leaving no room for a whole leaked generation.
 #
-# Static guests only: a dynamic one's ld.so maps its libraries itself, and those
-# are not ours to give back (the block comment in src/monitor/execve.c says why).
+# This one is the guest the harness builds, whatever link mode that is; the leg
+# below it builds a dynamic one deliberately, because a program's own library
+# mappings are the half no recorded extent describes.
 ECD=$(mktemp -d)
 if ! guest_xlate_ready "exec-chain address space"; then
     :
 elif ! guest_cc_report "$ECD/execchain" tests/guests/execchain.c; then
     :
 elif elf_has_interp "$ECD/execchain"; then
-    skip "exec-chain address space: this guest links dynamically, and an ld.so's own library mappings are not ours to reclaim"
+    skip "exec-chain address space: the dynamic form of this leg is below, with the binds an ld.so needs"
 else
     # CNG_EXEC_RECLAIM_FORCE: qemu-user runs a thread of its own (call_rcu)
     # beside the guest's, so the process never reads as single-threaded from
@@ -443,6 +444,69 @@ else
     esac
 fi
 rm -rf "$ECD"
+
+# ...and the same chain with a guest whose OWN ld.so maps its libraries. That
+# memory is not the loader's and no recorded extent describes it, so it is the
+# half the sweep exists for — and the half that used to hurt. Measured on an
+# Android 13 device before it: 10,790,480 kB per generation, most of it one
+# PROT_NONE reservation bionic's scudo makes at libc init and the next
+# generation makes again. A musl guest cost 20 kB a generation and hid the whole
+# thing, which is why this leg names a dynamic guest rather than trusting
+# whichever one the harness happens to link.
+#
+# No kernel differential here, unlike the leg above: a dynamic bionic guest's
+# VmSize swings ±80 MB between runs of the SAME binary (scudo sizes its regions
+# from what it finds), which is wider than that leg's whole slack and would make
+# the comparison a coin toss. One leaked generation is three orders of magnitude
+# above that swing, so the chain is simply run long enough that a leak cannot
+# survive it: sixty-four generations at the old cost is 690 GB against a 512 GB
+# address space, and the run before the sweep died exactly there — "Fatal signal
+# 6 (SIGABRT)" out of scudo, after 21 seconds of mapping. It now finishes in
+# 0.2 s. Completing at all is most of this assertion; the bound is the rest.
+ECDD=$(mktemp -d)
+cng_dyn_binds
+if [ -z "$GUESTCC" ]; then
+    skip "dynamic exec-chain address space: no AArch64 guest toolchain"
+elif [ "$CNG_SECCOMP_LIVE" != 1 ]; then
+    # A dynamic guest's execve is libc's, in a library our loader never mapped,
+    # so -R cannot have rewritten it and an inert filter leaves nothing to trap:
+    # the call goes to the host kernel with the guest's own path and fails.
+    # Same prerequisite M23's dynamic legs have.
+    skip "dynamic exec-chain address space: filter inert here, so nothing reaches a dynamic guest's own execve"
+elif ! $GUESTCC -O2 -o "$ECDD/execchain" tests/guests/execchain.c \
+    2>"$GUEST_CC_LOG"; then
+    fail=$((fail + 1)); printf '  FAIL could not build a dynamic execchain\n'
+    sed 's/^/    /' "$GUEST_CC_LOG"
+elif ! elf_has_interp "$ECDD/execchain"; then
+    skip "dynamic exec-chain address space: this toolchain links even -O2 guests statically"
+else
+    # shellcheck disable=SC2086  # both are deliberately split arg lists
+    ecd_g=$(CNG_EXEC_RECLAIM_FORCE=1 run_t 200 $GUEST_DYN_L $GUEST_DYN_BINDS \
+        -R "$ECDD" /execchain 64 2>/dev/null)
+    case "$ecd_g" in
+    *growth_kb=*)
+        ecd_gn=${ecd_g##*growth_kb=}
+        # A generation of this guest costs gigabytes; the run-to-run swing is
+        # tens of megabytes. Anything under a gigabyte over sixty-four execs is
+        # therefore "no generation was kept", with room to spare on both sides.
+        if [ "$ecd_gn" -lt 1048576 ]; then
+            pass=$((pass + 1))
+            printf '  ok   a dynamic chain gives its libraries back too (%s kB over 64)\n' \
+                "$ecd_gn"
+        else
+            fail=$((fail + 1))
+            printf '  FAIL a dynamic exec chain leaks address space: %s kB over 64 execs\n' \
+                "$ecd_gn"
+        fi
+        ;;
+    *)
+        fail=$((fail + 1))
+        printf '  FAIL a dynamic exec chain of 64 did not survive (%s)\n' \
+            "$(echo "$ecd_g" | tr '\n' '|')"
+        ;;
+    esac
+fi
+rm -rf "$ECDD"
 
 # emulated execve must close FD_CLOEXEC fds like a real execve, or fork/exec
 # launchers (git run-command, posix_spawn) block on their O_CLOEXEC notify pipe.

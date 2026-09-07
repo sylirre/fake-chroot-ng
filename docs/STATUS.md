@@ -90,8 +90,9 @@ vfork/`posix_spawn` child-stack handling.
   Caveat: the emulation runs on the main thread's large stack (multi-threaded
   execve would want a sigaltstack — tracked with the M5 signal-stack hazard).
   The old program's mappings were kept too, at 66.8 MB of address space per
-  generation; what the loader itself mapped for it — its image, its
-  interpreter's, and its 64 MiB stack — is given back now (see M32 below).
+  generation — and, on a guest whose libc reserves address space of its own,
+  gigabytes more. What the loader mapped for it is given back by M32, and what
+  the program mapped for itself by M35.
 
 - [x] **M7 — fidelity: fake user identity, /proc self-path fixups, link2symlink**
   - `-u`/`--fake-id[=uid[:gid]]` fake user identity (default `0:0` root): the
@@ -2092,11 +2093,12 @@ vfork/`posix_spawn` child-stack handling.
   What is given back is exactly what the loader itself mapped for the program
   being replaced — its image, its interpreter's image (each one reservation with
   a recorded extent, so nothing is inferred from `/proc/self/maps`) and its
-  stack. What is not is what the previous program mapped for itself: the
-  libraries its `ld.so` loaded, its arenas, its thread stacks. Following those
-  would mean a VMA table of our own maintained on every `mmap`/`munmap`/`mremap`,
-  which is the per-syscall cost the `-R` tier exists to avoid; the brk heap, the
-  one such region with a handle on it, was already wound back.
+  stack. What was *not*, until M35, is what the previous program mapped for
+  itself: the libraries its `ld.so` loaded, its arenas, its allocator's
+  reservations. Following those was taken to mean a VMA table of our own
+  maintained on every `mmap`/`munmap`/`mremap`, which is the per-syscall cost the
+  `-R` tier exists to avoid; the brk heap, the one such region with a handle on
+  it, was already wound back.
   Two conditions hold it up. The process must be single-threaded — a real execve
   kills the other threads and ours cannot, so they go on running the old code on
   the old stacks; `fork()` clones one thread, so the ordinary fork+exec arrives
@@ -2105,7 +2107,8 @@ vfork/`posix_spawn` child-stack handling.
   on it: a generation is retired and handed back at the new program's first
   dispatched syscall. An ET_EXEC image lands at its link-time vaddr, so a range
   the incoming program already occupies is dropped rather than unmapped.
-  Measured after: 516 kB over eight execs, against the kernel's own 0.
+  Measured after: 516 kB over eight execs, against the kernel's own 0 — for a
+  guest whose libc reserves nothing of its own. M35 is the other half.
 
 - [x] **M33 — the rewriter scanned data and called it code**
   The M8 scan matched a bare `0xD4000001` word anywhere in a `PF_X PT_LOAD`,
@@ -2238,6 +2241,58 @@ vfork/`posix_spawn` child-stack handling.
   handler untested on a cross host, where no filter ever fires; the device
   covers those. 814/814 tests on the dev host, and on the device 777 passed with
   the same 11 pre-existing failures as the commit before it.
+
+- [x] **M35 — an exec chain kept every allocator its programs had started**
+  M32 gave back what the loader mapped and said the program's own mappings were
+  not ours to follow. On Android they are most of the bill. Measured on the
+  device, a **static bionic** guest exec'ing itself: **8,667,232 kB per
+  generation**, almost all of it one
+  `mmap(NULL, 8858370048, PROT_NONE, MAP_NORESERVE)` that scudo makes at libc
+  init and that the next generation makes again; a **dynamic** one cost
+  **10,790,480 kB**, its libraries on top. Sixty-four execs exhausted the address
+  space outright — `Scudo ERROR: internal map failure (error desc=Out of memory)
+  requesting 8650752KB`, SIGABRT, after 21 seconds spent mapping it. A musl guest
+  hid the whole thing at 20 kB a generation, which is why the dev host never saw
+  it and M32's leg passed there for four milestones.
+  The fix does not build the per-`mmap` table M32 ruled out. It asks the question
+  the other way round — not *what did our loader map*, which cannot see a guest's
+  own `mmap`, but *what in this address space was never the guest's* — and gives
+  back everything else. Two records answer it, in `src/monitor/ownmap.c`: a
+  **floor**, every mapping that exists at the moment `cng_run` is about to load
+  the first program (our image, our stack, the heap, the kernel's pseudo
+  mappings), and a **registry** of the dozen long-lived regions the monitor maps
+  after that — the broker tables, the pid and IPC registries, the ptrace link
+  table, the argv snapshot an exec is standing on. The 256 scratch stacks are
+  asked of `sigsys.c`, which already records their bounds.
+  Where the floor stands is the whole of its accuracy: taken after the first
+  program was loaded, it claimed that program's image and its 64 MiB stack, and
+  once those were given back the kernel handed the same addresses to the next
+  generation's allocator — which the sweep then read as ours and kept, at 16 MB
+  a generation, with no way to say why. It goes in front of the load.
+  The sweep runs inside M32's single-threaded gate, and at the point where the
+  incoming image and stack are mapped but the new program has not executed an
+  instruction — deferring it the way the reap is deferred would not do, since by
+  the new program's first dispatched syscall its `ld.so` has mapped libraries and
+  an anonymous `mmap` does not trap on the seccomp tier. `[heap]`, `[stack]`,
+  `[vdso]`, `[vvar*]` and friends are kept; Android's `[anon:...]` names are not
+  (`PR_SET_VMA` puts them on ordinary guest memory, which is the memory this is
+  for). It is fail-closed: no floor, a lost record or an unreadable
+  `/proc/self/maps` leaves the address space exactly as every build before it.
+  One thing it must keep that is not ours: **the signal frame**. The SIGSYS tier
+  returns into the new program through `rt_sigreturn`, and what that reads sits
+  on the guest's alternate signal stack whenever the guest registered one —
+  bionic registers one per thread, so the first version of this segfaulted an
+  Android guest on its first exec. `cng_scr_hit` now keeps the mapping the live
+  frame lies in; it is dead one generation later, so this costs one alternate
+  stack rather than a chain of them.
+  Measured after: **0 kB over 8 execs** for the static guest and 0 over 64
+  (against 69,337,856 kB over 8 before), and for the dynamic one a chain of 64
+  that finishes in 0.2 s where it used to abort after 21. Both are legs of
+  `tests/m6_execve.sh`; the dynamic one asserts survival plus a bound rather than
+  a kernel differential, because a dynamic bionic guest's `VmSize` swings ±80 MB
+  between runs of the same binary and one leaked generation is three orders of
+  magnitude above that. 814 passed and 0 failed on the dev host, where the
+  dynamic leg needs a live filter and skips; 788/0 on the device.
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 

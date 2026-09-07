@@ -1,10 +1,13 @@
 /* What an exec chain costs the address space (tests/m6_execve.sh).
  *
  * A real execve throws the whole mm away. The emulated one cannot — the monitor
- * lives in that address space — so what it can give back is what its own loader
- * mapped for the program being replaced: the image, the interpreter's image, and
- * the stack built for it. Left behind, those accumulated: measured before the
- * reclaim, 66.8 MB of address space per generation, 64 MiB of it the stack.
+ * lives in that address space — so it gives back what its own loader mapped for
+ * the program being replaced (the image, the interpreter's image, the stack
+ * built for it) and then sweeps everything else that was never the monitor's.
+ * Left behind, those accumulated: 66.8 MB of address space per generation
+ * before the reclaim, 64 MiB of it the stack; and 8.25 GB per generation more
+ * once the guest's own allocator was counted, which on a bionic guest killed
+ * the chain outright at 64 execs.
  *
  * So: exec self N times and report the VmSize the chain gained end to end. The
  * same program run with no emulation under it gains nothing, which is what this

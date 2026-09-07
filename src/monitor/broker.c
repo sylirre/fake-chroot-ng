@@ -18,6 +18,7 @@
 #include "cng/ipcreg.h"
 #include "cng/loader.h"
 #include "cng/monitor.h"
+#include "cng/ownmap.h"
 #include "cng/path.h"
 #include "cng/procreg.h"
 #include "cng/rt.h"
@@ -423,8 +424,9 @@ static int shm_att_reserve(struct seg *s) {
         return 1;
     int want = s->attcap ? s->attcap * 2 : SHM_ATT_TRACK;
     u64 sz = cng_page_up((u64)want * sizeof(struct seg_att));
-    void *p = sys_mmap(0, sz, CNG_PROT_READ | CNG_PROT_WRITE,
-                       CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    void *p = cng_own_map(sys_mmap(0, sz, CNG_PROT_READ | CNG_PROT_WRITE,
+                                   CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0),
+                          sz);
     if (p == CNG_MAP_FAILED || cng_is_err((long)p))
         return 0;
     if (s->att) {
@@ -821,8 +823,9 @@ static int tab_memfd(void **tab_out) {
             sys_close((int)fd);
             return -1;
         }
-        void *p = sys_mmap(0, size, CNG_PROT_READ | CNG_PROT_WRITE,
-                           CNG_MAP_SHARED, (int)fd, 0);
+        void *p = cng_own_map(sys_mmap(0, size, CNG_PROT_READ | CNG_PROT_WRITE,
+                                       CNG_MAP_SHARED, (int)fd, 0),
+                              size);
         if (p == CNG_MAP_FAILED || cng_is_err((long)p)) {
             sys_close((int)fd);
             return -1;
@@ -904,9 +907,10 @@ static _Noreturn void broker_main(struct cng_sockaddr_un *a, unsigned al) {
         rl.cur = rl.max;
         sys_prlimit64(0, CNG_RLIMIT_NOFILE, &rl, 0);
     }
-    void *p = sys_mmap(0, (unsigned long)SHM_SEG_MAX * sizeof(struct seg),
-                       CNG_PROT_READ | CNG_PROT_WRITE,
-                       CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    unsigned long segsz = (unsigned long)SHM_SEG_MAX * sizeof(struct seg);
+    void *p = cng_own_map(sys_mmap(0, segsz, CNG_PROT_READ | CNG_PROT_WRITE,
+                                   CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0),
+                          segsz);
     if (p == CNG_MAP_FAILED || cng_is_err((long)p))
         sys_exit_group(0); /* clients keep missing and fail loud */
     g_seg = (struct seg *)p;
