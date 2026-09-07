@@ -87,6 +87,32 @@ check_contains "...and a well-formed one still arrives whole" \
 # for byte.
 check_contains "a segment that cannot be file-mapped is refused, not misplaced" \
     "elfspan pgoff: file=-10 anon=0 tail=1 -> OK" "$(run -t elfspan 2>&1)"
+# ...and the ordering the two strategies create between the passes. The fall
+# back from map_anon's EEXEC picks the file-backed strategy after the header
+# pass has already judged the object against the anonymous one, so the map pass
+# has to carry the header's verdict forward: an object no strategy can map is
+# the header's own EINVAL, not the EMAP of a mapping that was attempted — which
+# past an execve's point of no return is the difference between an errno and a
+# fatal signal.
+check_contains "a plan made under one strategy is refused by the other, before it maps" \
+    "elfspan pgoff-late: plan=0 file_ok=0 map=-10 -> OK" "$(run -t elfspan 2>&1)"
+# The same route with the denial that actually produces it: PR_SET_MDWE refuses
+# an mprotect that gains PROT_EXEC, exactly as Android's execmem revocation
+# does. A plan made before the denial and mapped after it answers EINVAL, and a
+# plan made after it never reaches the map pass at all — the header pass probes
+# execmem for an object it cannot file-map and refuses while the caller is
+# still there. Skips where MDWE is unavailable (pre-6.3 kernels, and qemu-user,
+# which answers EINVAL): nothing there can deny anonymous exec memory.
+out=$(run -t elfspan 2>&1)
+case "$out" in
+*"elfspan execmem: no PR_SET_MDWE here"*)
+    skip "execmem fall back: no PR_SET_MDWE here (pre-6.3 kernel, or qemu-user)"
+    ;;
+*)
+    check_contains "the fall back from denied execmem refuses, and the pass before it does too" \
+        "elfspan execmem: plan=0 map=-10 replan=-10 file-mode=1 -> OK" "$out"
+    ;;
+esac
 # The same arithmetic one step out: what gets reserved is that span plus, under
 # -R, a trampoline pool on top of it, and the sum is a mapping length. A span
 # within a pool's distance of the top of the address space wraps it, the mmap

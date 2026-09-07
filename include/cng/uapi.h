@@ -117,6 +117,12 @@ struct cng_open_how {
 #define CNG_PR_GET_SECCOMP      21
 #define CNG_PR_SET_TAGGED_ADDR_CTRL 55
 #define CNG_PR_GET_TAGGED_ADDR_CTRL 56
+/* Memory-Deny-Write-Execute (Linux 6.3+): with REFUSE_EXEC_GAIN set, an
+ * mprotect that adds PROT_EXEC to a mapping is EACCES — the same refusal
+ * Android's execmem revocation produces, and the only way a development host
+ * can reach the loader's fall back from the anonymous strategy. */
+#define CNG_PR_SET_MDWE             65
+#define CNG_PR_MDWE_REFUSE_EXEC_GAIN 1
 
 /* seccomp */
 #define CNG_SECCOMP_MODE_FILTER      2

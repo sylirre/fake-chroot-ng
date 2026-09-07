@@ -154,9 +154,9 @@ static int map_file(int fd, const Elf64_Ehdr *eh, const Elf64_Phdr *ph,
              * wrong bytes at the right address whenever p_offset and p_vaddr
              * did not agree modulo the page size, silently: the mapping
              * succeeded and the guest ran whatever was there. The header pass
-             * refuses such an object where this strategy is already in force;
-             * what reaches here is the one route it cannot judge, the fall back
-             * from map_anon's EEXEC, which is decided after it has run. */
+             * refuses such an object, and cng_elf_map re-asks its verdict on
+             * both routes into this function — so nothing should arrive here.
+             * This is what keeps that true if a third route is ever added. */
             if ((ph[i].p_offset ^ vstart) & (cng_page_size - 1)) {
                 cng_dprintf(2, "chroot-ng: load: file mmap(%lx): p_offset %lx"
                                " does not share the page offset of p_vaddr %lx"
@@ -212,6 +212,7 @@ static int map_file(int fd, const Elf64_Ehdr *eh, const Elf64_Phdr *ph,
 static int elf_read_headers(int fd, struct cng_elf_plan *plan,
                             struct cng_loaded *out) {
     Elf64_Ehdr *eh = &plan->eh;
+    plan->file_ok = 1; /* until a PT_LOAD below says otherwise */
     if (read_exact(fd, eh, sizeof *eh, 0) != (long)sizeof *eh)
         return CNG_LOAD_EIO;
     if (eh->e_ident[0] != ELF_MAG0 || eh->e_ident[1] != ELF_MAG1 ||
@@ -298,9 +299,23 @@ static int elf_read_headers(int fd, struct cng_elf_plan *plan,
          * the two agree (measured). A segment with no file part is not mapped
          * from the file at all — by either strategy, or by the kernel — so its
          * p_offset is nobody's business. */
-        if (cng_g_loader_file && ph[i].p_filesz &&
-            ((ph[i].p_offset ^ ph[i].p_vaddr) & (cng_page_size - 1)))
-            return CNG_LOAD_EINVAL;
+        if (ph[i].p_filesz &&
+            ((ph[i].p_offset ^ ph[i].p_vaddr) & (cng_page_size - 1))) {
+            plan->file_ok = 0;
+            /* Which strategy is in force is not a property of the header, and
+             * for this object it decides whether there is a load at all — so
+             * settle it here, in the pass that maps nothing. The anonymous one
+             * runs only while anon PROT_EXEC is granted, which the environment
+             * can revoke at any time (NO_NEW_PRIVS, SELinux) and which the map
+             * pass would otherwise discover from map_anon's EEXEC — past the
+             * caller's point of no return, where "nothing can map this" is a
+             * fatal signal rather than an errno. One mmap/mprotect pair, and
+             * only for an object that needs the answer. */
+            if (!cng_g_loader_file)
+                cng_loader_check_execmem();
+            if (cng_g_loader_file)
+                return CNG_LOAD_EINVAL;
+        }
         /* Overflow, which is the span question one step out: p_vaddr and
          * p_memsz are attacker-chosen 64-bit values, and a sum that wraps
          * yields an `e` below `lo` and a span that is not the range we then
@@ -366,6 +381,8 @@ int cng_elf_plan_fd(int fd, struct cng_elf_plan *plan, struct cng_loaded *out) {
     plan->fd = fd; /* borrowed: the caller owns it, so never own_fd */
     plan->own_fd = 0;
     plan->err = 0;
+    plan->file_ok = 0; /* the header pass decides; a plan that never got one
+                        * carries the answer that maps nothing */
     int rc = elf_check_execable(fd);
     if (rc == CNG_LOAD_OK)
         rc = elf_read_headers(fd, plan, out);
@@ -380,6 +397,7 @@ int cng_elf_plan(const char *path, struct cng_elf_plan *plan,
     plan->fd = -1;
     plan->own_fd = 0;
     plan->err = 0;
+    plan->file_ok = 0;
     long fd = sys_openat(CNG_AT_FDCWD, path, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
     if (fd < 0) {
         plan->err = (int)fd; /* ENOENT, EACCES, ENOTDIR, ELOOP: the caller's */
@@ -411,6 +429,12 @@ int cng_elf_map(const struct cng_elf_plan *plan, unsigned long base_hint,
     unsigned long lo = plan->lo, hi = plan->hi, span = hi - lo, bias = 0;
     unsigned long maplen = 0;
 
+    /* The strategy can have changed since the plan was made — another thread's
+     * load flipping cng_g_loader_file — so the geometry question the header
+     * pass answered against the strategy of the moment is re-asked against the
+     * one actually in force. */
+    if (cng_g_loader_file && !plan->file_ok)
+        return CNG_LOAD_EINVAL;
     int rc = cng_g_loader_file ? map_file(plan->fd, eh, ph, plan->is_dyn, lo,
                                           span, base_hint, &bias, &maplen)
                                : map_anon(plan->fd, eh, ph, plan->is_dyn, lo,
@@ -420,6 +444,14 @@ int cng_elf_map(const struct cng_elf_plan *plan, unsigned long base_hint,
          * execmem on Android). Fall back to file-backed exec mapping, which
          * works on an exec-permitted mount, and remember it for next time. */
         cng_g_loader_file = 1;
+        /* ...but a segment that cannot be file-mapped has no strategy left,
+         * and that is a verdict on the header, not a mapping that failed: the
+         * same CNG_LOAD_EINVAL the header pass gives it, rather than the
+         * CNG_LOAD_EMAP map_file would report on its way out. The header pass
+         * probes execmem for exactly this object, so this is reached only when
+         * the probe was granted and the real mprotect was not. */
+        if (!plan->file_ok)
+            return CNG_LOAD_EINVAL;
         rc = map_file(plan->fd, eh, ph, plan->is_dyn, lo, span, base_hint, &bias,
                       &maplen);
     }

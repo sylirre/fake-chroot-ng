@@ -109,6 +109,13 @@ struct cng_elf_plan {
     unsigned long lo;  /* page-aligned bottom of the PT_LOAD span */
     unsigned long hi;  /* page-aligned top of it */
     int is_dyn;
+    int file_ok;       /* every PT_LOAD with a file part can be mapped from the
+                        * file: p_offset and p_vaddr agree modulo the page
+                        * size. Only the file-backed strategy needs it, and the
+                        * header pass refuses an object that fails it where
+                        * that strategy is in force — but the fall back from
+                        * map_anon's EEXEC picks that strategy after the pass
+                        * has run, so the map pass has to be able to ask too. */
     int fd;            /* the file to map from, -1 once released */
     int own_fd;        /* set when the plan opened it and must close it */
     int err;           /* CNG_LOAD_EOPEN: the open's own errno, negative. An

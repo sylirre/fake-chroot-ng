@@ -3160,11 +3160,14 @@ static long synth_elf_memfd(unsigned short type, const struct synth_seg *segs,
 /* One PT_LOAD at p_offset `offset` (0 or SYNTH_ELF_HDRSZ, so the arithmetic
  * below is one expression), ELFSPAN_FILESZ of file behind `memsz` of memory,
  * the file padded out behind it and ending in a byte the caller can look for
- * once it is in memory. p_flags = PF_R|PF_W, never PF_X: an executable segment
- * would draw the -R trampoline pool in after the span and hide an overrun.
- * Returns the fd or -errno. */
-static long elfspan_memfd(unsigned long memsz, unsigned long offset) {
-    struct synth_seg one = {0, ELFSPAN_FILESZ, memsz, 6 /*PF_R|PF_W*/, offset};
+ * once it is in memory. `flags` is p_flags: PF_R|PF_W for every span leg,
+ * never PF_X — an executable segment would draw the -R trampoline pool in
+ * after the span and hide an overrun. The execmem leg needs PF_X for the
+ * opposite reason: only an executable segment asks for the mprotect that a
+ * host denying anonymous exec memory refuses. Returns the fd or -errno. */
+static long elfspan_memfd_f(unsigned long memsz, unsigned long offset,
+                            unsigned flags) {
+    struct synth_seg one = {0, ELFSPAN_FILESZ, memsz, flags, offset};
     long fd = synth_elf_memfd(3 /*ET_DYN*/, &one, 1);
     if (fd < 0)
         return fd;
@@ -3182,6 +3185,10 @@ static long elfspan_memfd(unsigned long memsz, unsigned long offset) {
         left -= k;
     }
     return fd;
+}
+
+static long elfspan_memfd(unsigned long memsz, unsigned long offset) {
+    return elfspan_memfd_f(memsz, offset, 6 /*PF_R|PF_W*/);
 }
 
 int cng_cmd_elfspan(int argc, char **argv, char **envp, unsigned long *auxv) {
@@ -3246,6 +3253,35 @@ int cng_cmd_elfspan(int argc, char **argv, char **envp, unsigned long *auxv) {
                 skew_anon, skew_tail, sok ? "OK" : "FAIL");
     ok = ok && sok;
 
+    /* The same object, planned while the anonymous strategy is in force — so
+     * the header pass records the geometry rather than refusing it — and
+     * mapped once the file-backed one is. That is the ordering map_anon's
+     * EEXEC fall back creates (it picks the strategy after the header pass has
+     * run), and the one another thread's load creates by flipping the flag in
+     * between. The map pass has to answer with the header's own verdict,
+     * before it maps anything: CNG_LOAD_EINVAL, an object no strategy can
+     * carry, and not the CNG_LOAD_EMAP of a mapping that was attempted and
+     * failed — which past an execve's point of no return is the difference
+     * between an errno and a fatal signal. */
+    int save_late = cng_g_loader_file;
+    cng_g_loader_file = 0;
+    fd = elfspan_memfd(ELFSPAN_FILESZ, SYNTH_ELF_HDRSZ);
+    struct cng_elf_plan lplan;
+    struct cng_loaded lout;
+    int lp = fd < 0 ? (int)fd : cng_elf_plan_fd((int)fd, &lplan, &lout);
+    int lfok = lp == CNG_LOAD_OK ? lplan.file_ok : -1;
+    cng_g_loader_file = 1; /* the fall back's own flip, before the map pass */
+    int lmap = lp == CNG_LOAD_OK ? cng_elf_map(&lplan, 0, &lout) : lp;
+    cng_g_loader_file = save_late;
+    if (lp == CNG_LOAD_OK)
+        cng_elf_plan_release(&lplan); /* borrowed fd: closed below */
+    if (fd >= 0)
+        sys_close((int)fd);
+    int lok = lp == CNG_LOAD_OK && lfok == 0 && lmap == CNG_LOAD_EINVAL;
+    cng_dprintf(1, "elfspan pgoff-late: plan=%d file_ok=%d map=%d -> %s\n", lp,
+                lfok, lmap, lok ? "OK" : "FAIL");
+    ok = ok && lok;
+
     /* ...and the same arithmetic one step out. What gets reserved is the span
      * plus, under -R, a trampoline pool on top of it, and that sum is a mapping
      * length: a span within a pool's distance of the top of the address space
@@ -3256,8 +3292,8 @@ int cng_cmd_elfspan(int argc, char **argv, char **envp, unsigned long *auxv) {
      * not a property of the header (and with it on there is nothing left to
      * report the failure with). */
     struct synth_seg wrap[2] = {
-        {0, SYNTH_ELF_HDRSZ, 0x1000, 6 /*PF_R|PF_W*/},
-        {0xFFFFFFFFFFF80000UL, 0, 0x1000, 6 /*PF_R|PF_W*/},
+        {0, SYNTH_ELF_HDRSZ, 0x1000, 6 /*PF_R|PF_W*/, 0},
+        {0xFFFFFFFFFFF80000UL, 0, 0x1000, 6 /*PF_R|PF_W*/, 0},
     };
     int wrc[2];
     int saved = cng_g_rewrite;
@@ -3272,7 +3308,56 @@ int cng_cmd_elfspan(int argc, char **argv, char **envp, unsigned long *auxv) {
     int wok = wrc[0] == CNG_LOAD_EFORMAT && wrc[1] == CNG_LOAD_EFORMAT;
     cng_dprintf(1, "elfspan wrap: plain=%d rewrite=%d -> %s\n", wrc[0], wrc[1],
                 wok ? "OK" : "FAIL");
-    return ok && wok ? 0 : 1;
+
+    /* The real route, with the denial that produces it. PR_SET_MDWE refuses an
+     * mprotect that adds PROT_EXEC — the same EACCES Android's execmem
+     * revocation gives — so map_anon reports CNG_LOAD_EEXEC and the fall back
+     * runs for real. Two things then have to hold, and neither could be
+     * reached before:
+     *
+     *  - a plan made BEFORE the denial and mapped after it answers with the
+     *    header's verdict (EINVAL), not with map_file's EMAP;
+     *  - a plan made after it never gets that far: the header pass probes
+     *    execmem for an object it cannot file-map and refuses while the caller
+     *    is still alive, which is the whole point of the split.
+     *
+     * MDWE is per-process and irreversible, so this is the last thing the
+     * command does. Where it is not available (a pre-6.3 kernel, or qemu-user,
+     * which answers EINVAL) the leg reports SKIP: nothing on such a host can
+     * deny anonymous exec memory. */
+    int save_x = cng_g_loader_file;
+    cng_g_loader_file = 0;
+    long xfd = elfspan_memfd_f(ELFSPAN_FILESZ, SYNTH_ELF_HDRSZ, 5 /*PF_R|PF_X*/);
+    struct cng_elf_plan xplan;
+    struct cng_loaded xout;
+    int xp = xfd < 0 ? (int)xfd : cng_elf_plan_fd((int)xfd, &xplan, &xout);
+    if (sys_prctl(CNG_PR_SET_MDWE, CNG_PR_MDWE_REFUSE_EXEC_GAIN, 0, 0, 0) != 0) {
+        if (xp == CNG_LOAD_OK)
+            cng_elf_plan_release(&xplan);
+        if (xfd >= 0)
+            sys_close((int)xfd);
+        cng_g_loader_file = save_x;
+        cng_dprintf(1, "elfspan execmem: no PR_SET_MDWE here -> SKIP\n");
+        return ok && wok ? 0 : 1;
+    }
+    int xmap = xp == CNG_LOAD_OK ? cng_elf_map(&xplan, 0, &xout) : xp;
+    if (xp == CNG_LOAD_OK)
+        cng_elf_plan_release(&xplan);
+    /* The fall back remembers the denial; put it back so the second half asks
+     * the question the header pass is meant to ask for itself. */
+    cng_g_loader_file = 0;
+    int xp2 = xfd < 0 ? (int)xfd : cng_elf_plan_fd((int)xfd, &xplan, &xout);
+    if (xp2 == CNG_LOAD_OK)
+        cng_elf_plan_release(&xplan);
+    if (xfd >= 0)
+        sys_close((int)xfd);
+    int xok = xp == CNG_LOAD_OK && xmap == CNG_LOAD_EINVAL &&
+              xp2 == CNG_LOAD_EINVAL && cng_g_loader_file == 1;
+    cng_dprintf(1,
+                "elfspan execmem: plan=%d map=%d replan=%d file-mode=%d -> %s\n",
+                xp, xmap, xp2, cng_g_loader_file, xok ? "OK" : "FAIL");
+    cng_g_loader_file = save_x;
+    return ok && wok && xok ? 0 : 1;
 }
 
 /* _elfinterp — a PT_INTERP the loader cannot honor has to be refused, never
@@ -3685,7 +3770,8 @@ int cng_cmd_imgtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     unsigned int gate0 = *(volatile unsigned int *)__cng_gate_start;
     struct cng_loaded ld;
 
-    struct synth_seg over_seg = {img, SYNTH_ELF_HDRSZ, 0x1000, 6 /*PF_R|PF_W*/};
+    struct synth_seg over_seg = {img, SYNTH_ELF_HDRSZ, 0x1000, 6 /*PF_R|PF_W*/,
+                                 0};
     long fd = synth_elf_memfd(2 /*ET_EXEC*/, &over_seg, 1);
     if (fd < 0) {
         cng_dprintf(1, "imgtest: memfd_create errno=%d -> SKIP\n", (int)-fd);
@@ -3698,7 +3784,7 @@ int cng_cmd_imgtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     /* One page below the base, sized to end exactly where the image starts. */
     unsigned long below = img - cng_page_size;
     struct synth_seg under_seg = {below, SYNTH_ELF_HDRSZ, cng_page_size,
-                                  6 /*PF_R|PF_W*/};
+                                  6 /*PF_R|PF_W*/, 0};
     fd = synth_elf_memfd(2 /*ET_EXEC*/, &under_seg, 1);
     int under = fd < 0 ? (int)fd : cng_load_elf_fd((int)fd, 0, &ld);
     if (fd >= 0)
@@ -3706,7 +3792,8 @@ int cng_cmd_imgtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     if (under == CNG_LOAD_OK)
         sys_munmap((void *)below, cng_page_size);
 
-    struct synth_seg dyn_seg = {img, SYNTH_ELF_HDRSZ, 0x1000, 6 /*PF_R|PF_W*/};
+    struct synth_seg dyn_seg = {img, SYNTH_ELF_HDRSZ, 0x1000, 6 /*PF_R|PF_W*/,
+                                0};
     fd = synth_elf_memfd(3 /*ET_DYN*/, &dyn_seg, 1);
     int dyn = fd < 0 ? (int)fd : cng_load_elf_fd((int)fd, img, &ld);
     if (fd >= 0)
