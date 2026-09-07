@@ -1503,18 +1503,38 @@ static void path_args_of(long nr, long a0, long a1, long a2, long a3,
  *    is created or truncated by an open, so asking after the fact costs
  *    nothing.
  *
+ * What gets re-issued is the validated COPY, never the guest's own struct —
+ * which is why the struct is not passed here at all. Both of the above, and the
+ * decision to come here rather than translate, were taken on the copy's
+ * `resolve` and `flags`; handing the kernel the guest's pointer would let a
+ * second thread rewrite them in between and have the call performed under a
+ * word nobody checked. Clearing the scoping alone is enough to matter: the path
+ * goes over untranslated, and it is the scoping that makes that safe. An
+ * oversized `size` is not carried over either — read_open_how has already
+ * proved the tail zero, which is what makes the two forms the same call.
+ *
  * Returns the syscall result. */
-static long openat2_scoped(long a0, long a1, long a2, long a3, long a4, long a5,
+static long how_precheck(const struct cng_open_how *how);
+
+static long openat2_scoped(long dirfd, long path, long a4, long a5,
                            const struct cng_open_how *how) {
     char hdir[CNG_PATH_MAX];
-    int have_dir = (int)a0 == CNG_AT_FDCWD
+    int have_dir = (int)dirfd == CNG_AT_FDCWD
                        ? sys_getcwd(hdir, sizeof hdir) > 0
-                       : dirfd_host((int)a0, hdir, sizeof hdir) == 0;
+                       : dirfd_host((int)dirfd, hdir, sizeof hdir) == 0;
     long oflags = (long)how->flags;
 
     if (have_dir && ro_denied(hdir) &&
         ((oflags & 3) != CNG_O_RDONLY ||
          (oflags & (CNG_O_CREAT | CNG_O_TRUNC)))) {
+        /* We are about to answer instead of the kernel, and build_open_flags()
+         * would have run before it looked at a path at all — so an open_how it
+         * refuses is EINVAL ahead of our EROFS. The probe below carries the
+         * guest's `resolve` and would draw that on its own, but not the flags,
+         * which it replaces; and the O_CREAT branch never gets that far. */
+        long inval = how_precheck(how);
+        if (inval)
+            return inval;
         if (oflags & CNG_O_CREAT)
             return -EROFS; /* creation takes write access on the parent first */
         struct cng_open_how probe = *how;
@@ -1523,15 +1543,16 @@ static long openat2_scoped(long a0, long a1, long a2, long a3, long a4, long a5,
          * same way, or a write-open of a dangling link reads as absent. */
         probe.flags = CNG_O_PATH | CNG_O_CLOEXEC | (oflags & CNG_O_NOFOLLOW);
         probe.mode = 0;
-        long e = cng_syscall6(a0, a1, (long)&probe, (long)sizeof probe, 0, 0,
-                              __NR_openat2);
+        long e = cng_syscall6(dirfd, path, (long)&probe, (long)sizeof probe, 0,
+                              0, __NR_openat2);
         if (e < 0)
             return e; /* the lookup's own error: ENOENT, ENOTDIR, ELOOP... */
         sys_close((int)e);
         return -EROFS;
     }
 
-    long r = reissue(a0, a1, a2, a3, a4, a5, __NR_openat2);
+    long r = reissue(dirfd, path, (long)how, (long)sizeof *how, a4, a5,
+                     __NR_openat2);
     if (r >= 0 && have_dir && !cng_g_no_proc && !strncmp(hdir, "/proc", 5) &&
         (!hdir[5] || hdir[5] == '/')) {
         char land[CNG_PATH_MAX];
@@ -1973,7 +1994,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
              * untouched the answer is exactly the kernel's — absolute symlinks,
              * escaping `..`, mount crossings and all. */
             if (resolve & (CNG_RESOLVE_BENEATH | CNG_RESOLVE_IN_ROOT))
-                return openat2_scoped(a0, a1, a2, a3, a4, a5, &how);
+                return openat2_scoped(a0, a1, a4, a5, &how);
             /* The rest constrain the walk itself, and are answered against the
              * GUEST's namespace — the one the guest described — then stripped.
              * Left in place they would be re-judged against the host path,
