@@ -9,6 +9,7 @@
  */
 #include "cng/elf.h"
 #include "cng/loader.h"
+#include "cng/monitor.h"
 #include "cng/rewrite.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
@@ -86,12 +87,25 @@ static int map_anon(int fd, const Elf64_Ehdr *eh, const Elf64_Phdr *ph,
     }
 
     if (cng_g_rewrite) {
+        /* Where this object says its instructions are. An empty map is not a
+         * refusal to rewrite — cng_rewrite_seg then falls back to scanning the
+         * whole segment behind the syscall-context filter. */
+        struct cng_code_ranges cr;
+        cng_code_ranges(fd, &cr);
         unsigned long pool = (unsigned long)seg + span, used = 0;
+        int sites = 0;
         for (int i = 0; i < eh->e_phnum; i++)
             if (ph[i].p_type == PT_LOAD && (ph[i].p_flags & PF_X))
-                cng_rewrite_seg(bias + ph[i].p_vaddr,
-                                bias + ph[i].p_vaddr + ph[i].p_filesz, pool,
-                                CNG_TRAMP_POOL, &used);
+                sites += cng_rewrite_seg(bias + ph[i].p_vaddr,
+                                         bias + ph[i].p_vaddr + ph[i].p_filesz,
+                                         ph[i].p_offset, &cr, pool,
+                                         CNG_TRAMP_POOL, &used);
+        /* `ranges=0` says the object carried no code map and the scan ran
+         * behind the syscall-context filter instead — worth telling apart when
+         * a site count comes out lower than expected. */
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] load: rewrote %d svc site(s), ranges=%d\n",
+                        sites, cr.n);
         if (used) {
             sys_mprotect((void *)pool, cng_page_up(used),
                          CNG_PROT_READ | CNG_PROT_EXEC);

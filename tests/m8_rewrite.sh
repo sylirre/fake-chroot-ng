@@ -24,6 +24,32 @@ check_contains "nothing behind a rewritten syscall is spent from the guest's own
 check_contains "the exit for a tracer-moved pc enters it, with the rest restored" \
     "marker=9a9a x12=c0c -> OK" "$rwout"
 
+# The other half of M8: which words may be rewritten at all. A scan matching a
+# bare 0xD4000001 cannot tell an instruction from a data word that equals one,
+# and a PF_X PT_LOAD is not a code segment — on a musl link it is the whole
+# read-only image, and even -z separate-code leaves the unwind tables in it.
+# Ten such data words sit in stock Alpine/Debian aarch64 rootfs images, every
+# one in .gcc_except_table; the site the probe below uses is verbatim from
+# Debian trixie's libstdc++. So the object's section headers say where its code
+# is, and the "unmapped" leg is the control that says the word really is taken
+# when nothing rules it out.
+case "$rwout" in
+*"rwtest codemap: unavailable"*)
+    skip "code map from section headers: no memfd to build a synthetic object"
+    ;;
+*)
+    check_contains "the code map is the section headers, contiguous ones merged" \
+        "rwtest codemap: ranges=2 [1000,1180) [3000,3040) headerless=0 -> OK" \
+        "$rwout"
+    ;;
+esac
+# mapped=1: with a code map, only the instruction is taken. unmapped=2: with a
+# map that covers the data too, the LSDA word is taken — the corruption this
+# guards against, reproduced. filtered=1 / dataonly=0: with no headers to trust,
+# the syscall-context filter keeps the site and rejects the data word.
+check_contains "a data word equal to svc #0 is left alone, the real site taken" \
+    "rwtest scan: mapped=1 unmapped=2 filtered=1 dataonly=0 -> OK" "$rwout"
+
 ROOT=$(mktemp -d)
 mkdir -p "$ROOT/bin" "$ROOT/etc"
 printf 'GREETING-VIA-REWRITE' > "$ROOT/etc/greeting"

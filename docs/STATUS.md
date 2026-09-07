@@ -139,9 +139,10 @@ vfork/`posix_spawn` child-stack handling.
   `open()` translated into the rootfs, 10/10 deterministic, with a no-`-R`
   negative control. This is also the first end-to-end proof of the full
   translation pipeline with a real glibc guest. 50/50 tests.
-  Caveat: `svc`-immediate scan is exact (`0xD4000001`); rare data words equal to
-  it in an executable segment would be mis-rewritten — none in the glibc we
-  tested (101 words, all real svc), but `-R` stays opt-in for that reason.
+  Caveat at M8: the `svc`-immediate scan is exact (`0xD4000001`), and a data
+  word equal to it anywhere in the executable segment was rewritten with it —
+  which stock rootfs images turned out to contain (see M33, where the scan
+  learned to ask the object where its code is).
 
 - [x] **M9 — robust link2symlink (backing-file scheme, `-l`/`--link2symlink`)**
   Ported from `/home/sol/arm64chroot`. Where the host refuses `link(2)`
@@ -1841,9 +1842,10 @@ vfork/`posix_spawn` child-stack handling.
   - **-R now reaches library code**, which it never could before: the copy is
     still writable when it arrives, so the `svc` sites go through the M8
     rewriter on the way. Only the PF_X `PT_LOAD`s are scanned (read from the
-    file, since the mapping may start past the headers) — scanning a whole
-    library would put `.rodata` words that happen to equal `svc #0` through the
-    rewriter, which is the M8 caveat. The trampoline pool cannot be
+    file, since the mapping may start past the headers), and since M33 only the
+    parts of them the section headers call code — a library's `.rodata` and its
+    unwind tables live inside that segment and do contain words equal to `svc
+    #0`. The trampoline pool cannot be
     over-allocated here the way the loader does it, because the span belongs to
     the guest's linker, so it goes immediately outside the object's own load
     span (`MAP_FIXED_NOREPLACE`, both sides tried), and failing that wherever
@@ -2104,6 +2106,72 @@ vfork/`posix_spawn` child-stack handling.
   dispatched syscall. An ET_EXEC image lands at its link-time vaddr, so a range
   the incoming program already occupies is dropped rather than unmapped.
   Measured after: 516 kB over eight execs, against the kernel's own 0.
+
+- [x] **M33 — the rewriter scanned data and called it code**
+  The M8 scan matched a bare `0xD4000001` word anywhere in a `PF_X PT_LOAD`,
+  on the reasoning that an executable segment holds instructions. It does not:
+  a musl/Alpine link puts the whole read-only image — `.rela.dyn`, `.dynstr`,
+  `.rodata`, `.eh_frame`, `.gcc_except_table` — in the one R+E segment, and
+  even a `-z separate-code` link leaves `.rodata` and the unwind tables in
+  there. Measured over 1717 aarch64 objects (an Alpine 3.x rootfs, the Debian
+  trixie aarch64 rootfs, the Debian cross libraries): **58% of the bytes the
+  scan walked were not instructions**, and ten data words in those stock images
+  equal `svc #0` exactly.
+  Every one of the ten is in `.gcc_except_table`, and not by chance: an LSDA
+  call-site record with no landing pad and no action emits `01 00 00`, and the
+  next entry's first byte lands on the `d4` — a rate some 10^5 times what a
+  uniformly random word would give. They are in `libstdc++` (both
+  distributions), `libapt-pkg`, `libicuuc`, `sqv`, `libgo` and `libgphobos`.
+  In Debian's `libstdc++.so.6.0.33` and `libapt-pkg.so.7.0.0` that word is the
+  **only** match in the entire executable segment — neither library contains an
+  `svc` of its own — so under `-R` every site rewritten in them was a data
+  word. What follows is a corrupted LSDA: the C++ personality routine reads it
+  during an unwind and takes a wrong landing pad or none, and nothing between
+  the store and `std::terminate` reports a thing. The failure is silent,
+  deferred and workload-dependent, which is why nothing had caught it.
+  The section headers separate the two exactly: all 1837 real `svc` words in
+  that corpus are inside `SHF_EXECINSTR` sections and all ten data words are
+  outside, and the headers survive `strip` — not one of the 1717 objects was
+  without them (the 896 with no executable section at all are `.o` files, which
+  nothing loads). So `cng_code_ranges` reads them from the fd the loader and
+  the mmap hook already hold, merging contiguous ones (`.init`/`.plt`/`.text`/
+  `.fini` become one range; three is the most a real object needs, against a
+  table of 16), and `cng_rewrite_seg` scans the intersection of the mapping
+  with that map. They are guest-controlled input, but a code map can only ever
+  *narrow* what is scanned, so nonsense there costs rewriting and never
+  correctness. The scan is also 2.4x cheaper for no longer walking the data.
+  An object with no usable headers does not get the old behaviour back; it gets
+  the old behaviour behind a syscall-context filter, which rewrites a candidate
+  only if one of the eight instructions before it writes x8. On the same corpus
+  97.1% of real sites set x8 that close (the rest keep the SIGSYS floor, which
+  is correct and only slower), and not one of the ten data words has anything
+  resembling it.
+  What this does not reach is data *inside* a code section — a literal pool or
+  a jump table. Measured with `$d`/`$x` mapping symbols on the objects that
+  still carry a `.symtab`, that is 0.71% of code-section bytes, with no
+  collision in 38 MB. Closing it exactly would mean patching lazily from the
+  SIGSYS floor instead of ahead of time (`si_call_addr - 4` is a word the CPU
+  really did execute), which is a different tier and would not serve the case
+  `-R` also exists for: hosts where seccomp never traps at all.
+  Validated by `-t rwtest`: the code map built from a synthetic section table
+  (contiguous sections merged, allocated-but-not-executable and `SHT_NOBITS`
+  ones skipped, an object with no section headers answering "no map"), and four
+  scan decisions over 44 bytes taken verbatim from Debian's `libstdc++` at file
+  offset `0x249b8c` — with the code map only the instruction is taken; with a
+  map stretched to cover the data as well the LSDA word is taken too (the
+  control, which reproduces the corruption on demand); with no map at all the
+  filter keeps the real site and rejects the data word; and the data alone
+  yields nothing.
+  Measured end to end against the previous build, on an Alpine guest whose
+  libraries all arrive through the mmap hook's anonymous copy
+  (`CNG_MMAP_FORCE_ANON=1`, `/usr/bin/node`): before, `libstdc++.so.6.0.32` and
+  `libicuuc.so.74.2` each had exactly one "site" rewritten, and in both it was
+  the `.gcc_except_table` word; after, all fourteen libraries report none, and
+  the real objects keep every site they had — a static-PIE glibc guest still
+  rewrites its 101, and `ld-musl-aarch64.so.1` its 477 (478 candidates, less
+  the sigreturn restorer the M8 guard already skipped). `CNG_DEBUG=1` now says
+  both numbers per object: `rewrote N svc site(s), ranges=M`, where `ranges=0`
+  is the headerless fallback. 813/813 tests.
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 

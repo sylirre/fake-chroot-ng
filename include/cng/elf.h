@@ -34,6 +34,19 @@ typedef struct {
     uint64_t p_align;
 } Elf64_Phdr;
 
+typedef struct {
+    uint32_t sh_name;
+    uint32_t sh_type;
+    uint64_t sh_flags;
+    uint64_t sh_addr;
+    uint64_t sh_offset;
+    uint64_t sh_size;
+    uint32_t sh_link;
+    uint32_t sh_info;
+    uint64_t sh_addralign;
+    uint64_t sh_entsize;
+} Elf64_Shdr;
+
 /* e_ident indices / values */
 #define ELF_MAG0 0x7f
 #define ELF_MAG1 'E'
@@ -93,5 +106,13 @@ typedef struct {
 #define AT_EXECFN        31
 #define AT_SYSINFO_EHDR  33
 #define AT_MINSIGSTKSZ   51
+
+/* sh_type */
+#define SHT_PROGBITS 1
+#define SHT_NOBITS   8
+
+/* sh_flags */
+#define SHF_ALLOC      0x2
+#define SHF_EXECINSTR  0x4
 
 #endif /* CNG_ELF_H */

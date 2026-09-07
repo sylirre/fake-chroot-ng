@@ -70,9 +70,11 @@ static unsigned long pool_at(unsigned long want) {
 }
 
 /* Rewrite the `svc` sites of this mapping, but only where the object says its
- * code is. The M8 scan matches a bare 0xD4000001 word, so running it over a
- * whole library would take .rodata and .data with it — the loader avoids that
- * by scanning PF_X PT_LOADs only, and the same discipline applies here.
+ * code is. The M8 scan matches a bare 0xD4000001 word, and a PF_X PT_LOAD is
+ * not a code segment: a musl link puts the whole read-only image in it, and
+ * every link leaves the unwind tables there, where LSDA bytes really do equal
+ * `svc #0` (see cng_code_ranges). So the segments say which bytes this mapping
+ * carries and the section headers say which of them are instructions.
  *
  * The trampoline pool has to be within a `b`'s reach of the code. The loader
  * gets that by over-allocating its own reservation; here the mapping belongs to
@@ -148,7 +150,9 @@ static int rewrite_text(int fd, unsigned long map, unsigned long off,
         return 0;
 
     /* Pass two: the executable segments, clipped to the bytes this mapping
-     * actually carries. */
+     * actually carries, and to the object's own code map. */
+    struct cng_code_ranges cr;
+    cng_code_ranges(fd, &cr);
     unsigned long used = 0;
     int sites = 0;
     for (int i = 0; i < eh.e_phnum; i++) {
@@ -166,8 +170,8 @@ static int rewrite_text(int fd, unsigned long map, unsigned long off,
             shi = off + got;
         if (shi <= slo)
             continue;
-        sites += cng_rewrite_seg(map + (slo - off), map + (shi - off), pool,
-                                 CNG_TRAMP_POOL, &used);
+        sites += cng_rewrite_seg(map + (slo - off), map + (shi - off), slo,
+                                 &cr, pool, CNG_TRAMP_POOL, &used);
     }
     if (!used) {
         sys_munmap((void *)pool, CNG_TRAMP_POOL); /* nothing was reachable */

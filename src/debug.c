@@ -7,6 +7,7 @@
  * under qemu).
  */
 #include "cng/broker.h"
+#include "cng/elf.h"
 #include "cng/l2s.h"
 #include "cng/loader.h"
 #include "cng/monitor.h"
@@ -1237,6 +1238,197 @@ static void rw_move_pc(struct cng_uregs *r) {
     r->pc += 4;
 }
 
+/* rwtest's "object" is two templates memcpy'd into anonymous memory, so every
+ * byte of it is code: an explicit whole-range map, rather than the headerless
+ * fallback, which would put the syscall-context filter in the way of a test
+ * that is about the trampoline. */
+static const struct cng_code_ranges rw_all = {1, {0}, {~0UL}};
+
+/* --- what the scan is allowed to touch ------------------------------------
+ *
+ * The trampoline checks below run over code this binary wrote itself. These
+ * run over the other half of the M8 problem: a scan matching a bare 0xD4000001
+ * word cannot tell an instruction from a data word that equals one, and stock
+ * aarch64 rootfs images do contain the latter — every one found so far in
+ * .gcc_except_table, whose uleb128 call-site records emit the byte string
+ * `01 00 00 d4` (a landing pad and an action of zero, then the next entry)
+ * often enough to be a matter of when, not whether. Rewriting one corrupts the
+ * LSDA the C++ personality routine later reads, and nothing between the store
+ * and the wrong landing pad reports a thing.
+ *
+ * Two independent things have to hold: an object's section headers keep the
+ * scan out of its data, and where an object has none the syscall-context
+ * filter rejects a word nothing set x8 for. */
+
+/* Verbatim from Debian trixie's libstdc++.so.6.0.33 at file offset 0x249b8c:
+ * the .gcc_except_table word that equals `svc #0`, behind the eight words
+ * before it — exactly as far back as the filter looks. */
+static const unsigned char rw_lsda[44] = {
+    0x00, 0xff, 0xff, 0x01, 0x1d, 0x38, 0xe4, 0x01, 0x00, 0x00, 0xe0,
+    0x06, 0xe4, 0x05, 0xc4, 0x14, 0x00, 0xdc, 0x0d, 0x48, 0x00, 0x00,
+    0xc4, 0x10, 0xd0, 0x02, 0xc4, 0x14, 0x00, 0xd8, 0x14, 0x04, 0x00,
+    0x00, 0xff, 0xff, 0x01, 0x1d, 0x38, 0xe4, 0x01, 0x00, 0x00, 0xd4,
+};
+
+/* `movz x8, #93; svc #0; ret; nop` — a syscall site of the shape every libc
+ * writes, and what the filter has to keep saying yes to. */
+static const unsigned rw_site[4] = {0xD2800BA8u, 0xD4000001u, 0xD65F03C0u,
+                                    0xD503201Fu};
+
+#define RW_FOFF     0x1000UL /* the file offset the image stands for */
+#define RW_SITE_OFF 4        /* the real svc, in bytes into the image */
+#define RW_DATA_OFF 56       /* the LSDA word that collides with it */
+
+/* Lay the two out the way an object does — code, then the data behind it — and
+ * scan with the map the caller passes (0 for the headerless fallback). Reports
+ * the two words afterwards, because a count alone does not say which one was
+ * taken. */
+static int rw_scan_probe(unsigned long region, const struct cng_code_ranges *cr,
+                         int data_only, unsigned *site_out, unsigned *data_out) {
+    unsigned char *img = (unsigned char *)region;
+    unsigned long len;
+    unsigned long used = 0;
+    if (data_only) {
+        memcpy(img, rw_lsda, sizeof rw_lsda);
+        len = sizeof rw_lsda;
+    } else {
+        memcpy(img, rw_site, sizeof rw_site);
+        memcpy(img + sizeof rw_site, rw_lsda, sizeof rw_lsda);
+        len = sizeof rw_site + sizeof rw_lsda;
+    }
+    int n = cng_rewrite_seg(region, region + len, RW_FOFF, cr, region + 4096,
+                            CNG_TRAMP_POOL, &used);
+    if (site_out)
+        *site_out = data_only ? 0 : *(unsigned *)(region + RW_SITE_OFF);
+    if (data_out)
+        *data_out = *(unsigned *)(region + (data_only ? 40 : RW_DATA_OFF));
+    return n;
+}
+
+/* An ELF header and a section table, and nothing else — all cng_code_ranges
+ * reads. `with_shdrs` 0 leaves e_shoff at zero: an object that kept none. */
+static long rw_shdr_memfd(int with_shdrs) {
+    long fd = sys_memfd_create("cng-shdr-elf", 0);
+    if (fd < 0)
+        return fd;
+    Elf64_Ehdr eh;
+    Elf64_Shdr sh[6];
+    memset(&eh, 0, sizeof eh);
+    memset(sh, 0, sizeof sh);
+    eh.e_ident[0] = ELF_MAG0;
+    eh.e_ident[1] = ELF_MAG1;
+    eh.e_ident[2] = ELF_MAG2;
+    eh.e_ident[3] = ELF_MAG3;
+    eh.e_ident[EI_CLASS] = ELFCLASS64;
+    eh.e_ident[EI_DATA] = ELFDATA2LSB;
+    eh.e_type = ET_DYN;
+    eh.e_machine = EM_AARCH64;
+    eh.e_version = 1;
+    eh.e_ehsize = sizeof eh;
+    if (with_shdrs) {
+        eh.e_shoff = sizeof eh;
+        eh.e_shentsize = sizeof(Elf64_Shdr);
+        eh.e_shnum = 6;
+    }
+    /* [1] code; [2] the section abutting it, which must merge into it; [3]
+     * allocated but not executable; [4] executable with no bytes in the file;
+     * [5] code standing apart. */
+    sh[1].sh_type = SHT_PROGBITS;
+    sh[1].sh_flags = SHF_ALLOC | SHF_EXECINSTR;
+    sh[1].sh_offset = 0x1000;
+    sh[1].sh_size = 0x100;
+    sh[2] = sh[1];
+    sh[2].sh_offset = 0x1100;
+    sh[2].sh_size = 0x80;
+    sh[3] = sh[1];
+    sh[3].sh_flags = SHF_ALLOC;
+    sh[3].sh_offset = 0x2000;
+    sh[3].sh_size = 0x40;
+    sh[4] = sh[1];
+    sh[4].sh_type = SHT_NOBITS;
+    sh[4].sh_offset = 0x2100;
+    sh[4].sh_size = 0x40;
+    sh[5] = sh[1];
+    sh[5].sh_offset = 0x3000;
+    sh[5].sh_size = 0x40;
+    if (cng_write_all((int)fd, &eh, sizeof eh) != (long)sizeof eh ||
+        cng_write_all((int)fd, sh, sizeof sh) != (long)sizeof sh) {
+        sys_close((int)fd);
+        return -EIO;
+    }
+    return fd;
+}
+
+/* The code map an object's headers produce, and the four scan decisions that
+ * follow from having one, from having one that covers the data too (the
+ * control: the word really is taken when nothing says not to), and from having
+ * none at all. Returns the number of failures. */
+static int rw_scan_checks(void) {
+    int fails = 0;
+
+    struct cng_code_ranges cr, headerless;
+    int n = -1, hn = -1;
+    long fd = rw_shdr_memfd(1);
+    if (fd >= 0) {
+        n = cng_code_ranges((int)fd, &cr);
+        sys_close((int)fd);
+    }
+    long hfd = rw_shdr_memfd(0);
+    if (hfd >= 0) {
+        hn = cng_code_ranges((int)hfd, &headerless);
+        sys_close((int)hfd);
+    }
+    if (fd < 0 || hfd < 0) {
+        /* No memfd, no synthetic object: say so rather than fail a host for
+         * something the scan itself has nothing to do with. */
+        cng_dprintf(1, "rwtest codemap: unavailable (memfd=%d) -> SKIP\n",
+                    (int)(fd < 0 ? fd : hfd));
+    } else {
+        int cok = (n == 2 && cr.lo[0] == 0x1000 && cr.hi[0] == 0x1180 &&
+                   cr.lo[1] == 0x3000 && cr.hi[1] == 0x3040 && hn == 0);
+        cng_dprintf(1,
+                    "rwtest codemap: ranges=%d [%lx,%lx) [%lx,%lx)"
+                    " headerless=%d -> %s\n",
+                    n, n > 0 ? cr.lo[0] : 0UL, n > 0 ? cr.hi[0] : 0UL,
+                    n > 1 ? cr.lo[1] : 0UL, n > 1 ? cr.hi[1] : 0UL, hn,
+                    cok ? "OK" : "FAIL");
+        fails += !cok;
+    }
+
+    /* [image | pool], so the pool is within a `b`'s reach of every site — the
+     * same reason the loader over-allocates. Nothing here is executed: what is
+     * under test is the decision to rewrite, not the trampoline. */
+    unsigned long total = 4096 + CNG_TRAMP_POOL;
+    void *region = sys_mmap(0, total, CNG_PROT_READ | CNG_PROT_WRITE,
+                            CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (region == CNG_MAP_FAILED || cng_is_err((long)region)) {
+        cng_dprintf(1, "rwtest scan: mmap failed -> FAIL\n");
+        return fails + 1;
+    }
+    unsigned long rg = (unsigned long)region;
+
+    struct cng_code_ranges code_only = {1, {RW_FOFF}, {RW_FOFF + 16}};
+    struct cng_code_ranges whole = {1, {RW_FOFF}, {RW_FOFF + 60}};
+    unsigned site = 0, data = 0;
+    int mapped = rw_scan_probe(rg, &code_only, 0, &site, &data);
+    int mok = (mapped == 1 && site != 0xD4000001u && data == 0xD4000001u);
+    int control = rw_scan_probe(rg, &whole, 0, &site, &data);
+    int nok = (control == 2 && site != 0xD4000001u && data != 0xD4000001u);
+    int filtered = rw_scan_probe(rg, 0, 0, &site, &data);
+    int fok = (filtered == 1 && site != 0xD4000001u && data == 0xD4000001u);
+    int dataonly = rw_scan_probe(rg, 0, 1, 0, &data);
+    int dok = (dataonly == 0 && data == 0xD4000001u);
+    sys_munmap(region, total);
+
+    int sok = mok && nok && fok && dok;
+    cng_dprintf(1,
+                "rwtest scan: mapped=%d unmapped=%d filtered=%d dataonly=%d"
+                " -> %s\n",
+                mapped, control, filtered, dataonly, sok ? "OK" : "FAIL");
+    fails += !sok;
+    return fails;
+}
+
 int cng_cmd_rwtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     (void)argc;
     (void)argv;
@@ -1266,13 +1458,13 @@ int cng_cmd_rwtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     cng_g_fs = &fs;
     cng_g_rewrite = 1;
 
-    int n = cng_rewrite_seg((unsigned long)buf, (unsigned long)buf + fsz, pool,
-                            CNG_TRAMP_POOL, &used);
+    int n = cng_rewrite_seg((unsigned long)buf, (unsigned long)buf + fsz, 0,
+                            &rw_all, pool, CNG_TRAMP_POOL, &used);
     /* The general-exit copy's own trampoline is the next one out of the pool, so
      * its dispatcher literal is at a known offset. */
     unsigned long gslot = pool + used;
-    int gn = cng_rewrite_seg((unsigned long)gbuf, (unsigned long)gbuf + gsz, pool,
-                             CNG_TRAMP_POOL, &used);
+    int gn = cng_rewrite_seg((unsigned long)gbuf, (unsigned long)gbuf + gsz, 0,
+                             &rw_all, pool, CNG_TRAMP_POOL, &used);
     *(unsigned long *)(gslot + (cng_svc_tramp_disp - cng_svc_tramp_tpl)) =
         (unsigned long)&rw_move_pc;
     sys_mprotect(region, total, CNG_PROT_READ | CNG_PROT_EXEC);
@@ -1334,7 +1526,9 @@ int cng_cmd_rwtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     cng_dprintf(1, "rwtest general exit: pid=%ld marker=%lx x12=%lx -> %s\n",
                 (long)g[0], g[1], g[2], gok ? "OK" : "FAIL");
 
-    return (ok && gok) ? 0 : 1;
+    int sfails = rw_scan_checks();
+
+    return (ok && gok && !sfails) ? 0 : 1;
 }
 
 /* _blocktest — validate that a syscall marked blocked (as cng_probe_blocked
