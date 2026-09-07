@@ -15,16 +15,57 @@ M14_ALPINE="${M14_ALPINE:-$CNG_ALPINE}"
 if [ -z "$M14_ALPINE" ] || [ ! -x "$M14_ALPINE/bin/busybox" ]; then
     skip "/dev zone scenarios: no alpine rootfs"
 else
+    # The host node each whitelist name stands for, which is the table in
+    # src/path/path.c and has to stay in step with it.
+    m14_host_of() {
+        case $1 in
+        console) echo /dev/tty ;;
+        fd)      echo /proc/self/fd ;;
+        stdin)   echo /proc/self/fd/0 ;;
+        stdout)  echo /proc/self/fd/1 ;;
+        stderr)  echo /proc/self/fd/2 ;;
+        *)       echo "/dev/$1" ;;
+        esac
+    }
+
     # ls /dev must show the whitelist. The Alpine rootfs physically contains
     # only "null", so anything beyond it came from the injection.
+    #
+    # ...as far as this host can supply it: the injection stats the host node
+    # and leaves out what it cannot see, because listing a name that then does
+    # not open is worse than not listing it. Android is where that bites —
+    # there is no /dev/shm at all, and SELinux refuses an app process even
+    # stat() on /dev/full — so the precondition is checked the same way the
+    # injection checks it rather than assumed.
     got=$(run -R "$M14_ALPINE" /bin/busybox sh -c \
         'ls /dev | tr "\n" " "' 2>/dev/null)
     for want in null zero full random urandom tty ptmx console pts shm fd \
                 stdin stdout stderr; do
+        m14_h=$(m14_host_of "$want")
+        if [ ! -e "$m14_h" ] && [ ! -L "$m14_h" ]; then
+            skip "m14 ls /dev shows $want: this host does not offer $m14_h"
+            continue
+        fi
         case " $got " in
         *" $want "*) pass=$((pass + 1)); echo "  ok   m14 ls /dev shows $want" ;;
         *) fail=$((fail + 1))
            echo "  FAIL m14 ls /dev shows $want"; echo "    got: $got" ;;
+        esac
+    done
+    # ...and the other half of that precondition: a name the host cannot supply
+    # must be absent, not merely unasserted. Without this the gate above could
+    # hide a listing that had stopped injecting anything at all.
+    for want in null zero full random urandom tty ptmx console pts shm fd \
+                stdin stdout stderr; do
+        m14_h=$(m14_host_of "$want")
+        { [ -e "$m14_h" ] || [ -L "$m14_h" ]; } && continue
+        case " $got " in
+        *" $want "*)
+            fail=$((fail + 1))
+            echo "  FAIL m14 ls /dev omits $want, which this host has no $m14_h for"
+            echo "    got: $got" ;;
+        *) pass=$((pass + 1))
+           echo "  ok   m14 ls /dev omits $want, absent from this host" ;;
         esac
     done
 

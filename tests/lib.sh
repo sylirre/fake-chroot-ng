@@ -259,13 +259,18 @@ cng_guest_binds() {
 # noexec .so path only exists for a guest whose OWN ld.so maps libraries). On a
 # cross host the AArch64 interpreter and libc are under the toolchain sysroot
 # rather than at the host's own /lib, so they are exposed at the guest paths the
-# binary names instead of at their host ones. Sets GUEST_DYN_BINDS.
+# binary names instead of at their host ones. Sets GUEST_DYN_BINDS, and beside
+# it GUEST_DYN_L — the `-L` that names the same sysroot to the loader, which is
+# empty on a native host and must be, or the interpreter the binary asks for is
+# looked up under a prefix that is not there.
 cng_dyn_binds() {
     GUEST_DYN_BINDS=
+    GUEST_DYN_L=
     if [ "$CNG_NATIVE" = 1 ]; then _sr=${CNG_SYSROOT-}; else
         _sr=${CNG_SYSROOT-/usr/aarch64-linux-gnu}
     fi
     if [ -n "$_sr" ]; then
+        GUEST_DYN_L="-L $_sr"
         for _d in lib lib64 usr/lib usr/lib64; do
             [ -d "$_sr/$_d" ] || continue
             GUEST_DYN_BINDS="$GUEST_DYN_BINDS -b $_sr/$_d:/$_d"

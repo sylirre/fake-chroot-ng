@@ -43,7 +43,7 @@ elif ! elf_has_interp "$XMR/bin/readfile"; then
     skip "execmap legs: this toolchain links even -O2 guests statically"
 else
     # shellcheck disable=SC2086  # both are deliberately split arg lists
-    xmrun() { run -L "${CNG_SYSROOT-/usr/aarch64-linux-gnu}" $GUEST_DYN_BINDS "$@"; }
+    xmrun() { run $GUEST_DYN_L $GUEST_DYN_BINDS "$@"; }
 
     out=$(CNG_MMAP_FORCE_ANON=1 xmrun -R "$XMR" /bin/readfile 2>/dev/null); rc=$?
     check "a dynamic guest starts with every library mapped from a copy" 0 $rc
