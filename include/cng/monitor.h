@@ -230,14 +230,23 @@ extern char **cng_g_host_envp;
  * also what the synthesized /proc/self/mounts shows it. NULL for every other
  * caller, which is all of them — nothing else in the syscall table has these.
  *
- * RESOLVE_BENEATH and RESOLVE_IN_ROOT are NOT here: they scope resolution to a
- * dirfd the guest already holds inside the view, which contains the call at
- * least as tightly as the rootfs does, so those are handed to the kernel
- * untranslated and answered exactly (see the openat2 case in dispatch.c). */
+ * RESOLVE_BENEATH and RESOLVE_IN_ROOT are here only for the resolutions that
+ * have to be walked: they scope the whole lookup to a dirfd, which the kernel
+ * applies exactly, so the call is handed over untranslated wherever the guest's
+ * namespace has nothing to add under that directory. Where it does — a bind
+ * mount, the /proc or /dev zone — the kernel would resolve in the host's view
+ * of that subtree, so the walk happens here and the scope is applied with it
+ * (see cng_scope_needs_walk and the openat2 case in dispatch.c). `scope` is the
+ * dirfd's own guest path: with IN_ROOT it is the root an absolute name, an
+ * absolute symlink target and a `..` run are all measured against; with
+ * BENEATH each of those is -EXDEV instead. */
 struct cng_res_limit {
     unsigned no_symlinks : 1;   /* RESOLVE_NO_SYMLINKS: magic links included */
     unsigned no_magiclinks : 1; /* RESOLVE_NO_MAGICLINKS */
     unsigned no_xdev : 1;       /* RESOLVE_NO_XDEV */
+    unsigned beneath : 1;       /* RESOLVE_BENEATH */
+    unsigned in_root : 1;       /* RESOLVE_IN_ROOT */
+    const char *scope;          /* guest dir BENEATH/IN_ROOT are anchored at */
     const char *xdev_base;      /* guest dir the walk starts in (0 = its base) */
     long err;                   /* the violation: -ELOOP or -EXDEV */
 };
@@ -261,6 +270,17 @@ int cng_resolve_at(long dirfd, const char *path, int deref, char *out,
 /* The fd behind a host path that names one of this process's own descriptors
  * ("/proc/self/fd/<n>" and its thread-self / own-pid spellings), else -1. */
 int cng_proc_self_fd(const char *host);
+
+/* Which route a scoped openat2 (RESOLVE_BENEATH / RESOLVE_IN_ROOT) has to take
+ * for `dirfd`: 1 when the guest's own namespace has something to say under that
+ * directory — a bind mount at or below it, or the /proc or /dev zone on the
+ * same branch — so the resolution must be walked here with the scope applied;
+ * 0 when the kernel's scoped resolution of the guest's own name is exactly
+ * right, which is what it is then handed. `gdir` comes back with the dirfd's
+ * guest path (the scope) whenever the answer is 1. Also 0 when the dirfd has no
+ * guest path at all (one inside /proc), where the host namespace is the right
+ * one anyway. Exposed for `-t o2test`. */
+int cng_scope_needs_walk(long dirfd, char *gdir, size_t sz);
 
 /* Serve an open the host refused (`err`) on a path naming one of our own fds,
  * from that descriptor: a duplicate when the inode grants the access anyway

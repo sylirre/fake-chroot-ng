@@ -243,6 +243,18 @@ static int proc_pid_visible(const char *canon) {
     return pid < 0 ? 0 : cng_procreg_has((int)pid);
 }
 
+/* Is `canon` exactly "/proc/<pid|self|thread-self>/fd" — the directory the fd
+ * links live in, rather than one of them? proc_magic classifies it with them,
+ * since the kernel takes that path to the host's own fd table either way, but
+ * it is not a link: opening it is an ordinary directory open, which both
+ * RESOLVE_NO_MAGICLINKS and a scoped lookup allow (measured). Only when
+ * nothing follows it — with a component after it, that component is the link
+ * and the walk is about to traverse it. */
+static int proc_fd_dir(const char *canon) {
+    size_t pl = proc_pid_prefix(canon, 0);
+    return pl && strcmp(canon + pl, "fd") == 0;
+}
+
 static int proc_magic(char *cur, size_t sz) {
     size_t pl = proc_pid_prefix(cur, 0);
     if (!pl)
@@ -591,7 +603,17 @@ int cng_resolve_lim(const char *path, int deref_final, char *out, size_t outsz,
     char canon[CNG_PATH_MAX], rest[CNG_PATH_MAX];
     if (!path || !path[0])
         return -ENOENT;
-    const char *base = path[0] == '/'          ? "/"
+    /* A scoped lookup starts at its scope, not at the root or the cwd, and an
+     * absolute name does not restart the walk: IN_ROOT re-roots it onto the
+     * scope (which is what starting there does, the leading slashes being
+     * skipped like any other), BENEATH refuses it outright. Measured both. */
+    int scoped = lim && (lim->beneath || lim->in_root) && lim->scope;
+    if (scoped && path[0] == '/' && lim->beneath) {
+        lim->err = -EXDEV;
+        return -EXDEV;
+    }
+    const char *base = scoped                  ? lim->scope
+                       : path[0] == '/'        ? "/"
                        : cng_g_fs->cwd[0] != 0 ? cng_g_fs->cwd
                                                : "/";
     if (cng_strlcpy(canon, base, sizeof canon) >= sizeof canon ||
@@ -629,6 +651,16 @@ int cng_resolve_lim(const char *path, int deref_final, char *out, size_t outsz,
         if (clen == 1 && comp[0] == '.')
             continue;
         if (clen == 2 && comp[0] == '.' && comp[1] == '.') {
+            /* At the scope this is the escape the scoping exists to stop: the
+             * kernel keeps IN_ROOT's `..` where it is, exactly as `..` at the
+             * real root stays there, and answers BENEATH with -EXDEV. */
+            if (scoped && strcmp(canon, lim->scope) == 0) {
+                if (lim->beneath) {
+                    lim->err = -EXDEV;
+                    return -EXDEV;
+                }
+                continue;
+            }
             canon_pop(canon);
             /* Backing out of a bind leaves its mount as surely as entering one
              * does, and RESOLVE_NO_XDEV forbids the crossing either way. */
@@ -651,11 +683,25 @@ int cng_resolve_lim(const char *path, int deref_final, char *out, size_t outsz,
         /* A magic link is a link: RESOLVE_NO_MAGICLINKS refuses it, and
          * RESOLVE_NO_SYMLINKS implies NO_MAGICLINKS. Both are ELOOP, which is
          * what the kernel answers for a constraint it cannot satisfy by
-         * resolving. */
-        if (magic != PROC_MAGIC_NONE && lim &&
-            (lim->no_magiclinks || lim->no_symlinks)) {
-            lim->err = -ELOOP;
-            return -ELOOP;
+         * resolving. Whether a link was actually traversed: exe/cwd/root
+         * always (they are rewritten in place, so the test has to be the
+         * verdict rather than the path), an fd link when it is one rather than
+         * the directory they live in. */
+        int magic_link = magic == PROC_MAGIC_GUEST ||
+                         (magic == PROC_MAGIC_HOST && !(last && proc_fd_dir(canon)));
+        if (magic_link && lim) {
+            if (lim->no_magiclinks || lim->no_symlinks) {
+                lim->err = -ELOOP;
+                return -ELOOP;
+            }
+            /* "Not currently safe for scoped-lookups", says nd_jump_link(),
+             * and it refuses every magic link under BENEATH or IN_ROOT with
+             * -EXDEV whatever the link would have named (measured on 6.17:
+             * /proc/self/fd/1, /proc/self/cwd and /proc/self/root all). */
+            if (scoped) {
+                lim->err = -EXDEV;
+                return -EXDEV;
+            }
         }
         if (magic == PROC_MAGIC_HOST) {
             /* The magic path IS the host path. Any components left ride along,
@@ -667,7 +713,8 @@ int cng_resolve_lim(const char *path, int deref_final, char *out, size_t outsz,
         }
         if (magic == PROC_MAGIC_GUEST) {
             /* exe/cwd/root: the guest-visible target replaces the link, which
-             * is a symlink expansion in everything but name. */
+             * is a symlink expansion in everything but name. (A scoped lookup
+             * never arrives here — the refusal above covers every magic link.) */
             if (++nlinks > 40)
                 return -ELOOP;
             if (splice_rest(rest, sizeof rest, canon, p) < 0)
@@ -700,7 +747,14 @@ int cng_resolve_lim(const char *path, int deref_final, char *out, size_t outsz,
             char tmp[CNG_PATH_MAX];
             if (cng_g_l2s && cng_l2s_untranslate_target(link, tmp, sizeof tmp))
                 cng_strlcpy(link, tmp, sizeof link);
-            cng_strlcpy(canon, "/", sizeof canon);
+            /* Under a scope the target is re-rooted onto that instead of onto
+             * the guest root, and BENEATH refuses it: an absolute target is a
+             * jump out of the scope however short it is. */
+            if (scoped && lim->beneath) {
+                lim->err = -EXDEV;
+                return -EXDEV;
+            }
+            cng_strlcpy(canon, scoped ? lim->scope : "/", sizeof canon);
         }
         if (splice_rest(rest, sizeof rest, link, p) < 0)
             return -ENAMETOOLONG;
@@ -922,6 +976,124 @@ int cng_resolve_at(long dirfd, const char *path, int deref, char *out,
     return cng_strlcpy(out + k, path, sz - k) >= sz - k ? -1 : 0;
 }
 
+#ifdef __NR_openat2
+/* Is guest path `x` at or below the directory `base`? Both canonical, `base`
+ * without a trailing slash except for the root, which everything is under. */
+static int guest_under(const char *x, const char *base) {
+    if (!base[0] || (base[0] == '/' && !base[1]))
+        return 1;
+    size_t n = strlen(base);
+    return strncmp(x, base, n) == 0 && (x[n] == '\0' || x[n] == '/');
+}
+
+/* The two zones and the binds are the whole of what the guest sees that the
+ * host does not, so this is the whole of the question cng_scope_needs_walk
+ * asks. A bind matters when its mount point is at or below the scope: that is
+ * where the guest's answer for a name diverges from the physical directory
+ * under the rootfs. The zones matter on either side of the scope — at or below
+ * it, for the same reason; and above it because their own contents are
+ * synthesized (the /dev whitelist, the /proc files procfs.c serves, the hidden
+ * pids), so a dirfd inside one is looking at a directory whose entries the
+ * kernel and the guest do not agree about. */
+static int scope_overlay(const char *gdir) {
+    for (int i = 0; cng_g_fs && i < cng_g_fs->nbinds; i++) {
+        const char *bg = cng_g_fs->binds[i].guest;
+        /* Strictly below: a dirfd on the bind's own mount point already IS the
+         * bind — its host directory is the bound one — so everything the
+         * kernel can reach under it is what the guest sees there. Only a mount
+         * point *inside* the scope makes the two trees differ. */
+        if (guest_under(bg, gdir) && strcmp(bg, gdir) != 0)
+            return 1;
+    }
+    /* The zones, unlike a bind, are not a directory handed over whole: their
+     * own contents are synthesized (the /dev whitelist, the files procfs.c
+     * serves, the hidden pids), so the scope being one of them is as much a
+     * divergence as it containing one. */
+    if (!cng_g_no_proc &&
+        (guest_under("/proc", gdir) || guest_under(gdir, "/proc")))
+        return 1;
+    if (!cng_g_no_dev && (guest_under("/dev", gdir) || guest_under(gdir, "/dev")))
+        return 1;
+    return 0;
+}
+
+int cng_scope_needs_walk(long dirfd, char *gdir, size_t sz) {
+    int dfd = (int)dirfd; /* int arg: the x-register's top half may be dirty */
+    if (dfd == CNG_AT_FDCWD) {
+        /* The virtual cwd, which is the guest's own answer — the host cwd is
+         * only its translation and would have to be mapped back. */
+        if (cng_strlcpy(gdir, cng_g_fs->cwd[0] ? cng_g_fs->cwd : "/", sz) >= sz)
+            return 0;
+    } else {
+        char hdir[CNG_PATH_MAX];
+        if (dirfd_host(dfd, hdir, sizeof hdir) != 0)
+            return 0;
+        if (cng_fs_untranslate(cng_g_fs, hdir, gdir, sz) != 0) {
+            /* No guest path — except in the /proc zone, which passes through
+             * to the host under the same name, so the guest path is the host
+             * one. That is worth recovering: the synthesized /proc files and
+             * the hidden-process view live under a dirfd like that, and they
+             * are exactly what the kernel's own resolution would miss. */
+            if (cng_g_no_proc || strncmp(hdir, "/proc", 5) != 0 ||
+                (hdir[5] && hdir[5] != '/') ||
+                cng_strlcpy(gdir, hdir, sz) >= sz)
+                return 0; /* the host namespace is the right one here */
+        }
+    }
+    return scope_overlay(gdir);
+}
+
+/* at_canon() for a scoped openat2: the same lexical canonicalization the
+ * synthesized-/proc check runs on every other open, but anchored at the scope
+ * rather than at the dirfd's own path — an absolute name is re-rooted onto it
+ * (IN_ROOT) or refused (BENEATH), and a `..` run is clamped there or refused.
+ * Lexical, like the check it feeds: a symlink expanded on the way moves the
+ * answer, and that is the walk's business, not this one's.
+ *
+ * Returns 0 with `out` filled; -EXDEV where the scope refuses the name outright
+ * and -1 where it does not fit, which the caller treats the same way — there is
+ * no synthesized file to serve, and the walk answers for the name itself. */
+static long scope_canon(const char *gdir, const char *gp, int beneath,
+                        char *out, size_t sz) {
+    char tmp[CNG_PATH_MAX], rel[CNG_PATH_MAX], full[CNG_PATH_MAX];
+    if (gp[0] == '/' && beneath)
+        return -EXDEV;
+    /* Against "/" first: for a relative name that is the walk with the scope
+     * standing in for the root, and cng_path_canon clamps a `..` run there
+     * exactly as the kernel clamps IN_ROOT's. An absolute name needs no join —
+     * re-rooting it onto the scope is what IN_ROOT means. */
+    size_t k = 0;
+    if (gp[0] != '/') {
+        tmp[0] = '/';
+        k = 1;
+    }
+    if (cng_strlcpy(tmp + k, gp, sizeof tmp - k) >= sizeof tmp - k ||
+        cng_path_canon(tmp, rel, sizeof rel) != 0)
+        return -1;
+    if (beneath) {
+        /* That clamp is what BENEATH must NOT do, so the same name is asked
+         * again against the scope itself: an answer that left it is -EXDEV. */
+        size_t n = cng_strlcpy(tmp, gdir, sizeof tmp);
+        if (n >= sizeof tmp ||
+            cng_strlcpy(tmp + n, "/", sizeof tmp - n) >= sizeof tmp - n)
+            return -1;
+        n = strlen(tmp);
+        if (cng_strlcpy(tmp + n, gp, sizeof tmp - n) >= sizeof tmp - n ||
+            cng_path_canon(tmp, full, sizeof full) != 0)
+            return -1;
+        if (!guest_under(full, gdir))
+            return -EXDEV;
+    }
+    size_t n = cng_strlcpy(out, gdir, sz);
+    if (n >= sz)
+        return -1;
+    if (n == 1 && out[0] == '/')
+        n = 0; /* the root is spelled "/", not "" — do not double the slash */
+    return cng_strlcpy(out + n, rel, sz - n) >= sz - n ? -1 : 0;
+}
+
+#endif /* __NR_openat2 */
+
 /* --- :ro binds, through the link2symlink emulation -----------------------
  *
  * A :ro verdict is keyed on the resolved HOST path, which is what makes a
@@ -1034,6 +1206,18 @@ static const char *xlate_lim(long dirfd, const char *gp, char *buf,
                              struct cng_res_limit *lim) {
     if (!gp)
         return gp;
+#ifdef __NR_openat2
+    /* A scoped openat2 is always walked, and from the scope the caller
+     * anchored rather than from the cwd or the dirfd: the fast path below
+     * would hand the kernel a name with the scope's own rules never applied,
+     * and the join in xlate_at_lim would turn a relative name into the
+     * absolute one BENEATH exists to refuse. */
+    if (lim && lim->scope) {
+        if (cng_resolve_lim(gp, deref_final, buf, bufsz, lim) == 0)
+            return buf;
+        return XLATE_TOOLONG; /* the caller reads lim->err where it is set */
+    }
+#endif
     int dfd = (int)dirfd; /* int arg: the x-register's top half may be dirty */
     if (gp[0] == '/' || dfd == CNG_AT_FDCWD) {
         if (cng_resolve_lim(gp, deref_final, buf, bufsz, lim) == 0)
@@ -1534,10 +1718,12 @@ static void path_args_of(long nr, long a0, long a1, long a2, long a3,
 
 #ifdef __NR_openat2
 /* RESOLVE_BENEATH / RESOLVE_IN_ROOT scope the whole resolution to `dirfd`, and
- * the kernel is the only thing that can apply them exactly — so the call goes
- * over untranslated and the two policies that a path-keyed check would have
- * applied are re-expressed against the directory instead. Both are sound
- * because the scoping guarantees the answer lies under that directory:
+ * the kernel is the only thing that can apply them exactly — so where the
+ * guest's namespace has nothing to add under that directory (which is what
+ * cng_scope_needs_walk answers) the call goes over untranslated, and the two
+ * policies that a path-keyed check would have applied are re-expressed against
+ * the directory instead. Both are sound because the scoping guarantees the
+ * answer lies under that directory:
  *
  *  - a :ro bind covering the dirfd covers everything the open can reach, so a
  *    write-intent open is refused here exactly as it would be by name. The
@@ -1545,10 +1731,12 @@ static void path_args_of(long nr, long a0, long a1, long a2, long a3,
  *    for one that is) is asked with the guest's OWN scoping, so it describes
  *    the same file the open would have found;
  *  - the /proc zone hides processes by path, and a scoped resolution never
- *    produces one. Only a dirfd already inside /proc can reach a hidden pid, so
- *    that case asks the descriptor afterwards where it landed. Nothing in /proc
- *    is created or truncated by an open, so asking after the fact costs
- *    nothing.
+ *    produces one. Only a dirfd already inside /proc can reach a hidden pid,
+ *    and one whose guest path is in the zone is walked rather than passed
+ *    through — what is left is a directory bound onto the host's /proc from
+ *    somewhere else in the view, which this asks the descriptor about
+ *    afterwards. Nothing in /proc is created or truncated by an open, so
+ *    asking after the fact costs nothing.
  *
  * What gets re-issued is the validated COPY, never the guest's own struct —
  * which is why the struct is not passed here at all. Both of the above, and the
@@ -1973,8 +2161,10 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         long oflags = 0;
 #ifdef __NR_openat2
         struct cng_open_how how;
-        struct cng_res_limit lim = {0, 0, 0, 0, 0};
+        struct cng_res_limit lim = {0, 0, 0, 0, 0, 0, 0, 0};
         unsigned long resolve = 0;
+        char sdir[CNG_PATH_MAX]; /* a scoped openat2's scope, as a guest path */
+        int scoped = 0;          /* ...and whether this is one */
 #endif
         if (is_open) {
             oflags = a2;
@@ -1992,6 +2182,41 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             }
 #endif
         }
+#ifdef __NR_openat2
+        /* RESOLVE_BENEATH / RESOLVE_IN_ROOT scope the whole resolution to
+         * `dirfd`, which the guest can only hold because we handed it over —
+         * so it already names a directory inside the view, and the kernel's
+         * own scoping then contains the call at least as tightly as the rootfs
+         * does. Where the guest's namespace has nothing to add under that
+         * directory the call goes over untranslated and is answered exactly:
+         * absolute symlinks, escaping `..`, mount crossings and all.
+         *
+         * Where it does have something to add — a bind mount at or below the
+         * dirfd, or the /proc or /dev zone on the same branch — the kernel
+         * would resolve in the HOST's view of that subtree, which is a
+         * different tree: `openat2(dirfd("/"), "mnt/file", RESOLVE_IN_ROOT)`
+         * found the empty mount point under the rootfs rather than what is
+         * bound over it, and a scoped name in /proc missed the synthesized
+         * files entirely. Those are walked here instead, with the scope
+         * applied by the walk (cng_resolve_lim) and then stripped from the
+         * re-issue, exactly as the other resolve bits already are. */
+        if (resolve & (CNG_RESOLVE_BENEATH | CNG_RESOLVE_IN_ROOT)) {
+            if (!cng_scope_needs_walk(a0, sdir, sizeof sdir))
+                return openat2_scoped(a0, a1, a4, a5, &how);
+            /* From here we answer in place of the kernel, so the how has to be
+             * judged the way it would have been: build_open_flags() runs before
+             * any lookup, and BENEATH and IN_ROOT together are one of the things
+             * it refuses. */
+            long e = how_precheck(&how);
+            if (e)
+                return e;
+            scoped = 1;
+            lim.beneath = (resolve & CNG_RESOLVE_BENEATH) != 0;
+            lim.in_root = (resolve & CNG_RESOLVE_IN_ROOT) != 0;
+            lim.scope = sdir;
+            lim.xdev_base = sdir; /* NO_XDEV starts where the scope does */
+        }
+#endif
         /* O_NOFOLLOW must reach the kernel as a symlink, or it has nothing to
          * refuse: resolving the final component here would hand over the
          * target and the open would succeed where it must ELOOP. (An l2s link
@@ -2012,6 +2237,25 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         /* A read-only open of a /proc file that would describe chroot-ng
          * instead of the guest is served from an in-memory copy of the guest
          * view (see procfs.c). */
+        /* The name the :ro checks below ask the l2s question about: the
+         * guest's own, which for an ordinary call is the one it passed. */
+        long rkd = a0;
+        const char *rkp = (const char *)a1;
+#ifdef __NR_openat2
+        /* For a scoped call it is not: the scope re-roots and clamps the name,
+         * so neither that question nor the synthesized-/proc lookup below is
+         * about the join of the dirfd and the name that every other call
+         * makes. Spelled out once here, lexically — which is what both of
+         * those already work from, the walk being the one that resolves. */
+        char scanon[CNG_PATH_MAX];
+        int have_scanon = 0;
+        if (scoped && a1) {
+            have_scanon = scope_canon(sdir, (const char *)a1, lim.beneath,
+                                      scanon, sizeof scanon) == 0;
+            rkd = CNG_AT_FDCWD;
+            rkp = have_scanon ? scanon : 0;
+        }
+#endif
         if (is_open) {
             const char *gp = (const char *)a1;
             char canon[CNG_PATH_MAX];
@@ -2020,6 +2264,17 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
              * a real dirfd costs a readlink, so it is resolved only when the
              * name could be a synthesized file at all. */
             int have = 0;
+#ifdef __NR_openat2
+            if (scoped) {
+                /* Already spelled out above, and it is not the join of the
+                 * dirfd and the name: where the scope refuses the name there
+                 * is nothing to synthesize for, and the refusal itself is left
+                 * to the walk, which resolves `..` physically as the kernel
+                 * does and so is the one entitled to answer EXDEV. */
+                if ((have = have_scanon))
+                    cng_strlcpy(canon, scanon, sizeof canon);
+            } else
+#endif
             if (gp && (gp[0] == '/' || (int)a0 == CNG_AT_FDCWD))
                 have = cng_fs_abscanon(cng_g_fs, gp, canon, sizeof canon) == 0;
             else if (gp && leaf_may_synth(gp))
@@ -2030,26 +2285,17 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         }
 #ifdef __NR_openat2
         if (resolve) {
-            /* RESOLVE_BENEATH / RESOLVE_IN_ROOT scope the whole resolution to
-             * `dirfd`, which the guest can only hold because we handed it over
-             * — so it already names a directory inside the view, and the
-             * kernel's own scoping then contains the call at least as tightly
-             * as the rootfs does. Translating breaks it either way: BENEATH
-             * rejects an absolute pathname outright (EXDEV, which is what the
-             * translated one always is), and IN_ROOT re-roots that host path at
-             * the dirfd and names a file nobody asked for. Handed over
-             * untouched the answer is exactly the kernel's — absolute symlinks,
-             * escaping `..`, mount crossings and all. */
-            if (resolve & (CNG_RESOLVE_BENEATH | CNG_RESOLVE_IN_ROOT))
-                return openat2_scoped(a0, a1, a4, a5, &how);
             /* The rest constrain the walk itself, and are answered against the
              * GUEST's namespace — the one the guest described — then stripped.
              * Left in place they would be re-judged against the host path,
              * where the rootfs prefix is a symlink chain and a mount boundary
-             * that the guest cannot see and did not mean. */
-            long e = how_precheck(&how);
-            if (e)
-                return e;
+             * that the guest cannot see and did not mean. The scoped pair is
+             * already settled above; its how has been prechecked there. */
+            if (!scoped) {
+                long e = how_precheck(&how);
+                if (e)
+                    return e;
+            }
             lim.no_symlinks = (resolve & CNG_RESOLVE_NO_SYMLINKS) != 0;
             lim.no_magiclinks = (resolve & CNG_RESOLVE_NO_MAGICLINKS) != 0;
             lim.no_xdev = (resolve & CNG_RESOLVE_NO_XDEV) != 0;
@@ -2068,7 +2314,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * write intent (non-RDONLY, or O_CREAT/O_TRUNC). name_to_handle_at also
          * lands here and never writes, so its a2 (a handle pointer) is never
          * read as flags. */
-        if (ro_denied(p) || ro_denied_l2s(a0, (const char *)a1)) {
+        if (ro_denied(p) || ro_denied_l2s(rkd, rkp)) {
             if (nr == __NR_mkdirat || nr == __NR_mknodat)
                 return -EROFS;
             if (is_open && ((oflags & 3) != CNG_O_RDONLY ||
@@ -2080,7 +2326,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                  * there is ENOENT. Both measured. */
                 if (oflags & CNG_O_CREAT)
                     return -EROFS;
-                long ro = ro_refusal_name(a0, (const char *)a1, p,
+                long ro = ro_refusal_name(rkd, rkp, p,
                                           deref ? 0 : CNG_AT_SYMLINK_NOFOLLOW);
                 if (ro)
                     return ro;
@@ -2098,7 +2344,9 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             how.resolve =
                 resolve & ~(unsigned long)(CNG_RESOLVE_NO_SYMLINKS |
                                            CNG_RESOLVE_NO_MAGICLINKS |
-                                           CNG_RESOLVE_NO_XDEV);
+                                           CNG_RESOLVE_NO_XDEV |
+                                           CNG_RESOLVE_BENEATH |
+                                           CNG_RESOLVE_IN_ROOT);
             ha2 = (long)&how;
             ha3 = (long)sizeof how;
         }

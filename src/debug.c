@@ -3569,9 +3569,184 @@ int cng_cmd_o2test(int argc, char **argv, char **envp, unsigned long *auxv) {
                     a, b, d, c, ok ? "OK" : "FAIL");
         fails += !ok;
     }
+
+    /* --- RESOLVE_BENEATH / RESOLVE_IN_ROOT, where the walk has to do them ---
+     *
+     * The kernel applies these exactly, so the call goes over untranslated
+     * wherever the guest's namespace has nothing to add under the dirfd. Where
+     * it does, the kernel would resolve in the HOST's view of that subtree —
+     * which is a different tree — so the scope is applied by the walk instead.
+     * These are the walk's own answers, judged against the kernel's rules
+     * (measured on 6.17, see tests/m24_openat2.sh).
+     *
+     * "<rootfs><suffix>", for comparing a walk's answer against the host path
+     * it should have produced. */
+    char want[CNG_PATH_MAX];
+#define O2_WANT(sfx)                                                          \
+    (cng_snprintf(want, sizeof want, "%s%s", rootfs, sfx), want)
+
+    /* A bind crossing, which is the whole reason these are walked at all: the
+     * kernel's own scoped resolution would find the empty mount point under
+     * the rootfs. Both spellings cross it — only NO_XDEV refuses a crossing. */
+    {
+        long a = O2_RESOLVE("mnt/file", 1, (lim.in_root = 1, lim.scope = "/"));
+        int aok = a == 0 && strcmp(out, O2_WANT("/b/file")) == 0;
+        long b = O2_RESOLVE("mnt/file", 1, (lim.beneath = 1, lim.scope = "/"));
+        int bok = b == 0 && strcmp(out, O2_WANT("/b/file")) == 0;
+        /* ...and the same name with no scope at all, so the leg cannot pass by
+         * the translation being right for some other reason. */
+        long c = O2_RESOLVE("/mnt/file", 1, (void)0);
+        int cok = c == 0 && strcmp(out, O2_WANT("/b/file")) == 0;
+        int ok = aok && bok && cok;
+        cng_dprintf(1,
+                    "o2test scope bind in-root=%d beneath=%d unscoped=%d"
+                    " -> %s\n",
+                    aok, bok, cok, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* Escaping the scope. BENEATH refuses an absolute name and a `..` run that
+     * leaves the directory (EXDEV); IN_ROOT takes the same two as the root it
+     * is standing in for — re-rooted, and clamped. */
+    {
+        long a = O2_RESOLVE("/w/file", 1, (lim.beneath = 1, lim.scope = "/w"));
+        long b = O2_RESOLVE("../w/file", 1, (lim.beneath = 1, lim.scope = "/w"));
+        long c = O2_RESOLVE("sub/../file", 1, (lim.beneath = 1, lim.scope = "/w"));
+        int cok = c == 0 && strcmp(out, O2_WANT("/w/file")) == 0;
+        long d = O2_RESOLVE("/file", 1, (lim.in_root = 1, lim.scope = "/w"));
+        int dok = d == 0 && strcmp(out, O2_WANT("/w/file")) == 0;
+        long e = O2_RESOLVE("../../file", 1, (lim.in_root = 1, lim.scope = "/w"));
+        int eok = e == 0 && strcmp(out, O2_WANT("/w/file")) == 0;
+        int ok = a == -EXDEV && b == -EXDEV && cok && dok && eok;
+        cng_dprintf(1,
+                    "o2test scope escape beneath-abs=%ld beneath-dotdot=%ld"
+                    " beneath-inside=%d in-root-abs=%d in-root-dotdot=%d"
+                    " -> %s\n",
+                    a, b, cok, dok, eok, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* A symlink with an absolute target is a jump out of the scope: BENEATH
+     * refuses it, IN_ROOT re-roots the target onto the scope (so "/w/file"
+     * read from a scope of "/w" names "/w/w/file", which is what the kernel
+     * makes of it too). */
+    {
+        cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/abs", 0, 0, 0, 0, 0);
+        cng_dispatch(__NR_symlinkat, (long)"/w/file", CNG_AT_FDCWD,
+                     (long)"/w/abs", 0, 0, 0, 0);
+        long a = O2_RESOLVE("abs", 1, (lim.beneath = 1, lim.scope = "/w"));
+        long b = O2_RESOLVE("abs", 1, (lim.in_root = 1, lim.scope = "/w"));
+        int bok = b == 0 && strcmp(out, O2_WANT("/w/w/file")) == 0;
+        /* Unscoped it is re-rooted at the guest root, as every absolute target
+         * is, and names the file it was made to name. */
+        long c = O2_RESOLVE("/w/abs", 1, (void)0);
+        int cok = c == 0 && strcmp(out, O2_WANT("/w/file")) == 0;
+        int ok = a == -EXDEV && bok && cok;
+        cng_dprintf(1,
+                    "o2test scope abslink beneath=%ld in-root=%d unscoped=%d"
+                    " -> %s\n",
+                    a, bok, cok, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* A magic link is refused under either scope — "not currently safe for
+     * scoped-lookups", says nd_jump_link(), and it answers EXDEV rather than
+     * the ELOOP the NO_*LINKS bits get. The directory the fd links live in is
+     * not one of them and opens normally. */
+    {
+        long a = O2_RESOLVE("proc/self/fd/0", 1, (lim.beneath = 1, lim.scope = "/"));
+        long b = O2_RESOLVE("proc/self/fd/0", 1, (lim.in_root = 1, lim.scope = "/"));
+        long c = O2_RESOLVE("proc/self/fd", 1, (lim.in_root = 1, lim.scope = "/"));
+        long d = O2_RESOLVE("/proc/self/fd/0", 1, (void)0); /* unscoped: fine */
+        int ok = a == -EXDEV && b == -EXDEV && c == 0 && d == 0;
+        cng_dprintf(1,
+                    "o2test scope magic beneath=%ld in-root=%ld fd-dir=%ld"
+                    " unscoped=%ld -> %s\n",
+                    a, b, c, d, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* And the route itself. The scope is the dirfd's guest path; the question
+     * is whether the guest's namespace has anything to add under it. The bind
+     * at /mnt does for a dirfd on "/", so that one is walked; nothing does
+     * under "/w", so the kernel is handed the call as the guest wrote it; and
+     * a dirfd on the bind's own mount point is the bind, so there is nothing
+     * under it the kernel would see differently either. */
+    {
+        char g[CNG_PATH_MAX];
+        long rf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/",
+                               CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+        long wf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w",
+                               CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+        long mf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/mnt",
+                               CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+        int at_root = rf >= 0 && cng_scope_needs_walk(rf, g, sizeof g) == 1 &&
+                      strcmp(g, "/") == 0;
+        int plain = wf >= 0 && cng_scope_needs_walk(wf, g, sizeof g) == 0;
+        int at_bind = mf >= 0 && cng_scope_needs_walk(mf, g, sizeof g) == 0;
+        if (rf >= 0)
+            sys_close((int)rf);
+        if (wf >= 0)
+            sys_close((int)wf);
+        if (mf >= 0)
+            sys_close((int)mf);
+        int ok = at_root && plain && at_bind;
+        cng_dprintf(1,
+                    "o2test scope route root=%d plain=%d at-bind=%d -> %s\n",
+                    at_root, plain, at_bind, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+#undef O2_WANT
 #undef O2_RESOLVE
 
 #ifdef __NR_openat2
+    /* End to end, through the dispatcher: a scoped openat2 whose name lands on
+     * a file chroot-ng synthesizes. The kernel cannot produce that answer — the
+     * pass-through route would hand it the HOST's /proc/mounts, or, on a host
+     * without openat2 at all, ENOSYS — so an fd holding the guest's own mount
+     * table (the bind at /mnt is in it, and the device column is ours) is the
+     * walked route's answer and nothing else's. */
+    {
+        struct cng_open_how h = {CNG_O_RDONLY, 0, CNG_RESOLVE_IN_ROOT};
+        /* Whether this host has the syscall at all. Without it ENOSYS is the
+         * right answer to every openat2, and it is the answer the how
+         * precheck brings back from the kernel before any judgement of ours
+         * is applied — so that is what the leg demands there. */
+        struct cng_open_how h0 = {CNG_O_RDONLY, 0, 0};
+        long probe = cng_syscall6(CNG_AT_FDCWD, (long)"", (long)&h0,
+                                  (long)sizeof h0, 0, 0, __NR_openat2);
+        if (probe >= 0)
+            sys_close((int)probe);
+        int have_o2 = probe != -ENOSYS;
+        long dfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/",
+                                CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+        long mfd = dfd < 0 ? dfd
+                           : cng_dispatch(__NR_openat2, dfd, (long)"proc/mounts",
+                                          (long)&h, (long)sizeof h, 0, 0, 0);
+        char mb[512];
+        long n = mfd < 0 ? mfd : sys_read((int)mfd, mb, sizeof mb - 1);
+        int guest_table = 0;
+        if (n > 0) {
+            mb[n] = '\0';
+            int dev = 0, bind = 0;
+            for (char *q = mb; *q; q++) {
+                if (!strncmp(q, "/dev/root", 9))
+                    dev = 1;
+                if (!strncmp(q, " /mnt ", 6))
+                    bind = 1;
+            }
+            guest_table = dev && bind;
+        }
+        if (mfd >= 0)
+            sys_close((int)mfd);
+        if (dfd >= 0)
+            sys_close((int)dfd);
+        int ok = have_o2 ? guest_table : mfd == -ENOSYS;
+        cng_dprintf(1, "o2test scope synth %s -> %s\n",
+                    have_o2 ? "table" : "enosys", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
     /* The size/pointer rules, through the dispatcher. Each is answered before
      * any path is looked at, so the answer does not depend on this host having
      * openat2 at all. */

@@ -17,7 +17,7 @@
 echo "== M24: openat2 resolve semantics =="
 
 O2R=$(mktemp -d)
-mkdir -p "$O2R/w" "$O2R/b"
+mkdir -p "$O2R/w/sub" "$O2R/b"
 out=$(run -t o2test "$O2R" 2>&1); rc=$?
 check "o2test overall" 0 "$rc"
 check_contains "RESOLVE_NO_SYMLINKS refuses a link, and only a link" \
@@ -34,6 +34,44 @@ check_contains "RESOLVE_NO_XDEV is judged against the guest's mount table" \
     "$out"
 check_contains "the open_how size rules are the kernel's (EINVAL/E2BIG/EFAULT)" \
     "o2test abi small=-22 tail=-7 null=-14 over=-7" "$out"
+# RESOLVE_BENEATH / RESOLVE_IN_ROOT. The kernel applies these exactly, so the
+# call goes over untranslated wherever the guest's namespace has nothing to add
+# under the dirfd — and where it does, the kernel would resolve in the HOST's
+# view of that subtree, which is a different tree: a bind is not there, and
+# neither are the /proc and /dev zones. Those are walked here instead, with the
+# scope applied by the walk and then stripped from the re-issue, exactly as the
+# other resolve bits already are. The differential below covers the pass-through
+# route (its dirfd has no overlay under it); this covers the walked one.
+check_contains "a scoped lookup crosses a bind, which the kernel's own cannot see" \
+    "o2test scope bind in-root=1 beneath=1 unscoped=1 -> OK" "$out"
+check_contains "BENEATH refuses what leaves the scope, IN_ROOT re-roots and clamps it" \
+    "o2test scope escape beneath-abs=-18 beneath-dotdot=-18 beneath-inside=1 in-root-abs=1 in-root-dotdot=1 -> OK" \
+    "$out"
+check_contains "an absolute symlink target is judged the same way" \
+    "o2test scope abslink beneath=-18 in-root=1 unscoped=1 -> OK" "$out"
+# nd_jump_link(): "Not currently safe for scoped-lookups" — every magic link is
+# EXDEV under either scope, where the NO_*LINKS bits give ELOOP. The directory
+# the fd links live in is not one of them and opens normally (both measured).
+check_contains "a magic link is EXDEV under a scope, and the fd directory is not one" \
+    "o2test scope magic beneath=-18 in-root=-18 fd-dir=0 unscoped=0 -> OK" "$out"
+# ...and the route itself: walked only where the guest's namespace has something
+# to add under the dirfd. A dirfd on the bind's own mount point already is the
+# bind, so it is handed to the kernel like any other unremarkable directory.
+check_contains "the walk is taken for a scope with an overlay under it, and only then" \
+    "o2test scope route root=1 plain=1 at-bind=1 -> OK" "$out"
+# ...and the whole of it through the dispatcher: a scoped name that lands on a
+# file chroot-ng synthesizes. No kernel can answer that — passed through, the
+# guest would have got the HOST's /proc/mounts — so the guest's own mount table
+# coming back is the walked route's answer and nothing else's.
+case "$out" in
+*"o2test scope synth enosys"*)
+    skip "scoped openat2 end to end: no openat2 here (pre-5.6 kernel, or qemu-user)"
+    ;;
+*)
+    check_contains "a scoped openat2 reaches the synthesized /proc" \
+        "o2test scope synth table -> OK" "$out"
+    ;;
+esac
 rm -rf "$O2R"
 
 # --- differential: the same program, once with no emulation at all -----------
