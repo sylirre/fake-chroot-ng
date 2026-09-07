@@ -141,7 +141,7 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     }
     if (!op || !gpath) {
         cng_dprintf(2, "usage: _dtest -r ROOT [-b SRC:DST[:ro]] "
-                       "(open|access|dbgpath|robind) GUESTPATH\n"
+                       "(open|access|dbgpath|robind|l2sro) GUESTPATH\n"
                        "       _dtest -r ROOT atrel GUESTDIR RELPATH\n");
         return 2;
     }
@@ -740,6 +740,113 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
             fails += !ok;
         }
         cng_dprintf(1, "robind: %d failures\n", fails);
+        return fails ? 1 : 0;
+    }
+    /* _dtest -r ROOT -b SRC:DST[:ro] l2sro GUESTPATH — the link2symlink
+     * emulation inside a read-only bind. A group's data file lives in the
+     * store under the rootfs, which no bind covers, so a mutator that reached
+     * it through the emulation's symlink found a perfectly writable file and
+     * went through: the :ro mount the guest's own name sits under was lost on
+     * the way (see ro_denied_l2s in dispatch.c). To the guest that name is a
+     * regular file, so the mount over the NAME is the one that governs it.
+     *
+     * The group is made here through the l2s API, on host paths, because the
+     * bind refuses the linkat that would otherwise make one — which is also
+     * how such a tree comes about in practice: linked while writable (or by
+     * arm64chroot), bound read-only afterwards.
+     *
+     * The rw run is the negative control: the same calls must NOT report EROFS
+     * there, so a blanket refusal cannot pass both legs. */
+    if (!strcmp(op, "l2sro")) {
+        int ro = fs.nbinds > 0 && fs.binds[0].ro;
+        cng_g_l2s = 1;
+        char host[CNG_PATH_MAX], sib[CNG_PATH_MAX], data[CNG_PATH_MAX];
+        char gsib[CNG_PATH_MAX];
+        if (cng_fs_translate(&fs, gpath, host, sizeof host) != 0) {
+            cng_dprintf(1, "l2sro: %s does not translate\n", gpath);
+            return 1;
+        }
+        size_t hl = cng_strlcpy(sib, host, sizeof sib);
+        cng_strlcpy(sib + hl, ".l2", sizeof sib - hl);
+        size_t gl = cng_strlcpy(gsib, gpath, sizeof gsib);
+        cng_strlcpy(gsib + gl, ".l2", sizeof gsib - gl);
+        int lrc = cng_l2s_link(host, sib);
+        int isgrp = cng_l2s_resolve(host, data, sizeof data, 0) == 1;
+        /* The point of the leg is the data file living OUTSIDE the bind: that
+         * is the central-store layout, and it is what takes the name's mount
+         * out of the picture. A same-directory (legacy) group keeps the data
+         * inside the bind, where the old keying refuses it anyway — so say so
+         * rather than pass on a case that proves nothing. */
+        const char *bh = fs.nbinds > 0 ? fs.binds[0].host : "";
+        size_t bl = strlen(bh);
+        int outside = isgrp && !(bl && !strncmp(data, bh, bl) &&
+                                 (data[bl] == '/' || data[bl] == '\0'));
+        cng_dprintf(1, "l2sro group: link=%d group=%d data-outside-bind=%d\n",
+                    lrc, isgrp, outside);
+        if (!isgrp || !outside)
+            return 1;
+
+        int fails = 0;
+        /* Reads first: they must work whatever the mount says, and the
+         * mutators below really do mutate in the rw control run. */
+        struct {
+            const char *name;
+            long r;
+        } rd[] = {
+            {"read", cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
+                                  CNG_O_RDONLY, 0, 0, 0, 0)},
+            {"access-r", cng_dispatch(__NR_faccessat, CNG_AT_FDCWD, (long)gpath,
+                                      4 /*R_OK*/, 0, 0, 0, 0)},
+        };
+        for (unsigned i = 0; i < sizeof rd / sizeof *rd; i++) {
+            int ok = rd[i].r >= 0;
+            if (rd[i].r >= 0 && !strcmp(rd[i].name, "read"))
+                sys_close((int)rd[i].r);
+            cng_dprintf(1, "l2sro %s %s: rc=%d -> %s\n", ro ? "ro" : "rw",
+                        rd[i].name, (int)rd[i].r, ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+
+        /* The mutators. Every one of them names the l2s link, and every one
+         * of them used to be answered by the store's own (writable) mount.
+         * The unlink takes the group's second name so the first survives for
+         * the rest whatever order these are evaluated in. */
+        struct {
+            const char *name;
+            long r;
+        } t[] = {
+            {"open-w", cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
+                                    CNG_O_WRONLY, 0, 0, 0, 0)},
+            {"open-trunc", cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
+                                        CNG_O_RDONLY | CNG_O_TRUNC, 0, 0, 0,
+                                        0)},
+            {"access-w", cng_dispatch(__NR_faccessat, CNG_AT_FDCWD, (long)gpath,
+                                      2 /*W_OK*/, 0, 0, 0, 0)},
+            {"truncate",
+             cng_dispatch(__NR_truncate, (long)gpath, 0, 0, 0, 0, 0, 0)},
+            {"fchmodat", cng_dispatch(__NR_fchmodat, CNG_AT_FDCWD, (long)gpath,
+                                      0600, 0, 0, 0, 0)},
+            {"fchownat", cng_dispatch(__NR_fchownat, CNG_AT_FDCWD, (long)gpath, 0,
+                                      0, 0, 0, 0)},
+            {"utimensat", cng_dispatch(__NR_utimensat, CNG_AT_FDCWD, (long)gpath,
+                                       0, 0, 0, 0, 0)},
+            {"setxattr",
+             cng_dispatch(__NR_setxattr, (long)gpath, (long)"user.cng",
+                          (long)"1", 1, 0, 0, 0)},
+            {"unlinkat", cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)gsib, 0,
+                                      0, 0, 0, 0)},
+        };
+        for (unsigned i = 0; i < sizeof t / sizeof *t; i++) {
+            int ok = ro ? t[i].r == -EROFS : t[i].r != -EROFS;
+            if (t[i].r >= 0 && !strcmp(t[i].name, "open-w"))
+                sys_close((int)t[i].r);
+            if (t[i].r >= 0 && !strcmp(t[i].name, "open-trunc"))
+                sys_close((int)t[i].r);
+            cng_dprintf(1, "l2sro %s %s: rc=%d -> %s\n", ro ? "ro" : "rw",
+                        t[i].name, (int)t[i].r, ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+        cng_dprintf(1, "l2sro: %d failures\n", fails);
         return fails ? 1 : 0;
     }
     cng_dprintf(2, "_dtest: unknown op %s\n", op);

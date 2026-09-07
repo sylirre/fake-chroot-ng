@@ -922,6 +922,42 @@ int cng_resolve_at(long dirfd, const char *path, int deref, char *out,
     return cng_strlcpy(out + k, path, sz - k) >= sz - k ? -1 : 0;
 }
 
+/* --- :ro binds, through the link2symlink emulation -----------------------
+ *
+ * A :ro verdict is keyed on the resolved HOST path, which is what makes a
+ * guest symlink leading into a read-only bind refuse however the name got
+ * there. An l2s name walks straight out of that keying: the resolution follows
+ * the emulation's own symlink into the central store, which sits under the
+ * rootfs and no bind covers — so a name inside a :ro bind resolved to a
+ * perfectly writable file and every mutator went through. The guest sees none
+ * of this. To it the name IS a regular file, and the mount that name sits
+ * under is the one that governs it (a real hardlink cannot span mounts at all,
+ * so there is no second mount to argue for).
+ *
+ * Hence: where the guest's own name is an l2s link, the :ro question is asked
+ * about the link, not about the data. The l2s hop is always the last component
+ * — a link to a regular file has nothing under it — so the name's own path is
+ * exactly the resolution with the final hop not taken. Asked only when -l and
+ * a :ro bind are both in play, so the default path pays nothing for it. */
+static int ro_denied_l2s(long dirfd, const char *gp) {
+    if (!cng_g_l2s || !gp || !gp[0] || !fs_has_ro())
+        return 0;
+    char hnf[CNG_PATH_MAX], data[CNG_PATH_MAX];
+    return cng_resolve_at(dirfd, gp, 0, hnf, sizeof hnf) == 0 &&
+           cng_l2s_resolve(hnf, data, sizeof data, 0) == 1 && ro_denied(hnf);
+}
+
+/* ro_refusal() for a call whose resolution followed the final component. The
+ * l2s case is answered first and always with EROFS: the name resolved to a
+ * link of ours, so it is there, and "there" is the whole of what the ENOENT
+ * half of ro_refusal exists to establish. */
+static long ro_refusal_name(long dirfd, const char *gp, const char *host,
+                            int atflags) {
+    if (ro_denied_l2s(dirfd, gp))
+        return -EROFS;
+    return ro_refusal(host, atflags);
+}
+
 /* An open the host refused on a path naming one of *our own* fds. We hold that
  * descriptor, so the guest can still be served — two distinct refusals, two
  * answers (apk 3 runs into both when it execs a package script and the shebang
@@ -2032,7 +2068,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * write intent (non-RDONLY, or O_CREAT/O_TRUNC). name_to_handle_at also
          * lands here and never writes, so its a2 (a handle pointer) is never
          * read as flags. */
-        if (ro_denied(p)) {
+        if (ro_denied(p) || ro_denied_l2s(a0, (const char *)a1)) {
             if (nr == __NR_mkdirat || nr == __NR_mknodat)
                 return -EROFS;
             if (is_open && ((oflags & 3) != CNG_O_RDONLY ||
@@ -2044,7 +2080,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                  * there is ENOENT. Both measured. */
                 if (oflags & CNG_O_CREAT)
                     return -EROFS;
-                long ro = ro_refusal(p, deref ? 0 : CNG_AT_SYMLINK_NOFOLLOW);
+                long ro = ro_refusal_name(a0, (const char *)a1, p,
+                                          deref ? 0 : CNG_AT_SYMLINK_NOFOLLOW);
                 if (ro)
                     return ro;
             }
@@ -2170,7 +2207,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * a file whose host copy is perfectly writable, and the write that
          * followed got the EROFS the check existed to avoid. Applied after the
          * access check, where the kernel applies it. */
-        if (r == 0 && ((int)a2 & CNG_W_OK) && ro_denied(p))
+        if (r == 0 && ((int)a2 & CNG_W_OK) &&
+            (ro_denied(p) || ro_denied_l2s(a0, (const char *)a1)))
             return -EROFS;
         return r;
     }
@@ -2181,7 +2219,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, 1);
         if (p == XLATE_TOOLONG)
             return -ENAMETOOLONG;
-        long ro = ro_refusal(p, 0);
+        long ro = ro_refusal_name(a0, (const char *)a1, p, 0);
         if (ro)
             return ro;
         return chattr_result(reissue(a0, (long)p, a2, a3, a4, a5, nr));
@@ -2195,7 +2233,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
         if (p == XLATE_TOOLONG)
             return -ENAMETOOLONG;
-        long ro = ro_refusal(p, deref ? 0 : CNG_AT_SYMLINK_NOFOLLOW);
+        long ro = ro_refusal_name(a0, (const char *)a1, p,
+                                  deref ? 0 : CNG_AT_SYMLINK_NOFOLLOW);
         if (ro)
             return ro;
         return chattr_result(reissue(a0, (long)p, a2, a3, a4, a5, nr));
@@ -2237,6 +2276,12 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             char hnf[CNG_PATH_MAX];
             if (cng_resolve_at(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0 &&
                 cng_l2s_resolve(hnf, data, sizeof data, &cnt) == 1) {
+                /* The backing file is in the store, which no bind covers: the
+                 * mount that governs this call is the one the NAME sits under
+                 * (see ro_denied_l2s). Asked here, before the redirect, since
+                 * the check below never sees the guest's name again. */
+                if (ro_denied(hnf))
+                    return -EROFS;
                 long r = cng_syscall6(CNG_AT_FDCWD, (long)data, a2, 0, 0, 0,
                                       __NR_utimensat);
                 if (cng_fake_root() && (r == -EPERM || r == -EACCES))
@@ -2248,7 +2293,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
         if (p == XLATE_TOOLONG)
             return -ENAMETOOLONG;
-        long ro = ro_refusal(p, deref ? 0 : CNG_AT_SYMLINK_NOFOLLOW);
+        long ro = ro_refusal_name(a0, (const char *)a1, p,
+                                  deref ? 0 : CNG_AT_SYMLINK_NOFOLLOW);
         if (ro)
             return ro;
         long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_utimensat);
@@ -2339,15 +2385,19 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             char hnf[CNG_PATH_MAX], data[CNG_PATH_MAX];
             if (cng_resolve_at(a0, (const char *)a1, 0, hnf, sizeof hnf) ==
                     0 &&
-                cng_l2s_resolve(hnf, data, sizeof data, 0) == 1)
+                cng_l2s_resolve(hnf, data, sizeof data, 0) == 1) {
+                if (ro_denied(hnf)) /* the name's mount, not the store's */
+                    return -EROFS;
                 return chattr_result(reissue(CNG_AT_FDCWD, (long)data, a2, a3,
                                              0, a5, __NR_fchownat));
+            }
         }
         int deref = !((int)a4 & CNG_AT_SYMLINK_NOFOLLOW);
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
         if (p == XLATE_TOOLONG)
             return -ENAMETOOLONG;
-        long ro = ro_refusal(p, deref ? 0 : CNG_AT_SYMLINK_NOFOLLOW);
+        long ro = ro_refusal_name(a0, (const char *)a1, p,
+                                  deref ? 0 : CNG_AT_SYMLINK_NOFOLLOW);
         if (ro)
             return ro;
         return chattr_result(reissue(a0, (long)p, a2, a3, a4, a5, __NR_fchownat));
@@ -3220,7 +3270,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         if (p == XLATE_TOOLONG)
             return -ENAMETOOLONG;
         if (writes) {
-            long ro = ro_refusal(p, deref ? 0 : CNG_AT_SYMLINK_NOFOLLOW);
+            long ro = ro_refusal_name(CNG_AT_FDCWD, (const char *)a0, p,
+                                      deref ? 0 : CNG_AT_SYMLINK_NOFOLLOW);
             if (ro)
                 return ro;
         }
@@ -3250,7 +3301,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         if (p == XLATE_TOOLONG)
             return -ENAMETOOLONG;
         if (nr == __NR_truncate) { /* statfs only reads */
-            long ro = ro_refusal(p, 0);
+            long ro = ro_refusal_name(CNG_AT_FDCWD, (const char *)a0, p, 0);
             if (ro)
                 return ro;
         }

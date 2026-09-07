@@ -359,6 +359,35 @@ out=$(run -t dtest -r "$ROOT" -b "$RB":/rw robind /rw/f 2>&1); rc=$?
 check "a plain (rw) bind reports no EROFS" 0 "$rc"
 rm -rf "$RB"
 
+# ...and the same bind with a link2symlink group in it. The emulation's names
+# are symlinks onto a data file in the store under the rootfs, which no bind
+# covers — so every mutator that followed one arrived at a writable file and
+# the :ro mount over the guest's own name was lost on the way. To the guest
+# that name is a regular file, and a real hardlink cannot leave its mount at
+# all, so the mount over the NAME is what governs it. The group is built by
+# the driver through the l2s API (the bind refuses the linkat that would make
+# one), which is also how such a tree arises: linked while writable, bound
+# read-only afterwards.
+LB=$(mktemp -d); printf 'L2S-DATA' > "$LB/f"
+out=$(run -t dtest -r "$ROOT" -b "$LB":/ro:ro l2sro /ro/f 2>&1); rc=$?
+check ":ro bind refuses every mutating syscall on an l2s name" 0 "$rc"
+check_contains "the group's data really is outside the bind" \
+    "l2sro group: link=0 group=1 data-outside-bind=1" "$out"
+check_contains ":ro bind still serves reads of an l2s name" \
+    "l2sro ro read: rc=" "$out"
+check_contains ":ro bind still answers access(R_OK) on an l2s name" \
+    "l2sro ro access-r: rc=0 -> OK" "$out"
+for _leg in open-w open-trunc access-w truncate fchmodat fchownat utimensat \
+    setxattr unlinkat; do
+    check_contains ":ro bind refuses $_leg on an l2s name" \
+        "l2sro ro $_leg: rc=-30 -> OK" "$out"
+done
+rm -rf "$LB"
+LB=$(mktemp -d); printf 'L2S-DATA' > "$LB/f"
+out=$(run -t dtest -r "$ROOT" -b "$LB":/rw l2sro /rw/f 2>&1); rc=$?
+check "a plain (rw) bind reports no EROFS on an l2s name" 0 "$rc"
+rm -rf "$LB"
+
 run -t sigtest >/dev/null 2>&1
 check "signal round-trip + ucontext readable" 0 $?
 check_contains "sigtest handler ran" "handler ran" "$(run -t sigtest 2>&1)"
