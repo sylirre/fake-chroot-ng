@@ -1429,6 +1429,93 @@ static int rw_scan_checks(void) {
     return fails;
 }
 
+/* The sentinels cng_rwtest_fn leaves in res[0..7]: the FP registers and the
+ * IP0/IP1 pair, none of which a syscall may spend. Shared by the two drivers
+ * that run that function — through an ahead-of-time rewrite and through a lazy
+ * one — because what must survive is the same either way. */
+static int rw_regs_ok(const unsigned long *res) {
+    static const unsigned long want[8] = {0xfd00UL,     0xfd01UL,  0xfd08UL,
+                                          0xfd10UL,     0xfd1fUL,  0x400000UL,
+                                          0xdead1616UL, 0xbeef1717UL};
+    static const char *const nm[8] = {"d0",   "d1",   "d8",  "d16",
+                                      "d31",  "fpcr", "x16", "x17"};
+    int ok = 1;
+    for (int i = 0; i < 8; i++)
+        if (res[i] != want[i]) {
+            ok = 0;
+            cng_dprintf(1, "rwtest: %s clobbered: %lx want %lx\n", nm[i], res[i],
+                        want[i]);
+        }
+    return ok;
+}
+
+/* The lazy tier, which no filter on this host will ever fire: hand the patcher
+ * the address a SIGSYS would have handed it. Everything the trap itself does
+ * not do is what this exercises — finding the mapping in /proc/self/maps,
+ * putting a pool within a branch's reach of it, and writing a word into
+ * read-only text with the page executable throughout — and then that the code
+ * still runs, through the same trampoline the ahead-of-time pass emits.
+ *
+ * The copy is mapped r-xp on purpose. The ahead-of-time pass only ever writes
+ * into a mapping it made itself and has not protected yet; a site that arrives
+ * here is in text that has been read-only for as long as it has existed. */
+static int rw_lazy_checks(void) {
+    size_t fsz = (size_t)(cng_rwtest_fn_end - cng_rwtest_fn);
+    unsigned long total = cng_page_up(fsz);
+    void *code = sys_mmap(0, total, CNG_PROT_READ | CNG_PROT_WRITE,
+                          CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (code == CNG_MAP_FAILED || cng_is_err((long)code)) {
+        cng_dprintf(1, "rwtest lazy: mmap failed -> FAIL\n");
+        return 1;
+    }
+    memcpy(code, cng_rwtest_fn, fsz);
+    if (sys_mprotect(code, total, CNG_PROT_READ | CNG_PROT_EXEC) < 0) {
+        /* No anonymous executable memory to be had (PR_SET_MDWE, or Android's
+         * execmem revoked): there is no lazy tier here to test. */
+        sys_munmap(code, total);
+        cng_dprintf(1, "rwtest lazy: no executable memory -> SKIP\n");
+        return 0;
+    }
+    cng_flush_icache(code, (char *)code + fsz);
+
+    unsigned long lo = (unsigned long)code, first = 0;
+    int sites = 0, patched = 0;
+    for (unsigned long a = lo; a + 4 <= lo + fsz; a += 4) {
+        if (*(uint32_t *)a != 0xD4000001u)
+            continue;
+        sites++;
+        if (!first)
+            first = a;
+        patched += cng_rewrite_site(a);
+    }
+    /* A site that is already a branch, and a word that was never an `svc`:
+     * both have to be declined, since what makes this tier exact is that it
+     * only ever patches a word it has been told the CPU executed. */
+    int repeat = first ? cng_rewrite_site(first) : 1;
+    int nonsvc = cng_rewrite_site(lo);
+
+    unsigned long res[9];
+    memset(res, 0, sizeof res);
+    cng_g_procstat_synth = 1;
+    long (*fn)(void *, const char *) = (long (*)(void *, const char *))code;
+    long got = fn(res, "/proc/stat");
+    if ((long)res[8] >= 0)
+        sys_close((int)res[8]);
+    long real = sys_getpid();
+
+    int ok = (sites >= 2 && patched == sites && !repeat && !nonsvc &&
+              got == real && (long)res[8] >= 0 && rw_regs_ok(res));
+    cng_dprintf(1,
+                "rwtest lazy: sites=%d patched=%d repeat=%d nonsvc=%d pid=%s"
+                " openat=%s -> %s\n",
+                sites, patched, repeat, nonsvc, got == real ? "ok" : "wrong",
+                (long)res[8] >= 0 ? "ok" : "failed", ok ? "OK" : "FAIL");
+
+    cng_rewrite_lazy_reset(); /* and the pool it took goes back */
+    sys_munmap(code, total);
+    return !ok;
+}
+
 int cng_cmd_rwtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     (void)argc;
     (void)argv;
@@ -1489,18 +1576,7 @@ int cng_cmd_rwtest(int argc, char **argv, char **envp, unsigned long *auxv) {
      * any of it. Nothing puts it back; the monitor is built to never generate an
      * FP instruction in the first place (-mgeneral-regs-only). x16/x17 are the
      * same claim about IP0/IP1, which the trampoline used to keep for itself. */
-    static const unsigned long want[8] = {0xfd00UL,     0xfd01UL,  0xfd08UL,
-                                          0xfd10UL,     0xfd1fUL,  0x400000UL,
-                                          0xdead1616UL, 0xbeef1717UL};
-    static const char *const nm[8] = {"d0",   "d1",   "d8",  "d16",
-                                      "d31",  "fpcr", "x16", "x17"};
-    int regs_ok = 1;
-    for (int i = 0; i < 8; i++)
-        if (res[i] != want[i]) {
-            regs_ok = 0;
-            cng_dprintf(1, "rwtest: %s clobbered: %lx want %lx\n", nm[i], res[i],
-                        want[i]);
-        }
+    int regs_ok = rw_regs_ok(res);
 
     int ok = (n >= 2 && got == real && (long)res[8] >= 0 && regs_ok);
     /* The descriptor number itself is the host's to choose — 3 where the three
@@ -1526,7 +1602,7 @@ int cng_cmd_rwtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     cng_dprintf(1, "rwtest general exit: pid=%ld marker=%lx x12=%lx -> %s\n",
                 (long)g[0], g[1], g[2], gok ? "OK" : "FAIL");
 
-    int sfails = rw_scan_checks();
+    int sfails = rw_scan_checks() + rw_lazy_checks();
 
     return (ok && gok && !sfails) ? 0 : 1;
 }

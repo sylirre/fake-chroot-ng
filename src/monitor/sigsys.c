@@ -12,6 +12,7 @@
 #include "cng/monitor.h"
 #include "cng/procreg.h"
 #include "cng/ptrace.h"
+#include "cng/rewrite.h"
 #include "cng/rt.h"
 #include "cng/shm.h"
 #include "cng/syscall.h"
@@ -233,6 +234,17 @@ void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si) {
     }
 
     long nr = (long)r[8];
+
+    /* This trap is also the only proof that exists about the word behind it:
+     * the CPU fetched and executed it as `svc #0`. The AoT rewriter has to
+     * decide that by reading bytes, and it is exactly the sites it could not
+     * reach — a natively mapped library, a JIT's output, an object whose
+     * headers named no code — that arrive here. Patch it, so the site costs
+     * this trap once. (`rt_sigreturn` is the site that must never become a
+     * trampoline call; the filter does not trap it, and if it ever did, this
+     * is where that would stop being true.) */
+    if (nr != __NR_rt_sigreturn)
+        cng_rewrite_site(ca - 4);
 
     /* Untraced — which is every guest until something in the session starts
      * tracing — goes straight to the syscall with no ptrace work at all. A

@@ -47,28 +47,6 @@ static int read_phdr(int fd, const Elf64_Ehdr *eh, int i, Elf64_Phdr *ph) {
                : -1;
 }
 
-/* Take CNG_TRAMP_POOL bytes at exactly `want`, or nothing. MAP_FIXED_NOREPLACE
- * so an occupied range is refused rather than replaced; on a kernel that
- * predates the flag it degrades to a hint, which answers a collision by placing
- * the mapping somewhere else — so the address is checked either way and a miss
- * is handed straight back. */
-static unsigned long pool_at(unsigned long want) {
-    if (!want || cng_hits_image(want, CNG_TRAMP_POOL))
-        return 0;
-    void *p = sys_mmap((void *)want, CNG_TRAMP_POOL,
-                       CNG_PROT_READ | CNG_PROT_WRITE,
-                       CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS |
-                           CNG_MAP_FIXED_NOREPLACE,
-                       -1, 0);
-    if (cng_is_err((long)p))
-        return 0;
-    if ((unsigned long)p != want) {
-        sys_munmap(p, CNG_TRAMP_POOL);
-        return 0;
-    }
-    return want;
-}
-
 /* Rewrite the `svc` sites of this mapping, but only where the object says its
  * code is. The M8 scan matches a bare 0xD4000001 word, and a PF_X PT_LOAD is
  * not a code segment: a musl link puts the whole read-only image in it, and
@@ -136,9 +114,9 @@ static int rewrite_text(int fd, unsigned long map, unsigned long off,
      * spots are often taken. The kernel's own choice comes out of that same
      * arena and is normally within reach as well — and when it is not,
      * cng_rewrite_seg rewrites nothing and the pool is handed straight back. */
-    unsigned long pool = pool_at(bias + vhi);
+    unsigned long pool = cng_pool_at(bias + vhi, CNG_TRAMP_POOL);
     if (!pool && bias + vlo >= CNG_TRAMP_POOL)
-        pool = pool_at(bias + vlo - CNG_TRAMP_POOL);
+        pool = cng_pool_at(bias + vlo - CNG_TRAMP_POOL, CNG_TRAMP_POOL);
     if (!pool) {
         void *any = sys_mmap(0, CNG_TRAMP_POOL,
                              CNG_PROT_READ | CNG_PROT_WRITE,

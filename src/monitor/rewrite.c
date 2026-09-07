@@ -2,9 +2,13 @@
 /* Copyright 2026 Sylirre */
 #include "cng/rewrite.h"
 #include "cng/elf.h"
+#include "cng/loader.h"
 #include "cng/monitor.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
+#include "cng/uapi.h"
+
+#include <asm/unistd.h>
 
 #include <stdint.h>
 
@@ -271,4 +275,317 @@ int cng_rewrite_seg(unsigned long lo, unsigned long hi, unsigned long foff,
                       pool, cap, used);
     }
     return count;
+}
+
+/* ---- lazy rewriting: the site the CPU just trapped from ------------------
+ *
+ * Everything above has to decide what is code before any of it runs, which is
+ * why it needs the section headers and a filter behind them. A SIGSYS trap
+ * needs neither: `si_call_addr - 4` is a word the CPU fetched and executed as
+ * `svc #0`, so patching it cannot be wrong about what it is. What it cannot do
+ * is find a site nothing has run yet, and where the filter never traps at all
+ * (qemu-user, a pre-3.5 kernel) it finds nothing — so this runs alongside the
+ * ahead-of-time pass rather than instead of it, and picks up exactly what that
+ * pass could not reach: a library the kernel mapped natively (there is no copy
+ * for the rewriter to walk), code a guest JIT wrote itself, and any site left
+ * behind by an exhausted pool, a branch out of reach, or an object whose
+ * headers named no code.
+ *
+ * Replacing `svc` with `b` is also the one edit that needs no stopping of the
+ * world: both are in the set the architecture allows to be modified while
+ * another PE is executing them (B, BL, BRK, HVC, ISB, NOP, SMC, SVC), so a
+ * thread in that instruction sees the old word or the new one, and the old one
+ * simply traps again. */
+
+#define LAZY_REGIONS 32
+#define LAZY_POOL    0x20000UL /* 128 KiB: ~800 trampolines per mapping */
+
+struct lazy_region {
+    unsigned long lo, hi;  /* the mapping, as /proc/self/maps had it */
+    unsigned long pool;    /* 0: this mapping is not one we can patch */
+    unsigned long used;
+    int prot;              /* what the page goes back to after the store */
+};
+
+static struct lazy_region g_lazy[LAZY_REGIONS];
+static int g_lazy_n;
+static int g_lazy_nomaps; /* no /proc to read: stop asking */
+/* Not a lock to wait on: a thread that finds the table busy leaves this site to
+ * the floor, which is what would have answered it anyway. That also keeps a
+ * nested trap (one of our own syscalls refused by Android, answered by the
+ * gate-net) from ever meeting a table it is already inside. */
+static volatile int g_lazy_busy;
+
+unsigned long cng_pool_at(unsigned long want, unsigned long size) {
+    if (!want || cng_hits_image(want, size))
+        return 0;
+    void *p = sys_mmap((void *)want, size, CNG_PROT_READ | CNG_PROT_WRITE,
+                       CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS |
+                           CNG_MAP_FIXED_NOREPLACE,
+                       -1, 0);
+    if (cng_is_err((long)p))
+        return 0;
+    if ((unsigned long)p != want) {
+        sys_munmap(p, size); /* a kernel without the flag placed it elsewhere */
+        return 0;
+    }
+    return want;
+}
+
+static unsigned long hex_at(char **p) {
+    unsigned long v = 0;
+    for (;; (*p)++) {
+        char c = **p;
+        int d = (c >= '0' && c <= '9')   ? c - '0'
+                : (c >= 'a' && c <= 'f') ? c - 'a' + 10
+                                         : -1;
+        if (d < 0)
+            return v;
+        v = v * 16 + (unsigned long)d;
+    }
+}
+
+/* One read of /proc/self/maps answers two questions at once, which is why it is
+ * one function: what the mapping holding `addr` is — bounds, protection, and
+ * whether it is private, since a store into a shared file mapping would not
+ * patch our copy but edit the file on disk — and where the nearest hole big
+ * enough to hold a pool is. The hole matters as much as the mapping: a pool has
+ * to be within a branch's reach of the sites that use it, and the addresses
+ * around a loaded library are exactly the ones the linker has already taken.
+ * Returns 0 if there is no line covering `addr` to find. */
+static int lazy_vma(unsigned long addr, unsigned long *lo_out,
+                    unsigned long *hi_out, int *prot_out, int *shared_out,
+                    unsigned long *hole_out) {
+    long fd = sys_openat(CNG_AT_FDCWD, "/proc/self/maps",
+                         CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    if (fd < 0) {
+        g_lazy_nomaps = 1;
+        return 0;
+    }
+    /* Small on purpose: this can run on a guest thread's own stack. A line
+     * split across two reads is carried over at the front of the next. */
+    char buf[1024];
+    long n, keep = 0;
+    int found = 0;
+    unsigned long prev_end = 0, best = 0, best_d = ~0UL;
+    while ((n = sys_read((int)fd, buf + keep, sizeof buf - 1 - (size_t)keep)) >
+           0) {
+        n += keep;
+        buf[n] = 0;
+        char *p = buf, *nl;
+        while ((nl = strchr(p, '\n'))) {
+            *nl = 0;
+            char *q = p;
+            unsigned long lo = hex_at(&q); /* "lo-hi perms ..." */
+            p = nl + 1;
+            if (*q != '-')
+                continue;
+            q++;
+            unsigned long hi = hex_at(&q);
+            if (*q != ' ')
+                continue;
+            if (prev_end && lo - prev_end >= LAZY_POOL) {
+                /* Distance from the hole to the site, both ways, kept as the
+                 * unsigned magnitude so the nearest one wins. */
+                unsigned long d = prev_end > addr ? prev_end - addr
+                                                  : addr - prev_end;
+                if (d < best_d) {
+                    best_d = d;
+                    best = prev_end;
+                }
+            }
+            prev_end = hi;
+            if (!found && addr >= lo && addr < hi) {
+                *lo_out = lo;
+                *hi_out = hi;
+                *prot_out = (q[1] == 'r' ? CNG_PROT_READ : 0) |
+                            (q[2] == 'w' ? CNG_PROT_WRITE : 0) |
+                            (q[3] == 'x' ? CNG_PROT_EXEC : 0);
+                *shared_out = (q[4] == 's');
+                found = 1;
+            }
+        }
+        keep = (long)strlen(p);
+        if (keep >= (long)sizeof buf - 1)
+            keep = 0; /* pathological line: drop it */
+        else
+            memmove(buf, p, (size_t)keep);
+    }
+    sys_close((int)fd);
+    *hole_out = best;
+    return found;
+}
+
+/* A pool the whole mapping can reach with a `b`: the hole the maps survey found
+ * first, then immediately above the mapping and immediately below it (both
+ * usually taken — a library's segments abut each other), then wherever the
+ * kernel cares to put one. The pool is executable from the start: a trampoline
+ * that is already live cannot be made unexecutable to write its neighbour, so
+ * what happens per trampoline is the far smaller window of adding W to a page
+ * that keeps X throughout. */
+static unsigned long lazy_pool(unsigned long lo, unsigned long hi,
+                               unsigned long hole) {
+    unsigned long p = cng_pool_at(hole, LAZY_POOL);
+    if (!p)
+        p = cng_pool_at(hi, LAZY_POOL);
+    if (!p && lo >= LAZY_POOL)
+        p = cng_pool_at(lo - LAZY_POOL, LAZY_POOL);
+    if (!p) {
+        void *any = sys_mmap(0, LAZY_POOL, CNG_PROT_READ | CNG_PROT_WRITE,
+                             CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+        if (!cng_is_err((long)any))
+            p = (unsigned long)any;
+    }
+    if (!p)
+        return 0;
+    /* Every site in the mapping has to be able to branch into it — the two
+     * extremes bound the rest — because a pool out of reach is worse than no
+     * pool at all: the table would keep the mapping alive and every trap out of
+     * it would go looking for a slot it can never use. Measured on the device
+     * before this check existed, where the kernel's own choice of address
+     * landed outside ±128 MiB: `ls -lR` took 3.9 s against 2.0 s, all of it
+     * /proc/self/maps read once per trapped syscall.
+     *
+     * Where anonymous executable memory is denied outright (Android's execmem,
+     * revoked by NO_NEW_PRIVS) there is no lazy tier to have at all; that is
+     * found out here, once per mapping, rather than once per site. */
+    if (!b_insn(lo, p + LAZY_POOL) || !b_insn(hi - 4, p) ||
+        sys_mprotect((void *)p, LAZY_POOL, CNG_PROT_READ | CNG_PROT_EXEC) < 0) {
+        sys_munmap((void *)p, LAZY_POOL);
+        return 0;
+    }
+    return p;
+}
+
+/* The table entry for the mapping holding `site`, or nothing. An entry with no
+ * pool is a mapping we know we cannot patch, kept precisely so the next trap
+ * out of it costs nothing — not even the read of /proc/self/maps, which is the
+ * whole reason the table exists. */
+static struct lazy_region *lazy_known(unsigned long site) {
+    for (int i = 0; i < g_lazy_n; i++)
+        if (site >= g_lazy[i].lo && site < g_lazy[i].hi)
+            return &g_lazy[i];
+    return 0;
+}
+
+/* Remember a mapping the first time a site in it traps, with the pool its sites
+ * will branch into — or with none, when the mapping is one we must not write,
+ * which is remembered just as carefully so the next trap out of it is answered
+ * from this table and costs nothing. */
+static struct lazy_region *lazy_add(unsigned long lo, unsigned long hi, int prot,
+                                    int usable, unsigned long hole) {
+    if (g_lazy_n == LAZY_REGIONS)
+        return 0;
+    struct lazy_region *r = &g_lazy[g_lazy_n++];
+    r->lo = lo;
+    r->hi = hi;
+    r->prot = prot;
+    r->used = 0;
+    r->pool = usable ? lazy_pool(lo, hi, hole) : 0;
+    return r;
+}
+
+/* One trampoline, into a pool that stays executable while it is written. */
+static char *lazy_emit(struct lazy_region *r, unsigned long site) {
+    unsigned long tsz = cng_tramp_size();
+    if (r->used + tsz > LAZY_POOL)
+        return 0;
+    unsigned long slot = r->pool + r->used;
+    if (!b_insn(site, slot))
+        return 0; /* out of a branch's reach: leave the site to the floor */
+    unsigned long p0 = cng_page_down(slot), p1 = cng_page_up(slot + tsz);
+    if (sys_mprotect((void *)p0, p1 - p0,
+                     CNG_PROT_READ | CNG_PROT_WRITE | CNG_PROT_EXEC) < 0)
+        return 0;
+    unsigned long used = r->used;
+    char *got = emit(r->pool, LAZY_POOL, &used, site + 4);
+    if (got) {
+        cng_flush_icache(got, got + tsz);
+        r->used = used;
+    }
+    sys_mprotect((void *)p0, p1 - p0, CNG_PROT_READ | CNG_PROT_EXEC);
+    return got;
+}
+
+int cng_rewrite_site(unsigned long site) {
+    if (!cng_g_rewrite || (site & 3) || g_lazy_nomaps)
+        return 0;
+    int idle = 0;
+    if (!__atomic_compare_exchange_n(&g_lazy_busy, &idle, 1, 0,
+                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        return 0;
+
+    int done = 0;
+    struct lazy_region *r = lazy_known(site);
+    if (!r) {
+        /* The first site to trap out of a mapping is the only one that pays for
+         * reading /proc/self/maps. What that answers is whether the word may be
+         * loaded at all — an execute-only mapping would fault on the load, in a
+         * handler running with SIGSEGV masked — whether the store would land in
+         * our copy or in a file on disk (a shared mapping is not ours to
+         * write), and what to put the page back to afterwards.
+         *
+         * That last one is remembered rather than re-read, so a guest that
+         * changes its own text protections after a site there is patched gets
+         * back what the mapping had when we first saw it. The alternative costs
+         * a read of /proc per trap, which is what this tier exists to avoid. */
+        unsigned long lo, hi, hole;
+        int prot, shared;
+        if (!lazy_vma(site, &lo, &hi, &prot, &shared, &hole))
+            goto out;
+        int usable = !shared && (prot & (CNG_PROT_READ | CNG_PROT_EXEC)) ==
+                                    (CNG_PROT_READ | CNG_PROT_EXEC);
+        r = lazy_add(lo, hi, prot, usable, hole);
+    }
+    if (!r || !r->pool)
+        goto out; /* known to be none of ours: answered without a syscall */
+
+    /* Not a `svc` any more is the ordinary outcome of two threads trapping the
+     * same site at once: the first patched it, and this one is finishing the
+     * syscall it was already in the middle of. */
+    if (*(uint32_t *)site != SVC0_INSN)
+        goto out;
+
+    char *slot = lazy_emit(r, site);
+    uint32_t br = slot ? b_insn(site, (unsigned long)slot) : 0;
+    if (!br)
+        goto retire; /* the pool is full: this mapping has had its share */
+
+    unsigned long p0 = cng_page_down(site), p1 = cng_page_up(site + 4);
+    int add_w = !(r->prot & CNG_PROT_WRITE);
+    if (add_w && sys_mprotect((void *)p0, p1 - p0, r->prot | CNG_PROT_WRITE) < 0)
+        goto retire; /* the mapping cannot be written at all: stop asking */
+    /* X is held throughout, so a thread executing this page while the store
+     * lands neither faults nor has to be stopped — and `svc` to `b` is one of
+     * the substitutions the architecture allows under exactly that condition. */
+    *(uint32_t *)site = br;
+    cng_flush_icache((void *)site, (void *)(site + 4));
+    if (add_w)
+        sys_mprotect((void *)p0, p1 - p0, r->prot);
+    done = 1;
+    goto out;
+
+retire:
+    /* Whatever stopped this site stops every other site in the mapping too, so
+     * the pool goes back and the entry stays as the record that it did. */
+    sys_munmap((void *)r->pool, LAZY_POOL);
+    r->pool = 0;
+out:
+    __atomic_store_n(&g_lazy_busy, 0, __ATOMIC_RELEASE);
+    if (done && cng_g_debug)
+        cng_dprintf(2, "[cng] lazy: patched the svc site at %lx\n", site);
+    return done;
+}
+
+void cng_rewrite_lazy_reset(void) {
+    /* An emulated execve is the one place the mappings these describe go away,
+     * and it happens single-threaded (a real execve kills the other threads and
+     * ours cannot, so the loader refuses to run with any) — there is nothing
+     * left running in a pool to take the lock against. Handing the address
+     * space back is the point: an exec chain must not accumulate pools the way
+     * M32 stopped it accumulating images. */
+    for (int i = 0; i < g_lazy_n; i++)
+        if (g_lazy[i].pool)
+            sys_munmap((void *)g_lazy[i].pool, LAZY_POOL);
+    g_lazy_n = 0;
 }

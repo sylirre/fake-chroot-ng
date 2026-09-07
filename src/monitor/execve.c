@@ -20,6 +20,7 @@
 #include "cng/path.h"
 #include "cng/procfs.h"
 #include "cng/ptrace.h"
+#include "cng/rewrite.h"
 #include "cng/rt.h"
 #include "cng/shm.h"
 #include "cng/syscall.h"
@@ -525,6 +526,7 @@ void cng_exec_generation(const struct cng_loaded *prog,
  * All best-effort: a kernel without POSIX timers has no such file, and a failed
  * brk simply leaves the heap where it was. */
 static void cng_exec_reset(void) {
+    cng_rewrite_lazy_reset(); /* the sites those pools branch from are gone */
     for (int i = 0; i < g_ntimers; i++)
         CNG_SYS(__NR_timer_delete, g_timers[i], 0, 0, 0, 0, 0);
     g_ntimers = 0;

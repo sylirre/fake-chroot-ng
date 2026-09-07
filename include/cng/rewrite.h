@@ -59,4 +59,21 @@ int cng_rewrite_seg(unsigned long lo, unsigned long hi, unsigned long foff,
                     const struct cng_code_ranges *cr, unsigned long pool,
                     unsigned long cap, unsigned long *used);
 
+/* Take `size` bytes at exactly `want`, or nothing. MAP_FIXED_NOREPLACE so an
+ * occupied range is refused rather than replaced; on a kernel that predates the
+ * flag it degrades to a hint, so the address is checked either way. */
+unsigned long cng_pool_at(unsigned long want, unsigned long size);
+
+/* Rewrite one site the SIGSYS floor just trapped from — `si_call_addr - 4`,
+ * a word the CPU executed as `svc #0`, which is the one thing a scan of the
+ * bytes cannot establish. Everything about it is best-effort: an unreadable
+ * mapping, a shared one, no pool in reach, a denied mprotect all mean the site
+ * keeps trapping, which is what it did before. Returns 1 if the site is now a
+ * branch. No-op unless cng_g_rewrite is set. */
+int cng_rewrite_site(unsigned long site);
+
+/* Hand back the lazy pools. For the emulated execve, whose images (and the
+ * sites in them) are gone. */
+void cng_rewrite_lazy_reset(void);
+
 #endif /* CNG_REWRITE_H */

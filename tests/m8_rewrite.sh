@@ -50,6 +50,24 @@ esac
 check_contains "a data word equal to svc #0 is left alone, the real site taken" \
     "rwtest scan: mapped=1 unmapped=2 filtered=1 dataonly=0 -> OK" "$rwout"
 
+# The lazy tier. A SIGSYS trap knows something no scan of the bytes can: the CPU
+# fetched that word and executed it as `svc #0`. So the sites the AoT pass could
+# not reach — a library the kernel mapped natively, a JIT's output, an object
+# whose headers named no code — are patched on their first trap instead. No
+# filter fires on a cross host, so the driver calls the patcher with the address
+# a SIGSYS would have handed it; what that leaves untested is three lines in the
+# handler, and the device covers those.
+case "$rwout" in
+*"rwtest lazy: no executable memory"*)
+    skip "lazy svc patching: no anonymous executable memory on this host"
+    ;;
+*)
+    check_contains "a site is patched in read-only text and runs from there" \
+        "rwtest lazy: sites=2 patched=2 repeat=0 nonsvc=0 pid=ok openat=ok -> OK" \
+        "$rwout"
+    ;;
+esac
+
 ROOT=$(mktemp -d)
 mkdir -p "$ROOT/bin" "$ROOT/etc"
 printf 'GREETING-VIA-REWRITE' > "$ROOT/etc/greeting"

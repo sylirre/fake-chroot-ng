@@ -381,9 +381,12 @@ static void help(char **envp) {
                       "unpack. Off by default: without it the host's refusal "
                       "is reported to the guest unchanged."},
         {"-R, --rewrite", "Rewrite the guest's svc instruction sites to "
-                      "trampolines ahead of time. Faster than trapping every "
-                      "syscall, and also provides path translation where the "
-                      "seccomp monitor is unavailable (e.g. under qemu-user)."},
+                      "trampolines: ahead of time where an object's section "
+                      "headers say its code is, and on its first trap for a "
+                      "site that pass could not reach. Faster than trapping "
+                      "every syscall, and also provides path translation where "
+                      "the seccomp monitor is unavailable (e.g. under "
+                      "qemu-user)."},
         {"-F, --file-backed", "Force file-backed segment mapping. Auto-selected "
                       "when anonymous executable memory is denied (Android "
                       "no-new-privs / execmem); this forces it unconditionally."},

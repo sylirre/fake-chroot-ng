@@ -2173,6 +2173,72 @@ vfork/`posix_spawn` child-stack handling.
   both numbers per object: `rewrote N svc site(s), ranges=M`, where `ranges=0`
   is the headerless fallback. 813/813 tests.
 
+- [x] **M34 — `-R`: the site the floor just trapped from, patched on the spot**
+  The ahead-of-time pass has to decide what is code by reading bytes, which is
+  why M33 had to give it the section headers and a filter behind them. A SIGSYS
+  trap needs neither: `si_call_addr - 4` is a word the CPU fetched and executed
+  as `svc #0`, so patching it cannot be wrong about what it is. `-R` now does
+  both — the scan at load time, and this on the first trap from any site that
+  scan could not reach.
+  What it reaches is the coverage `-R` never had. On the target platform the
+  guest's libraries are mapped **natively** (Termux app data forbids `execve`
+  but permits file-backed `PROT_EXEC`), so the mmap hook hands back the kernel's
+  own mapping and there is no copy for the rewriter to walk — measured on the
+  device, `cat` under `-R` gets 222 sites rewritten ahead of time in the bionic
+  linker and **not one** in libc, whose `svc` sites are in that natively mapped
+  text. Those are the sites this tier takes: five for `cat`, ten for `ls -lR`.
+  Also JIT'd code, and anything the scan left behind — a pool exhausted, a
+  branch out of reach, an object whose headers named no code.
+  Measured on the device (Android 13, 5.15), `ls -lR $PREFIX/lib` through a
+  natively mapped bionic, five runs each: **2010/2028/2026/2033/2042 ms without
+  the lazy tier against 1890/1881/1903/1855/1891 ms with it** — every run
+  separated, ~7%, for ten sites patched once each.
+  How it holds together:
+  - A table of mappings, keyed by what `/proc/self/maps` says. That file is read
+    **once per mapping** — never per site and never per trap — and answers three
+    things at once: whether the word may be loaded at all (an execute-only
+    mapping would fault on the load, in a handler that runs with SIGSEGV
+    masked), whether the store lands in our copy or in a file on disk (a shared
+    mapping is not ours to write), and what to put the page back to.
+  - The same survey finds the nearest hole big enough for the pool, which is
+    what makes the branch reach: the addresses either side of a loaded library
+    are the ones its linker has already taken. A pool that cannot be reached
+    from the whole mapping is refused outright — that is not a missed
+    optimization but a trap-time cost, and it was measured as one: before the
+    check, a pool the kernel placed outside ±128 MiB left every trapped syscall
+    reading `/proc/self/maps` and the same `ls -lR` took **3.9 s**.
+  - Anything that stops one site stops the mapping — no pool in reach, the pool
+    full, a refused `mprotect` (the SELinux `execmod` denial a device may answer
+    for file-backed text) — so the entry is kept with no pool and every later
+    trap out of it is answered from the table without a syscall.
+  - Nothing is ever made unexecutable. The pool is `r-x` from the start and a
+    page of it gains `w` only while a trampoline is written; the site's own page
+    gains `w` only while the branch is stored. A thread executing either page
+    throughout neither faults nor has to be stopped — and `svc` to `b` is one of
+    the substitutions the architecture explicitly permits while another PE is
+    executing them (B, BL, BRK, HVC, ISB, NOP, SMC, SVC), so a racing thread
+    sees the old word or the new one, and the old one simply traps again.
+  - `rt_sigreturn` is never patched (the filter does not trap it; this is where
+    that would stop being true), the table is taken with a try-lock so a nested
+    trap can never meet it, and an emulated `execve` hands the pools back — the
+    sites they branch from are gone, and an exec chain must not accumulate them
+    the way M32 stopped it accumulating images.
+  Two things it does not do. The protection to restore is remembered with the
+  mapping rather than re-read, so a guest that changes its own text protections
+  after a site there is patched gets back what the mapping had when we first saw
+  it; re-reading would cost `/proc` per trap, which is the whole thing this tier
+  avoids. And a guest that `MAP_FIXED`s over a pool unmaps the trampolines its
+  own code branches into — the same exposure the M8 and M23 pools have always
+  had, and the same answer: see the threat-model note in `docs/DESIGN.md`.
+  Validated by `-t rwtest`, which calls the patcher with the address a SIGSYS
+  would have handed it — a copy of the test function mapped `r-xp`, both of its
+  sites patched through the maps lookup, the pool placement and the `mprotect`
+  dance, then run, with the register sentinels intact and an already-patched
+  site and a non-`svc` word both declined. That leaves three lines in the
+  handler untested on a cross host, where no filter ever fires; the device
+  covers those. 814/814 tests on the dev host, and on the device 777 passed with
+  the same 11 pre-existing failures as the commit before it.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes
