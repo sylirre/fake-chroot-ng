@@ -62,10 +62,13 @@ check_contains "the walk is taken for a scope with an overlay under it, and only
 # ...and the whole of it through the dispatcher: a scoped name that lands on a
 # file chroot-ng synthesizes. No kernel can answer that — passed through, the
 # guest would have got the HOST's /proc/mounts — so the guest's own mount table
-# coming back is the walked route's answer and nothing else's.
+# coming back is the walked route's answer and nothing else's. Where the number
+# cannot be issued at all the walk never runs and ENOSYS is the whole answer:
+# a pre-5.6 kernel and qemu-user have no openat2, and Android's ambient filter
+# refuses the one its kernel has, which dispatch emulates the same way.
 case "$out" in
 *"o2test scope synth enosys"*)
-    skip "scoped openat2 end to end: no openat2 here (pre-5.6 kernel, or qemu-user)"
+    skip "scoped openat2 end to end: openat2 cannot be issued here (pre-5.6 kernel, qemu-user, or refused by the ambient filter)"
     ;;
 *)
     check_contains "a scoped openat2 reaches the synthesized /proc" \

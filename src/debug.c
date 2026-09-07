@@ -3768,6 +3768,12 @@ int cng_cmd_o2test(int argc, char **argv, char **envp, unsigned long *auxv) {
     size_t n = cng_strlcpy(bhost, rootfs, sizeof bhost);
     cng_strlcpy(bhost + n, "/b", sizeof bhost - n);
     cng_fs_add_bind(&fs, "/mnt", bhost, 0);
+    /* What the ambient (Android) filter refuses, measured the way the real
+     * monitor measures it — dispatch may only answer ENOSYS for a blocked
+     * syscall if it knows which ones those are, and nothing here catches a
+     * SIGSYS, so a re-issue of a refused number kills the run rather than
+     * coming back as an errno. openat2 itself is one of them on Android 13. */
+    cng_probe_blocked();
     int fails = 0;
 
     /* The tree, made through the dispatcher so it lands in the rootfs. */
@@ -3980,14 +3986,22 @@ int cng_cmd_o2test(int argc, char **argv, char **envp, unsigned long *auxv) {
         struct cng_open_how h = {CNG_O_RDONLY, 0, CNG_RESOLVE_IN_ROOT};
         /* Whether this host has the syscall at all. Without it ENOSYS is the
          * right answer to every openat2, and it is the answer the how
-         * precheck brings back from the kernel before any judgement of ours
-         * is applied — so that is what the leg demands there. */
-        struct cng_open_how h0 = {CNG_O_RDONLY, 0, 0};
-        long probe = cng_syscall6(CNG_AT_FDCWD, (long)"", (long)&h0,
-                                  (long)sizeof h0, 0, 0, __NR_openat2);
-        if (probe >= 0)
-            sys_close((int)probe);
-        int have_o2 = probe != -ENOSYS;
+         * precheck brings back before any judgement of ours is applied — so
+         * that is what the leg demands there.
+         *
+         * An ambient filter that refuses the number is the same answer and
+         * must be read from the probe map rather than by asking: Android 13
+         * blocks openat2, and the raw call below trapped to a SIGSYS nothing
+         * in this driver catches, killing the run five legs early. */
+        int have_o2 = !cng_blocked[__NR_openat2];
+        if (have_o2) {
+            struct cng_open_how h0 = {CNG_O_RDONLY, 0, 0};
+            long probe = cng_syscall6(CNG_AT_FDCWD, (long)"", (long)&h0,
+                                      (long)sizeof h0, 0, 0, __NR_openat2);
+            if (probe >= 0)
+                sys_close((int)probe);
+            have_o2 = probe != -ENOSYS;
+        }
         long dfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/",
                                 CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
         long mfd = dfd < 0 ? dfd

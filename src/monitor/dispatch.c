@@ -1775,7 +1775,10 @@ static long openat2_scoped(long dirfd, long path, long a4, long a5,
         struct cng_open_how probe = *how;
         /* O_PATH so nothing is opened for real, and the caller's own
          * O_NOFOLLOW carried over — ro_refusal() passes AT_SYMLINK_NOFOLLOW the
-         * same way, or a write-open of a dangling link reads as absent. */
+         * same way, or a write-open of a dangling link reads as absent. Raw,
+         * not reissue(): the precheck above has already answered ENOSYS for a
+         * blocked openat2, so nothing reaches this line where the number would
+         * trap. */
         probe.flags = CNG_O_PATH | CNG_O_CLOEXEC | (oflags & CNG_O_NOFOLLOW);
         probe.mode = 0;
         long e = cng_syscall6(dirfd, path, (long)&probe, (long)sizeof probe, 0,
@@ -1846,8 +1849,19 @@ static long read_open_how(long a2, unsigned long size, struct cng_open_how *out)
  * answer a constraint of our own, which would put our error in front of that
  * one, so ask the kernel first with a name that resolves to nothing: it
  * validates the struct, then fails the empty path. Returns 0 when the how is
- * good, else the errno the kernel gave it. */
+ * good, else the errno the kernel gave it.
+ *
+ * Where the ambient filter refuses openat2 there is no kernel to ask: this runs
+ * inside the SIGSYS handler, so a raw re-issue of a blocked number is the
+ * nested trap the whole design avoids — measured on an Android 13 device,
+ * which blocks openat2 outright and killed the process here. ENOSYS is the
+ * answer reissue() already gives every other blocked syscall, and it is what
+ * the guest would see from a kernel that has no openat2 at all. */
 static long how_precheck(const struct cng_open_how *how) {
+    if (cng_blocked[__NR_openat2]) {
+        cng_note_blocked(__NR_openat2);
+        return -ENOSYS;
+    }
     long r = cng_syscall6(CNG_AT_FDCWD, (long)"", (long)how, (long)sizeof *how,
                           0, 0, __NR_openat2);
     if (r >= 0) {
