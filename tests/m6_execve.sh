@@ -51,6 +51,17 @@ if guest_cc_report "$ER/hello" tests/guests/hello.c; then
         "exe=/hello" "$out"
     exec 9<&-
 
+    # ...and the number in that name is a descriptor, which is an int. The
+    # parse accumulated digits with no bound, so a long enough one overflowed
+    # and wrapped: "/proc/self/fd/4294967305" is 2^32 + 9, which came out as 9
+    # and exec'd whatever this process had open there. No such descriptor
+    # exists, and the kernel has no such name either — the answer is ENOENT.
+    exec 9< "$ER/hello"
+    check_contains "an out-of-range fd number names no descriptor" \
+        "emulate_execve failed x0=-2" \
+        "$(exectest /proc/self/fd/4294967305 X 2>&1)"
+    exec 9<&-
+
     # execve(2) checks *execute* permission; only a reopen needs read. apk's
     # package scripts are exec'd through an fd whose inode grants exactly that,
     # so the image has to come from the fd we already hold.

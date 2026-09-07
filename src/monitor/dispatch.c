@@ -187,6 +187,28 @@ static long reissue(long a0, long a1, long a2, long a3, long a4, long a5,
 
 static long proc_self_fixup(const char *canon, char *buf, unsigned long bufsz);
 
+/* The decimal run at *p, which in every /proc name that matters here is a pid
+ * or a descriptor number — both ints. So anything past INT_MAX names neither,
+ * and is refused rather than accumulated: the multiply-add is signed, and the
+ * digit string is the guest's to make as long as it likes, so letting it run
+ * is undefined behaviour that can wrap into a small valid number — a
+ * "/proc/self/fd/<20 digits>" that came out as one of OUR descriptors. Returns
+ * the value and advances *p past the run, or -1 for no digits or out of range.
+ */
+static long parse_int_run(const char **p) {
+    const char *q = *p;
+    long v = 0;
+    if (*q < '0' || *q > '9')
+        return -1;
+    for (; *q >= '0' && *q <= '9'; q++) {
+        v = v * 10 + (*q - '0');
+        if (v > 0x7fffffff)
+            return -1;
+    }
+    *p = q;
+    return v;
+}
+
 /* Length of a leading "/proc/<pid|self|thread-self>/" in a canonical guest
  * path, or 0. `self_only` matches only this process's own view. */
 static size_t proc_pid_prefix(const char *p, int self_only) {
@@ -216,13 +238,9 @@ static size_t proc_pid_prefix(const char *p, int self_only) {
 static int proc_pid_visible(const char *canon) {
     if (proc_pid_prefix(canon, 1))
         return 1; /* self / thread-self */
-    long pid = 0;
-    for (const char *q = canon + 6; *q >= '0' && *q <= '9'; q++) {
-        pid = pid * 10 + (*q - '0');
-        if (pid > 0x7fffffff)
-            return 0;
-    }
-    return cng_procreg_has((int)pid);
+    const char *q = canon + 6;
+    long pid = parse_int_run(&q);
+    return pid < 0 ? 0 : cng_procreg_has((int)pid);
 }
 
 static int proc_magic(char *cur, size_t sz) {
@@ -301,20 +319,16 @@ int cng_proc_self_fd(const char *host) {
     if (!pl || strncmp(host + pl, "fd/", 3) != 0)
         return -1;
     if (!proc_pid_prefix(host, 1)) { /* numeric form: must be our own pid */
-        long pid = 0;
         const char *q = host + 6;
-        for (; *q >= '0' && *q <= '9'; q++)
-            pid = pid * 10 + (*q - '0');
-        if (pid != sys_getpid())
+        long pid = parse_int_run(&q);
+        if (pid < 0 || pid != sys_getpid())
             return -1;
     }
     const char *d = host + pl + 3;
-    if (*d < '0' || *d > '9')
-        return -1;
-    int fd = 0;
-    for (; *d >= '0' && *d <= '9'; d++)
-        fd = fd * 10 + (*d - '0');
-    return *d == '\0' ? fd : -1;
+    long fd = parse_int_run(&d);
+    /* Nothing may follow the number: a trailing component is a path through a
+     * directory fd, not this. */
+    return (fd >= 0 && !*d) ? (int)fd : -1;
 }
 
 /* Rewrite the /dev aliases of the /proc fd links in place — /dev/fd[/...] to
@@ -1081,9 +1095,10 @@ static long proc_self_fixup(const char *canon, char *buf, unsigned long bufsz) {
               : rest[0] == 'c' ? cng_g_fs->cwd
                                : "/";
     } else {
-        long pid = 0;
-        for (const char *q = canon + 6; *q >= '0' && *q <= '9'; q++)
-            pid = pid * 10 + (*q - '0');
+        const char *q = canon + 6;
+        long pid = parse_int_run(&q);
+        if (pid < 0)
+            return -1; /* no process is numbered that high */
         if (pid == sys_getpid()) {
             val = rest[0] == 'e' ? cng_g_exe_guest
                   : rest[0] == 'c' ? cng_g_fs->cwd
@@ -1220,14 +1235,10 @@ static int dents_have_pid(const char *buf, long n) {
 static int proc_name_visible(const char *nm) {
     if (*nm < '0' || *nm > '9')
         return 1;
-    long pid = 0;
-    for (const char *p = nm; *p; p++) {
-        if (*p < '0' || *p > '9')
-            return 1; /* "1abc" is an ordinary name, not a pid */
-        pid = pid * 10 + (*p - '0');
-        if (pid > 0x7fffffff)
-            return 1;
-    }
+    const char *p = nm;
+    long pid = parse_int_run(&p);
+    if (pid < 0 || *p)
+        return 1; /* out of range, or "1abc": an ordinary name, not a pid */
     return cng_procreg_has((int)pid);
 }
 
