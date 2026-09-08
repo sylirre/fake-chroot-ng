@@ -167,11 +167,16 @@ static int sigsys_syscall(struct cng_ucontext *uc, long nr) {
          * conversion below erases CLONE_VFORK, and a tracer following vforks
          * must still see EVENT_VFORK rather than EVENT_FORK. */
         int ev = cng_pt_clone_event(orig_flags);
+        /* The guest's no_new_privs bit is per task and the child inherits the
+         * forking task's, so it is sampled before the fork: in the child,
+         * gettid answers a tid the table has never seen. */
+        int nnp = cng_nnp_get();
         long flags = (long)(orig_flags & ~(unsigned long)(CNG_CLONE_VM |
                                                           CNG_CLONE_VFORK));
         long ret = cng_syscall6(flags, 0, (long)r[2], (long)r[3], (long)r[4],
                                 (long)r[5], __NR_clone);
         if (ret == 0) {
+            cng_nnp_fork_child(nnp); /* one task, holding what we held */
             /* The child inherited both the mappings and the attach list, so
              * the broker must count those attaches again (shm.c). */
             cng_shm_fork_child();

@@ -253,7 +253,9 @@ See `src/monitor/ptrace.c`, `ptsig.c` and `ptstep.c`.
   layered on top of ours by the kernel and governs the syscalls the handler
   re-issues through the gate as well, so `seccomp(2)` is refused `ENOSYS` and
   `prctl(PR_SET_SECCOMP)` `EACCES`; `PR_GET_SECCOMP` and the `NO_NEW_PRIVS` pair
-  report the guest's own state rather than the bits we set to install the filter.
+  report the guest's own state rather than the bits we set to install the filter
+  — and the `no_new_privs` half is kept per *task*, the way `task_struct` keeps
+  it, so one thread setting it does not answer for its siblings.
   The remaining prctl ops are real process state and stay untrapped (the filter
   tests `args[0]`).
 - `SIGSYS` signal-stack correctness on guest-created threads → per-thread

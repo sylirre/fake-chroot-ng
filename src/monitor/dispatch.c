@@ -1921,6 +1921,186 @@ static void uts_set(char *field, const char *val) {
     cng_strlcpy(field, val, 65);
 }
 
+/* ---- the guest's no_new_privs bit ---------------------------------------- */
+
+/* cng_install_seccomp sets the real bit, because a filter cannot go in without
+ * one, so the kernel's own answer describes us and not the guest. What the
+ * guest is told is what the guest itself asked for — and the thing it asked
+ * for is per TASK. Linux keeps no_new_privs in task_struct: a thread setting
+ * it says nothing about its siblings, a task created afterwards inherits its
+ * creator's bit, and fork and execve both carry it across. Measured on the
+ * host: a sibling that set it reads 1 while main still reads 0, a thread
+ * created by a task holding the bit reads 1, and one created by a task without
+ * it reads 0.
+ *
+ * A single global said 1 for every thread the moment any one of them set it.
+ * What replaces it is a tid-keyed table over a process-wide floor:
+ *
+ *   set, on task T   every OTHER task alive right now predates the call, so
+ *                    none of them can have inherited anything — each is
+ *                    recorded 0. T is recorded 1, and the floor goes up.
+ *   get, on task T   T's own entry, or the floor where it has none: a task we
+ *                    have never seen was created after the snapshot, and its
+ *                    creator therefore held the bit.
+ *
+ * The floor is what makes the common shape right without a per-thread hook:
+ * set it in main, then spawn workers, and every worker reads 1 as it would on
+ * a kernel. The residue is the shape that needs the hook — a task created
+ * after the snapshot by a sibling that does NOT hold the bit reads 1 where the
+ * kernel says 0 — and there is no honest way to close it here: knowing a new
+ * task's creator means trapping thread creation, and a thread-creating clone
+ * is the one call this design cannot trap (a re-issued clone comes back into
+ * the handler on the new thread's stack, with no frame to sigreturn through;
+ * see cng_build_seccomp_traceall). Nothing else about the emulation depends on
+ * being told. The other residue is a tid the kernel hands out again after the
+ * thread recorded under it has exited, which needs a set, an exit, and the
+ * whole pid space to come round before a new task lands on that number.
+ *
+ * Both leave a task reading a bit it did not ask for either way, which is what
+ * a single global did for every task in the process — so neither is a step
+ * back from what this replaces.
+ *
+ * The table is ordinary memory, so it survives our emulated execve exactly as
+ * the bit survives a real one. A fork is the one event that has to reset it:
+ * the child is one task holding what the forking task held, so it starts with
+ * an empty table and that value as its floor — where the parent's table would
+ * have been read against tids belonging to threads the child does not have. */
+#define NNP_N 128
+
+/* One word per task: the tid shifted up with the bit in its low place, so that
+ * claiming a slot and giving it its value are a single store and no reader can
+ * catch one without the other. 0 is free, and a tid is never 0, so a free slot
+ * cannot be mistaken for an entry. Open addressing from a hash of the tid.
+ *
+ * Nothing is ever taken back out. A table that fills — 128 tasks recorded, and
+ * only a set records any — stops recording, and the tasks that did not fit
+ * read the floor, which is exactly where this started. Freeing entries would
+ * buy a little and cost the invariant the probe runs rest on: a hole in the
+ * middle of a run ends a later entry's chain, and the task it belonged to
+ * would start reading the floor as well. */
+static long g_nnp[NNP_N];
+static int g_nnp_floor;
+
+static unsigned nnp_hash(long tid) {
+    return (unsigned)((unsigned long)tid * 2654435761u) % NNP_N;
+}
+
+/* This task's recorded bit, or -1 where it has none. */
+static int nnp_lookup(long tid) {
+    unsigned h = nnp_hash(tid);
+    for (unsigned k = 0; k < NNP_N; k++) {
+        long e = __atomic_load_n(&g_nnp[(h + k) % NNP_N], __ATOMIC_ACQUIRE);
+        if (e == 0)
+            return -1; /* the probe run ends here, so the tid is not in it */
+        if ((e >> 1) == tid)
+            return (int)(e & 1);
+    }
+    return -1;
+}
+
+/* Record `val` for `tid`. `keep` leaves an existing entry alone, which is what
+ * a setter's siblings want: the second task to set the bit walks the first,
+ * and writing 0 over the 1 already there would take away a bit the kernel
+ * never takes away. A setter writes its own entry the other way — over
+ * whatever is there — so it wins that race in either order. */
+static void nnp_put(long tid, int val, int keep) {
+    long want = ((long)tid << 1) | (long)(val & 1);
+    unsigned h = nnp_hash(tid);
+    for (unsigned k = 0; k < NNP_N; k++) {
+        unsigned i = (h + k) % NNP_N;
+        long e = __atomic_load_n(&g_nnp[i], __ATOMIC_ACQUIRE);
+        if ((e >> 1) == tid) {
+            if (!keep)
+                __atomic_store_n(&g_nnp[i], want, __ATOMIC_RELEASE);
+            return;
+        }
+        if (e == 0) {
+            long free_slot = 0;
+            if (__atomic_compare_exchange_n(&g_nnp[i], &free_slot, want, 0,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+                return;
+            k--; /* another task took this slot; it may hold OUR tid now, so
+                  * read it again rather than stepping past it */
+        }
+    }
+}
+
+/* Every task of this process, into `out`. Returns how many, or -1 where the
+ * list cannot be had — no /proc, or more tasks than there is room for — and
+ * the caller then records none of them, leaving them on the floor. */
+static int nnp_tasks(long *out, int max) {
+    long fd = sys_openat(CNG_AT_FDCWD, "/proc/self/task",
+                         CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
+    if (fd < 0)
+        return -1;
+    char buf[4096];
+    int n = 0;
+    long got;
+    while ((got = CNG_SYS(__NR_getdents64, (int)fd, buf, sizeof buf, 0, 0, 0)) >
+           0) {
+        for (long o = 0; o + 19 <= got;) {
+            unsigned short reclen;
+            memcpy(&reclen, buf + o + 16, 2);
+            if (reclen == 0 || o + reclen > got) {
+                got = -1;
+                break;
+            }
+            const char *q = buf + o + 19;
+            long tid = parse_int_run(&q);
+            if (tid > 0 && !*q) { /* "." and ".." are not runs of digits */
+                if (n == max) {
+                    got = -1;
+                    break;
+                }
+                out[n++] = tid;
+            }
+            o += reclen;
+        }
+        if (got < 0)
+            break;
+    }
+    sys_close((int)fd);
+    return got < 0 ? -1 : n;
+}
+
+/* PR_SET_NO_NEW_PRIVS from this task. */
+static void nnp_set(void) {
+    long self = sys_gettid();
+    long live[NNP_N];
+    int n = nnp_tasks(live, NNP_N);
+
+    /* Ours first, so a sibling taking its own snapshot at the same moment
+     * finds an entry to leave alone rather than a free slot to write 0 into. */
+    nnp_put(self, 1, 0);
+    for (int k = 0; k < n; k++)
+        if (live[k] != self)
+            nnp_put(live[k], 0, 1);
+    /* Last: until it is up, nothing is looked up at all, and a task that has
+     * just been recorded 0 must not read 1 on the way there. */
+    __atomic_store_n(&g_nnp_floor, 1, __ATOMIC_RELEASE);
+}
+
+/* PR_GET_NO_NEW_PRIVS for this task. Cheap until something sets the bit: with
+ * the floor still down there is nothing recorded to look up, and no tid to go
+ * and ask the kernel for. */
+int cng_nnp_get(void) {
+    if (!__atomic_load_n(&g_nnp_floor, __ATOMIC_ACQUIRE))
+        return 0;
+    int v = nnp_lookup(sys_gettid());
+    return v < 0 ? 1 : v;
+}
+
+/* Called on the child side of a trapped fork with the value the forking task
+ * held, sampled before the clone (in the child, gettid answers a tid that has
+ * no entry). One task, one value, nothing inherited to look up: the floor
+ * carries it, and every thread the child goes on to create inherits it too,
+ * which is what a kernel does with the bit as well. */
+void cng_nnp_fork_child(int val) {
+    for (unsigned i = 0; i < NNP_N; i++)
+        __atomic_store_n(&g_nnp[i], 0L, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_nnp_floor, val, __ATOMIC_RELEASE);
+}
+
 /* Deliver a translated sockaddr to the guest exactly as move_addr_to_user()
  * would: copy at most what the caller's buffer holds, then report the
  * UNtruncated length ("fromlen shall refer to the value before truncation",
@@ -2840,6 +3020,9 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * itself is on the trampoline's stack, which the child inherits at the
          * same address. */
         struct cng_uregs *ur = cng_pt_cur_regs();
+        /* Sampled here for the same reason: in the child this task's tid is a
+         * new one, with nothing recorded against it. */
+        int nnp = cng_nnp_get();
         long flags = a0 & ~(long)(CNG_CLONE_VM | CNG_CLONE_VFORK);
         long r = cng_syscall6(flags, a1, a2, a3, a4, a5, __NR_clone);
         if (r > 0) {
@@ -2852,7 +3035,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                     cng_pt_report_event(ur, CNG_PTRACE_EVENT_VFORK_DONE, (u64)r);
             }
         } else if (r == 0) {
-            cng_shm_fork_child(); /* the child inherited our shm attaches */
+            cng_nnp_fork_child(nnp); /* one task, holding what we held */
+            cng_shm_fork_child();    /* the child inherited our shm attaches */
             if (ur)
                 cng_pt_fork_child(ur, ev);
         }
@@ -3868,7 +4052,6 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * itself asked for, not what we did. It survives fork (ordinary memory) and
      * our emulated execve, which is where a real one would keep it too. */
     case __NR_prctl: {
-        static int guest_nnp = 0;
         switch ((int)a0) {
         case CNG_PR_GET_SECCOMP:
             /* Mode 2 is the filter WE installed. A sandbox that asks this to
@@ -3888,12 +4071,12 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         case CNG_PR_SET_NO_NEW_PRIVS:
             if (a1 != 1 || a2 || a3 || a4)
                 return -EINVAL; /* the kernel's own argument check */
-            guest_nnp = 1;
+            nnp_set();
             return 0; /* already set for real, at install */
         case CNG_PR_GET_NO_NEW_PRIVS:
             if (a1 || a2 || a3 || a4)
                 return -EINVAL; /* the kernel's own check, as for the setter */
-            return guest_nnp;
+            return cng_nnp_get();
         }
         return reissue(a0, a1, a2, a3, a4, a5, nr);
     }

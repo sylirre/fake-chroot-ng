@@ -326,6 +326,12 @@ long cng_user_veclen(char *const *v, unsigned long max);
  * bytes are actually going to move. */
 long cng_user_copyin(void *dst, const void *src, unsigned long n);
 long cng_user_copyout(void *dst, const void *src, unsigned long n);
+
+/* The guest's own no_new_privs bit, which is per task and not per process (see
+ * dispatch.c). The getter is also how a trapped fork samples the value its
+ * child inherits, which the child then installs with cng_nnp_fork_child. */
+int cng_nnp_get(void);
+void cng_nnp_fork_child(int val);
 long cng_user_strcopyin(char *dst, const char *src, unsigned long cap);
 
 /* Ambient-seccomp block-list: cng_blocked[nr] != 0 means Android blocks that
