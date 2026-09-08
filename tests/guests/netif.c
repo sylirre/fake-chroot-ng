@@ -228,6 +228,7 @@ int main(void) {
     struct ifconf ifc;
     memset(&ifc, 0, sizeof ifc);
     int size_ok = (ioctl(s, SIOCGIFCONF, &ifc) == 0 && ifc.ifc_len > 0);
+    int need = ifc.ifc_len;
     char ibuf[8192];
     int nif = 0, saw_lo = 0, lo_addr = 0;
     ifc.ifc_len = (int)sizeof ibuf;
@@ -246,6 +247,32 @@ int main(void) {
     }
     printf("ifconf: size_ok=%d entries>0=%d lo=%d lo_addr=%d\n", size_ok,
            nif > 0, saw_lo, lo_addr);
+
+    /* Two edges of one rule: SIOCGIFCONF writes whole ifreqs and touches
+     * nothing else. A buffer 20 bytes short of a whole number of entries is
+     * what shows it — the bytes in that remainder are left exactly as the
+     * caller had them, where an emulation validating the buffer by WRITING to
+     * it wipes them. (A buffer longer than the list needs would not: that one
+     * is clamped to the length the entries take before anything looks at it.)
+     * And a negative ifc_len is not an error but a length no entry fits in, so
+     * the call succeeds reporting zero. */
+    int tail_ok = 0, neg_ok = 0;
+    if (need >= (int)sizeof(struct ifreq) && need <= (int)sizeof ibuf) {
+        int part = need - 20;
+        memset(ibuf, '#', sizeof ibuf);
+        ifc.ifc_len = part;
+        ifc.ifc_buf = ibuf;
+        if (ioctl(s, SIOCGIFCONF, &ifc) == 0 && ifc.ifc_len <= part) {
+            tail_ok = 1;
+            for (int i = ifc.ifc_len; i < part; i++)
+                if (ibuf[i] != '#')
+                    tail_ok = 0;
+        }
+    }
+    ifc.ifc_len = -8;
+    ifc.ifc_buf = ibuf;
+    neg_ok = (ioctl(s, SIOCGIFCONF, &ifc) == 0 && ifc.ifc_len == 0);
+    printf("ifconf_edge: tail=%d neg=%d\n", tail_ok, neg_ok);
     /* The exact count differs between the host's view and a synthesized one, so
      * it gets its own line: only the leg that pins the degraded (loopback-only)
      * view asserts it. */

@@ -28,6 +28,14 @@ check_contains "a vector that cannot proceed rolls back entirely" \
     "ipctest semop atomic rollback -> OK" "$out"
 check_contains "GETALL/SETALL stream their vector over the connection" \
     "ipctest semctl getall+setall -> OK" "$out"
+# The vector goes out through the guest's own pointer, and a bad one has to
+# answer like the kernel's single copy_to_user: what fit is written, the rest is
+# -EFAULT. Validating the array up front instead reported the same errno with
+# the readable part ZEROED -- that is how the write probe validates a range --
+# so a guest that survived the EFAULT found zeros where a real semctl leaves
+# semaphore values.
+check_contains "m20 a GETALL that runs into a hole keeps what fit" \
+    "ipctest getall partial=-14 wiped=0 -> OK" "$out"
 check_contains "msgctl's enumeration commands and the msginfo constants" \
     "ipctest msgctl enumeration -> OK" "$out"
 check_contains "IPC_STAT/IPC_SET and the ipcs enumeration commands" \

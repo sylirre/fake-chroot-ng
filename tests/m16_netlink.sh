@@ -88,6 +88,13 @@ else
         # host's whole interface list here.
         check_contains "m16 SIOCGIFCONF lists the same interfaces the dump did" \
             "ifconf: size_ok=1 entries>0=1 lo=1 lo_addr=1" "$em"
+        # It writes whole ifreqs and nothing else: bytes past the last entry
+        # that fits stay as the caller left them, and a negative ifc_len is a
+        # length no entry fits in rather than an error. Validating the buffer
+        # with the write probe -- which checks a range by ZEROING it -- wiped
+        # that tail on every call and turned the negative length into EFAULT.
+        check_contains "m16 SIOCGIFCONF leaves the tail and takes a negative length" \
+            "ifconf_edge: tail=1 neg=1" "$em"
         check_contains "m16 the per-interface getters agree with it" \
             "ifget: lo idx=1 up=1 loopback=1 mtu=65536 mask8=1 byidx=1" "$em"
         # A name nobody has is still ENODEV. An interface the host DOES know but
@@ -160,6 +167,8 @@ else
                 "lo=1" "$pt"
             check_contains "m16 unforced: SIOCGIFCONF answers from the same view" \
                 "ifconf: size_ok=1 entries>0=1 lo=1 lo_addr=1" "$pt"
+            check_contains "m16 unforced: it leaves the tail and takes a negative length" \
+                "ifconf_edge: tail=1 neg=1" "$pt"
             check_contains "m16 unforced: the per-interface getters agree" \
                 "ifget: lo idx=1 up=1 loopback=1 mtu=65536 mask8=1 byidx=1" \
                 "$pt"

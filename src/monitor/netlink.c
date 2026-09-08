@@ -1138,10 +1138,15 @@ int cng_nl_ioctl(int fd, unsigned long req, void *arg, long *out) {
         }
         if (len > need)
             len = need;
-        if (len < 0 || !cng_user_writable(buf, (unsigned long)len)) {
-            *out = -EFAULT;
-            return 1;
-        }
+        /* No up-front probe of the whole buffer. The kernel writes one whole
+         * ifreq at a time and stops at the first that will not go, so a range
+         * that goes bad partway keeps the entries already written and never
+         * touches the tail that no entry fits in — while the write probe
+         * validates by ZEROING (see uaccess.c), which would have wiped both.
+         * The per-entry copyout below is the same check in the same shape.
+         * A negative ifc_len needs no check of its own either: it is smaller
+         * than an ifreq, so the loop writes nothing and reports a length of 0,
+         * which is what the host answers for it (measured). */
         int w = 0;
         for (int i = 0; i < n && w + (int)sizeof(struct ifreq_) <= len; i++) {
             if (!v[i].addr)

@@ -384,15 +384,17 @@ long cng_cred_handle(long nr, long a0, long a1, long a2, long a3, long a4,
         return (long)c->rgid;
     case __NR_getegid:
         return (long)c->egid;
-    /* getres*id take three out pointers. The kernel writes none of them if any
-     * is bad, so validate all three first — and a NULL one is -EFAULT there
-     * too, unlike the optional pointers elsewhere in this family. */
+    /* getres*id take three out pointers and the kernel fills them in order,
+     * one put_user each, stopping at the first that will not take a store: a
+     * bad second pointer leaves the real id in the first and still answers
+     * -EFAULT (measured on the host). Probing all three up front said the
+     * opposite, and said it destructively — the write probe validates a range
+     * by zeroing it (see uaccess.c) — so a bad third pointer zeroed the two
+     * good ones the kernel would have filled. Each copyout is its own check,
+     * in the kernel's order, and a NULL pointer is -EFAULT here too, unlike
+     * the optional pointers elsewhere in this family. */
     case __NR_getresuid:
     case __NR_getresgid: {
-        if (!cng_user_writable((void *)a0, sizeof(unsigned)) ||
-            !cng_user_writable((void *)a1, sizeof(unsigned)) ||
-            !cng_user_writable((void *)a2, sizeof(unsigned)))
-            return -EFAULT;
         int u = (nr == __NR_getresuid);
         unsigned r_ = u ? c->ruid : c->rgid, e_ = u ? c->euid : c->egid,
                  s_ = u ? c->suid : c->sgid;

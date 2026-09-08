@@ -1956,6 +1956,28 @@ int cng_cmd_faulttest(int argc, char **argv, char **envp, unsigned long *auxv) {
     }
     cng_nl_force_block = 0;
 
+    /* Not every bad pointer means "nothing was written". getres*id fills its
+     * three out pointers in order, one store each, and stops at the first that
+     * will not take one — so a bad second pointer answers -EFAULT with the real
+     * id already sitting in the first (measured against the host). Validating
+     * all three up front reported the same errno and got the memory wrong: the
+     * write probe validates a range by ZEROING it, so the good pointer came
+     * back 0 where the kernel would have left an id. A non-zero fake uid is
+     * what makes the two outcomes tell apart. */
+    unsigned idbuf[3];
+    unsigned uid_was = cng_g_fake_uid;
+    cng_g_fake_uid = 4242;
+    cng_cred_seed();
+    idbuf[0] = 0xa5a5a5a5u;
+    long rpw = cng_dispatch(__NR_getresuid, (long)&idbuf[0], (long)bad,
+                            (long)bad, 0, 0, 0, 1);
+    int okpw = (rpw == -EFAULT && idbuf[0] == 4242u);
+    cng_dprintf(1, "faulttest getresuid partial=%d ruid=%u want=%d/4242 -> %s\n",
+                (int)rpw, idbuf[0], (int)-EFAULT, okpw ? "OK" : "FAIL");
+    fails += !okpw;
+    cng_g_fake_uid = uid_was;
+    cng_cred_seed();
+
     /* And the same calls with real memory still work. */
     long rr = cng_dispatch(__NR_getresuid, (long)good, (long)(good + 8),
                            (long)(good + 16), 0, 0, 0, 1);
@@ -6499,6 +6521,50 @@ int cng_cmd_ipctest(int argc, char **argv, char **envp, unsigned long *auxv) {
                  got[1] == 8 && got[2] == 9;
         cng_dprintf(1, "ipctest semctl getall+setall -> %s\n", ok ? "OK" : "FAIL");
         fails += !ok;
+    }
+
+    /* 3b) the same GETALL into an array whose tail is in a hole. The kernel
+     *     copies the vector out in one act, filling what it can before it
+     *     reports -EFAULT, so the values before the hole are the real ones
+     *     (measured on the host). Probing the whole array first answered the
+     *     same errno with those values wiped instead — the write probe
+     *     validates a range by ZEROING it — and that is guest memory a real
+     *     semctl would have left holding semaphore values.
+     *
+     *     Two pages with the second unmapped, as faulttest builds it; where no
+     *     pointer probe can be had at all the copy really would fault, and the
+     *     leg is skipped exactly as faulttest skips its own.
+     *
+     *     What is asserted is that the readable half is not WIPED, which is the
+     *     bug, and not that it holds 7,8, which is the kernel's side effect:
+     *     qemu-user is no oracle for a partial copy — it validates the whole
+     *     range before it starts and refuses without writing a byte — so under
+     *     it the values stay the caller's own. Both outcomes are what a guest
+     *     can survive; zeros in place of semaphore values are not. */
+    {
+        unsigned long pg = cng_page_size;
+        char *m = sys_mmap(0, 2 * pg, CNG_PROT_READ | CNG_PROT_WRITE,
+                           CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+        if (m == CNG_MAP_FAILED || cng_is_err((long)m)) {
+            cng_dprintf(1, "ipctest getall partial: no mapping -> SKIP\n");
+        } else if (cng_user_writable((void *)0x10, 8)) {
+            sys_munmap(m, 2 * pg);
+            cng_dprintf(1, "ipctest getall partial: no pointer probe -> SKIP\n");
+        } else {
+            sys_munmap(m + pg, pg);
+            u16 set[3] = {7, 8, 9};
+            u16 *arr = (u16 *)(m + pg - 4); /* two values fit, the third does not */
+            arr[0] = arr[1] = 0x1111;
+            long sa = sem_ctl(sid, 0, CNG_SETALL, (long)set);
+            long ga = sem_ctl(sid, 0, CNG_GETALL, (long)arr);
+            int wiped = (arr[0] == 0 && arr[1] == 0);
+            int ok = sa == 0 && ga == -EFAULT && !wiped;
+            cng_dprintf(1,
+                        "ipctest getall partial=%d wiped=%d -> %s (vals %d,%d)\n",
+                        (int)ga, wiped, ok ? "OK" : "FAIL", arr[0], arr[1]);
+            fails += !ok;
+            sys_munmap(m, pg);
+        }
     }
 
     /* 4) IPC_STAT / IPC_SET, and the ipcs enumeration commands. */

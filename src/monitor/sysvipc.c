@@ -9,10 +9,10 @@
  * death of the process rather than an -EFAULT, and a guest thread is free to
  * unmap or rewrite a struct between the moment it is validated and the moment
  * it is read. So every argument crosses through cng_user_copyin/copyout, which
- * does both in one act (see uaccess.c). The ordering rule that came with the
- * probes still holds where one is left: cng_user_writable() validates a range
- * by ZEROING it, so nothing may be probed for writing until everything that had
- * to be read out of it has been.
+ * does both in one act (see uaccess.c). The one bare probe left is the
+ * cng_user_readable() SETALL sizes its payload with, and reading is the
+ * harmless direction: cng_user_writable() validates a range by ZEROING it, so
+ * nothing here asks it about a guest buffer at all.
  *
  * The other difference is that there is no allocator here. Operation vectors and
  * messages are bounded by SEMOPM and MSGMAX and ride on the handler's scratch
@@ -206,15 +206,15 @@ static long sem_getall(s32 semid, void *out) {
         ret = r.ret;
         goto out;
     }
-    /* The whole array is probed in one go before any of it is read from the
-     * socket: the probe zeroes what it validates, and a half-filled guest array
-     * left behind by a failure partway would be worse than the plain EFAULT the
-     * kernel gives. */
+    /* No up-front probe of the whole array. The kernel copies it out in one
+     * copy_to_user, which fills what it can and reports -EFAULT for the rest —
+     * a half-filled guest array is exactly what a bad pointer leaves behind
+     * there (measured on the host: a vector straddling an unmapped page comes
+     * back EFAULT with the values before the hole written). Probing first
+     * would instead zero the readable part, since that is how the write probe
+     * validates (see uaccess.c), and abandoning the stream on the first window
+     * that will not go is both the kernel's answer and its side effect. */
     u64 n = (u64)r.ret;
-    if (!cng_user_writable(out, n * sizeof(u16))) {
-        ret = -EFAULT;
-        goto out;
-    }
     u16 win[SEM_STREAM];
     u16 *dst = (u16 *)out;
     ret = 0;

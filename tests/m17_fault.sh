@@ -99,6 +99,17 @@ case "$out" in
         check_contains "a forked child stages through a descriptor of its own" \
             "faulttest fork: parent=1 child=1 -> OK" "$_o"
     done
+    # -EFAULT is not the whole answer for a call with several out pointers.
+    # getres*id stores into them one at a time and stops at the first that will
+    # not take a store, so the ones before it keep the ids the kernel put there
+    # (checked against the host). Probing all three up front instead answered
+    # the same errno with the good pointer ZEROED, because that is how the
+    # write probe validates a range.
+    for _o in "$out" "$memfd_out"; do
+        check_contains "a partial fault keeps the ids already written" \
+            "faulttest getresuid partial=-14 ruid=4242 want=-14/4242 -> OK" \
+            "$_o"
+    done
     check_contains "valid pointers still work" \
         "faulttest valid getresuid=0" "$out"
     ;;
