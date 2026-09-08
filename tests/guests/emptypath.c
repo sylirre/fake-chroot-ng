@@ -21,6 +21,11 @@
  * a name. The number it is given has to BE a descriptor before it can be
  * treated as one — see the link_* lines below.
  *
+ * execveat takes the same flag and asks the same question of the number, with
+ * one answer of its own: AT_FDCWD is not a descriptor there either, and the
+ * kernel opens the working directory for execution rather than refusing the
+ * number — which is EACCES, not EBADF. See the exec_* lines.
+ *
  * Output is protocol only, so the same source built for the host is the oracle.
  */
 #define _GNU_SOURCE
@@ -28,6 +33,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 /* argv[1] is a directory prefix, so the host build can be pointed at a scratch
@@ -63,6 +69,17 @@ static void linkprobe(const char *tag, int fd, const char *name) {
     int r = linkat(fd, "", AT_FDCWD, p, AT_EMPTY_PATH);
     printf("%s=%d\n", tag, r < 0 ? errno : 0);
     unlink(p);
+}
+
+/* The errno of one execveat that cannot succeed. argv and envp are real, so
+ * nothing here depends on how a null vector is counted: the kernel opens the
+ * file before it counts them, and every case below fails at the open. */
+static void execprobe(const char *tag, int fd, int flags) {
+    char *av[] = {(char *)"x", 0};
+    char *ev[] = {0};
+    errno = 0;
+    long r = syscall(SYS_execveat, fd, "", av, ev, flags);
+    printf("%s=%d\n", tag, r < 0 ? errno : 0);
 }
 
 int main(int argc, char **argv) {
@@ -115,5 +132,28 @@ int main(int argc, char **argv) {
     linkprobe("link_negfd", -5, "lk_neg");
     close(lf);
     linkprobe("link_closedfd", lf, "lk_closed");
+
+    /* execveat(AT_EMPTY_PATH), which reads the number the same way and then
+     * has to open what it names for execution. None of these can succeed, so
+     * the process is still here to print the next line:
+     *
+     *  - AT_FDCWD names the working directory, and a directory is EACCES to
+     *    open for execution (may_open's MAY_EXEC arm) — where treating the
+     *    number as a descriptor and asking about it answered EBADF;
+     *  - a real directory descriptor is the same refusal by another route;
+     *  - a regular file that is merely not executable is EACCES too, which is
+     *    what tells that answer apart from "there is no such descriptor";
+     *  - a negative number and a closed one are EBADF;
+     *  - and without the flag an empty name is ENOENT, whatever the fd is. */
+    int df = open(base[0] ? base : "/", O_RDONLY | O_DIRECTORY);
+    int rf = open(src, O_RDONLY); /* mode 0644: readable, not executable */
+    execprobe("exec_cwd", AT_FDCWD, AT_EMPTY_PATH);
+    execprobe("exec_dirfd", df, AT_EMPTY_PATH);
+    execprobe("exec_regular", rf, AT_EMPTY_PATH);
+    execprobe("exec_negfd", -5, AT_EMPTY_PATH);
+    execprobe("exec_noflag", rf, 0);
+    close(df);
+    close(rf);
+    execprobe("exec_closedfd", rf, AT_EMPTY_PATH);
     return 0;
 }

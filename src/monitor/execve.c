@@ -1166,16 +1166,28 @@ static long execve_core(int dirfd, const char *path, char **argv, char **envp,
     /* AT_EMPTY_PATH: the dirfd IS the file to execute. Naming it through
      * /proc/self/fd puts it back on the ordinary path — the resolver keeps that
      * spelling in the host namespace, and the loader then works from the open
-     * description itself, which is what reaches an anonymous or deleted image. */
+     * description itself, which is what reaches an anonymous or deleted image.
+     *
+     * AT_FDCWD is the exception, because it is not a descriptor. The kernel
+     * resolves the empty name against the working directory and opens THAT for
+     * execution, which no directory can satisfy: may_open answers EACCES for
+     * MAY_EXEC on one. Asking fcntl about -100 instead said EBADF — an answer
+     * about a descriptor number for a call that never names one. Spelling it
+     * "." hands the working directory to the ordinary path, where the loader
+     * refuses it exactly as it refuses the directory a real dirfd names. */
     char fdpath[40];
     if (!plen) {
         if (!(flags & CNG_AT_EMPTY_PATH))
             return -ENOENT;
-        if (sys_fcntl(dirfd, CNG_F_GETFD, 0) < 0)
-            return -EBADF;
-        cng_snprintf(fdpath, sizeof fdpath, "/proc/self/fd/%d", dirfd);
-        path = fdpath;
-        dirfd = CNG_AT_FDCWD;
+        if (dirfd == CNG_AT_FDCWD) {
+            path = ".";
+        } else {
+            if (sys_fcntl(dirfd, CNG_F_GETFD, 0) < 0)
+                return -EBADF;
+            cng_snprintf(fdpath, sizeof fdpath, "/proc/self/fd/%d", dirfd);
+            path = fdpath;
+            dirfd = CNG_AT_FDCWD;
+        }
         flags &= ~CNG_AT_SYMLINK_NOFOLLOW; /* nothing left to follow */
     }
 
