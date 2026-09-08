@@ -770,12 +770,22 @@ int cng_resolve_lim(const char *path, int deref_final, char *out, size_t outsz,
 }
 
 /* "/proc/self/fd/<fd>" into out[40]. fd args are 32-bit: glibc passes ints in
- * w-registers and may leave the x-register's top half dirty, so truncate. */
+ * w-registers and may leave the x-register's top half dirty, so truncate.
+ *
+ * A negative number is not a descriptor and names no such file, but it has to
+ * spell as one: writing the digits of -100 without its sign produced
+ * "/proc/self/fd/0", so AT_FDCWD arrived at the caller as *stdin*. The sign
+ * makes every negative a path that simply does not exist, which is the only
+ * honest answer a caller that reaches here with one can be given. */
 static void proc_fd_path(long fd, char *out) {
     size_t p = cng_strlcpy(out, "/proc/self/fd/", 40);
     char num[16];
     int ni = 0;
-    long v = (int)fd;
+    int v32 = (int)fd;
+    /* Negated in unsigned, so INT_MIN has no overflow to fall into. */
+    unsigned v = v32 < 0 ? -(unsigned)v32 : (unsigned)v32;
+    if (v32 < 0 && p < 39)
+        out[p++] = '-';
     do {
         num[ni++] = (char)('0' + v % 10);
         v /= 10;
@@ -2983,7 +2993,23 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * with no flags. Link-by-fd (AT_EMPTY_PATH, the O_TMPFILE publish
          * idiom) goes through /proc/self/fd, which the host must follow. */
         if (empty) {
-            proc_fd_path(a0, srch);
+            /* The number has to be a descriptor before it can be spelled as
+             * one. AT_FDCWD is not: the kernel resolves the empty name against
+             * the working directory and answers about *that* — EEXIST if the
+             * new name is taken, EPERM otherwise, a directory being unlinkable
+             * — so it goes through the resolver like any other path. Every
+             * other negative, and every number that is not open, is EBADF, the
+             * same test execveat's own AT_EMPTY_PATH makes. Without either,
+             * proc_fd_path spelled AT_FDCWD as "/proc/self/fd/0" and the link
+             * was made to stdin. */
+            if ((int)a0 == CNG_AT_FDCWD) {
+                if (cng_resolve_at(CNG_AT_FDCWD, ".", 1, srch, sizeof srch) != 0)
+                    return -ENOENT;
+            } else if (sys_fcntl((int)a0, CNG_F_GETFD, 0) < 0) {
+                return -EBADF;
+            } else {
+                proc_fd_path(a0, srch);
+            }
         } else if (cng_resolve_at(a0, sp, follow, srch, sizeof srch) != 0) {
             if (cng_g_debug)
                 cng_dprintf(2, "[cng] linkat: src unresolved (%s)\n",
