@@ -155,10 +155,21 @@ struct cng_winsize { u16 ws_row, ws_col, ws_xpixel, ws_ypixel; };
 /* A named entry (option / argument / env var) with its description. */
 struct help_def { const char *name, *desc; };
 
-/* Parse a leading run of decimal digits (COLUMNS); 0 on no digits. */
+/* Parse a leading run of decimal digits (COLUMNS); 0 on no digits.
+ *
+ * The accumulator saturates instead of wrapping. The digits come out of the
+ * environment, an int holds ten of them, and signed overflow is undefined —
+ * which is not an abstraction here: the compiler is entitled to assume it
+ * cannot happen and to fold away the "did it go negative?" test that would
+ * otherwise have caught it. The cap is far above any terminal width, and the
+ * caller clamps to HELP_MAX_COLS anyway, so nothing real is lost by stopping
+ * there. */
+#define HELP_COLS_CAP 100000
+
 static int parse_uint(const char *s) {
     int v = 0;
-    for (; *s >= '0' && *s <= '9'; s++) v = v * 10 + (*s - '0');
+    for (; *s >= '0' && *s <= '9'; s++)
+        if (v <= HELP_COLS_CAP) v = v * 10 + (*s - '0');
     return v;
 }
 
@@ -452,6 +463,9 @@ static void help(char **envp) {
         {"    --",        "Stop option parsing."},
     };
     static const struct help_def env[] = {
+        {"COLUMNS", "Width to render this help at when no terminal answers "
+                      "TIOCGWINSZ (a redirected run). Clamped to 32..92; a "
+                      "value that is not a positive number is ignored."},
         {"CNG_DEBUG", "When set to a non-empty, non-zero value, log verbose "
                       "syscall-error diagnostics to stderr."},
         {"CNG_L2S_FORCE", "With -l: route every linkat through the emulation "

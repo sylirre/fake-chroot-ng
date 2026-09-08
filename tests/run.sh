@@ -65,6 +65,26 @@ out=$(run --help 2>&1); check "help rc" 0 $?
 check_contains "help usage line" "chroot-ng [options] <rootfs> <program>" "$out"
 check_contains "help OPTIONS section" "OPTIONS" "$out"
 out=$(run -h 2>&1); check "short -h rc" 0 $?
+# The help is reflowed to the terminal, and where no terminal answers
+# TIOCGWINSZ -- every redirected run, this one included -- to $COLUMNS. That
+# value arrives from the environment, so the parse has to survive anything sent
+# through it: an accumulator that overflowed was undefined behaviour, which the
+# compiler is entitled to act on rather than wrap. The width is clamped to
+# HELP_MIN_COLS..HELP_MAX_COLS, and the help is long enough that some line fills
+# whatever width it is given.
+help_width() { run --help 2>&1 | awk '{ if (length > m) m = length } END { print m+0 }'; }
+export COLUMNS
+COLUMNS=40
+check "COLUMNS renders the help at that width" 40 "$(help_width)"
+COLUMNS=1
+check "a COLUMNS under the floor clamps up" 32 "$(help_width)"
+COLUMNS=4294967296
+check "a COLUMNS past an int's range clamps to the ceiling" 92 "$(help_width)"
+COLUMNS=99999999999999999999
+check "...and so does one past every range" 92 "$(help_width)"
+COLUMNS=abc
+check "a COLUMNS that is not a number is ignored" 80 "$(help_width)"
+unset COLUMNS
 run >/dev/null 2>&1; check "no-args rc" 2 $?
 run --frobnicate >/dev/null 2>&1; check "unknown-option rc" 2 $?
 run / >/dev/null 2>&1; check "rootfs but no program rc" 2 $?
