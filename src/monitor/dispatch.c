@@ -3169,8 +3169,18 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * shared inode. Without -l the host's refusal reaches the guest unchanged. */
     case __NR_linkat: {
         const char *sp = (const char *)a1;
+        /* The kernel copies both names in before it looks at either, so a NULL
+         * one is -EFAULT: not an empty name, and not the -ENOENT the
+         * unresolvable arm below would otherwise have answered for it. Every
+         * other path-bearing call gets that for free by handing the NULL to
+         * the kernel — xlate_lim passes one straight through, and the re-issue
+         * lets the kernel say what it says, which is also how utimensat and
+         * statx keep the two spellings where a NULL pathname is legitimate.
+         * This one resolves both ends itself and re-issues neither. */
+        if (!sp || !a3)
+            return -EFAULT;
         int follow = ((int)a4 & CNG_AT_SYMLINK_FOLLOW) ? 1 : 0;
-        int empty = ((int)a4 & CNG_AT_EMPTY_PATH) && (!sp || !sp[0]);
+        int empty = ((int)a4 & CNG_AT_EMPTY_PATH) && !sp[0];
         char srch[CNG_PATH_MAX], dsth[CNG_PATH_MAX];
         /* AT_SYMLINK_FOLLOW is applied at guest level (the host must never
          * follow a guest symlink's target itself); the host call then runs
