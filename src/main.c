@@ -404,8 +404,13 @@ static void help(char **envp) {
                       "fd/*, std{in,out,err}) is visible to the guest, because a "
                       "rootfs directory tree ships no device nodes and mknod "
                       "needs privileges we lack; everything else under /dev "
-                      "comes from the rootfs. With this flag /dev is served from "
-                      "the rootfs (or a -b bind) only."},
+                      "comes from the rootfs. A name the host does not offer is "
+                      "left out rather than listed and then refused — except "
+                      "shm/, which where the host has no /dev/shm (Android) is "
+                      "served from a per-uid directory under $TMPDIR, so the "
+                      "guest's shm_open/sem_open have somewhere to go. With "
+                      "this flag /dev is served from the rootfs (or a -b bind) "
+                      "only."},
         {"    --no-proc", "Disable /proc emulation. By default the host /proc "
                       "is visible to the guest (a rootfs directory tree has "
                       "none, and mounting one needs privileges we lack), host "
@@ -470,6 +475,10 @@ static void help(char **envp) {
                       "stack table had no slot to give, so every dispatch runs "
                       "on a stack mapped for the call. Test aid: a working host "
                       "reaches that only with 256 threads live at once."},
+        {"CNG_DEVSHM_FORCE_TMP", "Serve the guest's /dev/shm from the per-uid "
+                      "directory under $TMPDIR even where the host has a real "
+                      "/dev/shm. Test aid: a host that has one otherwise never "
+                      "takes the stand-in path at all."},
         {"CNG_BROKER_NO_PEERCRED", "Behave as if the kernel would not say who "
                       "is on the other end of the IPC broker's rendezvous "
                       "socket, which refuses the connection. Test aid: a "

@@ -224,6 +224,12 @@ static void put_mounts(int fd, int fmt) {
     int nb = cng_g_fs->nbinds;
     int proc_row = !cng_g_no_proc;
     int dev_row = !cng_g_no_dev;
+    /* ...and the tmpfs at /dev/shm only where the guest actually has one. The
+     * row was unconditional, so on Android — which has no /dev/shm at all and
+     * where the stand-in under $TMPDIR may not have been available either — the
+     * mount table announced a filesystem that every open under it then answered
+     * ENOENT for. A mount table is something programs test before they act. */
+    int shm_row = dev_row && cng_dev_shm_ok();
     int id = 2; /* 1 is the root */
 
     if (fmt == MNT_MOUNTINFO) {
@@ -237,8 +243,9 @@ static void put_mounts(int fd, int fmt) {
                             "devtmpfs rw\n", id++);
             cng_dprintf(fd, "%d 1 0:7 / /dev/pts rw,nosuid,noexec,relatime - "
                             "devpts devpts rw\n", id++);
-            cng_dprintf(fd, "%d 1 0:8 / /dev/shm rw,nosuid,nodev,relatime - "
-                            "tmpfs tmpfs rw\n", id++);
+            if (shm_row)
+                cng_dprintf(fd, "%d 1 0:8 / /dev/shm rw,nosuid,nodev,relatime - "
+                                "tmpfs tmpfs rw\n", id++);
         }
         for (int i = 0; i < nb; i++) {
             unsigned long bmaj = maj, bmin = min;
@@ -266,8 +273,9 @@ static void put_mounts(int fd, int fmt) {
                         "device devtmpfs mounted on /dev with fstype devtmpfs\n");
             cng_dprintf(
                 fd, "device devpts mounted on /dev/pts with fstype devpts\n");
-            cng_dprintf(fd,
-                        "device tmpfs mounted on /dev/shm with fstype tmpfs\n");
+            if (shm_row)
+                cng_dprintf(
+                    fd, "device tmpfs mounted on /dev/shm with fstype tmpfs\n");
         }
         for (int i = 0; i < nb; i++)
             cng_dprintf(fd, "device " MNT_DEV " mounted on %s with fstype %s\n",
@@ -282,7 +290,9 @@ static void put_mounts(int fd, int fmt) {
             cng_dprintf(fd, "devtmpfs /dev devtmpfs rw,nosuid,relatime 0 0\n");
             cng_dprintf(
                 fd, "devpts /dev/pts devpts rw,nosuid,noexec,relatime 0 0\n");
-            cng_dprintf(fd, "tmpfs /dev/shm tmpfs rw,nosuid,nodev,relatime 0 0\n");
+            if (shm_row)
+                cng_dprintf(fd,
+                            "tmpfs /dev/shm tmpfs rw,nosuid,nodev,relatime 0 0\n");
         }
         for (int i = 0; i < nb; i++)
             cng_dprintf(fd, MNT_DEV " %s %s %s,relatime 0 0\n",

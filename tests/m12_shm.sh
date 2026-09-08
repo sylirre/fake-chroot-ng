@@ -127,6 +127,56 @@ else
     esac
 fi
 
+# --- POSIX shm: the other shared memory, which is a directory ---------------
+# shm_open() has no syscall behind it: it is an open() under /dev/shm, so a
+# guest has POSIX shared memory exactly when it has a writable one. Android has
+# no such directory at all, and the synthesized mount table said it did, so a
+# glibc or musl guest was told tmpfs and then handed ENOENT. chroot-ng serves
+# one from a per-uid directory under $TMPDIR there; this asks a real libc
+# whether that is enough, and asks it against the stand-in specifically, so a
+# host with its own /dev/shm exercises the same path.
+#
+# guest_cc rather than guest_cc_report on purpose: bionic has no shm_open at
+# all (Android uses ashmem), so on a Termux host the program cannot build and
+# that is a skip, not a failure. The rootfs guests this matters for — Alpine,
+# Debian — are the ones that have it.
+if ! guest_xlate_ready "POSIX shm"; then
+    :
+elif ! guest_cc "$SG/shm_posix" tests/guests/shm_posix.c; then
+    skip "POSIX shm: no shm_open in this guest libc (bionic has none)"
+else
+    m12_want="posix: created
+posix: read POSIX-SHM-OK
+posix: after-unlink gone
+posix: done"
+    M12T=$(mktemp -d)
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
+    m12_got=$(TMPDIR="$M12T" CNG_DEVSHM_FORCE_TMP=1 run_t 60 $GUEST_BINDS -R \
+        "$SG" /shm_posix 2>/dev/null); m12_rc=$?
+    check "m12 a POSIX shm round trip on the /dev/shm stand-in exits 0" 0 "$m12_rc"
+    if [ "$m12_got" = "$m12_want" ]; then
+        pass=$((pass + 1))
+        printf '  ok   m12 ...create, map, reopen by name, read back, unlink\n'
+    else
+        fail=$((fail + 1))
+        printf '  FAIL m12 POSIX shm round trip on the stand-in\n'
+        printf '    want: %s\n' "$(echo "$m12_want" | tr '\n' '|')"
+        printf '    got : %s\n' "$(echo "$m12_got" | tr '\n' '|')"
+    fi
+    # And it really was the stand-in: the object is created and unlinked inside
+    # the run, so what is left behind is the directory chroot-ng made for it.
+    if [ -n "$(find "$M12T" -maxdepth 1 -type d -name 'chroot-ng-shm.v1.*' \
+        2>/dev/null)" ]; then
+        pass=$((pass + 1))
+        printf '  ok   m12 ...in the per-uid directory under $TMPDIR\n'
+    else
+        fail=$((fail + 1))
+        printf '  FAIL m12 the stand-in directory was not made under $TMPDIR\n'
+        find "$M12T" | sed 's/^/    /' | head -5
+    fi
+    rm -rf "$M12T"
+fi
+
 m12_kbase=
 m12_ready=0
 if guest_xlate_ready "SysV shm differential"; then

@@ -2294,6 +2294,47 @@ vfork/`posix_spawn` child-stack handling.
   magnitude above that. 814 passed and 0 failed on the dev host, where the
   dynamic leg needs a live filter and skips; 788/0 on the device.
 
+- [x] **M36 — the guest's /dev/shm was a mount that was not there**
+  POSIX shared memory has no syscall behind it. `shm_open()` is an `open()`
+  under `/dev/shm` with the name checked, and `sem_open()` is the same — so a
+  guest has POSIX shm exactly when it has a writable `/dev/shm`, and nothing
+  else about it can be emulated. Android has no such directory at all, and no
+  privilege we hold can mount one, so every `shm_open` in an Alpine or Debian
+  rootfs came back ENOENT.
+  Worse than absent, it was *advertised*. The synthesized mount tables
+  (`/proc/mounts`, `/proc/self/mountinfo`, `/proc/self/mountstats`) emitted a
+  `tmpfs /dev/shm` row whenever the `/dev` zone was on, unconditionally, so a
+  program that checked before it acted — which is what a mount table is for —
+  was told tmpfs and then refused. Measured on the device, before:
+  `tmpfs /dev/shm tmpfs rw,nosuid,nodev,relatime 0 0`, then
+  `sh: can't create /dev/shm/probe: nonexistent directory`.
+  Where the host has a `/dev/shm` nothing changes: the whitelist passes it
+  through, and a real one is a single tmpfs global to the machine, which is
+  what the guest should see. Where it has none, the node is served from
+  `$TMPDIR/chroot-ng-shm.v1.<uid>` — created on demand, then `$XDG_RUNTIME_DIR`,
+  `/data/local/tmp` and `/tmp` behind it. One directory per uid rather than per
+  rootfs, deliberately: a passthrough `/dev/shm` is already shared by everything
+  on the machine, and scoping only the stand-in would make POSIX shm behave
+  differently depending on a property of the host the guest cannot see.
+  (`cng_broker_shared_dir()` is not reused for this — its list *starts* at
+  `/dev/shm`, which is the one place this cannot use.)
+  The mount row now follows the node: `cng_dev_shm_ok()` gates it, so a host
+  with neither a real `/dev/shm` nor a writable temporary directory anywhere
+  stops claiming one. `struct cng_dev_node` also gained a `dir` flag, since the
+  "may a guest name a path under this?" test used to compare `host` against the
+  string `"/dev/shm"` — which the day that path became a variable would have
+  quietly stopped matching.
+  Validated three ways: a busybox guest in the Alpine rootfs creates, reads,
+  lists and removes an object under `/dev/shm` (M14), the same guest proves the
+  mount table's claim and the node agree, and a compiled glibc guest does a full
+  `shm_open` → `ftruncate` → `mmap` → reopen-by-name → read-back → `shm_unlink`
+  round trip against the stand-in (M12, `tests/guests/shm_posix.c`). All of it
+  runs on a host that has a real `/dev/shm` too, through `CNG_DEVSHM_FORCE_TMP`,
+  and the last leg checks the objects landed under `$TMPDIR` and *not* in the
+  host's own `/dev/shm`. The compiled leg skips on Termux, bionic having no
+  `shm_open` at all — Android uses ashmem — which is the same reason the guests
+  that need this are the rootfs ones.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

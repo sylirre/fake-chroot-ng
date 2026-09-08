@@ -39,13 +39,28 @@ extern int cng_g_no_dev;
  * synthesis so the two can never disagree about what /dev contains. `host` is
  * what the name resolves to (usually itself; the std* aliases and fd point into
  * /proc/self/fd), and is what gets lstat'ed for a real d_type when the entry is
- * spliced into a listing. */
+ * spliced into a listing.
+ *
+ * `dir` marks the entries a guest may name a path *under* — the device nodes
+ * have no children, and a name like "/dev/null/x" is ENOTDIR, not a lookup. It
+ * is a field rather than a test on `host` because one of those host paths is
+ * chosen at startup (see cng_dev_shm_init) and comparing against a literal
+ * would silently stop matching the day it changes. */
 struct cng_dev_node {
     const char *name; /* basename under /dev */
     const char *host; /* host path it resolves to */
+    int dir;          /* a directory: subpaths under it resolve */
 };
 extern const struct cng_dev_node cng_dev_nodes[];
 extern const int cng_dev_nnodes;
+
+/* Settle what the guest's /dev/shm is. Called once from cng_run, before the
+ * guest runs and after the host environment is on record. */
+void cng_dev_shm_init(void);
+
+/* Is there a /dev/shm for the guest at all? Asked by the /proc mount tables,
+ * which must not announce a tmpfs the guest cannot then open. */
+int cng_dev_shm_ok(void);
 
 /* 0, or -1 when the rootfs path does not fit fs->rootfs: it is refused rather
  * than truncated, since a short prefix roots the guest somewhere else. */

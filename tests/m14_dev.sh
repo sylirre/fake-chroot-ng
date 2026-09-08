@@ -16,10 +16,15 @@ if [ -z "$M14_ALPINE" ] || [ ! -x "$M14_ALPINE/bin/busybox" ]; then
     skip "/dev zone scenarios: no alpine rootfs"
 else
     # The host node each whitelist name stands for, which is the table in
-    # src/path/path.c and has to stay in step with it.
+    # src/path/path.c and has to stay in step with it. An empty answer means
+    # the name is not a passthrough at all and is there whatever the host has:
+    # shm is served from a directory under $TMPDIR where the host offers no
+    # /dev/shm, so the only host that could fail it is one with no writable
+    # temporary directory anywhere, which could not have run this suite.
     m14_host_of() {
         case $1 in
         console) echo /dev/tty ;;
+        shm)     echo "" ;;
         fd)      echo /proc/self/fd ;;
         stdin)   echo /proc/self/fd/0 ;;
         stdout)  echo /proc/self/fd/1 ;;
@@ -34,15 +39,15 @@ else
     # ...as far as this host can supply it: the injection stats the host node
     # and leaves out what it cannot see, because listing a name that then does
     # not open is worse than not listing it. Android is where that bites —
-    # there is no /dev/shm at all, and SELinux refuses an app process even
-    # stat() on /dev/full — so the precondition is checked the same way the
-    # injection checks it rather than assumed.
+    # SELinux refuses an app process even stat() on /dev/full — so the
+    # precondition is checked the same way the injection checks it rather than
+    # assumed.
     got=$(run -R "$M14_ALPINE" /bin/busybox sh -c \
         'ls /dev | tr "\n" " "' 2>/dev/null)
     for want in null zero full random urandom tty ptmx console pts shm fd \
                 stdin stdout stderr; do
         m14_h=$(m14_host_of "$want")
-        if [ ! -e "$m14_h" ] && [ ! -L "$m14_h" ]; then
+        if [ -n "$m14_h" ] && [ ! -e "$m14_h" ] && [ ! -L "$m14_h" ]; then
             skip "m14 ls /dev shows $want: this host does not offer $m14_h"
             continue
         fi
@@ -58,6 +63,7 @@ else
     for want in null zero full random urandom tty ptmx console pts shm fd \
                 stdin stdout stderr; do
         m14_h=$(m14_host_of "$want")
+        [ -n "$m14_h" ] || continue
         { [ -e "$m14_h" ] || [ -L "$m14_h" ]; } && continue
         case " $got " in
         *" $want "*)
@@ -154,6 +160,58 @@ else
     got=$(run -R --no-dev "$M14_ALPINE" /bin/busybox sh -c \
         'grep -c " /dev devtmpfs " /proc/mounts' 2>/dev/null)
     check "m14 --no-dev drops the /dev mount rows" 0 "$got"
+
+    # ...and the row has to be true. /dev/shm is the one whitelist entry that is
+    # a writable *filesystem* rather than a device node, and on Android there is
+    # no such directory on the host at all — while the mount table said there
+    # was, unconditionally, so a program that checked before it acted (glibc's
+    # shm_open and sem_open are an open() under /dev/shm and nothing else) was
+    # told tmpfs and then given ENOENT. Whatever the table claims, a create
+    # under it must work.
+    got=$(run -R "$M14_ALPINE" /bin/busybox sh -c \
+        'grep -q " /dev/shm tmpfs " /proc/mounts || { echo norow; exit 0; }
+         echo SHM-PAYLOAD > /dev/shm/m14obj || { echo nocreate; exit 0; }
+         cat /dev/shm/m14obj; ls /dev/shm | grep -c "^m14obj$"
+         rm -f /dev/shm/m14obj' 2>/dev/null)
+    check_contains "m14 a /dev/shm the mount table claims can be written" \
+        "SHM-PAYLOAD" "$got"
+    check_contains "m14 ...and the object is listed in it" "1" "$got"
+
+    # The stand-in itself, forced so a host that has a real /dev/shm exercises
+    # it too: the guest's objects land in a per-uid directory under $TMPDIR and
+    # nowhere near the host's own /dev/shm.
+    M14T=$(mktemp -d)
+    got=$(TMPDIR="$M14T" CNG_DEVSHM_FORCE_TMP=1 run -R "$M14_ALPINE" \
+        /bin/busybox sh -c \
+        'echo STANDIN-PAYLOAD > /dev/shm/m14standin && cat /dev/shm/m14standin
+         grep -q " /dev/shm tmpfs " /proc/mounts && echo row-kept' 2>/dev/null)
+    check_contains "m14 the /dev/shm stand-in is writable" "STANDIN-PAYLOAD" \
+        "$got"
+    check_contains "m14 ...and still announced as a mount" "row-kept" "$got"
+    m14_obj=$(find "$M14T" -name m14standin 2>/dev/null | head -1)
+    if [ -n "$m14_obj" ]; then
+        pass=$((pass + 1))
+        echo "  ok   m14 the stand-in object is under \$TMPDIR (${m14_obj#"$M14T"/})"
+    else
+        fail=$((fail + 1))
+        echo "  FAIL m14 the stand-in object is not under \$TMPDIR"
+        find "$M14T" | sed 's/^/    /' | head -5
+    fi
+    rm -rf "$M14T"
+    # ...and it is a stand-in, not a second name for the host's /dev/shm: the
+    # object above must not be there. Only meaningful where the host has one.
+    if [ -d /dev/shm ]; then
+        if [ -e /dev/shm/m14standin ]; then
+            fail=$((fail + 1))
+            echo "  FAIL m14 the stand-in wrote into the host's own /dev/shm"
+            rm -f /dev/shm/m14standin
+        else
+            pass=$((pass + 1))
+            echo "  ok   m14 the stand-in left the host's /dev/shm alone"
+        fi
+    else
+        skip "stand-in containment leg: this host has no /dev/shm to keep clear"
+    fi
 fi
 
 # --- reaching an overlay entry through a dirfd ------------------------------

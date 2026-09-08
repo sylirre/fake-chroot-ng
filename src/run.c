@@ -214,6 +214,13 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
      * tree shares one namespace and separate launches stay isolated. */
     cng_broker_seed_session();
 
+    /* And what the guest's /dev/shm is, which on a host that has none is a
+     * directory of ours under $TMPDIR rather than a name that does not resolve.
+     * Needs the host environment on record (just above) and has to be settled
+     * before anything asks the path layer, which the workdir and the program
+     * lookup below both do. */
+    cng_dev_shm_init();
+
     /* CNG_DEBUG=1 in the environment enables verbose syscall-error logging;
      * CNG_L2S_FORCE=1 routes every linkat through the -l emulation (test aid
      * for hosts whose filesystem allows real hardlinks). */

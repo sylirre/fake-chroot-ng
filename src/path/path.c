@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
 #include "cng/path.h"
+#include "cng/broker.h" /* cng_broker_env: no getenv in a freestanding build */
 #include "cng/procreg.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
@@ -34,17 +35,89 @@ int cng_g_no_dev = 0;
  * dispatch.c) so the walk treats them as the magic links they are rather than
  * readlink'ing them as ordinary symlinks; this table is what a direct
  * cng_fs_translate call falls back on, and the two agree. */
+/* Where the guest's /dev/shm lives. Mutable, and the table below points at it:
+ * see cng_dev_shm_init for what may end up here and why. */
+static char g_shm_host[CNG_PATH_MAX] = "/dev/shm";
+
 const struct cng_dev_node cng_dev_nodes[] = {
-    {"null", "/dev/null"},         {"zero", "/dev/zero"},
-    {"full", "/dev/full"},         {"random", "/dev/random"},
-    {"urandom", "/dev/urandom"},   {"tty", "/dev/tty"},
-    {"ptmx", "/dev/ptmx"},         {"console", "/dev/tty"},
-    {"pts", "/dev/pts"},           {"shm", "/dev/shm"},
-    {"fd", "/proc/self/fd"},       {"stdin", "/proc/self/fd/0"},
-    {"stdout", "/proc/self/fd/1"}, {"stderr", "/proc/self/fd/2"},
+    {"null", "/dev/null", 0},         {"zero", "/dev/zero", 0},
+    {"full", "/dev/full", 0},         {"random", "/dev/random", 0},
+    {"urandom", "/dev/urandom", 0},   {"tty", "/dev/tty", 0},
+    {"ptmx", "/dev/ptmx", 0},         {"console", "/dev/tty", 0},
+    {"pts", "/dev/pts", 1},           {"shm", g_shm_host, 1},
+    {"fd", "/proc/self/fd", 1},       {"stdin", "/proc/self/fd/0", 0},
+    {"stdout", "/proc/self/fd/1", 0}, {"stderr", "/proc/self/fd/2", 0},
 };
 const int cng_dev_nnodes =
     (int)(sizeof cng_dev_nodes / sizeof cng_dev_nodes[0]);
+
+/* Is `path` a directory we can reach? Follows symlinks: what matters is what a
+ * guest's open under it would find, not how the name got there. */
+static int is_dir(const char *path) {
+    char st[144]; /* struct stat; st_mode is at 16 on every arch we build for */
+    if (CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, (long)path, (long)st, 0, 0, 0) !=
+        0)
+        return 0;
+    return (*(unsigned *)(st + 16) & 0170000) == 0040000;
+}
+
+int cng_dev_shm_ok(void) { return !cng_g_no_dev && is_dir(g_shm_host); }
+
+/* The guest's /dev/shm.
+ *
+ * Where the host has one, that is what the guest gets, and nothing here runs:
+ * a real /dev/shm is one tmpfs global to the machine, and the passthrough hands
+ * the guest exactly that.
+ *
+ * Android has none — there is no such directory at all, and no way for us to
+ * mount one — so glibc's shm_open() and sem_open(), which are `open()` under
+ * /dev/shm and nothing more, had nowhere to go. Worse, the synthesized
+ * /proc/mounts told the guest a tmpfs was mounted there, so a program that
+ * checked first still got ENOENT when it opened. A directory of our own stands
+ * in: $TMPDIR by preference, which on Termux is inside $PREFIX and therefore
+ * writable, then the same places the broker looks for shared state.
+ *
+ * One directory per uid, shared by every invocation, deliberately: that is what
+ * a passthrough /dev/shm already is, and a per-rootfs one would make POSIX
+ * shared memory behave differently depending on whether the host happened to
+ * have a /dev/shm. (Abstract sockets are isolated per rootfs, but nothing else
+ * can scope those — see the -A note in the help — while this has a real
+ * directory and inherits its scope.)
+ *
+ * Best effort throughout: a host with no writable temp directory anywhere keeps
+ * the old behaviour, which is that /dev/shm resolves to a name that is not
+ * there, is left out of the listing, and — now — is left out of the mount
+ * tables too. */
+void cng_dev_shm_init(void) {
+    if (cng_g_no_dev)
+        return;
+    /* CNG_DEVSHM_FORCE_TMP=1 takes the stand-in even where /dev/shm exists,
+     * which is the only way a host that has one can exercise this at all. */
+    if (!cng_broker_env("CNG_DEVSHM_FORCE_TMP") && is_dir("/dev/shm"))
+        return;
+    /* Not cng_broker_shared_dir(): that list starts at /dev/shm, which is the
+     * one place this cannot use — we are here because it is unusable, and under
+     * the force knob because we are pretending it is. */
+    const char *cand[] = {cng_broker_env("TMPDIR"),
+                          cng_broker_env("XDG_RUNTIME_DIR"), "/data/local/tmp",
+                          "/tmp"};
+    for (unsigned i = 0; i < sizeof cand / sizeof cand[0]; i++) {
+        if (!cand[i] || !is_dir(cand[i]))
+            continue;
+        char path[CNG_PATH_MAX];
+        /* Same shape as the broker's own files: named, versioned, per-uid. */
+        if (cng_snprintf(path, sizeof path, "%s/chroot-ng-shm.v1.%u", cand[i],
+                         (unsigned)sys_getuid()) >= sizeof path)
+            continue;
+        long r = CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, (long)path, 0700, 0, 0, 0);
+        if (r != 0 && r != -EEXIST)
+            continue;
+        if (!is_dir(path))
+            continue; /* something else is sitting on the name */
+        cng_strlcpy(g_shm_host, path, sizeof g_shm_host);
+        return;
+    }
+}
 
 /* Fill `out` for a guest path inside the /dev zone. Returns 1 when it did, 0 to
  * fall through to ordinary rootfs prefixing, -1 when the name did not fit. */
@@ -69,8 +142,7 @@ static int dev_zone(const char *canon, char *out, size_t outsz) {
          * (pts/<n>, shm/<name>, fd/<n>); a device node has no children. */
         if (c == '/') {
             const char *h = cng_dev_nodes[i].host;
-            if (strcmp(h, "/dev/pts") == 0 || strcmp(h, "/dev/shm") == 0 ||
-                strcmp(h, "/proc/self/fd") == 0) {
+            if (cng_dev_nodes[i].dir) {
                 size_t n = cng_strlcpy(out, h, outsz);
                 if (n >= outsz ||
                     cng_strlcpy(out + n, leaf + nl, outsz - n) >= outsz - n)
