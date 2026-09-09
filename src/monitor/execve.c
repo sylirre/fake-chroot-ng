@@ -823,10 +823,32 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
                     (*(unsigned *)(st + 16) & 0170000) == 0120000)
                     return -ELOOP;
             }
-        } else if (cng_resolve(cur, 1, host, sizeof host) != 0) {
-            if (cng_g_debug)
-                cng_dprintf(2, "[cng] execve interp %s -> unresolved\n", cur);
-            return -ENOENT;
+        } else {
+            /* An interpreter path is resolved like any other name, so its ".."
+             * components are walked through the directories they leave just the
+             * same: "#!/bin/sh/../ls" is ENOTDIR to the kernel, which opens the
+             * interpreter with open_exec and hands back whatever that says.
+             * Collapsing the pair unasked resolved it to a name the kernel
+             * never reaches — EACCES here because that name was not executable,
+             * and a running program if it had been.
+             *
+             * AT_FDCWD rather than the execveat dirfd, which is what the
+             * resolve below assumes as well: fs/binfmt_script.c opens the
+             * interpreter by name, and a #! line is absolute or cwd-relative. */
+            long dd = cng_dotdot_verdict(CNG_AT_FDCWD, cur);
+            if (dd) {
+                if (cng_g_debug)
+                    cng_dprintf(2,
+                                "[cng] execve interp %s -> \"..\" errno=%ld\n",
+                                cur, -dd);
+                return dd;
+            }
+            if (cng_resolve(cur, 1, host, sizeof host) != 0) {
+                if (cng_g_debug)
+                    cng_dprintf(2, "[cng] execve interp %s -> unresolved\n",
+                                cur);
+                return -ENOENT;
+            }
         }
         /* Every failure below this point is silent otherwise, and the guest only
          * sees an errno — trace the resolution so a device-side failure says

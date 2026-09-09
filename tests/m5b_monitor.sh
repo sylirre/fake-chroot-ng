@@ -606,7 +606,9 @@ rm -rf "$DR"
 # Neither statement reached the kernel, so every one of these answered about a
 # file the kernel would have refused to reach. Mostly that was a wrong answer;
 # for the calls that WRITE it was worse, since `unlink("f/")` and
-# `unlink("f/../f")` both removed a file the kernel will not touch.
+# `unlink("f/../f")` both removed a file the kernel will not touch. The last
+# legs ask it of a #! interpreter path, which the kernel opens by name like any
+# other and which the emulation resolves down its own chain.
 # Byte-for-byte against the host build.
 TSD=$(mktemp -d)
 mkdir -p "$TSD/d" "$TSD/d2"; printf hi > "$TSD/f"; : > "$TSD/d/mark"

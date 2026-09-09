@@ -53,6 +53,18 @@ static const char *P(const char *name) {
     return b;
 }
 
+/* An executable script at `at` whose only line names `interp`. Returns 0/-1. */
+static int write_script(const char *at, const char *interp) {
+    char line[600];
+    int n = snprintf(line, sizeof line, "#!%s\n", interp);
+    int fd = open(at, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    if (fd < 0)
+        return -1;
+    int ok = n > 0 && write(fd, line, (size_t)n) == n;
+    close(fd);
+    return ok ? 0 : -1;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1)
         base = argv[1];
@@ -202,6 +214,45 @@ int main(int argc, char **argv) {
         errno = 0;
         execve(P("/d/../d"), av, ev);
         printf("exec_dir_dotdot=%d\n", errno);
+    }
+
+    /* --- a #! interpreter path is a path too ----------------------------- */
+    /* fs/binfmt_script.c opens it by name, so both statements apply to it and
+     * whatever the open says is what execve says. The scripts are written here
+     * rather than by the harness, so each build names its own tree. None of
+     * these can succeed — the last one resolves all the way to a file that is
+     * merely not executable, which is what says a good ".." was let through —
+     * so the process is still here to print the rest. */
+    {
+        static const struct {
+            const char *tag, *interp;
+        } sh[] = {
+            {"sheb_file_dotdot", "/f/../f"},
+            {"sheb_missing_dotdot", "/nope/../f"},
+            {"sheb_link_dotdot", "/l2f/../f"},
+            {"sheb_file_slash", "/f/"},
+            {"sheb_dir_dotdot", "/d/../f"},
+        };
+        char *av[] = {(char *)"x", 0}, *ev[] = {0};
+        for (unsigned i = 0; i < sizeof sh / sizeof sh[0]; i++) {
+            if (write_script(P("/scr"), P(sh[i].interp)) < 0) {
+                printf("%s=writefail\n", sh[i].tag);
+                continue;
+            }
+            errno = 0;
+            execve(P("/scr"), av, ev);
+            printf("%s=%d\n", sh[i].tag, errno);
+        }
+        /* ...and two levels of it, each reached through a "..": the chain has
+         * to be walked all the way down to the interpreter that cannot run. */
+        if (write_script(P("/scr2"), P("/d/../f")) == 0 &&
+            write_script(P("/scr"), P("/d/../scr2")) == 0) {
+            errno = 0;
+            execve(P("/scr"), av, ev);
+            printf("sheb_nested_dotdot=%d\n", errno);
+        }
+        unlink(P("/scr"));
+        unlink(P("/scr2"));
     }
 
     /* --- and the zones that exist only inside the emulation -------------- */
