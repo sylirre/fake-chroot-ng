@@ -620,6 +620,15 @@ int cng_resolve_lim(const char *path, int deref_final, char *out, size_t outsz,
         cng_strlcpy(rest, path, sizeof rest) >= sizeof rest)
         return -ENAMETOOLONG;
 
+    /* "This must be a directory" — a trailing slash or "/." — which the walk
+     * below has to know about for the final component, and which is put back
+     * onto the host path at the end. Read off what is left to walk rather than
+     * off `path` once, so a symlink whose own target ends in one (or does not)
+     * changes the answer where it should: after a splice, `rest` holds the
+     * whole of what remains, and the last component of the name is always
+     * somewhere in it. */
+    int want_dir = cng_path_wants_dir(rest);
+
     /* The mount the resolution starts in. For a name reached through a real
      * dirfd the walk is handed an absolute path built from that directory, so
      * the caller names the true starting point; otherwise it is this base. */
@@ -720,11 +729,20 @@ int cng_resolve_lim(const char *path, int deref_final, char *out, size_t outsz,
             if (splice_rest(rest, sizeof rest, canon, p) < 0)
                 return -ENAMETOOLONG;
             p = rest;
+            want_dir = cng_path_wants_dir(rest);
             cng_strlcpy(canon, "/", sizeof canon);
             continue;
         }
 
-        if (last && !deref_final)
+        /* The final component's own symlink is left alone for O_NOFOLLOW and
+         * AT_SYMLINK_NOFOLLOW — unless a trailing slash asked for a directory,
+         * which the kernel answers by following the link anyway (measured:
+         * lstat("l2d/") describes the DIRECTORY, lstat("l2f/") is ENOTDIR).
+         * Following it here is also what keeps the guest inside the rootfs: the
+         * host path would otherwise still name the link, the trailing slash
+         * would make the kernel follow it, and an absolute target would resolve
+         * from the HOST root — the one thing this walk exists to prevent. */
+        if (last && !deref_final && !want_dir)
             continue;
         char host[CNG_PATH_MAX], link[CNG_PATH_MAX];
         if (cng_fs_translate(cng_g_fs, canon, host, sizeof host) != 0)
@@ -759,12 +777,25 @@ int cng_resolve_lim(const char *path, int deref_final, char *out, size_t outsz,
         if (splice_rest(rest, sizeof rest, link, p) < 0)
             return -ENAMETOOLONG;
         p = rest;
+        want_dir = cng_path_wants_dir(rest);
     }
     /* cng_fs_translate fails only on length — the canonical form overflowing,
      * or the rootfs prefix pushing the result past `outsz` — so its refusal is
      * the same -ENAMETOOLONG the walk above answers. */
     if (xdev_hit(lim, start, canon))
         return lim->err;
+    /* Hand the requirement to the translation, which puts it on the host path:
+     * the walk is done with names, and this is a statement about the file the
+     * last name reached. */
+    if (want_dir) {
+        size_t cl = strlen(canon);
+        if (cl && canon[cl - 1] != '/') {
+            if (cl + 2 > sizeof canon)
+                return -ENAMETOOLONG;
+            canon[cl] = '/';
+            canon[cl + 1] = '\0';
+        }
+    }
     return cng_fs_translate(cng_g_fs, canon, out, outsz) == 0 ? 0
                                                               : -ENAMETOOLONG;
 }

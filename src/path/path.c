@@ -429,6 +429,34 @@ int cng_path_canon(const char *abs, char *out, size_t outsz) {
     return 0;
 }
 
+/* See the header for what this asks. Scanned backwards over any run of slashes
+ * and "." components, so "d/", "d/.", "d/./" and "d//." all answer the same.
+ *
+ * ".." is deliberately not one of them. "f/.." is ENOTDIR to the kernel too,
+ * but for a different reason — it walks INTO f before it goes back up — and the
+ * answer to it is not about the final component at all: the path it names is
+ * f's parent, which is a directory whatever f is. What that case needs is a
+ * check on the component being left, not on the one arrived at. */
+int cng_path_wants_dir(const char *path) {
+    size_t n = strlen(path);
+    int want = 0;
+    while (n) {
+        if (path[n - 1] == '/') {
+            want = 1;
+            n--;
+            continue;
+        }
+        /* A "." component: preceded by a slash, or the whole of a bare ".". */
+        if (path[n - 1] == '.' && (n == 1 || path[n - 2] == '/')) {
+            want = 1;
+            n--;
+            continue;
+        }
+        break;
+    }
+    return want;
+}
+
 int cng_fs_abscanon(const struct cng_fs *fs, const char *path, char *out,
                     size_t outsz) {
     /* Every copy here is checked, because a cut path is a different path — the
@@ -522,6 +550,23 @@ int cng_fs_translate_mnt(const struct cng_fs *fs, const char *path, char *out,
     /* Applied to the result, so a bind onto the host /proc is covered too. */
     if (host_proc_hidden(out))
         hide_proc_pid(out, outsz);
+    /* The trailing slash the canonicalization dropped, put back on the host
+     * spelling that is about to be handed over. It is not decoration: it is the
+     * caller's statement that this had better be a directory, and the kernel is
+     * what answers it — so "<rootfs>/f/" is the ENOTDIR that "f/" is natively,
+     * an O_CREAT on one is EISDIR, and a bind mount point or a /dev node named
+     * with one is judged by whatever really sits there. Doing it last keeps
+     * every string test above (the bind match, the hidden-pid rewrite) on a
+     * plain path. */
+    if (cng_path_wants_dir(path)) {
+        size_t n = strlen(out);
+        if (n && out[n - 1] != '/') {
+            if (n + 2 > outsz)
+                return -1; /* no room: the same refusal a long name gets */
+            out[n] = '/';
+            out[n + 1] = '\0';
+        }
+    }
     return 0;
 }
 

@@ -86,6 +86,19 @@ void cng_fs_chroot(struct cng_fs *fs, const char *guest_root,
  * the root stays at the root. Returns 0 on success, -1 on overflow. */
 int cng_path_canon(const char *abs, char *out, size_t outsz);
 
+/* Does this spelling require its final component to resolve to a DIRECTORY?
+ *
+ * A trailing slash says so, and it is a statement about the file, not about the
+ * name: Linux answers ENOTDIR for "f/" where "f" is anything but a directory,
+ * follows the final symlink to find out however loudly O_NOFOLLOW or
+ * AT_SYMLINK_NOFOLLOW asked it not to, and turns an O_CREAT into EISDIR. A
+ * trailing "/." says the identical thing ("f/." is ENOTDIR too).
+ *
+ * cng_path_canon drops both, because what it produces is a name. So the
+ * question is asked of the spelling before it is canonicalized, and carried to
+ * the host path the kernel is finally handed. */
+int cng_path_wants_dir(const char *path);
+
 /* Resolve a guest path (absolute or relative to fs->cwd) to a canonical guest
  * absolute path (no host rootfs applied). Returns 0/-1. */
 int cng_fs_abscanon(const struct cng_fs *fs, const char *path, char *out,

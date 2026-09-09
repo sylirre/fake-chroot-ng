@@ -589,3 +589,54 @@ check_contains "quotactl likewise" "denied quotactl: rc=-38 -> OK" "$out"
 check_contains "swapon likewise" "denied swapon: rc=-38 -> OK" "$out"
 check_contains "acct likewise" "denied acct: rc=-38 -> OK" "$out"
 rm -rf "$DR"
+
+# A trailing slash is a statement about the FILE, not about the name: "f/" says
+# f had better be a directory, and Linux answers ENOTDIR when it is not. It says
+# it loudly enough to override the caller -- a final symlink is followed under
+# O_NOFOLLOW and AT_SYMLINK_NOFOLLOW alike, and an O_CREAT becomes EISDIR.
+#
+# Canonicalizing a guest path drops trailing slashes, which is what turns a
+# spelling into a name, so the statement never reached the kernel and every one
+# of these answered about the file itself. Mostly that was a wrong answer;
+# for the calls that WRITE it was worse, since `unlink("f/")` removed the file
+# the kernel refuses to touch. Byte-for-byte against the host build.
+TSD=$(mktemp -d)
+mkdir -p "$TSD/d" "$TSD/d2"; printf hi > "$TSD/f"; : > "$TSD/d/mark"
+ln -s f "$TSD/l2f"; ln -s d "$TSD/l2d"; ln -s nowhere "$TSD/dang"
+ln -s /d "$TSD/labs"   # absolute target: only the walk can re-root it
+if ! guest_xlate_ready "trailing-slash legs"; then
+    :
+elif guest_cc_report "$TSD/trailslash" tests/guests/trailslash.c; then
+    ts_k=""
+    if have cc && cc -O1 -o "$TSD/ts_host" tests/guests/trailslash.c \
+        2>/dev/null; then
+        ts_k=$("$TSD/ts_host" "$TSD" 2>/dev/null)
+    fi
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+    ts_g=$(run_t 60 -R $GUEST_BINDS "$TSD" /trailslash 2>/dev/null)
+    if [ -z "$ts_k" ]; then
+        skip "trailing-slash differential: no host compiler for the oracle"
+    elif [ "$ts_k" = "$ts_g" ]; then
+        pass=$((pass + 1))
+        echo "  ok   a trailing slash matches the kernel byte-for-byte"
+    else
+        fail=$((fail + 1))
+        echo "  FAIL a trailing slash diverges from the kernel"
+        printf '    kernel: %s\n' "$(echo "$ts_k" | tr '\n' '|')"
+        printf '    cng   : %s\n' "$(echo "$ts_g" | tr '\n' '|')"
+    fi
+    # ...and the tree is still standing, which is the half of it that a diff
+    # against a mangled oracle could not have caught on its own.
+    check_contains "the trailing-slash probes left the tree as they found it" \
+        "intact=1" "$ts_g"
+    # The one question the oracle cannot be asked: the same tree on the host has
+    # no rootfs to be inside of. A trailing slash makes the kernel follow the
+    # final symlink whatever O_NOFOLLOW said, so leaving that link for the
+    # kernel would have it follow an ABSOLUTE target from the host root -- out
+    # of the rootfs. The walk follows it first, where the target is re-rooted.
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+    check_contains "a trailing slash on an absolute symlink stays in the rootfs" \
+        "contain=rootfs" \
+        "$(run_t 60 -R $GUEST_BINDS "$TSD" /trailslash "" contain 2>/dev/null)"
+fi
+rm -rf "$TSD"
