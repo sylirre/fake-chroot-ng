@@ -89,6 +89,43 @@ int main(int argc, char **argv) {
     say("stat_file_dot", stat(P("/f/."), &st));
     say("stat_dir_dot", stat(P("/d/."), &st));
 
+    /* --- ".." is walked through, so what it leaves must be a directory ---- */
+    say("stat_file_dotdot", stat(P("/f/.."), &st));
+    say("stat_file_dotdot_d", stat(P("/f/../d"), &st));
+    say("stat_dir_dotdot", stat(P("/d/.."), &st));
+    say("stat_dir_dotdot_f", stat(P("/d/../f"), &st));
+    say("stat_missing_dotdot", stat(P("/nope/.."), &st));
+    say("stat_l2f_dotdot", stat(P("/l2f/.."), &st)); /* link to a file */
+    say("stat_l2d_dotdot", stat(P("/l2d/.."), &st)); /* link to a directory */
+    say("stat_dang_dotdot", stat(P("/dang/.."), &st));
+    say("stat_file_dot_dotdot", stat(P("/f/./.."), &st));
+    say("stat_file_dotdot_twice", stat(P("/d/../f/../d"), &st));
+    /* The one that did damage: the name the kernel refuses to reach names f
+     * itself once the pair is collapsed away, so the call went through. */
+    say("unlink_file_dotdot", unlink(P("/f/../f")));
+    say("stat_after_unlink", stat(P("/f"), &st));
+    { /* Put f back if it was wrongly removed, so what follows still means
+       * something on a build where this is broken. */
+        int fd = open(P("/f"), O_WRONLY | O_CREAT, 0644);
+        if (fd >= 0) {
+            if (write(fd, "hi", 2) != 2)
+                printf("rewrite=short\n");
+            close(fd);
+        }
+    }
+    say("unlink_via_file_dotdot", unlink(P("/f/../nope/../f")));
+    say("intact_after_bad_dotdot", stat(P("/f"), &st));
+    /* A good ".." still gets through, including to a name that is not there
+     * yet: the check is on what is left, not on where the path ends up. */
+    say("creat_via_dotdot", open(P("/d/../new3"), O_WRONLY | O_CREAT, 0644));
+    say("unlink_via_dotdot", unlink(P("/d/../new3")));
+    /* ...and the two spellings meet: "f/../" is both. */
+    say("stat_file_dotdot_slash", stat(P("/f/../"), &st));
+    say("stat_dir_dotdot_slash", stat(P("/d/../"), &st));
+    /* Only a whole ".." component counts. A name with dots in it is a name. */
+    say("stat_dotty_name", stat(P("/a..b"), &st));
+    say("stat_dotty_name_dotdot", stat(P("/a..b/.."), &st));
+
     /* --- and it overrides "do not follow the last link" ------------------- */
     say("lstat_l2f_slash", lstat(P("/l2f/"), &st));
     say("lstat_l2d_slash", lstat(P("/l2d/"), &st));
@@ -140,7 +177,32 @@ int main(int argc, char **argv) {
     say("at_open_file_slash", openat(d, "f/", O_RDONLY));
     say("at_open_dir_slash", openat(d, "d/", O_RDONLY | O_DIRECTORY));
     say("at_unlink_file_slash", unlinkat(d, "f/", 0));
+    /* ...and "..", which against a real dirfd is joined onto the directory's
+     * own guest path before it is walked. */
+    say("at_stat_file_dotdot", fstatat(d, "f/..", &st, 0));
+    say("at_stat_dir_dotdot", fstatat(d, "d/..", &st, 0));
+    say("at_stat_bare_dotdot", fstatat(d, "..", &st, 0));
+    say("at_open_file_dotdot", openat(d, "f/../d", O_RDONLY | O_DIRECTORY));
+    say("at_unlink_file_dotdot", unlinkat(d, "f/../f", 0));
     close(d);
+
+    /* --- exec asks the same of its path, and is the one call that does not
+     * reach the kernel through the dispatcher's argument table. None of these
+     * can succeed, so the process is still here to print what follows: the
+     * first two fail on the ".." itself, and the third gets as far as trying to
+     * execute a directory, which is what says the check let a good one past. */
+    {
+        char *av[] = {(char *)"x", 0}, *ev[] = {0};
+        errno = 0;
+        execve(P("/f/../d"), av, ev);
+        printf("exec_file_dotdot=%d\n", errno);
+        errno = 0;
+        execve(P("/nope/../d"), av, ev);
+        printf("exec_missing_dotdot=%d\n", errno);
+        errno = 0;
+        execve(P("/d/../d"), av, ev);
+        printf("exec_dir_dotdot=%d\n", errno);
+    }
 
     /* --- and the zones that exist only inside the emulation -------------- */
     say("dev_null_slash", stat("/dev/null/", &st));

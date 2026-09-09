@@ -590,18 +590,27 @@ check_contains "swapon likewise" "denied swapon: rc=-38 -> OK" "$out"
 check_contains "acct likewise" "denied acct: rc=-38 -> OK" "$out"
 rm -rf "$DR"
 
-# A trailing slash is a statement about the FILE, not about the name: "f/" says
-# f had better be a directory, and Linux answers ENOTDIR when it is not. It says
-# it loudly enough to override the caller -- a final symlink is followed under
-# O_NOFOLLOW and AT_SYMLINK_NOFOLLOW alike, and an O_CREAT becomes EISDIR.
+# Two ways a guest path says "this had better be a directory", both of which
+# canonicalization throws away -- because what canonicalization makes is a name,
+# and neither of these is about the name.
 #
-# Canonicalizing a guest path drops trailing slashes, which is what turns a
-# spelling into a name, so the statement never reached the kernel and every one
-# of these answered about the file itself. Mostly that was a wrong answer;
-# for the calls that WRITE it was worse, since `unlink("f/")` removed the file
-# the kernel refuses to touch. Byte-for-byte against the host build.
+# A trailing slash: "f/" says f is a directory, and Linux answers ENOTDIR when
+# it is not, loudly enough to override the caller -- a final symlink is followed
+# under O_NOFOLLOW and AT_SYMLINK_NOFOLLOW alike, and an O_CREAT becomes EISDIR.
+#
+# And "..", which is walked THROUGH the directory it leaves: "f/.." is ENOTDIR
+# and "missing/.." is ENOENT, where collapsing the pair -- the thing that keeps
+# a guest inside its rootfs, since "/../../etc" has to come out as "/etc" --
+# never looks at what is being left.
+#
+# Neither statement reached the kernel, so every one of these answered about a
+# file the kernel would have refused to reach. Mostly that was a wrong answer;
+# for the calls that WRITE it was worse, since `unlink("f/")` and
+# `unlink("f/../f")` both removed a file the kernel will not touch.
+# Byte-for-byte against the host build.
 TSD=$(mktemp -d)
 mkdir -p "$TSD/d" "$TSD/d2"; printf hi > "$TSD/f"; : > "$TSD/d/mark"
+printf x > "$TSD/a..b"   # dots in a name are not a ".." component
 ln -s f "$TSD/l2f"; ln -s d "$TSD/l2d"; ln -s nowhere "$TSD/dang"
 ln -s /d "$TSD/labs"   # absolute target: only the walk can re-root it
 if ! guest_xlate_ready "trailing-slash legs"; then
@@ -618,16 +627,16 @@ elif guest_cc_report "$TSD/trailslash" tests/guests/trailslash.c; then
         skip "trailing-slash differential: no host compiler for the oracle"
     elif [ "$ts_k" = "$ts_g" ]; then
         pass=$((pass + 1))
-        echo "  ok   a trailing slash matches the kernel byte-for-byte"
+        echo "  ok   a trailing slash and \"..\" match the kernel byte-for-byte"
     else
         fail=$((fail + 1))
-        echo "  FAIL a trailing slash diverges from the kernel"
+        echo "  FAIL a trailing slash or \"..\" diverges from the kernel"
         printf '    kernel: %s\n' "$(echo "$ts_k" | tr '\n' '|')"
         printf '    cng   : %s\n' "$(echo "$ts_g" | tr '\n' '|')"
     fi
     # ...and the tree is still standing, which is the half of it that a diff
     # against a mangled oracle could not have caught on its own.
-    check_contains "the trailing-slash probes left the tree as they found it" \
+    check_contains "the path-spelling probes left the tree as they found it" \
         "intact=1" "$ts_g"
     # The one question the oracle cannot be asked: the same tree on the host has
     # no rootfs to be inside of. A trailing slash makes the kernel follow the

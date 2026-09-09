@@ -670,6 +670,26 @@ int cng_resolve_lim(const char *path, int deref_final, char *out, size_t outsz,
                 }
                 continue;
             }
+            /* What is being left has to be a directory that exists: see
+             * cng_dotdot_verdict, which is the only caller that asks for this
+             * and the only one that acts on the answer. */
+            if (lim && lim->check_dotdot) {
+                char dh[CNG_PATH_MAX], dst[144];
+                long e = 0; /* a name with no host path is not this to answer */
+                if (cng_fs_translate(cng_g_fs, canon, dh, sizeof dh) == 0) {
+                    e = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, (long)dh,
+                                (long)dst, 0, 0, 0);
+                    if (e >= 0)
+                        e = (*(unsigned *)(dst + STAT_MODE_OFF) & CNG_S_IFMT) ==
+                                    CNG_S_IFDIR
+                                ? 0
+                                : -ENOTDIR;
+                }
+                if (e) {
+                    lim->dotdot_err = e;
+                    return e;
+                }
+            }
             canon_pop(canon);
             /* Backing out of a bind leaves its mount as surely as entering one
              * does, and RESOLVE_NO_XDEV forbids the crossing either way. */
@@ -1757,6 +1777,68 @@ static void path_args_of(long nr, long a0, long a1, long a2, long a3,
     }
 }
 
+/* Is there a ".." component in this path at all? A string test, so the walk
+ * below is paid for only by the paths that have one — which is very few. */
+static int has_dotdot(const char *p) {
+    for (const char *q = p; *q; q++)
+        if (q[0] == '.' && q[1] == '.' && (q == p || q[-1] == '/') &&
+            (q[2] == '/' || q[2] == '\0'))
+            return 1;
+    return 0;
+}
+
+/* ".." is walked THROUGH the directory it leaves, and the kernel requires that
+ * directory to exist and to be one: "f/.." is ENOTDIR, so is "f/../g", and
+ * "missing/.." is ENOENT. Canonicalization collapses the pair away instead —
+ * which is what keeps a guest inside its rootfs, since "/../../etc" has to come
+ * out as "/etc" — and the component being left is then never looked at, so
+ * every one of these answered about a path the kernel would have refused to
+ * reach. `unlink("f/../f")` did not merely answer wrongly: it removed f.
+ *
+ * The verdict is reached by the ordinary walk, in one pass, because the walk is
+ * the only thing that knows what each component really is — it has expanded the
+ * symlinks by then, so "l2f/.." is ENOTDIR because the link leads to a file.
+ * Asking prefix by prefix from outside would have re-resolved the path once per
+ * ".." in it, and a guest may write a PATH_MAX name that is nothing but those:
+ * a thousand walks of a thousand components each, for one syscall.
+ *
+ * A second walk, though. The verdict cannot ride out of cng_resolve_lim on its
+ * return value, because that value is advisory — xlate falls back to the
+ * lexical translation for a walk that fails, on the grounds that the kernel
+ * re-derives an ELOOP or an ENAMETOOLONG for itself on the guest's own name,
+ * which it cannot do for this one: the name it is handed no longer has the ".."
+ * in it. So the check runs as its own pass, once, on the copy of the guest's
+ * own spelling, and every path-bearing syscall gets it from one place.
+ *
+ * What it deliberately does not do is stop the collapse. The host path handed
+ * over still has no ".." in it, so a race that turned the component into a
+ * directory between this and the syscall costs a wrong errno and cannot cost
+ * containment.
+ *
+ * Exported because exec is the one path-bearing call that does not come through
+ * the dispatcher's argument table: cng_emulate_execve and cng_execve_tramp go
+ * straight to the emulation, and it asks this for itself. */
+long cng_dotdot_verdict(long dirfd, const char *path) {
+    if (!path || !has_dotdot(path))
+        return 0;
+    struct cng_res_limit lim;
+    memset(&lim, 0, sizeof lim);
+    lim.check_dotdot = 1;
+    char out[CNG_PATH_MAX];
+    int dfd = (int)dirfd;
+    /* deref_final=0: every ".." here is preceded by a component the walk treats
+     * as non-final and therefore expands anyway, so nothing is gained by
+     * following the last one — and a dangling final link is not this check's
+     * business. */
+    if (path[0] == '/' || dfd == CNG_AT_FDCWD)
+        cng_resolve_lim(path, 0, out, sizeof out, &lim);
+    else if (dfd >= 0)
+        xlate_at_lim(dfd, path, out, sizeof out, 0, &lim);
+    /* Only the ".." verdict is acted on. Every other way the walk can fail is
+     * one the ordinary translation already absorbs or the kernel reproduces. */
+    return lim.dotdot_err;
+}
+
 #ifdef __NR_openat2
 /* RESOLVE_BENEATH / RESOLVE_IN_ROOT scope the whole resolution to `dirfd`, and
  * the kernel is the only thing that can apply them exactly — so where the
@@ -2366,6 +2448,22 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         }
     }
 
+    /* ...and every ".." in them goes through a directory that has to be one.
+     * After the l2s refusal above, which has to stay absolute: a name the store
+     * hides must look like nothing at all, not like something with a file in
+     * front of it. */
+    if (pa.p1 || pa.p2) {
+        long e = pa.p1 ? cng_dotdot_verdict(pa.d1, pa.p1) : 0;
+        if (!e && pa.p2)
+            e = cng_dotdot_verdict(pa.d2, pa.p2);
+        if (e) {
+            if (cng_g_debug)
+                cng_dprintf(2, "[cng] nr=%ld \"..\" through a non-directory "
+                               "-> errno=%ld\n", nr, -e);
+            return e;
+        }
+    }
+
     /* The designed-ENOSYS set. The filter answers these with RET_ERRNO, so a
      * seccomp-tier guest never gets here; a rewritten svc site (-R) has no
      * filter and calls straight in, so the refusal has to live here too. */
@@ -2396,7 +2494,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         long oflags = 0;
 #ifdef __NR_openat2
         struct cng_open_how how;
-        struct cng_res_limit lim = {0, 0, 0, 0, 0, 0, 0, 0};
+        struct cng_res_limit lim = {0}; /* every field: see the header */
         unsigned long resolve = 0;
         char sdir[CNG_PATH_MAX]; /* a scoped openat2's scope, as a guest path */
         int scoped = 0;          /* ...and whether this is one */

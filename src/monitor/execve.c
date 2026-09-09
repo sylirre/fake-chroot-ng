@@ -1269,6 +1269,18 @@ static long execve_core(int dirfd, const char *path, char **argv, char **envp,
         return -ENOENT;
     }
 
+    /* ...and the ".." components of the name, for the same reason every other
+     * path-bearing syscall has them checked: "/bin/sh/../ls" is ENOTDIR to the
+     * kernel, which walks into sh before it goes back up. Taken on the snapshot
+     * like every check around it. */
+    long dd = cng_dotdot_verdict(dirfd, a.path);
+    if (dd) {
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] execve %s -> \"..\" errno=%ld\n", a.path, -dd);
+        exec_args_free(&a);
+        return dd;
+    }
+
     rc = execve_load(dirfd, a.path, a.argv, a.envp, flags, out_sp, out_entry);
     /* The new stack owns its own copy of everything by now (on the failure paths
      * nothing was consumed at all), so the snapshot goes either way. */

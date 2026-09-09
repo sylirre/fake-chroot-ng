@@ -249,6 +249,10 @@ struct cng_res_limit {
     const char *scope;          /* guest dir BENEATH/IN_ROOT are anchored at */
     const char *xdev_base;      /* guest dir the walk starts in (0 = its base) */
     long err;                   /* the violation: -ELOOP or -EXDEV */
+    unsigned check_dotdot : 1;  /* validate what each ".." leaves (below) */
+    long dotdot_err;            /* that verdict, kept apart from `err` because
+                                 * it is the only one a caller acts on rather
+                                 * than letting the kernel re-derive it */
 };
 
 /* Resolve a guest path to a host path, following symlinks within the guest
@@ -259,6 +263,15 @@ struct cng_res_limit {
 int cng_resolve(const char *path, int deref_final, char *out, size_t outsz);
 int cng_resolve_lim(const char *path, int deref_final, char *out, size_t outsz,
                     struct cng_res_limit *lim);
+
+/* The errno a guest path's ".." components earn it, or 0. Each one is walked
+ * THROUGH the directory it leaves, so that directory has to exist and be one:
+ * "f/.." is ENOTDIR and "missing/.." is ENOENT, where the canonicalization that
+ * keeps a guest inside its rootfs collapses the pair away and never looks. The
+ * dispatcher asks this of every path argument it handles; exec asks it of its
+ * own, being the one call that does not pass through there. See the block
+ * comment on the definition in dispatch.c. */
+long cng_dotdot_verdict(long dirfd, const char *path);
 
 /* Resolve (dirfd, path) to a HOST path: absolute names and AT_FDCWD through the
  * rootfs, a real dirfd through the guest path it names — so a relative name is
