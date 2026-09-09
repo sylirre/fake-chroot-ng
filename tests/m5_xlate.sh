@@ -105,6 +105,37 @@ check_contains "a :ro suffix is not part of the guest mount point" \
     "/dev/null -> /hostdev/null" \
     "$(run -t xlate -r /root -b /hostdev:/dev:ro /dev/null)"
 
+# A bind source may be a single FILE. `mount --bind` takes one, and
+# `-b /etc/resolv.conf:/etc/resolv.conf` is the commonest bind there is.
+#
+# Two things it needs from the path layer, and the second is what a directory
+# bind was quietly getting for free. A bind source is stored the way the KERNEL
+# spells it — symlink-free — because the same prefix is matched against host
+# paths the kernel produces, a /proc/self/fd readback above all; the resolution
+# used an O_RDONLY|O_DIRECTORY open, which a file cannot satisfy, so a file bind
+# kept the caller's spelling and a guest that opened it read the host path back
+# out of /proc/self/fd. Asserted as the absence of the symlink component, since
+# the mktemp prefix itself may resolve differently on any given host.
+FB=$(mktemp -d)
+mkdir -p "$FB/real"
+printf 'bound\n' >"$FB/real/f"
+ln -s real "$FB/link"
+fb_out=$(run -t xlate -r /root -b "$FB/link/f":/etc/x /etc/x)
+check_absent "a file bind's host path is stored symlink-free" "/link/" "$fb_out"
+check_contains "...naming what the link pointed at" "/real/f" "$fb_out"
+check_absent "...and a directory bind still is" "/link" \
+    "$(run -t xlate -r /root -b "$FB/link":/etc/d /etc/d)"
+# A file has no children either: the name is joined to it and the kernel
+# answers ENOTDIR, exactly as it does under a /dev node.
+check_contains "a name under a file bind stays on the file" "/real/f/y" \
+    "$(run -t xlate -r /root -b "$FB/link/f":/etc/x /etc/x/y)"
+# ...and the whole thing end to end, through the dispatcher: the bind resolves
+# and the file reads.
+check_contains "a file bind opens and reads through the dispatcher" \
+    "read: bound" \
+    "$(run -t dtest -r "$FB" -b "$FB/real/f":/etc/x open /etc/x 2>&1)"
+rm -rf "$FB"
+
 # --- M17-11: physical resolution ------------------------------------------
 # Resolution is the kernel's, not the shell's: ".." backs out of where a symlink
 # actually led, so it has to be applied while walking, not collapsed lexically

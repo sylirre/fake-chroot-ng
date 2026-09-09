@@ -343,12 +343,15 @@ static void help(char **envp) {
         {"args...",   "Arguments passed on to the guest program."},
     };
     static const struct help_def opts[] = {
-        {"-b, --bind SRC:DST[:ro]", "Expose host directory SRC at guest path "
-                      "DST (repeatable, up to 64). Guest accesses under DST "
-                      "resolve to SRC on the host; append ':ro' to make the "
-                      "mount read-only (mutating syscalls under it answer "
-                      "EROFS). DST must be absolute; host paths may not contain "
-                      "':'."},
+        {"-b, --bind SRC:DST[:ro]", "Expose host path SRC at guest path DST "
+                      "(repeatable, up to 64). SRC is a directory and "
+                      "everything under it, or a single file — `mount --bind` "
+                      "takes either and so does this, which is what binding "
+                      "one config file over another needs. Guest accesses "
+                      "under DST resolve to SRC on the host; append ':ro' to "
+                      "make the mount read-only (mutating syscalls under it "
+                      "answer EROFS). DST must be absolute; host paths may not "
+                      "contain ':'."},
         {"-E, --env VAR=VAL", "Set a guest environment variable (repeatable, up "
                       "to 128). The guest does NOT inherit chroot-ng's "
                       "environment: a host variable describes the host, not the "
@@ -636,8 +639,11 @@ static int host_exists(const char *path) {
                    0) == 0;
 }
 
-/* Register a "-b SRC:DST[:ro]" spec: host directory SRC is exposed at absolute
- * guest path DST, read-only with a trailing ":ro". This is the arm64chroot
+/* Register a "-b SRC:DST[:ro]" spec: host path SRC is exposed at absolute guest
+ * path DST, read-only with a trailing ":ro". SRC is a directory or a single
+ * file — `mount --bind` takes either, and the file form is what
+ * `-b /etc/resolv.conf:/etc/resolv.conf` is; only existence is required of it
+ * here. This is the arm64chroot
  * order — host first — and it is the reverse of what chroot-ng accepted before
  * 0.1.0, so a swapped spec is diagnosed explicitly below rather than silently
  * mounting the wrong way round. Host paths may not contain ':'.

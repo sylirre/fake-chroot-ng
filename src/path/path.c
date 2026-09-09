@@ -251,10 +251,19 @@ static int fd_names(int fd, const char *path) {
  * answered /data/data/..., which cng_fs_untranslate could not reverse, so the
  * virtual cwd stayed where it was and the script resolved under it — ENOENT.
  *
- * Resolved by opening the directory and reading back the kernel's own name for
- * it. Anything that does not resolve (a nonexistent path — diagnosed by the
- * caller — or the synthetic roots the self-tests use, which have no host inode)
- * is kept verbatim, exactly as before.
+ * Resolved by opening the path and reading back the kernel's own name for it.
+ * Anything that does not resolve (a nonexistent path — diagnosed by the caller
+ * — or the synthetic roots the self-tests use, which have no host inode) is
+ * kept verbatim, exactly as before.
+ *
+ * The open is O_PATH, which refers to a file of any kind without opening it.
+ * O_RDONLY|O_DIRECTORY was two restrictions the reverse map cannot afford: a
+ * bind source that is a FILE — `-b /etc/resolv.conf:/etc/resolv.conf`, the
+ * commonest bind there is — could not be opened at all and so kept the
+ * caller's spelling, and a guest that opened it then read the host path back
+ * out of /proc/self/fd; and a directory that grants search but not read
+ * (mode 0111, and every /data/data/<pkg> ancestor on Android) failed the same
+ * way. O_PATH needs neither permission and takes every file type.
  *
  * What used to stand in for "is this readback a name at all" was refusing any
  * that contained a space, on the grounds that " (deleted)" has one. So did
@@ -264,8 +273,7 @@ static int fd_names(int fd, const char *path) {
  * is the same reverse-lookup failure the symlink case above describes, reached
  * a different way, and on the same paths a phone hands out. */
 static int canon_host_root(char *dst, size_t dstsz, const char *src) {
-    long fd = sys_openat(CNG_AT_FDCWD, src,
-                         CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
+    long fd = sys_openat(CNG_AT_FDCWD, src, CNG_O_PATH | CNG_O_CLOEXEC, 0);
     if (fd >= 0) {
         char link[40], real[CNG_PATH_MAX];
         cng_snprintf(link, sizeof link, "/proc/self/fd/%d", (int)fd);
