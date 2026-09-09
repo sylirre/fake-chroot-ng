@@ -52,4 +52,15 @@ else
     check_contains "ld.so bootstrapped main (argc)" "guest: argc=3" "$out"
     check_contains "dynamic argv forwarded" "guest: argv1=XX" "$out"
     check_contains "dynamic env forwarded" "guest: CNG_TEST=dyn" "$out"
+
+    # -L is a prefix the interpreter's own name is joined onto, and the join
+    # truncated at PATH_MAX. A cut path is a different path — one that may
+    # exist, and would then have been loaded as the interpreter — so the join
+    # refuses rather than shortening. Before, the shortened name reached the
+    # loader and the failure was reported about a path nobody typed.
+    m4_long="/$(printf '%4090s' '' | tr ' ' 'a')"
+    out=$(run -L "$m4_long" / "$GDIR/hello_dyn" 2>&1); rc=$?
+    check "an over-long --lib-prefix is refused" 1 $rc
+    check_contains "...as a length, not as a failure to load something else" \
+        "interpreter path is too long" "$out"
 fi

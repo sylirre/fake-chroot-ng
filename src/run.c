@@ -70,10 +70,16 @@ static const char *load_err(int rc) {
     }
 }
 
+/* Join `a` and `b` into `dst`. Returns dst, or 0 when the result did not fit:
+ * cng_strlcpy truncates, and a cut path is a different path — the one caller
+ * hands the result straight to the loader, which would then open whatever the
+ * shortened name happens to be, or report "cannot open" about a name nobody
+ * asked for. Same rule as everywhere else a path is assembled here (see
+ * normalize_root and cng_fs_abscanon in path.c). */
 static char *join2(char *dst, size_t size, const char *a, const char *b) {
     size_t n = cng_strlcpy(dst, a, size);
-    if (n < size)
-        cng_strlcpy(dst + n, b, size - n);
+    if (n >= size || cng_strlcpy(dst + n, b, size - n) >= size - n)
+        return 0;
     return dst;
 }
 
@@ -378,9 +384,15 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
     if (prog.has_interp) {
         char ipath[CNG_PATH_MAX];
         const char *ip;
-        if (libprefix)
+        if (libprefix) {
             ip = join2(ipath, sizeof ipath, libprefix, prog.interp);
-        else if (cng_resolve(prog.interp, 1, ipath, sizeof ipath) == 0)
+            if (!ip) {
+                cng_dprintf(2,
+                            "chroot-ng: interpreter path is too long: %s + %s\n",
+                            libprefix, prog.interp);
+                return 1;
+            }
+        } else if (cng_resolve(prog.interp, 1, ipath, sizeof ipath) == 0)
             ip = ipath;
         else
             ip = prog.interp;
