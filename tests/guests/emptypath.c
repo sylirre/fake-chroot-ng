@@ -26,12 +26,23 @@
  * kernel opens the working directory for execution rather than refusing the
  * number — which is EACCES, not EBADF. See the exec_* lines.
  *
+ * And the descriptor it is given may be an O_PATH one, which is the documented
+ * shape of fexecve: it refers to the file without opening it, so it needs no
+ * read permission and has no readable side at all. The kernel runs it by
+ * opening what it names with its own exec flags. An emulation that loads the
+ * image by reading the descriptor cannot — pread and mmap answer EBADF on an
+ * O_PATH fd — and has to reopen the file by name instead, which is a different
+ * act in exactly one place: a descriptor may hold a SYMLINK, where opening for
+ * execution is ELOOP and reopening by name follows it. See the exec_opath*
+ * lines.
+ *
  * Output is protocol only, so the same source built for the host is the oracle.
  */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -83,6 +94,13 @@ static void execprobe(const char *tag, int fd, int flags) {
 }
 
 int main(int argc, char **argv) {
+    /* The image the last probe below re-executes through an O_PATH descriptor.
+     * It prints one line and leaves, so the exec is observable as output rather
+     * than as an exit status. */
+    if (argc > 2 && !strcmp(argv[2], "child")) {
+        printf("exec_opath=ok\n");
+        return 0;
+    }
     if (argc > 1)
         base = argv[1];
     probe("symlink_fd", "/l");   /* -> f, a regular file */
@@ -155,5 +173,51 @@ int main(int argc, char **argv) {
     close(df);
     close(rf);
     execprobe("exec_closedfd", rf, AT_EMPTY_PATH);
+
+    /* An O_PATH descriptor refers to a file without opening it, which is
+     * exactly what a caller holding one to execute later wants — it is the
+     * documented shape of fexecve, and needs no read permission. The kernel
+     * executes it: with AT_EMPTY_PATH it opens the file the descriptor names
+     * with its own exec flags. An emulation that reads the image out of the
+     * descriptor cannot, since pread and mmap answer EBADF on one, so what it
+     * must do instead is reopen the file by name.
+     *
+     * The refusals come first, because they leave the process here to print:
+     *  - a regular file that is not executable is EACCES, the same answer its
+     *    readable descriptor gets, so this says the reopen did not quietly
+     *    become the permission check;
+     *  - a directory is EACCES;
+     *  - a SYMLINK is the one thing only an O_PATH|O_NOFOLLOW descriptor can
+     *    hold, and opening it for execution is ELOOP — where the same file
+     *    named as "/proc/self/fd/N" would have followed the link and run its
+     *    target. */
+    int of = openat(AT_FDCWD, src, O_PATH);
+    execprobe("exec_opath_regular", of, AT_EMPTY_PATH);
+    close(of);
+    char lp[512];
+    snprintf(lp, sizeof lp, "%s/l", base);
+    of = openat(AT_FDCWD, lp, O_PATH | O_NOFOLLOW);
+    execprobe("exec_opath_link", of, AT_EMPTY_PATH);
+    close(of);
+    of = openat(AT_FDCWD, base[0] ? base : "/", O_PATH);
+    execprobe("exec_opath_dir", of, AT_EMPTY_PATH);
+    close(of);
+
+    /* ...and the one that succeeds, last, since it replaces this program: our
+     * own image through an O_PATH descriptor. The line comes from the new
+     * image on success and from here on failure, so either way there is
+     * exactly one — and the buffer is flushed first, because a successful
+     * exec drops everything not yet written. */
+    of = openat(AT_FDCWD, argv[0], O_PATH);
+    if (of < 0) {
+        printf("exec_opath=openfail\n");
+        return 0;
+    }
+    char *av[] = {(char *)"x", (char *)base, (char *)"child", 0};
+    char *ev[] = {0};
+    fflush(stdout);
+    errno = 0;
+    syscall(SYS_execveat, of, "", av, ev, AT_EMPTY_PATH);
+    printf("exec_opath=%d\n", errno);
     return 0;
 }

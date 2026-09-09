@@ -832,6 +832,22 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
          * below reads it with pread/mmap, so the guest's file offset — shared
          * with its parent through fork — is left alone. */
         gfd = cng_proc_self_fd(host); /* the guest's fd: never close it */
+        /* ...but only one whose contents we can reach. An O_PATH descriptor
+         * refers to a file without opening it: pread and mmap both answer
+         * EBADF, and everything below reads the image, so working from it
+         * produced ENOEXEC for a program the kernel runs. The kernel runs it by
+         * opening the file the descriptor names with its own exec flags, and
+         * opening the /proc/self/fd name — the ordinary route below — is that
+         * same act, so hand it back to that. (An O_PATH fd is the documented
+         * way to hold a file you intend to fexecve; both musl and glibc reach
+         * for these two spellings in this order.) What no route can recover is
+         * an image with no name left, since an O_PATH fd has no readable side
+         * to fall back on. */
+        if (gfd >= 0) {
+            long gfl = sys_fcntl(gfd, CNG_F_GETFL, 0);
+            if (gfl < 0 || (gfl & CNG_O_PATH))
+                gfd = -1;
+        }
         if (gfd >= 0 && cng_g_debug) {
             char st[128]; /* AArch64 struct stat: mode@16, uid@24, gid@28 */
             if (CNG_SYS(__NR_fstat, gfd, st, 0, 0, 0, 0) == 0)
@@ -1184,6 +1200,19 @@ static long execve_core(int dirfd, const char *path, char **argv, char **envp,
         } else {
             if (sys_fcntl(dirfd, CNG_F_GETFD, 0) < 0)
                 return -EBADF;
+            /* The descriptor IS the file, and one opened O_PATH|O_NOFOLLOW may
+             * hold a symlink — the only way a descriptor can. The kernel opens
+             * what it names for execution and refuses a final symlink there:
+             * ELOOP. Naming it below puts it back on the ordinary path, where
+             * the magic link is followed like any other and the TARGET runs.
+             * Both measured on 6.17, and the difference is the spelling, not
+             * the descriptor: the same fd written out by the guest as
+             * "/proc/self/fd/N" does run the target. So this belongs to the
+             * empty-path form alone, which is where it sits. */
+            char lst[144]; /* struct stat; st_mode at 16 on every arch we build */
+            if (CNG_SYS(__NR_fstat, dirfd, (long)lst, 0, 0, 0, 0) == 0 &&
+                (*(unsigned *)(lst + 16) & 0170000) == 0120000)
+                return -ELOOP;
             cng_snprintf(fdpath, sizeof fdpath, "/proc/self/fd/%d", dirfd);
             path = fdpath;
             dirfd = CNG_AT_FDCWD;
