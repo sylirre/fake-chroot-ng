@@ -72,9 +72,20 @@ check_contains "/dev/fd is the /proc fd link" \
     "/dev/fd/7 -> /proc/self/fd/7" "$(run -t xlate -r /root /dev/fd/7)"
 check_contains "/dev/stdin is fd 0" \
     "/dev/stdin -> /proc/self/fd/0" "$(run -t xlate -r /root /dev/stdin)"
+# A whitelist entry has no children of its own making: a name under one is
+# joined to the host node and answered by the kernel there. For a device that is
+# ENOTDIR, which is what Linux says about /dev/null/x — and NOT a lookup in the
+# rootfs, which would hand a tree's own dev/null/x to the guest through a name
+# it was told is a character device.
+check_contains "a name under a device node stays on the host node" \
+    "/dev/null/x -> /dev/null/x" "$(run -t xlate -r /root /dev/null/x)"
+check_contains "...and under the std* aliases follows the fd they name" \
+    "/dev/stdin/x -> /proc/self/fd/0/x" "$(run -t xlate -r /root /dev/stdin/x)"
 # The containment half: a device NOT on the whitelist must not be reachable.
 check_contains "a non-whitelisted device resolves into the rootfs" \
     "/dev/sda1 -> /root/dev/sda1" "$(run -t xlate -r /root /dev/sda1)"
+check_contains "...and so does a name under it" \
+    "/dev/sda1/x -> /root/dev/sda1/x" "$(run -t xlate -r /root /dev/sda1/x)"
 check_contains "/dev itself is the rootfs directory (so it can be listed)" \
     "/dev -> /root/dev" "$(run -t xlate -r /root /dev)"
 # A bind still outranks the zone: cng_fs_translate matches binds first.

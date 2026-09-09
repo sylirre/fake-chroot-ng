@@ -302,3 +302,23 @@ elif guest_cc_report "$M14D/atoverlay" tests/guests/atoverlay.c; then
         "bind-openat=ok" "$out"
 fi
 rm -rf "$M14D" "$M14DB"
+
+# A whitelist device node has no children. The zone says /dev/null IS the host's
+# character device, so a name under it has to be the ENOTDIR the kernel gives
+# below one — never a lookup in the rootfs, which would serve the tree's own
+# dev/null/x through a name the guest was told is a device. The rootfs here
+# carries exactly that file, so the two answers are distinguishable.
+M14N=$(mktemp -d)
+mkdir -p "$M14N/dev/null"
+echo LEAK >"$M14N/dev/null/x"
+if [ -z "$M14_ALPINE" ] || [ ! -x "$M14_ALPINE/bin/busybox" ]; then
+    skip "m14 a name under a device node: no alpine rootfs"
+else
+    out=$(run -R -b "$M14_ALPINE/bin":/bin -b "$M14_ALPINE/lib":/lib \
+        -b "$M14_ALPINE/usr":/usr "$M14N" /bin/busybox cat /dev/null/x 2>&1)
+    check_absent "m14 a rootfs file under /dev/null is not reachable" "LEAK" \
+        "$out"
+    check_contains "m14 ...it is ENOTDIR, as under a real device node" \
+        "Not a directory" "$out"
+fi
+rm -rf "$M14N"

@@ -41,15 +41,15 @@ extern int cng_g_no_dev;
  * /proc/self/fd), and is what gets lstat'ed for a real d_type when the entry is
  * spliced into a listing.
  *
- * `dir` marks the entries a guest may name a path *under* — the device nodes
- * have no children, and a name like "/dev/null/x" is ENOTDIR, not a lookup. It
- * is a field rather than a test on `host` because one of those host paths is
- * chosen at startup (see cng_dev_shm_init) and comparing against a literal
- * would silently stop matching the day it changes. */
+ * A name *under* an entry is joined to that host path, so what may be reached
+ * there is whatever the host node offers: an entry under pts/, shm/ or fd/ for
+ * the directory-valued ones, and for a device node the ENOTDIR the kernel gives
+ * for a path below a character device — "/dev/null/x" is ENOTDIR, not a lookup
+ * in the rootfs. No entry needs to say which kind it is: the host node already
+ * does, and it is the one asked. */
 struct cng_dev_node {
     const char *name; /* basename under /dev */
     const char *host; /* host path it resolves to */
-    int dir;          /* a directory: subpaths under it resolve */
 };
 extern const struct cng_dev_node cng_dev_nodes[];
 extern const int cng_dev_nnodes;

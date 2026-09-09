@@ -40,13 +40,13 @@ int cng_g_no_dev = 0;
 static char g_shm_host[CNG_PATH_MAX] = "/dev/shm";
 
 const struct cng_dev_node cng_dev_nodes[] = {
-    {"null", "/dev/null", 0},         {"zero", "/dev/zero", 0},
-    {"full", "/dev/full", 0},         {"random", "/dev/random", 0},
-    {"urandom", "/dev/urandom", 0},   {"tty", "/dev/tty", 0},
-    {"ptmx", "/dev/ptmx", 0},         {"console", "/dev/tty", 0},
-    {"pts", "/dev/pts", 1},           {"shm", g_shm_host, 1},
-    {"fd", "/proc/self/fd", 1},       {"stdin", "/proc/self/fd/0", 0},
-    {"stdout", "/proc/self/fd/1", 0}, {"stderr", "/proc/self/fd/2", 0},
+    {"null", "/dev/null"},         {"zero", "/dev/zero"},
+    {"full", "/dev/full"},         {"random", "/dev/random"},
+    {"urandom", "/dev/urandom"},   {"tty", "/dev/tty"},
+    {"ptmx", "/dev/ptmx"},         {"console", "/dev/tty"},
+    {"pts", "/dev/pts"},           {"shm", g_shm_host},
+    {"fd", "/proc/self/fd"},       {"stdin", "/proc/self/fd/0"},
+    {"stdout", "/proc/self/fd/1"}, {"stderr", "/proc/self/fd/2"},
 };
 const int cng_dev_nnodes =
     (int)(sizeof cng_dev_nodes / sizeof cng_dev_nodes[0]);
@@ -138,18 +138,21 @@ static int dev_zone(const char *canon, char *out, size_t outsz) {
             cng_strlcpy(out, cng_dev_nodes[i].host, outsz);
             return 1;
         }
-        /* A subpath is only meaningful for the directory-valued entries
-         * (pts/<n>, shm/<name>, fd/<n>); a device node has no children. */
+        /* A subpath rides along on the host node, whichever kind it is. For the
+         * directory-valued entries that is the entry the guest asked for
+         * (pts/<n>, shm/<name>, fd/<n>). For a device node it is a name *under*
+         * a character device, and the host kernel answers the ENOTDIR Linux
+         * gives for /dev/null/x — which is the point: falling through to the
+         * rootfs instead made the answer depend on the tree, so a rootfs
+         * carrying a real dev/null/x had it opened, reached through a name the
+         * guest was told is a device. The std* aliases resolve through the fd
+         * they name, exactly as following the symlink they are on Linux does. */
         if (c == '/') {
-            const char *h = cng_dev_nodes[i].host;
-            if (cng_dev_nodes[i].dir) {
-                size_t n = cng_strlcpy(out, h, outsz);
-                if (n >= outsz ||
-                    cng_strlcpy(out + n, leaf + nl, outsz - n) >= outsz - n)
-                    return -1; /* truncated: the caller must not use `out` */
-                return 1;
-            }
-            return 0;
+            size_t n = cng_strlcpy(out, cng_dev_nodes[i].host, outsz);
+            if (n >= outsz ||
+                cng_strlcpy(out + n, leaf + nl, outsz - n) >= outsz - n)
+                return -1; /* truncated: the caller must not use `out` */
+            return 1;
         }
     }
     return 0;
