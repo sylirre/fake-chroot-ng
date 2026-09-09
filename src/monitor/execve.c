@@ -9,9 +9,22 @@
  * monitor resident. This is the piece that makes the in-process model hold
  * together across program replacement.
  *
- * We do not tear down the previous program's mappings; the new program gets a
- * fresh stack and a kernel-chosen load base, so they don't collide. Repeated
- * execve leaks the old images (acceptable for now; noted in STATUS).
+ * The address space stays, but the program it held does not. The incoming
+ * program gets a fresh stack and a kernel-chosen load base, so the two never
+ * collide, and what the outgoing one occupied is handed back in two parts:
+ *
+ *  - the images and the stack our loader mapped, whose extents we recorded.
+ *    cng_exec_generation retires them and cng_exec_reap unmaps them at the next
+ *    dispatched syscall, by which time nothing is standing on them any more;
+ *  - everything the outgoing program mapped for ITSELF — the libraries its
+ *    ld.so loaded, its allocator's reservations — which no record of ours
+ *    describes. exec_sweep asks the question the other way round and gives back
+ *    what in this address space was never the monitor's.
+ *
+ * Both halves happen only where the process is single-threaded, since another
+ * thread may still be running the old program on the old program's stack, and
+ * both fail closed: a guest with threads keeps every byte of the outgoing
+ * generation. See the block comments on each below.
  */
 #include "cng/broker.h" /* cng_broker_env: no getenv in a freestanding build */
 #include "cng/l2s.h"
