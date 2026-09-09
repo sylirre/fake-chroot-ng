@@ -101,6 +101,11 @@ check_contains "stat falls back to synthesis where the host denies it" \
 check_contains "maps leaks no host path" "proctest maps:" "$out"
 check_contains "an fd link reports the guest path" \
     "proctest fdlink: / -> OK" "$out"
+# ...and a buffer the value does not fit in cuts the guest spelling, rather than
+# being left as the kernel wrote it — which for a short buffer is the head of
+# the HOST path, and past the answer its tail.
+check_contains "a short readlink buffer truncates the guest path, not the host one" \
+    "proctest fdlink short: 1=/ 2=/r 3=/rl 4=/rl residue=0 -> OK" "$out"
 check_contains "a map_files link target is mapped into the guest view" \
     "proctest map_files:" "$out"
 check_contains "status Uid/Gid remapped under --fake-id" \

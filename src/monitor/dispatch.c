@@ -2912,21 +2912,44 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * lsof's map_files walk all land here. Targets outside the view
          * (memfd:, pipe:[..], a host-only file) are left exactly as the kernel
          * wrote them. */
-        if (r > 0 && r < bufsiz && rl_may_fdlink(a0, gp)) {
+        if (r > 0 && rl_may_fdlink(a0, gp)) {
             char canon[CNG_PATH_MAX];
             if (at_canon(a0, gp, canon, sizeof canon) == 0) {
                 size_t pl = proc_pid_prefix(canon, 0);
                 if (pl && (!strncmp(canon + pl, "fd/", 3) ||
                            !strncmp(canon + pl, "map_files/", 10))) {
                     char tgt[CNG_PATH_MAX], guest[CNG_PATH_MAX];
-                    /* The kernel wrote this buffer, but that says nothing about
-                     * reading it back a syscall later: the guest owns it and can
-                     * unmap it in between, so it is taken like any other guest
-                     * range rather than dereferenced. */
-                    if ((size_t)r < sizeof tgt &&
-                        cng_user_copyin(tgt, (const char *)a2, (size_t)r) == 0 &&
-                        tgt[0] == '/') {
-                        tgt[r] = '\0';
+                    long tl = -1;
+                    if (r < bufsiz) {
+                        /* The whole value fit, so the kernel's answer is
+                         * complete. It wrote this buffer, but that says nothing
+                         * about reading it back a syscall later: the guest owns
+                         * it and can unmap it in between, so it is taken like
+                         * any other guest range rather than dereferenced. */
+                        if ((size_t)r < sizeof tgt &&
+                            cng_user_copyin(tgt, (const char *)a2,
+                                            (size_t)r) == 0)
+                            tl = r;
+                    } else {
+                        /* r == bufsiz: readlink truncates to the buffer, so
+                         * what came back is a PREFIX of the value and there is
+                         * nothing here to map — "/rootfs/etc/hosts" cut to 12
+                         * bytes is not a path the untranslate can recognize,
+                         * and cutting the guest spelling out of it afterwards
+                         * would answer a different name than the one asked
+                         * about. Leaving it alone was worse still: it handed
+                         * the guest the head of the HOST path, which for any
+                         * buffer shorter than the rootfs prefix is nothing but
+                         * where the rootfs lives on the device — the one thing
+                         * this fixup exists to keep from it. So the link is
+                         * read again into a buffer that cannot truncate, and
+                         * the guest spelling of the whole value is what gets
+                         * cut to size below, exactly as the kernel cuts its
+                         * own. */
+                        tl = sys_readlinkat((int)a0, p, tgt, sizeof tgt - 1);
+                    }
+                    if (tl > 0 && (size_t)tl < sizeof tgt && tgt[0] == '/') {
+                        tgt[tl] = '\0';
                         if (cng_fs_untranslate(cng_g_fs, tgt, guest,
                                                sizeof guest) == 0) {
                             size_t gl = strlen(guest);
@@ -2937,6 +2960,28 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                              * kernel validated — the copy asks as it goes. */
                             if (cng_user_copyout((char *)a2, guest, gl) < 0)
                                 return -EFAULT;
+                            /* The kernel filled this buffer with the HOST path
+                             * before we got here, and the guest spelling is
+                             * usually the shorter of the two, so the bytes past
+                             * `gl` still hold its tail. readlink(2) does not
+                             * terminate its answer and a correct caller reads
+                             * only the returned length — but the bytes are in
+                             * the guest's memory either way, and what they
+                             * spell is the one thing this fixup exists to keep
+                             * from it. (Not academic: filling a buffer and
+                             * taking strlen of it is how much of the world
+                             * reads a link.) Scrub what the kernel wrote and
+                             * the mapped answer did not cover. */
+                            for (long z = (long)gl; z < r;) {
+                                static const char zeros[64] = {0};
+                                long k = r - z;
+                                if (k > (long)sizeof zeros)
+                                    k = (long)sizeof zeros;
+                                if (cng_user_copyout((char *)a2 + z, zeros,
+                                                     (unsigned long)k) < 0)
+                                    break;
+                                z += k;
+                            }
                             r = (long)gl;
                         }
                     }

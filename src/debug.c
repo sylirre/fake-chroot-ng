@@ -5000,6 +5000,78 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
         fails += !ok;
     }
 
+    /* 7a) ...and a buffer too small for it cuts the GUEST spelling, never the
+     *     host one. readlink truncates to the buffer and reports the cut
+     *     length, so the bytes a short buffer gets are the head of whatever
+     *     value was mapped into it: skipping the fixup whenever the answer
+     *     filled the buffer handed back the head of the HOST path, which for
+     *     any buffer shorter than the rootfs prefix is nothing but where the
+     *     rootfs lives on the device. Mapped first, cut second — so every
+     *     answer here is a prefix of the guest's own name. */
+    {
+        char hr[CNG_PATH_MAX], hp[CNG_PATH_MAX], line[160];
+        size_t li = 0;
+        int ok = 1;
+        long ffd = -1;
+        line[0] = '\0';
+        size_t hrl = cng_fs_translate(&fs, "/", hr, sizeof hr) == 0
+                         ? strlen(hr)
+                         : 0;
+        while (hrl > 1 && hr[hrl - 1] == '/')
+            hr[--hrl] = '\0'; /* the join below adds its own separator */
+        if (hrl && cng_snprintf(hp, sizeof hp, "%s/rl", hr) < sizeof hp)
+            ffd = sys_openat(CNG_AT_FDCWD, hp,
+                             CNG_O_RDWR | CNG_O_CREAT | CNG_O_CLOEXEC, 0644);
+        if (ffd >= 0) {
+            char p[64];
+            cng_snprintf(p, sizeof p, "/proc/self/fd/%d", (int)ffd);
+            for (int n = 1; n <= 4 && li < sizeof line; n++) {
+                char lb[8];
+                memset(lb, 0, sizeof lb);
+                long r = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD, (long)p,
+                                      (long)lb, n, 0, 0, 0);
+                long want = n < 3 ? n : 3; /* "/rl", cut to the buffer */
+                if (r != want || strncmp(lb, "/rl", (size_t)want))
+                    ok = 0;
+                li += cng_snprintf(line + li, sizeof line - li, " %d=%s", n,
+                                   r > 0 ? lb : "(err)");
+            }
+            /* ...and nothing of the host path is left lying past the answer.
+             * The kernel wrote its own, longer value here before the fixup
+             * replaced the head of it, so the tail stayed behind: a buffer
+             * filled and then strlen'd — how much of the world reads a link —
+             * spelled out where the rootfs lives on the device. */
+            char big[256];
+            memset(big, 'X', sizeof big);
+            long r = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD, (long)p,
+                                  (long)big, sizeof big, 0, 0, 0);
+            /* Looked for by the rootfs directory's own last component rather
+             * than by the whole prefix: the mapped answer overwrites the head
+             * of what the kernel wrote, so the leak that was here showed up as
+             * the TAIL of the host path ("...tmp.XXXXXXXXXX/rl"). */
+            const char *tail = strrchr(hr, '/');
+            tail = tail && tail[1] ? tail + 1 : hr;
+            int residue = 0;
+            size_t hl = strlen(tail);
+            for (size_t i = 0; hl > 1 && i + hl <= sizeof big; i++)
+                if (!memcmp(big + i, tail, hl))
+                    residue = 1;
+            if (r != 3 || strncmp(big, "/rl", 3) || residue)
+                ok = 0;
+            li += cng_snprintf(line + li, sizeof line - li,
+                               " residue=%d", residue);
+            sys_close((int)ffd);
+            cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/rl", 0, 0, 0, 0,
+                         0);
+        } else {
+            ok = 0;
+            cng_strlcpy(line, " (no rootfs file)", sizeof line);
+        }
+        cng_dprintf(1, "proctest fdlink short:%s -> %s\n", line,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
     /* 7b) a map_files link target is mapped back into the guest view, like an
      *     fd link: map a file that lives inside the rootfs and readlink its
      *     map_files entry. The range must come from the HOST's view of our
