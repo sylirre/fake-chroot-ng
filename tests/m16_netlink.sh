@@ -61,6 +61,21 @@ else
             "getifaddrs: ok" "$em"
         check_contains "m16 the loopback interface is visible" "lo=1" "$em"
         check_contains "m16 socket(AF_NETLINK) is served" "socket: ok" "$em"
+        # ...and only for the types netlink takes. The emulation reads the
+        # family and the protocol; the type went unread, so a SOCK_STREAM
+        # netlink socket — which no kernel grants — was served as readily as a
+        # SOCK_RAW one. On the hosts this shim exists for, the real syscall
+        # cannot be left to say so: it answers about the SELinux policy, from a
+        # hook that runs before netlink_create is reached.
+        check_contains "m16 netlink's other type, SOCK_DGRAM, is served too" \
+            "socktype dgram: 0" "$em"
+        check_contains "m16 a socket type netlink does not take is ESOCKTNOSUPPORT" \
+            "socktype stream: 94" "$em"
+        check_contains "m16 ...for every one of them" \
+            "socktype seqpacket: 94" "$em"
+        check_contains "m16 ...including type 0" "socktype zero: 94" "$em"
+        check_contains "m16 a type outside the kernel's table is EINVAL" \
+            "socktype outofrange: 22" "$em"
         check_contains "m16 bind on an emulated socket succeeds" "bind: ok" "$em"
         # iproute2 refuses a getsockname answer that is not sockaddr_nl-sized;
         # the underlying AF_UNIX socket would report 2 bytes.

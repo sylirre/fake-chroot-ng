@@ -3318,8 +3318,13 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * refusal, so getifaddrs/iproute2/bubblewrap keep working. Every other
      * socket runs native. */
     case __NR_socket: {
+        /* Not `>= 0`: the hook also answers the refusals the emulated interface
+         * owes a request no kernel would grant, and those are its answers to
+         * give — the real syscall below would refuse the same call for the
+         * policy reason this whole file exists to paper over. -1 alone means
+         * "not ours". */
         long fd = cng_nl_socket(a0, a1, a2);
-        if (fd >= 0)
+        if (fd != -1)
             return fd;
         long r = reissue(a0, a1, a2, a3, a4, a5, nr);
         /* The same policy denies NETLINK_AUDIT, which is not emulated but does

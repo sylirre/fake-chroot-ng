@@ -41,9 +41,15 @@ void cng_nl_init(void);
 /* 1 if `fd` is one of our emulated netlink sockets. */
 int cng_nl_is_fake(int fd);
 
-/* socket(2) hook. Returns the new guest fd, or -1 when this is not an emulated
- * case (wrong family/protocol, host rtnetlink works, or the table is full) and
- * the real syscall should run. */
+/* socket(2) hook. Returns the new guest fd; the negative errno the emulated
+ * interface answers a request no kernel would grant (a socket type netlink does
+ * not take); or -1 when this is not an emulated case (wrong family/protocol,
+ * host rtnetlink works, or the table is full) and the real syscall should run.
+ *
+ * -1 is the sentinel and never an answer: EPERM is not something this interface
+ * says, and the refusals it does give have to reach the guest rather than fall
+ * through to a real syscall that, on the hosts this exists for, would answer
+ * about the policy instead of about the request. */
 long cng_nl_socket(long domain, long type, long protocol);
 
 /* NETLINK_AUDIT is refused, not emulated — but with the errno libaudit's callers

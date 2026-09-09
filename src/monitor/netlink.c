@@ -62,6 +62,7 @@ int cng_nl_deny_audit = 0;
 #define SOCK_DGRAM_    2
 #define SOCK_RAW_      3
 #define SOCK_TYPE_MASK 0xf /* SOCK_CLOEXEC/NONBLOCK ride the upper bits */
+#define SOCK_MAX_      11  /* SOCK_PACKET is 10, and __sock_create stops there */
 
 #define NLMSG_ERROR_   2
 #define NLMSG_DONE_    3
@@ -829,6 +830,28 @@ long cng_nl_socket(long domain, long type, long protocol) {
         return -1; /* not ours: let the real syscall run */
     if (!host_blocks())
         return -1; /* rtnetlink works here; nothing to emulate */
+    /* What the socket type is, is the kernel's to say — and this interface has
+     * to say it in the kernel's place. On the hosts this emulation exists for,
+     * the real syscall answers about the POLICY (EACCES from the security hook,
+     * which runs before netlink_create is ever reached) and never about the
+     * type, so a malformed request could not be handed to it for a verdict.
+     * Nothing asked, nothing refused: socket(AF_NETLINK, SOCK_STREAM,
+     * NETLINK_ROUTE) came back a working emulated socket, where every kernel
+     * refuses one.
+     *
+     * The order below is the kernel's own: __sys_socket rejects unknown flag
+     * bits, then __sock_create a type outside its table, and only then does
+     * netlink_create get to say that it takes exactly two types — SOCK_RAW and
+     * SOCK_DGRAM, which netlink treats alike. SOCK_CLOEXEC and SOCK_NONBLOCK
+     * are the O_ bits of the same names. */
+    if ((type & ~(long)SOCK_TYPE_MASK) &
+        ~(long)(CNG_O_CLOEXEC | CNG_O_NONBLOCK))
+        return -EINVAL;
+    long sotype = type & SOCK_TYPE_MASK;
+    if (sotype >= SOCK_MAX_)
+        return -EINVAL;
+    if (sotype != SOCK_RAW_ && sotype != SOCK_DGRAM_)
+        return -ESOCKTNOSUPPORT;
     int free_slot = -1;
     for (int i = 0; i < NL_SLOTS; i++) {
         if (g_slots[i].fd < 0 || !fd_ino(g_slots[i].fd) ||

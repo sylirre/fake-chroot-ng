@@ -50,6 +50,36 @@ int main(void) {
     }
     printf("socket: ok\n");
 
+    /* Which socket types netlink takes is the kernel's answer, and an emulated
+     * interface owes the same one: netlink_create accepts SOCK_RAW and
+     * SOCK_DGRAM and treats them alike, answers ESOCKTNOSUPPORT (94) for every
+     * other type in the table, and never sees a type outside it — __sock_create
+     * refuses that with EINVAL (22) first. Under emulation the type went
+     * unread, so a SOCK_STREAM netlink socket, which no kernel grants, came
+     * back working.
+     *
+     * The third refusal in that family, an unknown FLAG bit above the type,
+     * is not probed here: qemu-user rebuilds the flags word for the host
+     * socket() and drops bits it does not know, so under the cross-host
+     * emulator the unemulated run — this file's oracle — answers success for a
+     * call every real kernel refuses. The monitor still answers it (EINVAL,
+     * measured on 6.17 natively); there is just no oracle for it here. */
+    static const struct {
+        const char *tag;
+        int type;
+    } sk[] = {
+        {"dgram", SOCK_DGRAM},         {"stream", SOCK_STREAM},
+        {"seqpacket", SOCK_SEQPACKET}, {"rdm", SOCK_RDM},
+        {"zero", 0},                   {"outofrange", 15},
+    };
+    for (unsigned i = 0; i < sizeof sk / sizeof sk[0]; i++) {
+        errno = 0;
+        int t = socket(AF_NETLINK, sk[i].type, NETLINK_ROUTE);
+        printf("socktype %s: %d\n", sk[i].tag, t >= 0 ? 0 : errno);
+        if (t >= 0)
+            close(t);
+    }
+
     struct sockaddr_nl sa;
     memset(&sa, 0, sizeof sa);
     sa.nl_family = AF_NETLINK;
