@@ -484,7 +484,7 @@ static long inject_dents(long dirfd, const char *gdir, char *buf, long used,
         if (dent_present(dirfd, base, buf, used + added))
             continue;
         unsigned long long ino = 0xffffffffULL - (unsigned)i;
-        unsigned char type = 4; /* DT_DIR */
+        unsigned char type = CNG_DT_DIR;
         char st[144];
         if (CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD,
                     (long)cng_g_fs->binds[i].host, (long)st, 0, 0, 0) == 0) {
@@ -1576,11 +1576,16 @@ static int fd_is_rootfs_root(long fd) {
 }
 
 /* getdents64: hide the l2s machinery from directory listings — backing
- * data/marker names anywhere, and the ".l2s" store dir in the rootfs root; when
- * a whole batch is ours, re-read so a filtered 0 isn't mistaken for
- * end-of-directory. Then splice in the entries that exist only as resolution
- * overlays (bind mount points, /dev nodes) and so have no physical dirent to
- * return.
+ * data/marker names anywhere, and the ".l2s" store dir in the rootfs root — and
+ * make the links themselves read as what stat() says they are: the kernel's
+ * record for an emulated hardlink is the symlink's (DT_LNK, its own inode),
+ * and a guest taking d_type/d_ino on trust — GNU ls -F and --color, find -type
+ * f, ls -i, anything using the readdir fast path — saw a symlink where stat
+ * showed a regular file (busybox stats every entry, which is why the shell
+ * differential never caught it). When a whole batch is ours, re-read so a
+ * filtered 0 isn't mistaken for end-of-directory. Then splice in the entries
+ * that exist only as resolution overlays (bind mount points, /dev nodes) and so
+ * have no physical dirent to return.
  *
  * All of that reads the records back and rewrites them, and the buffer they sit
  * in is the guest's. The kernel having just filled it says nothing about the
@@ -1695,9 +1700,11 @@ __attribute__((noinline)) static long do_getdents64(long a0, long a1, long a2,
         return pre + n;
     int at_root = cng_g_l2s && fd_is_rootfs_root(a0);
     for (;;) {
-        /* linux_dirent64: d_reclen u16 @16, d_name @19. d_off cookies are
-         * directory-stream positions, so compaction is seek-safe. */
+        /* linux_dirent64: d_ino u64 @0, d_reclen u16 @16, d_type u8 @18,
+         * d_name @19. d_off cookies are directory-stream positions, so
+         * compaction is seek-safe. */
         long w = 0, o = 0;
+        int edited = 0;
         while (o + 19 <= n) {
             unsigned short reclen;
             memcpy(&reclen, kb + o + 16, 2);
@@ -1708,6 +1715,22 @@ __attribute__((noinline)) static long do_getdents64(long a0, long a1, long a2,
                                       (at_root && !strcmp(nm, ".l2s")))) ||
                        (at_proc && !proc_name_visible(nm));
             if (!hide) {
+                /* An emulated hardlink's record is rewritten to the data
+                 * file's inode and type. Asked only of a record that can be a
+                 * symlink: DT_LNK, or DT_UNKNOWN from a filesystem that does
+                 * not type its entries — a guest then stats every entry, and
+                 * the inode it compares against must still agree. Costs one
+                 * readlink per symlink listed under -l, two per link. */
+                unsigned char dt = (unsigned char)kb[o + 18];
+                if (cng_g_l2s && (dt == CNG_DT_LNK || dt == CNG_DT_UNKNOWN)) {
+                    unsigned long long ino;
+                    unsigned type;
+                    if (cng_l2s_dirent(a0, nm, &ino, &type)) {
+                        memcpy(kb + o, &ino, sizeof ino);
+                        kb[o + 18] = (char)type;
+                        edited = 1;
+                    }
+                }
                 if (w != o)
                     memmove(kb + w, kb + o, reclen);
                 w += reclen;
@@ -1715,9 +1738,11 @@ __attribute__((noinline)) static long do_getdents64(long a0, long a1, long a2,
             o += reclen;
         }
         if (w > 0) {
-            /* Only a batch that lost a record has to go back: what the filter
-             * left untouched is already exactly what the kernel wrote there. */
-            if (w != n && cng_user_copyout(buf, kb, (unsigned long)w) < 0)
+            /* Only a batch that lost or changed a record has to go back: what
+             * the filter left untouched is already exactly what the kernel
+             * wrote there. */
+            if ((w != n || edited) &&
+                cng_user_copyout(buf, kb, (unsigned long)w) < 0)
                 return -EFAULT;
             return pre + w;
         }

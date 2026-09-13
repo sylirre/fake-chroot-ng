@@ -2789,6 +2789,66 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
                 have_w, ok_hide ? "OK" : "FAIL");
     fails += !ok_hide;
 
+    /* The links' own records: the kernel lists an emulated hardlink as the
+     * symlink it is (DT_LNK, the link's inode), and a guest trusting
+     * d_type/d_ino — GNU ls -F, find -type f, ls -i — saw through it. A fresh
+     * group /w/dl1 + /w/dl2, listed through the dispatcher, must read DT_REG
+     * with the inode stat() reports for them; a real symlink beside them stays
+     * DT_LNK with its own. */
+    int de_1 = 0, de_2 = 0, de_sym = 0, de_seen = 0;
+    long delf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/dl1",
+                            CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (delf >= 0)
+        sys_close((int)delf);
+    long delr = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/dl1",
+                            CNG_AT_FDCWD, (long)"/w/dl2", 0, 0, 0);
+    cng_dispatch(__NR_symlinkat, (long)"dl1", CNG_AT_FDCWD, (long)"/w/dsym", 0,
+                 0, 0, 0);
+    char sd1[144], sd2[144], ssy[144];
+    long rd1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/dl1",
+                            (long)sd1, 0, 0, 0, 0);
+    long rd2 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/dl2",
+                            (long)sd2, 0, 0, 0, 0);
+    long rsy = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/dsym",
+                            (long)ssy, CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0);
+    long dwfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w",
+                             CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+    if (dwfd >= 0) {
+        char db[4096];
+        long dn;
+        while ((dn = cng_dispatch(__NR_getdents64, dwfd, (long)db, sizeof db,
+                                  0, 0, 0, 0)) > 0) {
+            long o = 0;
+            while (o + 19 <= dn) {
+                unsigned short rl;
+                memcpy(&rl, db + o + 16, 2);
+                if (rl == 0 || o + rl > dn)
+                    break;
+                unsigned long long dino;
+                memcpy(&dino, db + o, 8);
+                unsigned char dt = (unsigned char)db[o + 18];
+                const char *nm = db + o + 19;
+                if (!strcmp(nm, "dl1"))
+                    de_1 = dt == CNG_DT_REG && rd1 == 0 && dino == ST_INO(sd1);
+                else if (!strcmp(nm, "dl2"))
+                    de_2 = dt == CNG_DT_REG && rd2 == 0 && dino == ST_INO(sd2);
+                else if (!strcmp(nm, "dsym"))
+                    de_sym = dt == CNG_DT_LNK && rsy == 0 && dino == ST_INO(ssy);
+                de_seen++;
+                o += rl;
+            }
+        }
+        sys_close((int)dwfd);
+    }
+    cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/dsym", 0, 0, 0, 0, 0);
+    cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/dl2", 0, 0, 0, 0, 0);
+    cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/dl1", 0, 0, 0, 0, 0);
+    int ok_dent = (delr == 0 && de_1 && de_2 && de_sym && de_seen > 3);
+    cng_dprintf(1, "l2s-dirent: rc=%d dl1_reg_ino=%d dl2_reg_ino=%d sym_lnk=%d "
+                   "-> %s\n",
+                (int)delr, de_1, de_2, de_sym, ok_dent ? "OK" : "FAIL");
+    fails += !ok_dent;
+
     /* Handcraft a dir holding only legacy hidden files (raw host syscalls
      * bypass the guard), then list it through the dispatcher with a buffer so
      * small each batch holds one record: every batch filters away and the

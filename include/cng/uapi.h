@@ -39,6 +39,12 @@
 #define CNG___O_SYNC    04000000
 #define CNG___O_TMPFILE 020000000
 #define CNG_O_TMPFILE   (CNG___O_TMPFILE | CNG_O_DIRECTORY)
+
+/* linux_dirent64 d_type: S_IFMT >> 12 of the entry's mode. */
+#define CNG_DT_UNKNOWN 0
+#define CNG_DT_DIR     4
+#define CNG_DT_REG     8
+#define CNG_DT_LNK     10
 #define CNG_O_PATH      010000000
 
 /* renameat2 flags */

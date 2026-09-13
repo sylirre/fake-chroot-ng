@@ -197,7 +197,13 @@ vfork/`posix_spawn` child-stack handling.
     mask/flags and advertises `STATX_NLINK`; `readlinkat` refuses (`EINVAL`)
     through real dirfds too; `getdents64` hides data/marker entries everywhere
     plus the `.l2s` store dir at the root, re-reading when a whole batch was
-    filtered (a fully-hidden batch must not read as EOF); paths naming the
+    filtered (a fully-hidden batch must not read as EOF), and rewrites each
+    link's own record from the symlink's (`DT_LNK`, its inode) to the backing
+    file's `d_type`/`d_ino` — what `stat` of the name answers — so the readdir
+    fast path of GNU `ls -F`/`find -type f`/`ls -i` sees a regular file
+    (`cng_l2s_dirent`: one `readlinkat` per symlink listed under `-l`, one
+    `fstatat` more per link; `tests/guests/dents.c` diffs the raw records
+    against real hardlinks in M10); paths naming the
     machinery return `ENOENT` from every path syscall including execve
     (`cng_l2s_deny`); `fchownat`/`faccessat2` with `AT_SYMLINK_NOFOLLOW` land
     on the backing file; `RENAME_EXCHANGE` no longer decrefs the surviving

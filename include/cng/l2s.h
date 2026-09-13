@@ -26,6 +26,8 @@
  * overridden to the marker count, so the group presents as ordinary regular
  * files sharing one inode (matching st_ino, shared contents) — which is what
  * lets programs that set+verify metadata (e.g. apk preserving mtime) succeed.
+ * A directory listing says the same: the names' dirents carry the data file's
+ * d_type/d_ino rather than the symlinks' own (cng_l2s_dirent).
  *
  * All paths here are already rootfs-resolved *host* paths. Freestanding: raw
  * syscalls only, safe to call from the SIGSYS handler. Triggered as the linkat
@@ -84,6 +86,15 @@ void cng_l2s_fix_fd_statx(long fd, void *statxbuf);
 /* True for any hidden l2s file (data or marker) basename — used to hide them
  * from the guest's directory listings. */
 int cng_l2s_hidden(const char *name);
+
+/* Listing side of the emulation: is the entry `name` of the directory open
+ * on `dirfd` one of our links? If so fill *ino and *type (a DT_* value) with
+ * what stat(2) of that name answers — the data file's — since the kernel's
+ * record describes the symlink (DT_LNK, the link's own inode) and a guest that
+ * trusts d_type/d_ino (GNU ls -F, find -type f, ls -i) would see through the
+ * emulation. Returns 1 (ours, filled) or 0 (leave the record as it is). */
+int cng_l2s_dirent(long dirfd, const char *name, unsigned long long *ino,
+                   unsigned *type);
 
 /* If `tgt` (a symlink target) is an absolute host path naming an l2s data
  * file, fill `out` with its guest-view path — for the guest-level resolver,

@@ -128,6 +128,42 @@ if [ "$m10_ready" -eq 1 ]; then
     rm -rf "$RO" "$REM"
 fi
 
+# The dirents themselves. Every leg above goes through busybox, which stats
+# each entry it lists, so a record that lies about a link — the kernel's is the
+# symlink's own: DT_LNK, the link's inode — never showed. GNU ls -F, find
+# -type f and ls -i read the record instead. A compiled guest reads the
+# directory raw and prints each entry's d_type and whether d_ino is what stat()
+# and lstat() of the same name answer; with real hardlinks a link is "REG
+# same same", and the emulation has to print the same line. The links are
+# made in three shapes: beside the file, cross-directory (the group joined
+# through the store), and after the tree is moved, which leaves the links'
+# absolute targets stale until the first stat heals them — a listing must
+# say what that stat will.
+if [ "$m10_ready" -eq 1 ] && guest_xlate_ready "l2s raw-dirent leg" &&
+    guest_cc_report "$CNG_TMP/dents" tests/guests/dents.c; then
+    RO=$(mktemp -d); REM=$(mktemp -d)
+    cp -a "$M10_ALPINE/." "$RO"; cp -a "$M10_ALPINE/." "$REM"
+    cp "$CNG_TMP/dents" "$RO/bin/dents"; cp "$CNG_TMP/dents" "$REM/bin/dents"
+    s1='cd /tmp; mkdir d d/sub; cd d; echo hi>a; ln a b; ln -s a s; ln a sub/c;
+        /bin/dents . | sort; /bin/dents sub | sort'
+    s2='cd /tmp/d; /bin/dents . | sort; /bin/dents sub | sort; stat -c %h a b sub/c'
+    o1=$("$M10_ORACLE" "$RO" /bin/sh -c "$s1" 2>/dev/null)
+    e1=$(run -R -l "$REM" /bin/sh -c "$s1" 2>/dev/null)
+    mv "$RO" "$RO.moved"; mv "$REM" "$REM.moved"
+    RO="$RO.moved"; REM="$REM.moved"
+    o2=$("$M10_ORACLE" "$RO" /bin/sh -c "$s2" 2>/dev/null); rc_o=$?
+    e2=$(run -R -l "$REM" /bin/sh -c "$s2" 2>/dev/null); rc_e=$?
+    if [ "$o1" = "$e1" ] && [ "$o2" = "$e2" ] && [ "$rc_o" = "$rc_e" ] &&
+        [ -n "$o1" ]; then
+        pass=$((pass + 1)); echo "  ok   m10 raw dirents: d_type/d_ino of the links"
+    else
+        fail=$((fail + 1)); echo "  FAIL m10 raw dirents: d_type/d_ino of the links"
+        echo "    oracle rc=$rc_o: $(printf %s "$o1|$o2" | head -c 600)"
+        echo "    chroot rc=$rc_e: $(printf %s "$e1|$e2" | head -c 600)"
+    fi
+    rm -rf "$RO" "$REM"
+fi
+
 # Debian leg: glibc + GNU coreutils/findutils (`find -samefile`, GNU stat).
 # Gated on a smoke test proving translation is live — a dynamic-glibc guest
 # under -R + qemu can silently run untranslated (ld.so-loaded libc.so has no

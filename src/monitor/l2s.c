@@ -708,6 +708,58 @@ static int l2s_fd_count(long fd, unsigned long *count) {
     return 1;
 }
 
+/* The host path of the directory behind an open fd, for the one place a
+ * listing has to fall back to the path-based machinery. */
+static int l2s_fd_dir(long fd, char *out, size_t sz) {
+    char link[64], *p = link;
+    char *end = link + sizeof link - 1;
+    p += cng_strlcpy(p, "/proc/self/fd/", (size_t)(end - p) + 1);
+    put_u64(&p, end, (unsigned long long)(unsigned)(int)fd, 1);
+    *p = '\0';
+    long n = l2s_readlink(link, out, sz - 1);
+    if (n <= 0)
+        return -1;
+    out[n] = '\0';
+    return 0;
+}
+
+int cng_l2s_dirent(long dirfd, const char *name, unsigned long long *ino,
+                   unsigned *type) {
+    /* One readlink tells an ordinary symlink from ours: the target of ours
+     * is a data file's name, absolute (the store, or a legacy group joined
+     * from another directory) or bare (a legacy same-directory link). A name
+     * that is not a symlink at all answers EINVAL here, which is what makes
+     * this cheap enough to ask about a DT_UNKNOWN record too. */
+    char tgt[CNG_PATH_MAX];
+    long n = sys_readlinkat((int)dirfd, name, tgt, sizeof tgt - 1);
+    if (n <= 0)
+        return 0;
+    tgt[n] = '\0';
+    if (!parse_data(l2s_basename(tgt), 0))
+        return 0;
+    /* What stat(2) of the name answers is the data file — a follow lands on
+     * it — so the record carries that inode and type. */
+    char st[ST_SIZE];
+    if (CNG_SYS(__NR_newfstatat, (int)dirfd, name, st, 0, 0, 0) < 0) {
+        /* Dangling: the rootfs tree was moved and the absolute target went
+         * stale. cng_l2s_stat self-heals that onto the current store, and a
+         * listing must say what the stat after it will. */
+        char host[CNG_PATH_MAX];
+        size_t dl;
+        if (l2s_fd_dir(dirfd, host, sizeof host) < 0 ||
+            (dl = strlen(host)) + 1 + strlen(name) >= sizeof host)
+            return 0;
+        if (dl && host[dl - 1] != '/')
+            host[dl++] = '/';
+        cng_strlcpy(host + dl, name, sizeof host - dl);
+        if (cng_l2s_stat(host, st) != 1)
+            return 0; /* still dangling: what the kernel said stands */
+    }
+    *ino = *(unsigned long long *)(st + ST_INO_OFF);
+    *type = (st_mode(st) & S_IFMT_) >> 12; /* DT_* is S_IFMT >> 12 */
+    return 1;
+}
+
 void cng_l2s_fix_fd(long fd, void *statbuf) {
     unsigned long c;
     if (l2s_fd_count(fd, &c))

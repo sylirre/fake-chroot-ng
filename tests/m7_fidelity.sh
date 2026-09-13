@@ -105,6 +105,12 @@ check_contains "l2s cross-directory link shares inode/count via the store" \
     "l2s-xdir: rc=0 ino=1 nlink3=1 abs=1 rel=1 -> OK" "$out"
 check_contains "l2s store dir hidden from root listing" \
     "l2s-hide: root_clean=1 have_w=1 -> OK" "$out"
+# The records the kernel writes for the links are the symlinks' own — DT_LNK,
+# the link's inode — where stat() of the same name answers the backing file's.
+# Busybox stats every entry, so M10's shell differential never saw it; GNU ls
+# -F / find -type f / ls -i read the record and did.
+check_contains "l2s links list as the regular file stat() reports" \
+    "l2s-dirent: rc=0 dl1_reg_ino=1 dl2_reg_ino=1 sym_lnk=1 -> OK" "$out"
 check_contains "l2s fully-filtered getdents batch re-reads (no fake EOF)" \
     "l2s-hide-batch: clean=1 eof=1 -> OK" "$out"
 check_contains "l2s machinery is unreachable by name (ENOENT)" \
