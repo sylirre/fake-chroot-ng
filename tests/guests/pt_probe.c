@@ -967,6 +967,113 @@ static int sc_waitid(void) {
     return 0;
 }
 
+/* waitid(WNOWAIT) reports a child's state without consuming it: the next wait
+ * finds the same stop or exit again, and only that one consumes it. The
+ * emulation knew the bit and handed it to the host wait, but its own registry
+ * consumed the stop (or freed the synthetic exit) all the same, so the wait
+ * that was meant to follow found nothing. Alongside, what the siginfo carries:
+ * si_status is the whole exit code the wait status holds above the 0x7f — the
+ * 0x80 marker of a TRACESYSGOOD syscall stop, the event byte of a ptrace event
+ * — which the emulation cut to its low byte; si_uid is the tracee's.
+ *
+ * The exit half runs twice: once for a child, whose death the host wait
+ * reports (the kernel honors WNOWAIT there on its own), and once for a tracee
+ * that is not our child — a grandchild we attach to — whose death reaches a
+ * tracer only through the emulation's own registry. */
+static volatile int g_usr1;
+static void sig_usr1(int s) { (void)s; g_usr1 = 1; }
+
+static void wid(const char *tag, pid_t pid, int flags) {
+    siginfo_t si;
+    memset(&si, 0, sizeof si);
+    int r = waitid(P_PID, pid, &si, flags);
+    if (r == 0 && si.si_pid == 0)
+        printf("%s rc=0 nothing\n", tag);
+    else if (r == 0)
+        printf("%s rc=0 code=%d status=%#x uid_self=%d\n", tag, si.si_code,
+               si.si_status, si.si_uid == getuid());
+    else
+        printf("%s rc=%d errno=%d\n", tag, r, errno);
+}
+
+static int sc_waitnowait(void) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        child_start();
+        _exit(7);
+    }
+    expect_first_stop(pid);
+    ptrace(PTRACE_SETOPTIONS, pid, 0,
+           (void *)(long)(PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEEXIT));
+    ptrace(PTRACE_SYSCALL, pid, 0, 0); /* to the next syscall entry */
+    wid("sysstop peek", pid, WSTOPPED | WNOWAIT);
+    wid("sysstop again", pid, WSTOPPED | WNOHANG);
+    wid("sysstop consumed", pid, WSTOPPED | WNOHANG);
+    ptrace(PTRACE_CONT, pid, 0, 0); /* to the exit event */
+    wid("exit event peek", pid, WSTOPPED | WNOWAIT);
+    wid("exit event", pid, WSTOPPED);
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    wid("child exit peek", pid, WEXITED | WNOWAIT);
+    wid("child exit", pid, WEXITED);
+
+    /* A tracee that is not our child: attached, then told to exit. */
+    int fds[2];
+    if (pipe(fds) != 0)
+        return 1;
+    pid_t mid = fork();
+    if (mid == 0) {
+        close(fds[0]);
+        /* The grandchild's SIGUSR1 is armed before it exists, so one that
+         * arrives early is not fatal. It spins on the handler's flag rather
+         * than blocking in a wait: the emulation stops a running task with a
+         * signal of its own, which would end a sigsuspend/pause with EINTR
+         * where a real PTRACE_ATTACH leaves the wait standing. */
+        signal(SIGUSR1, sig_usr1);
+        pid_t g = fork();
+        if (g == 0) {
+            while (!g_usr1) {
+                g_spin++;
+                usleep(1000);
+            }
+            _exit(5);
+        }
+        ssize_t ignore = write(fds[1], &g, sizeof g);
+        (void)ignore;
+        signal(SIGUSR1, SIG_DFL);
+        pause(); /* stay the real parent until the tracer is done */
+        _exit(0);
+    }
+    close(fds[1]);
+    pid_t g = 0;
+    ssize_t n = read(fds[0], &g, sizeof g);
+    (void)n;
+    if (ptrace(PTRACE_ATTACH, g, 0, 0) != 0) {
+        printf("attach failed %d\n", errno);
+        kill(g, SIGKILL);
+        kill(mid, SIGKILL);
+        return 1;
+    }
+    int st;
+    wait_for(g, &st);
+    printf("attach %s\n",
+           (WIFSTOPPED(st) && WSTOPSIG(st) == SIGSTOP) ? "stopped" : "odd");
+    ptrace(PTRACE_CONT, g, 0, 0);
+    kill(g, SIGUSR1);
+    wait_for(g, &st); /* the SIGUSR1 delivery stop */
+    if (WIFSTOPPED(st) && WSTOPSIG(st) == SIGUSR1)
+        printf("usr1 stopped\n");
+    else {
+        printf("usr1 odd: ");
+        show(st);
+    }
+    ptrace(PTRACE_CONT, g, 0, (void *)(long)SIGUSR1);
+    wid("tracee exit peek", g, WEXITED | WNOWAIT);
+    wid("tracee exit", g, WEXITED);
+    kill(mid, SIGKILL);
+    wait_for(mid, &st);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, 0, _IOLBF, 0);
     if (argc > 1 && !strcmp(argv[1], "hello")) {
@@ -1018,6 +1125,8 @@ int main(int argc, char **argv) {
         return sc_sigchld(1);
     if (!strcmp(s, "waitid"))
         return sc_waitid();
+    if (!strcmp(s, "waitnowait"))
+        return sc_waitnowait();
     fprintf(stderr, "unknown scenario %s\n", s);
     return 2;
 }

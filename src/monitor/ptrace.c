@@ -1564,8 +1564,12 @@ static int pt_have_tracee(s32 wpid) {
 
 /* Consume one ready stop or synthetic exit matching wpid (<=0 means any), of a
  * kind the caller asked for. Fills *status with a wait-status word and returns
- * the tid, or 0. */
-static s32 pt_collect(s32 wpid, int *status, int want) {
+ * the tid, or 0. With `peek` (waitid's WNOWAIT) the event is reported but left
+ * where it is — a stop stays unreported, an exit stays collectable — so the
+ * next wait finds it again, as the kernel leaves a child's state in place for
+ * that flag (measured: a WNOWAIT'd ptrace stop is handed over by the next
+ * WNOHANG wait, and only then consumed). */
+static s32 pt_collect(s32 wpid, int *status, int want, int peek) {
     if (!g_tab)
         return 0;
     s32 me = (s32)sys_getpid();
@@ -1583,7 +1587,8 @@ static s32 pt_collect(s32 wpid, int *status, int want) {
             if (!(want & PT_COLLECT_EXITS))
                 continue; /* leave it for a wait that asked for exits */
             *status = e->exit_status;
-            pt_free(e);
+            if (!peek)
+                pt_free(e);
             return t;
         }
         if (st != PT_ST_STOPPED)
@@ -1610,7 +1615,8 @@ static s32 pt_collect(s32 wpid, int *status, int want) {
                 sig |= 0x80;
             w = (sig << 8) | 0x7f;
         }
-        __atomic_store_n(&e->reported, 1, __ATOMIC_RELEASE);
+        if (!peek)
+            __atomic_store_n(&e->reported, 1, __ATOMIC_RELEASE);
         *status = w;
         return t;
     }
@@ -1701,7 +1707,7 @@ long cng_pt_wait4(long pid, u64 status, long options, u64 rusage,
     for (;;) {
         u32 gen = g_tab ? __atomic_load_n(&g_tab->global_gen, __ATOMIC_ACQUIRE) : 0;
         int st = 0;
-        s32 t = pt_collect((s32)pid, &st, PT_COLLECT_STOPS | PT_COLLECT_EXITS);
+        s32 t = pt_collect((s32)pid, &st, PT_COLLECT_STOPS | PT_COLLECT_EXITS, 0);
         if (t > 0) {
             if (status && cng_user_copyout((void *)status, &st, sizeof st) < 0)
                 return -EFAULT;
@@ -1758,20 +1764,38 @@ long cng_pt_waitid(long idtype, long id, u64 infop, long options, u64 rusage,
          * that as "keep waiting", so it spun until something else woke it. */
         int want = ((options & PT_WSTOPPED) ? PT_COLLECT_STOPS : 0) |
                    ((options & PT_WEXITED) ? PT_COLLECT_EXITS : 0);
-        if (wpid && want && (t = pt_collect(wpid, &st, want)) > 0) {
+        /* WNOWAIT reports without consuming. The bit was known here and
+         * passed to the host wait below, but the registry side consumed the
+         * stop or freed the exit all the same, so the wait that was meant to
+         * follow found nothing. */
+        int peek = (options & PT_WNOWAIT) != 0;
+        if (wpid && want && (t = pt_collect(wpid, &st, want, peek)) > 0) {
             if (infop) {
+                /* The siginfo the kernel's wait_task_stopped/zombie fill in.
+                 * For a stop, si_status is the whole exit code the wait status
+                 * carries above the 0x7f — (event << 8) | SIGTRAP for a ptrace
+                 * event, sig | 0x80 for a TRACESYSGOOD syscall stop — not its
+                 * low byte, which dropped the event and the marker (measured:
+                 * 0x605 for EVENT_EXIT, 0x85 for a syscall stop). A death by
+                 * signal is CLD_DUMPED when the status carries the core bit.
+                 * si_uid is the tracee's, which here is the same user as its
+                 * tracer, shown through the fake identity like every other
+                 * uid the guest is told. */
                 u8 si[128];
                 memset(si, 0, sizeof si);
                 s32 *w = (s32 *)si;
                 w[0] = 17; /* SIGCHLD */
-                w[2] = (st & 0xff) == 0x7f ? PT_CLD_TRAPPED
-                       : ((st & 0x7f) == 0) ? PT_CLD_EXITED
-                                            : PT_CLD_KILLED;
-                w[4] = t;                          /* si_pid */
-                w[5] = 0;                          /* si_uid */
-                w[6] = (st & 0xff) == 0x7f ? (st >> 8) & 0xff
-                       : ((st & 0x7f) == 0) ? (st >> 8) & 0xff
-                                            : (st & 0x7f); /* si_status */
+                int stopped = (st & 0xff) == 0x7f;
+                int exited = !stopped && (st & 0x7f) == 0;
+                w[2] = stopped  ? PT_CLD_TRAPPED
+                       : exited ? PT_CLD_EXITED
+                       : (st & 0x80) ? PT_CLD_DUMPED
+                                     : PT_CLD_KILLED;
+                w[4] = t;                                        /* si_pid */
+                w[5] = (s32)cng_remap_uid((unsigned)sys_getuid()); /* si_uid */
+                w[6] = stopped  ? (st >> 8) & 0xffff
+                       : exited ? (st >> 8) & 0xff
+                                : (st & 0x7f);                   /* si_status */
                 if (cng_user_copyout((void *)infop, si, sizeof si) < 0)
                     return -EFAULT;
             }

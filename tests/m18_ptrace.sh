@@ -186,6 +186,17 @@ else
     # exits — what a tracer reaping a dead tracee issues — never consulted the
     # registry at all.
     pt_case waitid
+    # ...and WNOWAIT reports without consuming: the next wait finds the same
+    # stop or exit again. The emulation passed the bit to the host wait but its
+    # registry consumed the stop (or freed the synthetic exit) regardless, so
+    # the wait meant to follow found nothing — for an exit that is a tracer
+    # hanging on a death it was already told about. The same scenario pins the
+    # siginfo: si_status is the whole exit code above the wait status' 0x7f
+    # (the 0x80 of a TRACESYSGOOD stop, the event byte of a ptrace event), not
+    # its low byte, and si_uid is the tracee's. Run for a child, whose death
+    # the host reports, and for an attached grandchild, whose death reaches a
+    # tracer only through the registry.
+    pt_case waitnowait
 
     # ...and the same, with a rootfs actually in the way: the guest binary is
     # bound in so it can be loaded, and the trace must still read the guest's
