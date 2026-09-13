@@ -197,6 +197,18 @@ else
     # the host reports, and for an attached grandchild, whose death reaches a
     # tracer only through the registry.
     pt_case waitnowait
+    # The option word, judged as the kernel judges it. PTRACE_SEIZE refuses a
+    # nonzero addr and any bit outside PTRACE_O_MASK with EIO, where the
+    # emulation masked unknown bits off and told the tracer they were set;
+    # PTRACE_O_SUSPEND_SECCOMP is EPERM without CAP_SYS_ADMIN (fake-root has
+    # it) for SEIZE and SETOPTIONS both; a pid nothing owns is ESRCH before any
+    # of that, non-positive ones included (they were EPERM); TRACESECCOMP is
+    # accepted, since a guest can install no filter for it to ever fire. A
+    # freshly SEIZE'd tracee is running, and answers nothing but INTERRUPT and
+    # KILL until it is parked — SETOPTIONS was answered anyway. And the "vfork
+    # done" stop is an event like the others, reported only under
+    # TRACEVFORKDONE; it was reported for every vfork.
+    pt_case options
 
     # ...and the same, with a rootfs actually in the way: the guest binary is
     # bound in so it can be loaded, and the trace must still read the guest's

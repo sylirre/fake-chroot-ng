@@ -1053,6 +1053,15 @@ void cng_pt_report_event(struct cng_uregs *r, int event, u64 msg) {
     struct pt_self *s = pt_self_get(0);
     if (!s || !s->active || !s->link || !event)
         return;
+    /* The fork-family events arrive here already gated on their option (see
+     * cng_pt_clone_event); VFORK_DONE's callers report it for every vfork and
+     * it is gated here, as ptrace_event() gates every event on its option. A
+     * tracer that asked only for PTRACE_O_TRACEVFORK used to get a second,
+     * unasked-for stop after the vfork event. */
+    if (event == CNG_PTRACE_EVENT_VFORK_DONE &&
+        !(__atomic_load_n(&s->link->options, __ATOMIC_ACQUIRE) &
+          CNG_PTRACE_O_TRACEVFORKDONE))
+        return;
     if (event == CNG_PTRACE_EVENT_FORK || event == CNG_PTRACE_EVENT_VFORK ||
         event == CNG_PTRACE_EVENT_CLONE)
         pt_child_claim((s32)msg, s->link);
@@ -1321,6 +1330,19 @@ static long pt_traceme(void) {
 
 /* ---- tracer: the guest's ptrace(2) ---- */
 
+/* check_ptrace_options(): the one option with a privilege attached.
+ * PTRACE_O_SUSPEND_SECCOMP wants CAP_SYS_ADMIN and a tracer that is not itself
+ * under seccomp, else EPERM (measured). Both are judged as the guest sees
+ * itself: fake-root holds every capability, and no guest sees a filter on
+ * itself (PR_GET_SECCOMP answers 0), so it comes down to the identity. What
+ * the option would suspend is the tracee's own filters, of which it has none
+ * it can see, so accepting it has nothing further to do. */
+static long pt_check_options(u32 data) {
+    if ((data & CNG_PTRACE_O_SUSPEND_SECCOMP) && !cng_fake_root())
+        return -EPERM;
+    return 0;
+}
+
 long cng_pt_syscall(long req, long pid, u64 addr, u64 data) {
     if (cng_g_no_ptrace)
         return -EPERM;
@@ -1332,8 +1354,16 @@ long cng_pt_syscall(long req, long pid, u64 addr, u64 data) {
 
     s32 me = (s32)sys_getpid();
     if (req == CNG_PTRACE_ATTACH || req == CNG_PTRACE_SEIZE) {
-        if (pid <= 0 || (s32)pid == me)
-            return -EPERM;
+        /* In the kernel's order (measured): the task is looked up first, so a
+         * pid nothing owns is ESRCH whatever else is wrong with the call — a
+         * non-positive one included, which used to be EPERM here; then SEIZE
+         * validates its arguments, addr and the option word both EIO rather
+         * than the SETOPTIONS EINVAL, and the word's privilege check; only
+         * then does the caller's own thread group draw EPERM. The option
+         * word used to be masked to the known bits instead, so a tracer
+         * asking for a bit this kernel does not have was told it was set. */
+        if (pid <= 0)
+            return -ESRCH;
         s32 tgid = (s32)pid;
         if (!cng_procreg_has((int)pid)) {
             /* Not a guest pid: it may be a secondary thread's tid, whose thread
@@ -1341,6 +1371,13 @@ long cng_pt_syscall(long req, long pid, u64 addr, u64 data) {
             tgid = (s32)cng_proc_tgid((int)pid);
             if (tgid <= 0 || !cng_procreg_has((int)tgid))
                 return -ESRCH;
+        }
+        if (req == CNG_PTRACE_SEIZE) {
+            if (addr != 0 || (data & ~(u64)CNG_PTRACE_O_MASK))
+                return -EIO;
+            long bad = pt_check_options((u32)data);
+            if (bad)
+                return bad;
         }
         if (tgid == me)
             return -EPERM; /* our own thread group: the kernel's rule */
@@ -1352,8 +1389,7 @@ long cng_pt_syscall(long req, long pid, u64 addr, u64 data) {
                                          __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
             return -EPERM; /* already traced by someone */
         e->seize = (req == CNG_PTRACE_SEIZE);
-        __atomic_store_n(&e->options,
-                         e->seize ? ((u32)data & CNG_PTRACE_O_MASK) : 0,
+        __atomic_store_n(&e->options, e->seize ? (u32)data : 0,
                          __ATOMIC_RELAXED);
         __atomic_store_n(&e->attach_pending, 1, __ATOMIC_RELEASE);
         __atomic_store_n(&g_tab->any_trace, 1, __ATOMIC_RELEASE);
@@ -1374,16 +1410,48 @@ long cng_pt_syscall(long req, long pid, u64 addr, u64 data) {
         return 0;
     }
 
-    /* Requests answerable from the link alone. */
-    switch (req) {
-    case CNG_PTRACE_SETOPTIONS:
-        if (data & ~(u64)CNG_PTRACE_O_MASK)
-            return -EINVAL;
-        __atomic_store_n(&e->options, (u32)data, __ATOMIC_RELEASE);
-        return 0;
-    case CNG_PTRACE_KILL:
+    /* PTRACE_KILL is the one request besides INTERRUPT that the kernel takes
+     * on a tracee in any state (ptrace_check_attach's ignore_state). */
+    if (req == CNG_PTRACE_KILL) {
         CNG_SYS(__NR_kill, e->tgid, 9 /*SIGKILL*/, 0, 0, 0, 0);
         return 0;
+    }
+
+    /* Everything else needs the tracee parked. */
+    if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) != PT_ST_STOPPED)
+        return -ESRCH;
+
+    /* A listening tracee (post-LISTEN, parked awaiting SIGCONT) is stopped but
+     * counts as running to data operations, exactly as the kernel treats it. */
+    if (__atomic_load_n(&e->listening, __ATOMIC_ACQUIRE)) {
+        switch (req) {
+        case CNG_PTRACE_CONT:
+        case CNG_PTRACE_SYSCALL:
+        case CNG_PTRACE_SINGLESTEP:
+        case CNG_PTRACE_DETACH:
+            __atomic_store_n(&e->listening, 0, __ATOMIC_RELEASE);
+            break;
+        case CNG_PTRACE_LISTEN:
+            return 0;
+        default:
+            return -ESRCH;
+        }
+    }
+
+    switch (req) {
+    /* Answered from the link, but only for a parked tracee: the kernel's
+     * ptrace_check_attach() refuses every request but KILL and INTERRUPT with
+     * ESRCH while the tracee runs (measured for SETOPTIONS on a freshly SEIZE'd,
+     * still-running child), and these used to be answered regardless. */
+    case CNG_PTRACE_SETOPTIONS: {
+        if (data & ~(u64)CNG_PTRACE_O_MASK)
+            return -EINVAL;
+        long bad = pt_check_options((u32)data);
+        if (bad)
+            return bad;
+        __atomic_store_n(&e->options, (u32)data, __ATOMIC_RELEASE);
+        return 0;
+    }
     case CNG_PTRACE_GETEVENTMSG: {
         u64 msg = e->eventmsg;
         if (cng_user_copyout((void *)data, &msg, sizeof msg) < 0)
@@ -1445,30 +1513,6 @@ long cng_pt_syscall(long req, long pid, u64 addr, u64 data) {
             return -EFAULT;
         return (long)actual;
     }
-    }
-
-    /* Everything else needs the tracee parked. */
-    if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) != PT_ST_STOPPED)
-        return -ESRCH;
-
-    /* A listening tracee (post-LISTEN, parked awaiting SIGCONT) is stopped but
-     * counts as running to data operations, exactly as the kernel treats it. */
-    if (__atomic_load_n(&e->listening, __ATOMIC_ACQUIRE)) {
-        switch (req) {
-        case CNG_PTRACE_CONT:
-        case CNG_PTRACE_SYSCALL:
-        case CNG_PTRACE_SINGLESTEP:
-        case CNG_PTRACE_DETACH:
-            __atomic_store_n(&e->listening, 0, __ATOMIC_RELEASE);
-            break;
-        case CNG_PTRACE_LISTEN:
-            return 0;
-        default:
-            return -ESRCH;
-        }
-    }
-
-    switch (req) {
     case CNG_PTRACE_PEEKTEXT:
     case CNG_PTRACE_PEEKDATA:
         pt_cmd(e, PT_CMD_PEEK, addr, 0);

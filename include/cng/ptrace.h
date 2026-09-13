@@ -84,16 +84,24 @@ static inline struct cng_uregs *cng_pt_uregs(struct cng_ucontext *uc) {
 #define CNG_PTRACE_SETSIGMASK       0x420b
 #define CNG_PTRACE_GET_SYSCALL_INFO 0x420e
 
-/* PTRACE_SETOPTIONS bits. */
-#define CNG_PTRACE_O_TRACESYSGOOD   0x0001
-#define CNG_PTRACE_O_TRACEFORK      0x0002
-#define CNG_PTRACE_O_TRACEVFORK     0x0004
-#define CNG_PTRACE_O_TRACECLONE     0x0008
-#define CNG_PTRACE_O_TRACEEXEC      0x0010
-#define CNG_PTRACE_O_TRACEVFORKDONE 0x0020
-#define CNG_PTRACE_O_TRACEEXIT      0x0040
-#define CNG_PTRACE_O_EXITKILL       0x00100000
-#define CNG_PTRACE_O_MASK           0x003000ff
+/* PTRACE_SETOPTIONS bits: the kernel's PTRACE_O_MASK, every one of which is
+ * accepted where the kernel accepts it. TRACESECCOMP is honored vacuously — the
+ * event fires for a filter answering SECCOMP_RET_TRACE, and a guest cannot
+ * install one (seccomp(2) and PR_SET_SECCOMP are refused), so a tracer that
+ * asks for it gets exactly the events it would get: none. SUSPEND_SECCOMP needs
+ * CAP_SYS_ADMIN, which the guest holds under fake-root; it suspends the
+ * tracee's own filters, of which it has none it can see. */
+#define CNG_PTRACE_O_TRACESYSGOOD    0x0001
+#define CNG_PTRACE_O_TRACEFORK       0x0002
+#define CNG_PTRACE_O_TRACEVFORK      0x0004
+#define CNG_PTRACE_O_TRACECLONE      0x0008
+#define CNG_PTRACE_O_TRACEEXEC       0x0010
+#define CNG_PTRACE_O_TRACEVFORKDONE  0x0020
+#define CNG_PTRACE_O_TRACEEXIT       0x0040
+#define CNG_PTRACE_O_TRACESECCOMP    0x0080
+#define CNG_PTRACE_O_EXITKILL        0x00100000
+#define CNG_PTRACE_O_SUSPEND_SECCOMP 0x00200000
+#define CNG_PTRACE_O_MASK            0x003000ff
 
 /* PTRACE_EVENT_* (the wait status' high byte). */
 #define CNG_PTRACE_EVENT_FORK        1

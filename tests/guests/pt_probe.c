@@ -46,6 +46,7 @@
 #define PT_SYSCALL_INFO_EXIT  2
 #define O_TRACESYSGOOD 0x01
 #define O_TRACEFORK    0x02
+#define O_TRACEVFORK   0x04
 #define O_TRACEEXEC    0x10
 #define O_TRACEEXIT    0x40
 #define EV_FORK 1
@@ -1088,6 +1089,177 @@ static int sc_waitnowait(void) {
     return 0;
 }
 
+/* The option word, judged as the kernel judges it. PTRACE_SEIZE refuses a
+ * nonzero addr and any bit outside PTRACE_O_MASK with EIO — not SETOPTIONS'
+ * EINVAL, and not by quietly masking the bit off, which told a tracer a bit
+ * this kernel does not have was set — and PTRACE_O_SUSPEND_SECCOMP is EPERM
+ * without CAP_SYS_ADMIN; those checks come after the task lookup (a pid that
+ * names nothing is ESRCH whatever else is wrong, and so is a non-positive one)
+ * and before the caller's own thread group draws its EPERM. TRACESECCOMP is
+ * simply accepted. Then TRACEVFORKDONE: the "vfork done" stop is an event like
+ * the others and arrives only when asked for; the emulation reported it for
+ * every vfork, so a tracer that asked only for PTRACE_O_TRACEVFORK got an
+ * unasked-for second stop where the kernel sends the child on to its exit. */
+static const char *ptres(long r) {
+    if (r == 0)
+        return "ok";
+    switch (errno) {
+    case EIO:    return "EIO";
+    case EINVAL: return "EINVAL";
+    case EPERM:  return "EPERM";
+    case ESRCH:  return "ESRCH";
+    default:     return "other";
+    }
+}
+
+/* A vfork-style clone whose child exits at once, both halves in asm: the
+ * child shares the parent's stack on a real kernel until it leaves, so it
+ * must not touch it — a C call through the libc wrapper is not that, and at
+ * -O2 corrupted the suspended parent. Not vfork(3) either: glibc's passes the
+ * current sp as the child stack, which the -R tier's clone path hands to the
+ * real clone and so kills the converted child (a separate defect). Returns in
+ * the parent once the child is gone. */
+static void vfork_child_exits(void) {
+#if defined(__aarch64__)
+    register long x0 __asm__("x0");
+    __asm__ volatile("mov x8, #220\n\t" /* clone */
+                     "mov x0, #0x4111\n\t" /* CLONE_VM|CLONE_VFORK|SIGCHLD */
+                     "mov x1, #0\n\tmov x2, #0\n\tmov x3, #0\n\tmov x4, #0\n\t"
+                     "svc #0\n\t"
+                     "cbnz x0, 1f\n\t"
+                     "mov x8, #94\n\t" /* exit_group(0) in the child */
+                     "mov x0, #0\n\t"
+                     "svc #0\n"
+                     "1:"
+                     : "=r"(x0)
+                     :
+                     : "x1", "x2", "x3", "x4", "x8", "memory", "cc");
+    (void)x0;
+#elif defined(__x86_64__)
+    long rax;
+    __asm__ volatile("mov $56, %%eax\n\t" /* clone */
+                     "mov $0x4111, %%edi\n\t"
+                     "xor %%esi, %%esi\n\txor %%edx, %%edx\n\t"
+                     "xor %%r10d, %%r10d\n\txor %%r8d, %%r8d\n\t"
+                     "syscall\n\t"
+                     "test %%rax, %%rax\n\t"
+                     "jnz 1f\n\t"
+                     "mov $231, %%eax\n\t" /* exit_group(0) in the child */
+                     "xor %%edi, %%edi\n\t"
+                     "syscall\n"
+                     "1:"
+                     : "=a"(rax)
+                     :
+                     : "rdi", "rsi", "rdx", "r10", "r8", "rcx", "r11", "memory",
+                       "cc");
+    (void)rax;
+#else
+    pid_t k = vfork();
+    if (k == 0)
+        _exit(0);
+#endif
+}
+
+static int sc_options(void) {
+    long r;
+    int st;
+    errno = 0; r = ptrace(PTRACE_ATTACH, 0, 0, 0);
+    printf("attach pid0 %s\n", ptres(r));
+    errno = 0; r = ptrace(PTRACE_SEIZE, -1, 0, 0);
+    printf("seize pid-1 %s\n", ptres(r));
+    errno = 0; r = ptrace(PTRACE_SEIZE, getpid(), (void *)1, 0);
+    printf("seize self addr %s\n", ptres(r));
+    errno = 0; r = ptrace(PTRACE_SEIZE, getpid(), 0, (void *)0x10000);
+    printf("seize self badopt %s\n", ptres(r));
+    errno = 0; r = ptrace(PTRACE_SEIZE, getpid(), 0, (void *)0x00200000);
+    printf("seize self suspend_seccomp %s\n", ptres(r));
+    errno = 0; r = ptrace(PTRACE_SEIZE, getpid(), 0, 0);
+    printf("seize self %s\n", ptres(r));
+
+    /* A running child, to SEIZE for real. */
+    pid_t pid = fork();
+    if (pid == 0) {
+        for (;;) {
+            g_spin++;
+            usleep(1000);
+        }
+    }
+    usleep(50000);
+    errno = 0; r = ptrace(PTRACE_SEIZE, pid, 0, (void *)0x10000);
+    printf("seize badopt %s\n", ptres(r));
+    errno = 0; r = ptrace(PTRACE_SEIZE, pid, (void *)1, 0);
+    printf("seize addr %s\n", ptres(r));
+    errno = 0; r = ptrace(PTRACE_SEIZE, pid, 0, (void *)0x00200000);
+    printf("seize suspend_seccomp %s\n", ptres(r));
+    errno = 0;
+    r = ptrace(PTRACE_SEIZE, pid, 0,
+               (void *)(long)(O_TRACESYSGOOD | 0x80 /*TRACESECCOMP*/ |
+                              O_TRACEEXIT | 0x100000 /*EXITKILL*/));
+    printf("seize good %s\n", ptres(r));
+    /* SEIZE leaves it running, and a running tracee answers nothing but
+     * INTERRUPT and KILL: SETOPTIONS is ESRCH until it is parked. */
+    errno = 0; r = ptrace(PTRACE_SETOPTIONS, pid, 0, (void *)0x1);
+    printf("setoptions running %s\n", ptres(r));
+    ptrace(PTRACE_INTERRUPT, pid, 0, 0);
+    wait_for(pid, &st);
+    show(st); /* event 128 (PTRACE_EVENT_STOP) */
+    errno = 0; r = ptrace(PTRACE_SETOPTIONS, pid, 0, (void *)0x10000);
+    printf("setoptions badopt %s\n", ptres(r));
+    errno = 0; r = ptrace(PTRACE_SETOPTIONS, pid, 0, (void *)0x00200000);
+    printf("setoptions suspend_seccomp %s\n", ptres(r));
+    errno = 0; r = ptrace(PTRACE_SETOPTIONS, pid, 0, (void *)0x80);
+    printf("setoptions traceseccomp %s\n", ptres(r));
+    kill(pid, SIGKILL);
+    wait_for(pid, &st);
+    show(st);
+
+    /* vfork with TRACEVFORK alone, then with TRACEVFORKDONE too. SIGCHLD is
+     * blocked in the middle process: a traced task stops for a signal it is
+     * about to be handed even when it would ignore it, and whether the vfork
+     * child's death gets its SIGCHLD in before the exit is a race (see
+     * sc_fork). Blocked, it is never handed over. */
+    for (int done = 0; done < 2; done++) {
+        pid = fork();
+        if (pid == 0) {
+            sigset_t chld;
+            sigemptyset(&chld);
+            sigaddset(&chld, SIGCHLD);
+            sigprocmask(SIG_BLOCK, &chld, 0);
+            child_start();
+            vfork_child_exits();
+            _exit(3);
+        }
+        expect_first_stop(pid);
+        ptrace(PTRACE_SETOPTIONS, pid, 0,
+               (void *)(long)(O_TRACEVFORK | (done ? 0x20 /*VFORKDONE*/ : 0)));
+        ptrace(PTRACE_CONT, pid, 0, 0);
+        wait_for(pid, &st);
+        printf("vforkdone=%d ", done);
+        show(st); /* event 2 (PTRACE_EVENT_VFORK) */
+        unsigned long msg = 0;
+        ptrace(PTRACE_GETEVENTMSG, pid, 0, &msg);
+        ptrace(PTRACE_CONT, pid, 0, 0);
+        int gst;
+        pid_t g = waitpid((pid_t)msg, &gst, 0); /* the auto-attached vfork child */
+        printf("vfork child %s\n",
+               (g == (pid_t)msg && WIFSTOPPED(gst)) ? "stopped" : "missing");
+        ptrace(PTRACE_CONT, (pid_t)msg, 0, 0);
+        waitpid((pid_t)msg, &gst, 0);
+        printf("vfork child ");
+        show(gst);
+        wait_for(pid, &st);
+        printf("then ");
+        show(st); /* event 5 (VFORK_DONE) only when asked for; else exited 3 */
+        if (WIFSTOPPED(st)) {
+            ptrace(PTRACE_CONT, pid, 0, 0);
+            wait_for(pid, &st);
+            printf("then ");
+            show(st);
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, 0, _IOLBF, 0);
     if (argc > 1 && !strcmp(argv[1], "hello")) {
@@ -1141,6 +1313,8 @@ int main(int argc, char **argv) {
         return sc_waitid();
     if (!strcmp(s, "waitnowait"))
         return sc_waitnowait();
+    if (!strcmp(s, "options"))
+        return sc_options();
     fprintf(stderr, "unknown scenario %s\n", s);
     return 2;
 }
