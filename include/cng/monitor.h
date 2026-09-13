@@ -208,6 +208,12 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
 struct cng_uregs;
 void cng_tramp_dispatch(struct cng_uregs *r);
 
+/* A trapped clone (the process-making kinds), answered in the guest's register
+ * frame rather than by return value: CLONE_VM|CLONE_VFORK become a COW fork,
+ * the result lands in x0 and — in the child — the caller-supplied child stack
+ * in sp, for the tier's exit to install. Both tiers and the tests call it. */
+void cng_clone_convert(struct cng_uregs *ur);
+
 /* One-shot-per-number diagnostic for a syscall we emulate away. */
 void cng_note_blocked(int nr);
 

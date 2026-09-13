@@ -4698,9 +4698,11 @@ int cng_cmd_imgtest(int argc, char **argv, char **envp, unsigned long *auxv) {
 }
 
 /* _clonetest — a CLONE_VFORK|CLONE_VM clone must be converted to a real (COW)
- * fork by the dispatcher, so the child gets a private address space (our
+ * fork by cng_clone_convert, so the child gets a private address space (our
  * emulated execve would otherwise corrupt the shared parent). Verify the child
- * runs and exits, and that a write in the child is NOT visible in the parent. */
+ * runs and exits, and that a write in the child is NOT visible in the parent.
+ * Driven with a register frame the way both tiers drive it; a bare vfork (no
+ * child stack) must leave the frame's sp alone on both sides. */
 int cng_cmd_clonetest(int argc, char **argv, char **envp, unsigned long *auxv) {
     (void)argc;
     (void)argv;
@@ -4710,20 +4712,27 @@ int cng_cmd_clonetest(int argc, char **argv, char **envp, unsigned long *auxv) {
     cng_fs_init(&fs, "/");
     cng_g_fs = &fs;
     volatile long marker = 0;
-    long pid = cng_dispatch(__NR_clone,
-                            CNG_CLONE_VM | CNG_CLONE_VFORK | 17 /*SIGCHLD*/, 0, 0,
-                            0, 0, 0, /*trapped=*/1);
+    unsigned long sentinel = 0x5eed0d5eed0d0000UL;
+    static struct cng_uregs fr;
+    memset(&fr, 0, sizeof fr);
+    fr.x[0] = CNG_CLONE_VM | CNG_CLONE_VFORK | 17; /* SIGCHLD */
+    fr.x[8] = __NR_clone;
+    fr.sp = sentinel;
+    cng_clone_convert(&fr);
+    long pid = (long)fr.x[0];
     if (pid == 0) {        /* child */
         marker = 1;        /* if the VM were shared, the parent would see this */
-        sys_exit_group(7);
+        sys_exit_group(fr.sp == sentinel ? 7 : 8);
     }
     int status = 0;
     sys_wait4((int)pid, &status, 0, 0);
     int exited7 = ((status & 0x7f) == 0 && ((status >> 8) & 0xff) == 7);
     int private_vm = (marker == 0); /* real fork => parent's copy untouched */
-    int ok = (pid > 0 && exited7 && private_vm);
-    cng_dprintf(1, "clone: pid>0=%d child_exit7=%d private_vm=%d -> %s\n",
-                pid > 0, exited7, private_vm, ok ? "OK" : "FAIL");
+    int sp_kept = (fr.sp == sentinel);
+    int ok = (pid > 0 && exited7 && private_vm && sp_kept);
+    cng_dprintf(1,
+                "clone: pid>0=%d child_exit7=%d private_vm=%d sp_kept=%d -> %s\n",
+                pid > 0, exited7, private_vm, sp_kept, ok ? "OK" : "FAIL");
     return ok ? 0 : 1;
 }
 
@@ -5001,6 +5010,16 @@ static int pt_has(const char *hay, const char *needle) {
         if (!strncmp(p, needle, nl))
             return 1;
     return 0;
+}
+
+/* capget through the dispatcher for one pid: the result in *out, the effective
+ * set returned (0 when the call failed or wrote nothing). */
+static unsigned dbg_capget(int pid, long *out) {
+    unsigned hdr[2] = {0x20080522u, (unsigned)pid};
+    unsigned dat[6];
+    memset(dat, 0, sizeof dat);
+    *out = cng_dispatch(__NR_capget, (long)hdr, (long)dat, 0, 0, 0, 0, 1);
+    return dat[0];
 }
 
 /* Count of NUL-separated entries in a cmdline/environ blob. */
@@ -5751,15 +5770,10 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
         cng_g_host_uid = (unsigned)sys_getuid();
         cng_g_host_gid = (unsigned)sys_getgid();
         cng_cred_seed();
-        unsigned hdr[2], dat[6];
         long self_r, tid_r, kid_r, dead_r, host_r, neg_r, none_r;
         unsigned self_e, tid_e, kid_e;
-#define PT_CAPGET(pid_, out_)                                                   \
-        (hdr[0] = 0x20080522u, hdr[1] = (unsigned)(pid_), memset(dat, 0, sizeof dat), \
-         (out_) = cng_dispatch(__NR_capget, (long)hdr, (long)dat, 0, 0, 0, 0, 1), \
-         dat[0])
-        self_e = PT_CAPGET(0, self_r);
-        tid_e = PT_CAPGET(sys_gettid(), tid_r);
+        self_e = dbg_capget(0, &self_r);
+        tid_e = dbg_capget((int)sys_gettid(), &tid_r);
         long kid = sys_fork();
         if (kid == 0) {
             struct cng_timespec nap = {5, 0};
@@ -5771,20 +5785,19 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
         kid_r = dead_r = -1;
         if (kid > 0) {
             cng_procreg_fork((int)kid);
-            kid_e = PT_CAPGET(kid, kid_r);
+            kid_e = dbg_capget((int)kid, &kid_r);
             CNG_SYS(__NR_kill, kid, 9, 0, 0, 0, 0);
             sys_wait4((int)kid, 0, 0, 0);
-            PT_CAPGET(kid, dead_r);
+            dbg_capget((int)kid, &dead_r);
         }
-        PT_CAPGET(CNG_SYS(__NR_getppid, 0, 0, 0, 0, 0, 0), host_r);
-        PT_CAPGET(-1, neg_r);
+        dbg_capget((int)CNG_SYS(__NR_getppid, 0, 0, 0, 0, 0, 0), &host_r);
+        dbg_capget(-1, &neg_r);
         /* a pid that is certainly not there: just under pid_max's ceiling,
          * walked down until the kernel agrees nothing owns it */
         long none = 0x3ffff0;
         while (CNG_SYS(__NR_kill, none, 0, 0, 0, 0, 0) != -ESRCH)
             none--;
-        PT_CAPGET(none, none_r);
-#undef PT_CAPGET
+        dbg_capget((int)none, &none_r);
         ok &= self_r == 0 && self_e == 0xffffffffu && tid_r == 0 &&
               tid_e == 0xffffffffu && kid_r == 0 && kid_e == 0xffffffffu &&
               dead_r == -ESRCH && host_r == 0 && neg_r == -EINVAL &&

@@ -134,6 +134,38 @@ if guest_xlate_ready "execve-via-rewrite leg" &&
     check_contains "exec'd program got its argv" "argv1=from-execer" "$out"
 fi
 
+# The other clone the trampoline lets through: a vfork-style one, which the
+# converter turns into a COW fork because our execve is emulated in-process.
+# The converted child comes back through the dispatcher's frames on the scratch
+# stack and has to leave through the trampoline's exit onto the stack the guest
+# handed it — glibc's vfork hands the parent's own sp, posix_spawn a stack of
+# its own. The -R path used to give the real clone that stack as newsp, so the
+# child returned from the raw syscall with SP in a buffer holding none of those
+# frames: every vfork(3) and posix_spawn(3) under -R ended in the child's
+# SIGSEGV, before it could even reach its exec. The SIGSYS tier had this right
+# from the start (clonestktest); this is the same program under the kernel,
+# with the exec'd program named by host path, against it under -R.
+if guest_xlate_ready "vfork-under-rewrite leg" &&
+    guest_cc_report "$ROOT/bin/hello" tests/guests/hello.c &&
+    guest_cc_report "$ROOT/bin/vforker" tests/guests/vforker.c; then
+    want=$(emu_t 60 "$ROOT/bin/vforker" "$ROOT/bin/hello" 2>/dev/null |
+        grep -v '^guest: ')
+    out=$(m8run -R "$ROOT" /bin/vforker /bin/hello 2>/dev/null); rc=$?
+    check "a vforking guest runs under -R" 0 $rc
+    check_contains "a bare vfork child exits on the parent's stack" \
+        "vfork-exit: exited 7" "$out"
+    check_contains "a vfork child execs" "vfork-exec: exited 42" "$out"
+    check_contains "a posix_spawn child resumes on its own stack and execs" \
+        "spawn-exec: exited 42" "$out"
+    check_contains "the exec'd program got its argv" "argv1=from-vforker" "$out"
+    if [ -n "$want" ]; then
+        check "and the outcomes match the same program under the kernel" \
+            "$want" "$(printf '%s\n' "$out" | grep -v '^guest: ')"
+    else
+        skip "vforker kernel differential: the reference run produced nothing"
+    fi
+fi
+
 rm -rf "$ROOT"
 
 # ...and the same chain with BOTH programs non-PIE, which the emulation used to

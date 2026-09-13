@@ -145,63 +145,11 @@ static int sigsys_syscall(struct cng_ucontext *uc, long nr) {
     }
 #endif
 
-    /* clone with CLONE_VFORK (only these trap; see seccomp.c): a vfork-style
-     * spawn shares the parent's address space and suspends us until the child
-     * execs. Our execve is emulated in-process, so a shared-VM child would load
-     * the new program over the parent and never issue the real execve that
-     * resumes it. Convert to a plain COW fork, with two stack adjustments:
-     *  - pass child_stack=0 to the real clone so the forked child inherits (COW)
-     *    the parent's current SP — which here is the *scratch stack* our handler
-     *    frames sit on. The child must unwind those frames and sigreturn; giving
-     *    it the caller-supplied child stack instead sets its SP into a buffer
-     *    with no such frames -> Bus error before it can even execve.
-     *  - then point uc->sp at that caller-supplied child stack for the child, so
-     *    after sigreturn it resumes on the stack the guest's clone wrapper
-     *    expects (musl's __clone/posix_spawn stored the child fn+arg there).
-     *    child_stack==0 is a bare vfork: the child just continues on the
-     *    parent's stack, so leave uc->sp alone. */
+    /* clone: the vfork-style kinds the filter traps are converted to a COW
+     * fork, and the child's stack goes into the context for sigreturn to
+     * install (cng_clone_convert has the whole story). */
     if (nr == __NR_clone) {
-        unsigned long child_stack = (unsigned long)r[1];
-        unsigned long orig_flags = (unsigned long)r[0];
-        /* Decided before the fork, from the flags the guest asked for: the
-         * conversion below erases CLONE_VFORK, and a tracer following vforks
-         * must still see EVENT_VFORK rather than EVENT_FORK. */
-        int ev = cng_pt_clone_event(orig_flags);
-        /* The guest's no_new_privs bit is per task and the child inherits the
-         * forking task's, so it is sampled before the fork: in the child,
-         * gettid answers a tid the table has never seen. */
-        int nnp = cng_nnp_get();
-        long flags = (long)(orig_flags & ~(unsigned long)(CNG_CLONE_VM |
-                                                          CNG_CLONE_VFORK));
-        long ret = cng_syscall6(flags, 0, (long)r[2], (long)r[3], (long)r[4],
-                                (long)r[5], __NR_clone);
-        if (ret == 0) {
-            cng_nnp_fork_child(nnp); /* one task, holding what we held */
-            /* The child inherited both the mappings and the attach list, so
-             * the broker must count those attaches again (shm.c). */
-            cng_shm_fork_child();
-            if (child_stack)
-                uc->uc_mcontext.sp = child_stack;
-            r[0] = 0;
-            cng_pt_fork_child(ur, ev);
-            return 1;
-        }
-        if (ret > 0) {
-            /* Publish the child into the PID registry: it cannot do that for
-             * itself, because nothing guarantees it makes another trapped
-             * syscall before something reads its /proc entry — and a tracer
-             * attaching to it by pid needs it to be a known guest process. */
-            cng_procreg_fork((int)ret);
-            r[0] = (unsigned long long)ret;
-            cng_pt_report_event(ur, ev, (u64)ret);
-            /* A real vfork would have suspended us until the child exec'd or
-             * exited; ours does not, so the "vfork done" event is reported as
-             * soon as the child exists. */
-            if (orig_flags & CNG_CLONE_VFORK)
-                cng_pt_report_event(ur, CNG_PTRACE_EVENT_VFORK_DONE, (u64)ret);
-            return 1;
-        }
-        r[0] = (unsigned long long)ret;
+        cng_clone_convert(ur);
         return 1;
     }
 

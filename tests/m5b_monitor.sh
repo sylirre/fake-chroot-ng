@@ -492,7 +492,7 @@ check_contains "a 50k-entry argv builds on a handler-sized stack" \
 out=$(run -t clonetest 2>&1); rc=$?
 check "clonetest exit 0" 0 "$rc"
 check_contains "vfork clone converted to private-VM fork" \
-    "clone: pid>0=1 child_exit7=1 private_vm=1 -> OK" "$out"
+    "clone: pid>0=1 child_exit7=1 private_vm=1 sp_kept=1 -> OK" "$out"
 
 # A vfork-style clone carrying a caller-provided child stack (musl __clone /
 # posix_spawn, as gcc uses to launch cc1) must resume the converted child on

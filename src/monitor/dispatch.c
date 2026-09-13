@@ -2408,6 +2408,74 @@ static long mmsg_deadline_report(struct mmsg_deadline *d, long tp,
     return 0;
 }
 
+/* clone, for the process-making kinds the tiers trap (a thread's clone runs
+ * natively on both: the filter tests CLONE_VM/CLONE_VFORK, tramp.S does the
+ * same). `ur` is the guest's register frame — the SIGSYS tier's signal context
+ * or the -R trampoline's saved register file — read for the arguments and
+ * written with the result, and in the child with its stack.
+ *
+ * A vfork-style clone (CLONE_VM|CLONE_VFORK) shares the parent's address space
+ * and suspends the parent until the child execs. Our execve is emulated
+ * in-process, so a shared-VM child would load the new program over the parent
+ * and never issue the real execve that resumes it. Convert it to a plain COW
+ * fork, with two stack adjustments:
+ *  - pass child_stack=0 to the real clone so the forked child inherits (COW)
+ *    the parent's current SP — which here is the *scratch stack* this runs on.
+ *    The child must unwind these frames and leave through the tier's exit;
+ *    giving it the caller-supplied child stack instead sets its SP into a
+ *    buffer with none of them -> the return from the raw syscall restores
+ *    garbage and the child dies before it can even execve. The -R tier did
+ *    exactly that: glibc's vfork passes the current sp as child_stack, and
+ *    every vfork/posix_spawn under -R ended in the child's SIGSEGV.
+ *  - then point the frame's sp at that caller-supplied child stack for the
+ *    child, so once the tier returns to the guest it resumes on the stack the
+ *    guest's clone wrapper expects (musl's __clone/posix_spawn stored the child
+ *    fn+arg there). child_stack==0 is a bare vfork: the child continues on the
+ *    parent's stack, so the frame's sp is left alone. A bare glibc vfork hands
+ *    the parent's own sp, which is the same value the frame already holds.
+ * The parent then publishes the child into the PID registry, which is what
+ * makes the new process visible as a guest one. The child cannot do this
+ * itself: nothing guarantees it makes another traced syscall before something
+ * reads its /proc entry — and a tracer attaching to it by pid needs it to be a
+ * known guest process. */
+void cng_clone_convert(struct cng_uregs *ur) {
+    unsigned long orig_flags = (unsigned long)ur->x[0];
+    unsigned long child_stack = (unsigned long)ur->x[1];
+    /* Decided before the fork, from the flags the guest asked for: the
+     * conversion below erases CLONE_VFORK, and a tracer following vforks must
+     * still see EVENT_VFORK rather than EVENT_FORK. */
+    int ev = cng_pt_clone_event(orig_flags);
+    /* The guest's no_new_privs bit is per task and the child inherits the
+     * forking task's, so it is sampled before the fork: in the child, gettid
+     * answers a tid the table has never seen. */
+    int nnp = cng_nnp_get();
+    long flags = (long)(orig_flags &
+                        ~(unsigned long)(CNG_CLONE_VM | CNG_CLONE_VFORK));
+    long ret = cng_syscall6(flags, 0, (long)ur->x[2], (long)ur->x[3],
+                            (long)ur->x[4], (long)ur->x[5], __NR_clone);
+    if (ret == 0) {
+        cng_nnp_fork_child(nnp); /* one task, holding what we held */
+        /* The child inherited both the mappings and the attach list, so the
+         * broker must count those attaches again (shm.c). */
+        cng_shm_fork_child();
+        if (child_stack)
+            ur->sp = child_stack;
+        ur->x[0] = 0;
+        cng_pt_fork_child(ur, ev);
+        return;
+    }
+    ur->x[0] = (u64)ret;
+    if (ret > 0) {
+        cng_procreg_fork((int)ret);
+        cng_pt_report_event(ur, ev, (u64)ret);
+        /* A real vfork would have suspended us until the child exec'd or
+         * exited; ours does not, so the "vfork done" event is reported as soon
+         * as the child exists. */
+        if (orig_flags & CNG_CLONE_VFORK)
+            cng_pt_report_event(ur, CNG_PTRACE_EVENT_VFORK_DONE, (u64)ret);
+    }
+}
+
 long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                   int trapped) {
     char b1[CNG_PATH_MAX], b2[CNG_PATH_MAX];
@@ -3229,54 +3297,24 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_getdents64:
         return do_getdents64(a0, a1, a2, a3, a4, a5);
 
-    /* clone with CLONE_VFORK (only these are trapped; see seccomp.c): a
-     * vfork-style spawn shares the parent's address space and suspends the
-     * parent until the child execs. Our execve is emulated in-process, so a
-     * shared-VM child would load the new program over the parent's memory and
-     * never issue the real execve that resumes the parent. Strip CLONE_VM and
-     * CLONE_VFORK so it becomes an ordinary COW fork: the child gets a private
-     * copy, the emulated execve happens there, and the parent continues (the
-     * child's execve closes the O_CLOEXEC notify pipe, signalling success). */
-    /* The SIGSYS path handles clone in cng_sigsys_body (it needs the ucontext to
-     * fix the child's stack). This branch is only reached via an M8 trampoline
-     * (-R); best-effort strip of the shared-VM flags. */
-    /* clone: trapped for process creation only (a thread keeps CLONE_VM and
-     * runs natively). CLONE_VM|CLONE_VFORK are stripped — our execve is
-     * emulated in-process, so a child sharing our address space would corrupt
-     * it — and the parent then publishes the child into the PID registry, which
-     * is what makes the new process visible as a guest one. The child cannot do
-     * this itself: nothing guarantees it makes another traced syscall before
-     * something reads its /proc entry. */
+    /* A guest's clone never arrives here: both tiers hand it to
+     * cng_clone_convert with their register frame first, because the child's
+     * stack is a frame edit and not a return value. This entry is for the
+     * direct callers (the tests) that fork through the dispatcher to have the
+     * child-side hooks run; with no frame to return through they cannot ask for
+     * a child stack, and a bare fork does not. */
     case __NR_clone: {
-        /* Decided from the flags the guest asked for, before the conversion
-         * below erases CLONE_VFORK. */
-        int ev = cng_pt_clone_event((unsigned long)a0);
-        /* Sampled before the clone: in the child the per-task lookup is keyed
-         * by a tid that has no entry yet, so it would answer NULL. The frame
-         * itself is on the trampoline's stack, which the child inherits at the
-         * same address. */
-        struct cng_uregs *ur = cng_pt_cur_regs();
-        /* Sampled here for the same reason: in the child this task's tid is a
-         * new one, with nothing recorded against it. */
-        int nnp = cng_nnp_get();
-        long flags = a0 & ~(long)(CNG_CLONE_VM | CNG_CLONE_VFORK);
-        long r = cng_syscall6(flags, a1, a2, a3, a4, a5, __NR_clone);
-        if (r > 0) {
-            cng_procreg_fork((int)r);
-            if (ur) {
-                cng_pt_report_event(ur, ev, (u64)r);
-                /* Our fork does not suspend the parent the way a real vfork
-                 * would, so "vfork done" is reported as soon as the child is. */
-                if (a0 & CNG_CLONE_VFORK)
-                    cng_pt_report_event(ur, CNG_PTRACE_EVENT_VFORK_DONE, (u64)r);
-            }
-        } else if (r == 0) {
-            cng_nnp_fork_child(nnp); /* one task, holding what we held */
-            cng_shm_fork_child();    /* the child inherited our shm attaches */
-            if (ur)
-                cng_pt_fork_child(ur, ev);
-        }
-        return r;
+        struct cng_uregs fr;
+        memset(&fr, 0, sizeof fr);
+        fr.x[0] = (u64)a0;
+        fr.x[1] = (u64)a1;
+        fr.x[2] = (u64)a2;
+        fr.x[3] = (u64)a3;
+        fr.x[4] = (u64)a4;
+        fr.x[5] = (u64)a5;
+        fr.x[8] = __NR_clone;
+        cng_clone_convert(&fr);
+        return (long)fr.x[0];
     }
 
     /* System V shared memory. Android's seccomp filter denies all four
@@ -4431,6 +4469,19 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
  * read and write, and the same single-step report. `trapped` is 0 here — an
  * unhandled syscall on this path is an ordinary one to re-issue, not one
  * Android blocked. */
+/* The trapped syscall itself, the -R counterpart of sigsys_syscall: the one
+ * case that needs the register frame rather than six arguments (the converted
+ * clone puts the child's stack into it, for the trampoline's exit to install),
+ * then the dispatcher for everything else. */
+static void tramp_syscall(struct cng_uregs *r, long nr) {
+    if (nr == __NR_clone) {
+        cng_clone_convert(r);
+        return;
+    }
+    r->x[0] = (u64)cng_dispatch(nr, (long)r->x[0], (long)r->x[1], (long)r->x[2],
+                                (long)r->x[3], (long)r->x[4], (long)r->x[5], 0);
+}
+
 static void tramp_body(void *p) {
     struct cng_uregs *r = (struct cng_uregs *)p;
     long nr = (long)r->x[8];
@@ -4443,17 +4494,14 @@ static void tramp_body(void *p) {
         cng_scratch_leave();
     cng_pt_set_frame(r, 0);
     if (!cng_pt_active()) {
-        r->x[0] = (u64)cng_dispatch(nr, (long)r->x[0], (long)r->x[1],
-                                    (long)r->x[2], (long)r->x[3], (long)r->x[4],
-                                    (long)r->x[5], 0);
+        tramp_syscall(r, nr);
         return;
     }
     if (!cng_pt_syscall_entry(r, &nr)) {
         cng_pt_syscall_exit(r); /* cancelled: x0 is the tracer's own answer */
         return;
     }
-    r->x[0] = (u64)cng_dispatch(nr, (long)r->x[0], (long)r->x[1], (long)r->x[2],
-                                (long)r->x[3], (long)r->x[4], (long)r->x[5], 0);
+    tramp_syscall(r, nr);
     cng_pt_syscall_exit(r);
     cng_pt_step_report(r);
 }
