@@ -1833,12 +1833,21 @@ long cng_pt_waitid(long idtype, long id, u64 infop, long options, u64 rusage,
 /* ---- tracer: process_vm_readv/writev against a stopped tracee ---- */
 
 int cng_pt_vm_rw(long nr, long pid, u64 lvec, u64 lcnt, u64 rvec, u64 rcnt,
-                 long *out) {
+                 u64 flags, long *out) {
     if (!g_tab || !g_pt_local)
         return 0;
     struct pt_link *e = pt_find((s32)pid);
     if (!e || __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) != (s32)sys_getpid())
         return 0; /* not our tracee: let the host answer */
+    /* The flags word is reserved and must be 0: process_vm_rw() refuses
+     * anything else with EINVAL before it so much as looks the pid up
+     * (measured: a nonexistent pid with flags=1 is EINVAL, with flags=0
+     * ESRCH). The emulated path dropped the argument on the floor, so a
+     * tracer probing for the refusal was told the call worked. */
+    if (flags) {
+        *out = -EINVAL;
+        return 1;
+    }
     if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) != PT_ST_STOPPED) {
         *out = -ESRCH;
         return 1;

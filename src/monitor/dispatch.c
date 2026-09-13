@@ -4214,7 +4214,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_process_vm_readv:
     case __NR_process_vm_writev: {
         long out;
-        if (cng_pt_vm_rw(nr, a0, (u64)a1, (u64)a2, (u64)a3, (u64)a4, &out))
+        if (cng_pt_vm_rw(nr, a0, (u64)a1, (u64)a2, (u64)a3, (u64)a4, (u64)a5,
+                         &out))
             return out;
         return reissue(a0, a1, a2, a3, a4, a5, nr);
     }

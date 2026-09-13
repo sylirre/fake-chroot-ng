@@ -239,10 +239,11 @@ long cng_pt_waitid(long idtype, long id, u64 infop, long options, u64 rusage,
                    const struct cng_ucontext *uc);
 
 /* process_vm_readv/writev where the peer is one of our stopped tracees: served
- * over the mailbox, because the host may refuse the real thing. Returns 1 and
- * sets *out when it handled the call, 0 to let it run natively. */
+ * over the mailbox, because the host may refuse the real thing. `flags` is the
+ * call's last argument, which the kernel requires to be 0. Returns 1 and sets
+ * *out when it handled the call, 0 to let it run natively. */
 int cng_pt_vm_rw(long nr, long pid, u64 lvec, u64 lcnt, u64 rvec, u64 rcnt,
-                 long *out);
+                 u64 flags, long *out);
 
 /* A stop signal (SIGSTOP/SIGTSTP/...) or SIGCONT aimed at a task with tracees:
  * routed into cooperative group-stops instead of a real host stop, which would

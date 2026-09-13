@@ -782,6 +782,20 @@ static int sc_vmrw(void) {
     n = process_vm_readv(pid, &liov, 2048, &riov, 1, 0);
     printf("vmrw overmax %s\n", vmres(n));
 
+    /* The flags word is reserved: anything but 0 is EINVAL, and that refusal
+     * comes first — before the pid is looked up, before the iovecs are read —
+     * so it wins over the ESRCH and the count errors above. The emulation
+     * never read the argument. Both directions, since each has its own entry. */
+    errno = 0;
+    n = process_vm_readv(pid, &liov, 1, &riov, 1, 1);
+    printf("vmrw flags %s\n", vmres(n));
+    errno = 0;
+    n = process_vm_writev(pid, &liov, 1, &riov, 1, 0x80);
+    printf("vmrw wflags %s\n", vmres(n));
+    errno = 0;
+    n = process_vm_readv(pid, &liov, 2048, &riov, 1, 1);
+    printf("vmrw flags+overmax %s\n", vmres(n));
+
     /* Several entries a side, of different lengths, with an empty one among
      * them: the two lists are walked in lockstep and neither index moves with
      * the other, so this is the case where the walk leaves an entry behind and
