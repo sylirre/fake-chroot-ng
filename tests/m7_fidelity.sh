@@ -123,6 +123,17 @@ check_contains "l2s linkat-by-fd bumps the group" \
     "l2s-fdlink: rc=0 nlink4=1 -> OK" "$out"
 check_contains "l2s O_NOFOLLOW opens the link, still ELOOPs real symlinks" \
     "l2s-nofollow: open=1 content=1 sym_eloop=1 -> OK" "$out"
+# ...and every other call that declines to follow the final component lands on
+# the backing file too: O_PATH|O_NOFOLLOW (an fd whose fstat is the regular
+# file), name_to_handle_at (the group's handle, not the link's), the l-xattr
+# calls (set through one name, read through another), an IN_DONT_FOLLOW watch
+# (fires for a change through another name), fchmodat2(AT_SYMLINK_NOFOLLOW),
+# and openat2's O_NOFOLLOW and RESOLVE_NO_SYMLINKS. Each used to operate on the
+# emulation's own symlink. Fields the host cannot issue (openat2 under qemu-user,
+# fchmodat2 with older headers) read -1 and are not failures; the rest must be 1.
+check_contains "l2s no-follow calls all land on the backing file" \
+    "l2s-nofollow-rest: opath_reg=1 handle=1 xattr=1 watch=1" "$out"
+check_absent "...and none of them failed" "-> FAIL (-1 = not issuable here)" "$out"
 check_contains "l2s legacy per-dir format fully interoperates" \
     "l2s-old: reg=1 same=1 bump3=1 xdir4=1 back2=1 einval=1 -> OK" "$out"
 check_contains "l2s unusable store falls back to the per-dir scheme" \

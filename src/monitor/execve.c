@@ -778,6 +778,49 @@ static long exec_load_errno(int rc, const struct cng_elf_plan *plan, int interp)
     }
 }
 
+/* The host path of the l2s link an exec of (dirfd, path) lands on, if any:
+ * the resolution followed, symlink by symlink, up to but not through the
+ * emulation's own hop — the point where a real kernel's walk would have
+ * arrived at the hardlink's dentry and stopped. An absolute target is re-rooted
+ * into the guest view as the resolver re-roots it; a relative one is taken
+ * against the guest spelling of the directory the link sits in. 1 with `out`
+ * filled, 0 for a chain that ends anywhere else (a plain file, a dangling
+ * link, a name outside the view). */
+static int l2s_exe_name(int dirfd, const char *path, char *out, size_t sz) {
+    char nm[CNG_PATH_MAX], tgt[CNG_PATH_MAX], next[CNG_PATH_MAX];
+    long d = dirfd;
+    const char *p = path;
+    for (int hops = 0; hops < 40; hops++) {
+        if (cng_resolve_at(d, p, 0, nm, sizeof nm) != 0)
+            return 0;
+        if (cng_l2s_resolve(nm, tgt, sizeof tgt, 0) == 1) {
+            cng_strlcpy(out, nm, sz);
+            return 1;
+        }
+        long n = sys_readlinkat(CNG_AT_FDCWD, nm, tgt, sizeof tgt - 1);
+        if (n <= 0)
+            return 0; /* not a symlink: the resolution above stands */
+        tgt[n] = '\0';
+        if (tgt[0] == '/') {
+            cng_strlcpy(next, tgt, sizeof next);
+        } else {
+            /* Relative: against the guest directory of the link itself. */
+            if (cng_fs_untranslate(cng_g_fs, nm, next, sizeof next) != 0)
+                return 0;
+            char *sl = strrchr(next, '/');
+            if (!sl)
+                return 0;
+            sl[1] = '\0';
+            if (cng_strlcpy(sl + 1, tgt, sizeof next - (size_t)(sl + 1 - next)) >=
+                sizeof next - (size_t)(sl + 1 - next))
+                return 0;
+        }
+        p = next;
+        d = CNG_AT_FDCWD;
+    }
+    return 0;
+}
+
 static long execve_load(int dirfd, const char *path, char **argv, char **envp,
                         int flags, unsigned long *out_sp,
                         unsigned long *out_entry) {
@@ -815,13 +858,20 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
                 return -ENOENT;
             }
             /* AT_SYMLINK_NOFOLLOW does not open the link's target, it refuses:
-             * the kernel answers ELOOP for a final symlink. */
+             * the kernel answers ELOOP for a final symlink. Not for the l2s
+             * emulation's own link, which to the guest is the regular file it
+             * asked to run: that one takes the hop to its backing file. */
             if (nofollow) {
                 char st[144];
                 if (CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, host, st,
                             CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0 &&
-                    (*(unsigned *)(st + 16) & 0170000) == 0120000)
-                    return -ELOOP;
+                    (*(unsigned *)(st + 16) & 0170000) == 0120000) {
+                    char data[CNG_PATH_MAX];
+                    if (!(cng_g_l2s &&
+                          cng_l2s_resolve(host, data, sizeof data, 0) == 1))
+                        return -ELOOP;
+                    cng_strlcpy(host, data, sizeof host);
+                }
             }
         } else {
             /* An interpreter path is resolved like any other name, so its ".."
@@ -1122,6 +1172,18 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
                 exe_host = linked;
         }
     }
+    /* An l2s name is a name of the file in its own right, as a hardlink is,
+     * and the kernel records the name it resolved — not another name of the
+     * same inode. The resolution above took the emulation's hop to the backing
+     * file, whose path is in the store the guest cannot see: /proc/self/exe
+     * read "/.l2s/.l2s.<ino>", a name that does not even open. The name the
+     * chain ends at is what the link reports. `cur` is the guest name of the
+     * image loaded: level 0 against the execveat dirfd, an interpreter by its
+     * own #! spelling. */
+    else if (cng_g_l2s &&
+             l2s_exe_name(depth == 0 ? dirfd : CNG_AT_FDCWD, cur, linked,
+                          sizeof linked))
+        exe_host = linked;
 
     /* Commit point: the new image loaded successfully, so from here we behave
      * like a real execve. Close FD_CLOEXEC descriptors (see cng_close_cloexec)

@@ -178,6 +178,24 @@ if guest_cc_report "$ER/hello" tests/guests/hello.c; then
         "emulate_execve failed x0=-40" "$(exectest -N /go X 2>&1)"
     out=$(exectest -N /hello X 2>&1); rc=$?
     check "AT_SYMLINK_NOFOLLOW on a real file still runs it" 42 $rc
+    # ...and on an emulated hardlink, which to the guest is a regular file and
+    # not the l2s symlink it is implemented with: the flag used to ELOOP it.
+    # /proc/self/exe then names the hardlink itself, as the kernel names the
+    # dentry it resolved — it used to read the backing file's path in the
+    # store, "/.l2s/.l2s.<ino>", a name the guest cannot even open. On a copy
+    # of the program: -L turns both names into l2s links, and the fixture's own
+    # /hello has legs after this one that want it plain.
+    cp "$ER/hello" "$ER/hello_l"
+    ln -s /hello_l "$ER/go_l"
+    out=$(exectest -l -L /hello_l:/hlink -N /hlink X 2>&1); rc=$?
+    check "AT_SYMLINK_NOFOLLOW runs an l2s name rather than ELOOP it" 42 $rc
+    check_contains "...and /proc/self/exe names the hardlink, not the store" \
+        "exe=/hlink" "$out"
+    # A real symlink leading to an l2s name: the chain ends at the hardlink.
+    check_contains "a symlink to an l2s name reports that name as exe" \
+        "exe=/hello_l" "$(exectest -l /go_l X 2>&1)"
+    check_contains "...while a real symlink is still refused under -l" \
+        "emulate_execve failed x0=-40" "$(exectest -l -N /go X 2>&1)"
     check_contains "an undefined execveat flag is EINVAL" \
         "emulate_execve failed x0=-22" "$(exectest -B /hello 2>&1)"
 

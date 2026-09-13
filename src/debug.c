@@ -2271,10 +2271,10 @@ int cng_cmd_loadtwice(int argc, char **argv, char **envp, unsigned long *auxv) {
     return (rc1 == 0 && rc2 == 0) ? 0 : 1;
 }
 
-/* _exectest -r ROOT [-b SRC:DST[:ro]]... [-D DIR] [-e] [-N] [-B] PROG [args]
- * — drive cng_emulate_execve (incl. shebang) and, on success, enter the loaded
- * program. Exercises execve emulation under qemu where neither the SIGSYS nor
- * trampoline route reaches it.
+/* _exectest -r ROOT [-b SRC:DST[:ro]]... [-D DIR] [-e] [-N] [-B] [-l]
+ * [-L SRC:DST] PROG [args] — drive cng_emulate_execve (incl. shebang) and, on
+ * success, enter the loaded program. Exercises execve emulation under qemu
+ * where neither the SIGSYS nor trampoline route reaches it.
  *
  * The execveat form is reachable through the option flags, which is the only way
  * to test what its flags word means now that it is read at all:
@@ -2282,6 +2282,9 @@ int cng_cmd_loadtwice(int argc, char **argv, char **envp, unsigned long *auxv) {
  *   -e      AT_EMPTY_PATH: open PROG and execute the fd, with an empty path
  *   -N      AT_SYMLINK_NOFOLLOW
  *   -B      set an undefined flag bit, which the kernel refuses with EINVAL
+ *   -l      enable link2symlink, forced (every linkat goes through it)
+ *   -L S:D  linkat(S, D) through the dispatcher first — with -l, an l2s link
+ *           for -N to exec, which must run it rather than ELOOP
  *
  * The binds matter for a dynamically linked guest: its ELF interpreter is named
  * by an absolute guest path, and a synthetic rootfs holding only the test binary
@@ -2293,11 +2296,18 @@ int cng_cmd_exectest(int argc, char **argv, char **envp, unsigned long *auxv) {
     const char *bind_h[CNG_MAX_BINDS];
     int bind_ro[CNG_MAX_BINDS];
     const char *dirpath = 0;
-    int nb = 0, xflags = 0, empty = 0, probe_reset = 0;
+    char *linkspec = 0;
+    int nb = 0, xflags = 0, empty = 0, probe_reset = 0, l2s = 0;
     int i = 1;
     while (i < argc) {
         if (!strcmp(argv[i], "-r") && i + 1 < argc) {
             rootfs = argv[i + 1];
+            i += 2;
+        } else if (!strcmp(argv[i], "-l")) {
+            l2s = 1;
+            i++;
+        } else if (!strcmp(argv[i], "-L") && i + 1 < argc) {
+            linkspec = argv[i + 1];
             i += 2;
         } else if (!strcmp(argv[i], "-D") && i + 1 < argc) {
             dirpath = argv[i + 1];
@@ -2340,7 +2350,7 @@ int cng_cmd_exectest(int argc, char **argv, char **envp, unsigned long *auxv) {
     }
     if (i >= argc) {
         cng_dprintf(2, "usage: _exectest -r ROOT [-b SRC:DST[:ro]]... "
-                       "[-D DIR] [-e] [-N] [-B] PROG [args]\n");
+                       "[-D DIR] [-e] [-N] [-B] [-l] [-L SRC:DST] PROG [args]\n");
         return 2;
     }
     static struct cng_fs fs;
@@ -2350,6 +2360,23 @@ int cng_cmd_exectest(int argc, char **argv, char **envp, unsigned long *auxv) {
     cng_g_fs = &fs;
     cng_host_auxv = auxv;
     cng_g_host_envp = envp;
+    if (l2s)
+        cng_g_l2s = cng_g_l2s_force = 1;
+    if (linkspec) {
+        char *c = strchr(linkspec, ':');
+        if (!c) {
+            cng_dprintf(2, "exectest: -L wants SRC:DST\n");
+            return 2;
+        }
+        *c = '\0';
+        long r = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)linkspec,
+                              CNG_AT_FDCWD, (long)(c + 1), 0, 0, 1);
+        if (r != 0) {
+            cng_dprintf(2, "exectest: linkat %s -> %s failed %ld\n", linkspec,
+                        c + 1, r);
+            return 1;
+        }
+    }
     /* The emulation asks this what the ambient (Android) filter refuses, the
      * same as it does when the real monitor installs it — and here nothing
      * catches a SIGSYS, so a syscall issued in ignorance is fatal rather than
@@ -2998,6 +3025,139 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
     cng_dprintf(1, "l2s-nofollow: open=%d content=%d sym_eloop=%d -> %s\n",
                 nf_open, nf_content, nf_sym, ok_nf ? "OK" : "FAIL");
     fails += !ok_nf;
+
+    /* Every other call that declines to follow the final component has to land
+     * on the backing file the same way — handed the name, the kernel operated
+     * on the emulation's own symlink, and the guest saw a symlink where it has
+     * a file. O_PATH|O_NOFOLLOW handed over an fd whose fstat said S_IFLNK
+     * (glibc's fchmodat emulation goes this way and then refuses with ENOTSUP);
+     * name_to_handle_at encoded a handle to the link; the l-xattr calls worked
+     * on the link (EPERM to set user.* on a symlink); an IN_DONT_FOLLOW watch
+     * armed on the link never fired for the data; fchmodat2(AT_SYMLINK_NOFOLLOW)
+     * was EOPNOTSUPP; openat2 drew ELOOP from O_NOFOLLOW, and from
+     * RESOLVE_NO_SYMLINKS in our own walk. Each lands on the data now, shown
+     * through ANOTHER name of the group where the call has an effect to show.
+     * Legs the host cannot issue (no openat2 under qemu-user, a build whose
+     * headers predate fchmodat2, a filesystem without user xattrs or file
+     * handles) report themselves skipped rather than failed. */
+    {
+        int opath_reg = 0, handle_same = -1, xattr = -1, watch = 0, chmod2 = -1,
+            o2_nofollow = -1, o2_nosym = -1;
+        /* (a) O_PATH|O_NOFOLLOW: the real inode of the group, a regular file */
+        long pfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/f",
+                                CNG_O_PATH | CNG_O_NOFOLLOW, 0, 0, 0, 0);
+        if (pfd >= 0) {
+            char sp[144];
+            if (sys_fstat((int)pfd, sp) == 0)
+                opath_reg = (ST_MODE(sp) & 0170000) == 0100000 &&
+                            ST_INO(sp) == ST_INO(sf);
+            sys_close((int)pfd);
+        }
+        /* (b) name_to_handle_at without AT_SYMLINK_FOLLOW: the same handle a
+         *     following call returns */
+        struct {
+            unsigned bytes, type;
+            unsigned char h[128];
+        } h1 = {128, 0, {0}}, h2 = {128, 0, {0}};
+        int mid1 = 0, mid2 = 0;
+        long hr1 = cng_dispatch(__NR_name_to_handle_at, CNG_AT_FDCWD,
+                                (long)"/w/f", (long)&h1, (long)&mid1, 0, 0, 0);
+        long hr2 = cng_dispatch(__NR_name_to_handle_at, CNG_AT_FDCWD,
+                                (long)"/w/j", (long)&h2, (long)&mid2,
+                                CNG_AT_SYMLINK_FOLLOW, 0, 0);
+        if (hr1 == 0 && hr2 == 0)
+            handle_same = h1.bytes == h2.bytes && h1.type == h2.type &&
+                          !memcmp(h1.h, h2.h, h1.bytes);
+        else if (hr1 != -EOPNOTSUPP && hr2 != -EOPNOTSUPP)
+            handle_same = 0;
+        /* (c) l-xattr: set through one name, read back through another, listed,
+         *     removed, gone */
+        long xs = cng_dispatch(__NR_lsetxattr, (long)"/w/f", (long)"user.cng",
+                               (long)"v", 1, 0, 0, 0);
+        if (xs == 0) {
+            char xv[8], xl[64];
+            long xg = cng_dispatch(__NR_lgetxattr, (long)"/w/j", (long)"user.cng",
+                                   (long)xv, sizeof xv, 0, 0, 0);
+            long xls = cng_dispatch(__NR_llistxattr, (long)"/w/f", (long)xl,
+                                    sizeof xl, 0, 0, 0, 0);
+            int listed = 0;
+            for (long i = 0; xls > 0 && i < xls; i += (long)strlen(xl + i) + 1)
+                listed |= !strcmp(xl + i, "user.cng");
+            long xr = cng_dispatch(__NR_lremovexattr, (long)"/w/f",
+                                   (long)"user.cng", 0, 0, 0, 0, 0);
+            long xg2 = cng_dispatch(__NR_lgetxattr, (long)"/w/j", (long)"user.cng",
+                                    (long)xv, sizeof xv, 0, 0, 0);
+            xattr = xg == 1 && xv[0] == 'v' && listed && xr == 0 &&
+                    xg2 == -ENODATA;
+        } else if (xs != -EOPNOTSUPP) {
+            xattr = 0;
+        }
+        /* (d) IN_DONT_FOLLOW: the watch is on the data, so a change made
+         *     through another name of the group fires it */
+        long ifd = CNG_SYS(__NR_inotify_init1, CNG_O_NONBLOCK | CNG_O_CLOEXEC, 0,
+                           0, 0, 0, 0);
+        if (ifd >= 0) {
+            long wd = cng_dispatch(__NR_inotify_add_watch, ifd, (long)"/w/f",
+                                   0x4 /*IN_ATTRIB*/ | CNG_IN_DONT_FOLLOW, 0, 0,
+                                   0, 0);
+            cng_dispatch(__NR_utimensat, CNG_AT_FDCWD, (long)"/w/j", 0, 0, 0,
+                         0, 0);
+            char ev[64];
+            long n = sys_read((int)ifd, ev, sizeof ev);
+            watch = wd >= 0 && n >= 16 && *(int *)ev == (int)wd;
+            sys_close((int)ifd);
+        }
+        /* (e) fchmodat2(AT_SYMLINK_NOFOLLOW): the mode lands on the data */
+#ifdef __NR_fchmodat2
+        long cm = cng_dispatch(__NR_fchmodat2, CNG_AT_FDCWD, (long)"/w/f", 0640,
+                               CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0);
+        if (cm == 0) {
+            char sc[144];
+            chmod2 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/j",
+                                  (long)sc, 0, 0, 0, 0) == 0 &&
+                     (ST_MODE(sc) & 07777) == 0640;
+            cng_dispatch(__NR_fchmodat, CNG_AT_FDCWD, (long)"/w/f", 0644, 0, 0,
+                         0, 0);
+        } else if (cm != -ENOSYS) {
+            chmod2 = 0;
+        }
+#endif
+        /* (f) openat2: O_NOFOLLOW in the how, and RESOLVE_NO_SYMLINKS */
+#ifdef __NR_openat2
+        struct cng_open_how how = {CNG_O_RDONLY | CNG_O_NOFOLLOW, 0, 0};
+        long o2 = cng_dispatch(__NR_openat2, CNG_AT_FDCWD, (long)"/w/f",
+                               (long)&how, sizeof how, 0, 0, 0);
+        if (o2 >= 0) {
+            char nb[8];
+            long nrd = sys_read((int)o2, nb, sizeof nb);
+            o2_nofollow = nrd == 2 && nb[0] == 'y' && nb[1] == 'o';
+            sys_close((int)o2);
+        } else if (o2 != -ENOSYS) {
+            o2_nofollow = 0;
+        }
+        how.flags = CNG_O_RDONLY;
+        how.resolve = CNG_RESOLVE_NO_SYMLINKS;
+        o2 = cng_dispatch(__NR_openat2, CNG_AT_FDCWD, (long)"/w/f", (long)&how,
+                          sizeof how, 0, 0, 0);
+        if (o2 >= 0) {
+            char nb[8];
+            long nrd = sys_read((int)o2, nb, sizeof nb);
+            o2_nosym = nrd == 2 && nb[0] == 'y' && nb[1] == 'o';
+            sys_close((int)o2);
+        } else if (o2 != -ENOSYS) {
+            o2_nosym = 0;
+        }
+#endif
+        int ok = opath_reg && handle_same != 0 && xattr != 0 && watch &&
+                 chmod2 != 0 && o2_nofollow != 0 && o2_nosym != 0;
+        cng_dprintf(1,
+                    "l2s-nofollow-rest: opath_reg=%d handle=%d xattr=%d watch=%d "
+                    "fchmodat2=%d openat2_nofollow=%d openat2_nosymlinks=%d "
+                    "-> %s (-1 = not issuable here)\n",
+                    opath_reg, handle_same, xattr, watch, chmod2, o2_nofollow,
+                    o2_nosym, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
 
     /* Legacy per-dir format end to end (what arm64chroot writes, and what a
      * pre-store chroot-ng left behind): stat, same-dir bump keeping the

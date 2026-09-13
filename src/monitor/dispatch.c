@@ -772,8 +772,15 @@ int cng_resolve_lim(const char *path, int deref_final, char *out, size_t outsz,
             continue; /* not a symlink, or missing */
         link[n] = '\0';
         if (lim && lim->no_symlinks) {
-            lim->err = -ELOOP;
-            return -ELOOP;
+            /* ...unless the link is the l2s emulation's own, which to the
+             * guest is a regular file and not a symlink at all: refusing it
+             * made openat2(RESOLVE_NO_SYMLINKS) ELOOP on an emulated hardlink
+             * where a real one opens. */
+            char d[CNG_PATH_MAX];
+            if (!(cng_g_l2s && cng_l2s_resolve(host, d, sizeof d, 0) == 1)) {
+                lim->err = -ELOOP;
+                return -ELOOP;
+            }
         }
         if (++nlinks > 40)
             return -ELOOP;
@@ -1178,6 +1185,36 @@ static int ro_denied_l2s(long dirfd, const char *gp) {
     char hnf[CNG_PATH_MAX], data[CNG_PATH_MAX];
     return cng_resolve_at(dirfd, gp, 0, hnf, sizeof hnf) == 0 &&
            cng_l2s_resolve(hnf, data, sizeof data, 0) == 1 && ro_denied(hnf);
+}
+
+/* --- no-follow calls on an l2s name -----------------------------------------
+ *
+ * To the guest an l2s name IS a regular file, so a call that declines to follow
+ * the final component — AT_SYMLINK_NOFOLLOW, O_NOFOLLOW, IN_DONT_FOLLOW, the
+ * l-prefixed xattr calls, name_to_handle_at without AT_SYMLINK_FOLLOW — has to
+ * land on the backing file all the same. Handed the name, the kernel operates
+ * on (or refuses) the emulation's own symlink instead, and the guest is shown a
+ * symlink where it has a file: a handle that opens the link, an xattr set on
+ * it, a watch that never fires for the data, EOPNOTSUPP from fchmodat2, an
+ * O_PATH fd whose fstat says S_IFLNK. stat, access, chown and utimensat were
+ * already redirected this way; this is the same hop for the rest of them.
+ *
+ * Returns 1 with `data` filled when (dirfd, gp) is such a name, 0 otherwise.
+ * `hnf`, when given, gets the name's own host path, which is the one the :ro
+ * question is asked about (see ro_denied_l2s above). The l2s hop is always the
+ * last component, so the backing path is absolute and a dirfd-relative call
+ * can simply be re-issued against it. */
+static int l2s_nofollow_data(long dirfd, const char *gp, char *hnf_out,
+                             size_t hsz, char *data, size_t dsz) {
+    if (!cng_g_l2s || !gp || !gp[0])
+        return 0;
+    char hnf[CNG_PATH_MAX];
+    if (cng_resolve_at(dirfd, gp, 0, hnf, sizeof hnf) != 0 ||
+        cng_l2s_resolve(hnf, data, dsz, 0) != 1)
+        return 0;
+    if (hnf_out)
+        cng_strlcpy(hnf_out, hnf, hsz);
+    return 1;
 }
 
 /* ro_refusal() for a call whose resolution followed the final component. The
@@ -2684,20 +2721,34 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             ha3 = (long)sizeof how;
         }
 #endif
+        /* An l2s name asked about without following it (see l2s_nofollow_data)
+         * is answered from its backing file. For a plain O_NOFOLLOW open that
+         * is done after the fact, on the ELOOP the kernel draws for the link —
+         * so the common case, a name that is not ours, costs no extra
+         * resolution. Two calls never draw that ELOOP and have to be redirected
+         * before: O_PATH|O_NOFOLLOW, which opens the symlink itself and handed
+         * over an fd whose fstat said S_IFLNK (glibc's own fchmodat emulation
+         * goes this way and then refuses with ENOTSUP); and name_to_handle_at
+         * without AT_SYMLINK_FOLLOW, which encoded a handle to the link. The
+         * backing path is absolute, so the dirfd is simply ignored. */
+        char l2d[CNG_PATH_MAX];
+        int l2nf = (is_open && (oflags & CNG_O_NOFOLLOW) && (oflags & CNG_O_PATH))
+#ifdef __NR_name_to_handle_at
+                   || (nr == __NR_name_to_handle_at && !deref)
+#endif
+            ;
+        if (l2nf && l2s_nofollow_data(rkd, rkp, 0, 0, l2d, sizeof l2d))
+            p = l2d;
         long r = reissue(a0, (long)p, ha2, ha3, a4, a5, nr);
         /* O_NOFOLLOW through a real dirfd lands on the l2s symlink and draws
          * ELOOP where a real hardlink would open. Retry on the backing file —
          * never a symlink itself, so O_NOFOLLOW stays honored for real
-         * guest symlinks. */
-        if (r == -ELOOP && cng_g_l2s && nr == __NR_openat &&
-            ((int)a2 & CNG_O_NOFOLLOW)) {
-            char hnf[CNG_PATH_MAX], data[CNG_PATH_MAX];
-            if (cng_resolve_at(a0, (const char *)a1, 0, hnf, sizeof hnf) ==
-                    0 &&
-                cng_l2s_resolve(hnf, data, sizeof data, 0) == 1)
-                r = reissue(CNG_AT_FDCWD, (long)data, a2, a3, a4, a5,
-                            __NR_openat);
-        }
+         * guest symlinks. openat2 carries the flag in its open_how and drew
+         * the same ELOOP; the retry re-issues our copy of that struct, its
+         * resolve constraints already answered and stripped. */
+        if (r == -ELOOP && is_open && (oflags & CNG_O_NOFOLLOW) &&
+            l2s_nofollow_data(rkd, rkp, 0, 0, l2d, sizeof l2d))
+            r = reissue(CNG_AT_FDCWD, (long)l2d, ha2, ha3, a4, a5, nr);
         if ((r == -EACCES || r == -EPERM) && nr == __NR_openat)
             r = cng_fd_reopen(p, a2, a3, r);
         return r;
@@ -2811,6 +2862,17 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
 #ifdef __NR_fchmodat2
     case __NR_fchmodat2: {
         int deref = !((int)a3 & CNG_AT_SYMLINK_NOFOLLOW);
+        /* An l2s name, not followed: the mode belongs to the backing file
+         * (handed the link, the kernel answers EOPNOTSUPP — a symlink has no
+         * mode to change). The name's own mount governs the :ro question. */
+        char hnf[CNG_PATH_MAX], data[CNG_PATH_MAX];
+        if (!deref && l2s_nofollow_data(a0, (const char *)a1, hnf, sizeof hnf,
+                                        data, sizeof data)) {
+            if (ro_denied(hnf))
+                return -EROFS;
+            return chattr_result(reissue(CNG_AT_FDCWD, (long)data, a2, a3, a4,
+                                         a5, nr));
+        }
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
         if (p == XLATE_TOOLONG)
             return -ENAMETOOLONG;
@@ -3912,8 +3974,11 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     }
 
     /* Extended attributes: the path is a0 and there is no dirfd, so this is a
-     * plain translate + reissue. The "l" forms do not follow a final symlink;
-     * the setters and removers mutate, so a :ro bind refuses them. */
+     * plain translate + reissue. The "l" forms do not follow a final symlink
+     * — except the l2s emulation's own, whose attributes are the backing
+     * file's (on the link itself the kernel keeps user.* attributes off
+     * symlinks entirely: EPERM to set, ENODATA to get); the setters and
+     * removers mutate, so a :ro bind refuses them. */
     case __NR_setxattr:
     case __NR_lsetxattr:
     case __NR_getxattr:
@@ -3926,6 +3991,13 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                       nr == __NR_llistxattr || nr == __NR_lremovexattr);
         int writes = (nr == __NR_setxattr || nr == __NR_lsetxattr ||
                       nr == __NR_removexattr || nr == __NR_lremovexattr);
+        char hnf[CNG_PATH_MAX], data[CNG_PATH_MAX];
+        if (!deref && l2s_nofollow_data(CNG_AT_FDCWD, (const char *)a0, hnf,
+                                        sizeof hnf, data, sizeof data)) {
+            if (writes && ro_denied(hnf))
+                return -EROFS;
+            return reissue((long)data, a1, a2, a3, a4, a5, nr);
+        }
         const char *p =
             xlate(CNG_AT_FDCWD, (const char *)a0, b1, sizeof b1, deref);
         if (p == XLATE_TOOLONG)
@@ -3948,6 +4020,13 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * mask's IN_DONT_FOLLOW is this call's spelling of AT_SYMLINK_NOFOLLOW. */
     case __NR_inotify_add_watch: {
         int deref = !((unsigned)a2 & CNG_IN_DONT_FOLLOW);
+        /* An l2s name, not followed: the watch belongs on the backing file,
+         * where the events are. Armed on the link it never fired for a write
+         * through any name of the group. */
+        char data[CNG_PATH_MAX];
+        if (!deref && l2s_nofollow_data(CNG_AT_FDCWD, (const char *)a1, 0, 0,
+                                        data, sizeof data))
+            return reissue(a0, (long)data, a2, a3, a4, a5, nr);
         const char *p =
             xlate(CNG_AT_FDCWD, (const char *)a1, b1, sizeof b1, deref);
         if (p == XLATE_TOOLONG)
