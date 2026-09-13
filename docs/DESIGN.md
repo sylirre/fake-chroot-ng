@@ -213,7 +213,13 @@ until we virtualized it. We trap `rt_sigprocmask` and `rt_sigaction`: mask
 changes are applied with SIGSYS forced clear (in the SIGSYS handler we edit
 `uc_sigmask`, which `sigreturn` restores — re-issuing there would be undone),
 `sa_mask` on installed handlers has SIGSYS stripped, and `rt_sigaction(SIGSYS)`
-is ignored so the guest can't take over our slot.
+never reaches the kernel: it is answered from a per-process mirror of what the
+guest asked for (with the kernel's own EINVAL/EFAULT checks, reset by the
+emulated execve as `flush_signal_handlers` would), so the guest can't take over
+our slot but sees its own disposition back. A SIGSYS that is not a seccomp trap
+— `kill -SYS`, a `raise` — is delivered by our handler to that mirrored
+disposition: the default action kills, SIG_IGN drops, a handler runs under its
+`sa_mask` (SIGSYS itself being the one bit that stays unblocked).
 
 For a real container you want `-u`/`--fake-id` (fake user identity, default
 `0:0` root), which emulates the credential syscalls against a synthetic
