@@ -4962,6 +4962,126 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
         fails += !ok;
     }
 
+    /* 5a) the description a synthesized open hands over is what the real file
+     *     gives: read-only, and refused the same things. memfd_create only
+     *     makes O_RDWR files, and that was what the guest got — a /proc file it
+     *     could write(), ftruncate() and mmap(MAP_SHARED|PROT_WRITE), that
+     *     reported O_RDWR from F_GETFL. The status flags it did ask for
+     *     (O_APPEND here) still have to come back from F_GETFL, as the kernel
+     *     records them on any file. Every answer here is the host kernel's for
+     *     the real file (measured). */
+    {
+        long fd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/proc/loadavg",
+                               CNG_O_RDONLY | CNG_O_APPEND | CNG_O_CLOEXEC, 0, 0,
+                               0, 0);
+        long fl = fd >= 0 ? sys_fcntl((int)fd, CNG_F_GETFL, 0) : -1;
+        long wr = fd >= 0 ? sys_write((int)fd, "x", 1) : 0;
+        long tr = fd >= 0 ? sys_ftruncate((int)fd, 0) : 0;
+        void *m = fd >= 0 ? sys_mmap(0, 4096, CNG_PROT_READ | CNG_PROT_WRITE,
+                                     CNG_MAP_SHARED, (int)fd, 0)
+                          : 0;
+        long mm = (long)m;
+        if (m && !cng_is_err(mm))
+            sys_munmap(m, 4096);
+        /* ...and the content still reads after all that. */
+        long n = pt_slurp(fd, buf, sizeof buf);
+        if (fd >= 0)
+            sys_close((int)fd);
+        int ro = fl >= 0 && (fl & CNG_O_ACCMODE) == CNG_O_RDONLY &&
+                 (fl & CNG_O_APPEND);
+        int ok = ro && wr == -EBADF && tr == -EINVAL && mm == -EACCES && n > 0;
+        cng_dprintf(1,
+                    "proctest synth fd is read-only: accmode=%ld append=%d "
+                    "write=%ld ftruncate=%ld mmap_rw=%ld read=%ld -> %s\n",
+                    fl >= 0 ? fl & CNG_O_ACCMODE : fl, fl >= 0 && (fl & CNG_O_APPEND),
+                    wr, tr, mm, n, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 5b) the open flags are judged as the kernel judges them on the real
+     *     file, in its order. Write intent — a non-read access mode, or
+     *     O_TRUNC, which build_open_flags() folds into MAY_WRITE — is EACCES on
+     *     a 0444 file; O_CREAT|O_EXCL is EEXIST on a name that exists; a
+     *     regular file is ENOTDIR to O_DIRECTORY; O_DIRECT is EINVAL on an
+     *     inode with no direct_IO; O_NOATIME is the owner's, and the global
+     *     files are root's (unless we are root, when the kernel allows it);
+     *     and /proc/mounts is itself a symlink, so O_NOFOLLOW on that spelling
+     *     is ELOOP where the same flag on self/mounts opens. O_PATH ignores
+     *     everything else and hands over the real inode, which cannot be read
+     *     from: the old code answered it with a readable memfd. Each of these
+     *     used to synthesize as if nothing had been asked. */
+    {
+        long tr = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/proc/loadavg",
+                               CNG_O_RDONLY | CNG_O_TRUNC, 0, 0, 0, 0);
+        long ex = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/proc/loadavg",
+                               CNG_O_RDONLY | CNG_O_CREAT | CNG_O_EXCL, 0600, 0,
+                               0, 0);
+        long dr = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/proc/uptime",
+                               CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+        long di = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/proc/uptime",
+                               CNG_O_RDONLY | CNG_O_DIRECT, 0, 0, 0, 0);
+        long na = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/proc/loadavg",
+                               CNG_O_RDONLY | CNG_O_NOATIME, 0, 0, 0, 0);
+        long na_want = sys_geteuid() == 0 ? 0 : -EPERM;
+        if (na >= 0) {
+            sys_close((int)na);
+            na = 0;
+        }
+        /* our own entries are ours to O_NOATIME */
+        long nself = cng_dispatch(__NR_openat, CNG_AT_FDCWD,
+                                  (long)"/proc/self/cmdline",
+                                  CNG_O_RDONLY | CNG_O_NOATIME, 0, 0, 0, 0);
+        if (nself >= 0)
+            sys_close((int)nself);
+        /* Differential: the real answer for the symlink spelling is whatever
+         * the host gives the same raw call — ELOOP on a kernel, but qemu-user
+         * realpath()s the name first and opens the target. */
+        long el = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/proc/mounts",
+                               CNG_O_RDONLY | CNG_O_NOFOLLOW, 0, 0, 0, 0);
+        long el_want = sys_openat(CNG_AT_FDCWD, "/proc/mounts",
+                                  CNG_O_RDONLY | CNG_O_NOFOLLOW, 0);
+        if (el_want >= 0) {
+            sys_close((int)el_want);
+            el_want = 0;
+        }
+        if (el >= 0) {
+            sys_close((int)el);
+            el = 0;
+        }
+        long nf = cng_dispatch(__NR_openat, CNG_AT_FDCWD,
+                               (long)"/proc/self/mounts",
+                               CNG_O_RDONLY | CNG_O_NOFOLLOW, 0, 0, 0, 0);
+        long nfn = pt_slurp(nf, buf, sizeof buf);
+        if (nf >= 0)
+            sys_close((int)nf);
+        long pa = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/proc/loadavg",
+                               CNG_O_PATH | CNG_O_RDWR | CNG_O_TRUNC, 0, 0, 0, 0);
+        long pa_read = pa >= 0 ? sys_read((int)pa, buf, 8) : 0;
+        long pa_fl = pa >= 0 ? sys_fcntl((int)pa, CNG_F_GETFL, 0) : 0;
+        if (pa >= 0)
+            sys_close((int)pa);
+        /* a plain O_CREAT on the existing name opens it, as the kernel does */
+        long cr = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/proc/loadavg",
+                               CNG_O_RDONLY | CNG_O_CREAT, 0600, 0, 0, 0);
+        long crn = pt_slurp(cr, buf, sizeof buf);
+        if (cr >= 0)
+            sys_close((int)cr);
+        int ok = tr == -EACCES && ex == -EEXIST && dr == -ENOTDIR &&
+                 di == -EINVAL && na == na_want && nself >= 0 &&
+                 el == el_want && nf >= 0 && nfn > 0 && pa >= 0 &&
+                 pa_read == -EBADF && (pa_fl & CNG_O_PATH) && cr >= 0 && crn > 0;
+        cng_dprintf(1,
+                    "proctest open flags: trunc=%ld creat_excl=%ld dir=%ld "
+                    "direct=%ld noatime=%ld noatime_self=%d mounts_nofollow=%ld "
+                    "(host %ld) self_mounts_nofollow=%d path_read=%ld path_fl=%d "
+                    "creat=%d -> %s\n",
+                    tr, ex, dr, di, na, nself >= 0, el, el_want,
+                    nf >= 0 && nfn > 0,
+                    pa_read, (pa_fl & CNG_O_PATH) != 0, cr >= 0 && crn > 0,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
     /* 6) maps: the guest's own mappings, with no host path left in them. */
     {
         long fd = pt_open("/proc/self/maps");

@@ -96,6 +96,25 @@ check_contains "the readv path takes the same refresh hook" \
 check_contains "a pread that triggers the refresh leaves the offset alone" \
     "proctest pread keeps the offset: 8 then 8 -> OK" "$out"
 check_contains "uptime is synthesized" "proctest uptime:" "$out"
+# The description handed over is what the real file gives. memfd_create only
+# makes O_RDWR files, and that was what the guest got: a /proc file it could
+# write(), ftruncate() and mmap(MAP_SHARED|PROT_WRITE), reporting O_RDWR from
+# F_GETFL — all refused on the real file (EBADF, EINVAL, EACCES, O_RDONLY). The
+# status flags it did ask for (O_APPEND) still come back from F_GETFL.
+check_contains "a synthesized fd is read-only, with the guest's status flags" \
+    "proctest synth fd is read-only: accmode=0 append=1 write=-9 ftruncate=-22 mmap_rw=-13" \
+    "$out"
+# ...and the open flags are judged as the kernel judges them on the real file,
+# in its order: O_TRUNC is write intent (EACCES on a 0444 file), O_CREAT|O_EXCL
+# is EEXIST on a name that exists, O_DIRECTORY is ENOTDIR, O_DIRECT EINVAL,
+# O_NOATIME the owner's, O_NOFOLLOW on the /proc/mounts symlink whatever the
+# host says for it (ELOOP on a kernel; qemu-user realpath()s the name), and
+# O_PATH hands over the real inode, which cannot be read. Each of these used to
+# synthesize as if nothing had been asked. (The noatime field is -1 unprivileged
+# and 0 as root, so the line is matched up to it and the overall rc covers it.)
+check_contains "synthesized /proc opens judge their flags as the kernel does" \
+    "proctest open flags: trunc=-13 creat_excl=-17 dir=-20 direct=-22 noatime=" \
+    "$out"
 check_contains "stat falls back to synthesis where the host denies it" \
     "proctest stat:" "$out"
 check_contains "maps leaks no host path" "proctest maps:" "$out"

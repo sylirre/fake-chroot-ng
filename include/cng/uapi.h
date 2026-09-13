@@ -22,15 +22,23 @@
 #define CNG_O_RDONLY    0
 #define CNG_O_WRONLY    1
 #define CNG_O_RDWR      2
+#define CNG_O_ACCMODE   3
 #define CNG_O_CREAT     0100
 #define CNG_O_EXCL      0200
+#define CNG_O_NOCTTY    0400
 #define CNG_O_TRUNC     01000
 #define CNG_O_APPEND    02000
 #define CNG_O_NONBLOCK  04000
+#define CNG_O_DSYNC     010000
 #define CNG_O_DIRECTORY 040000
 #define CNG_O_NOFOLLOW  0100000
+#define CNG_O_DIRECT    0200000  /* arm64's own value, not asm-generic's */
+#define CNG_O_LARGEFILE 0400000  /* likewise */
+#define CNG_O_NOATIME   01000000
 #define CNG_O_CLOEXEC   02000000
-#define CNG_O_TMPFILE   (020000000 | CNG_O_DIRECTORY)
+#define CNG___O_SYNC    04000000
+#define CNG___O_TMPFILE 020000000
+#define CNG_O_TMPFILE   (CNG___O_TMPFILE | CNG_O_DIRECTORY)
 #define CNG_O_PATH      010000000
 
 /* renameat2 flags */

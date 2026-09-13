@@ -665,22 +665,43 @@ static void pf_track(int fd, int kind) {
     /* Table full: the fd simply keeps its open-time snapshot. */
 }
 
+/* A second description of the memfd behind `fd`, opened with `oflags` through
+ * the fd's own magic link. The memfd is ours (0777, no seals), so the mode can
+ * be anything: this is how the guest's read-only description is made from the
+ * writable one memfd_create hands out, and how a writer is had again for a
+ * refresh. -errno where the host will not (a /proc a policy keeps us out of,
+ * an fd table that is full). */
+static long synth_reopen(int fd, long oflags) {
+    char link[40];
+    cng_snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+    return sys_openat(CNG_AT_FDCWD, link, oflags | CNG_O_CLOEXEC, 0);
+}
+
 static void regen(int fd, int kind) {
-    if (sys_ftruncate(fd, 0) != 0)
-        return; /* memfd: cannot fail in practice */
-    sys_lseek(fd, 0, CNG_SEEK_SET);
-    switch (kind) {
-    case PF_LOADAVG:
-        put_loadavg(fd);
-        break;
-    case PF_UPTIME:
-        put_uptime(fd);
-        break;
-    case PF_STAT:
-        put_stat(fd);
-        break;
+    /* The guest holds a read-only description, so the rewrite goes through a
+     * writable one taken for the call. Where that cannot be had, the fd itself
+     * is tried: it is writable exactly when the seal below could not be
+     * applied, and the rewrite moves its offset, which the caller puts back. */
+    long w = synth_reopen(fd, CNG_O_RDWR);
+    int wfd = w >= 0 ? (int)w : fd;
+    if (sys_ftruncate(wfd, 0) == 0) {
+        sys_lseek(wfd, 0, CNG_SEEK_SET);
+        switch (kind) {
+        case PF_LOADAVG:
+            put_loadavg(wfd);
+            break;
+        case PF_UPTIME:
+            put_uptime(wfd);
+            break;
+        case PF_STAT:
+            put_stat(wfd);
+            break;
+        }
     }
-    sys_lseek(fd, 0, CNG_SEEK_SET);
+    if (w >= 0)
+        sys_close((int)w);
+    else
+        sys_lseek(fd, 0, CNG_SEEK_SET);
 }
 
 void cng_procfs_pre_read(int fd, long off) {
@@ -699,14 +720,15 @@ void cng_procfs_pre_read(int fd, long off) {
         if (off != 0)
             return; /* mid-file: keep the current snapshot */
         regen(fd, g_pf[i].kind);
-        /* pread(2) is defined never to move the file offset, and regen()
-         * rewinds the description it rewrote. Put the position back: reached
-         * only for the p-variants, since read()/readv() arrive here with an
-         * offset that already is 0. Without this a sequential reader that
-         * pread's its own held fd at offset 0 — one refresh idiom among
-         * several — silently starts over from the top on its next read.
-         * (Measured: the kernel leaves /proc/uptime's offset at 8 across a
-         * pread of the whole file.) */
+        /* pread(2) is defined never to move the file offset. The rewrite goes
+         * through a description of its own and leaves the guest's where it
+         * was — unless it had to write through the guest's own, which it then
+         * rewinds — so put the position back either way: reached only for the
+         * p-variants, since read()/readv() arrive here with an offset that
+         * already is 0. Without this a sequential reader that pread's its own
+         * held fd at offset 0 — one refresh idiom among several — silently
+         * starts over from the top on its next read. (Measured: the kernel
+         * leaves /proc/uptime's offset at 8 across a pread of the whole file.) */
         if (cur > 0)
             sys_lseek(fd, cur, CNG_SEEK_SET);
         return;
@@ -715,7 +737,8 @@ void cng_procfs_pre_read(int fd, long off) {
 
 /* Anonymous backing for a synthesized view, moved into the reserved high fd
  * range when the file needs refresh-on-rewind (that range is what the seccomp
- * filter traps the read family on). Returns the fd, or -1. */
+ * filter traps the read family on). Returns the fd, or -1. Writable at this
+ * point — the content still has to go in; synth_seal() makes it the guest's. */
 static long synth_memfd(int refreshable) {
     long fd = sys_memfd_create("cng-proc", CNG_MFD_CLOEXEC);
     if (fd < 0)
@@ -729,6 +752,57 @@ static long synth_memfd(int refreshable) {
         /* On failure the low fd stands: correct content, no refresh. */
     }
     return fd;
+}
+
+/* The open(2) status flags the guest may ask for and get back from F_GETFL on
+ * a /proc file: recorded on the description, no effect on what a read returns.
+ * The rest of the word is either decided above (access mode, O_TRUNC, O_PATH,
+ * ...), consumed at open time (O_CREAT, O_EXCL, O_NOFOLLOW, O_CLOEXEC — the
+ * last put on the fd separately), or a hint. */
+#define SYNTH_STATUS_FLAGS                                                     \
+    (CNG_O_APPEND | CNG_O_NONBLOCK | CNG_O_DSYNC | CNG___O_SYNC |              \
+     CNG_O_NOATIME | CNG_O_NOCTTY | CNG_O_LARGEFILE)
+
+/* Turn the writable memfd holding a finished view into what the guest opened:
+ * a read-only description, with the status flags it asked for. The memfd is
+ * reopened through its own /proc link with O_RDONLY and the new description is
+ * dup3'd over the same fd number, so the number the guest gets is still the
+ * lowest that was free (or the reserved slot) and the inode the refresh
+ * bookkeeping recorded is unchanged.
+ *
+ * memfd_create only ever hands out O_RDWR, and that was what the guest got: a
+ * /proc file it could write(), ftruncate(), mmap(MAP_SHARED|PROT_WRITE) and
+ * see O_RDWR from F_GETFL on — every one of which the kernel refuses on the
+ * real file (EBADF, EINVAL, EACCES, O_RDONLY; measured). Where the reopen is
+ * refused the writable fd stands, as before: the content is right and only the
+ * description's mode is wrong. */
+static void synth_seal(int fd, long gflags) {
+    long ro = synth_reopen(fd, CNG_O_RDONLY | (gflags & SYNTH_STATUS_FLAGS));
+    if (ro < 0) {
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] procfs fd %d stays writable: reopen errno=%ld\n",
+                        fd, -ro);
+        return;
+    }
+    if (CNG_SYS(__NR_dup3, ro, fd, CNG_O_CLOEXEC, 0, 0, 0) < 0 && cng_g_debug)
+        cng_dprintf(2, "[cng] procfs fd %d stays writable: dup3 failed\n", fd);
+    sys_close((int)ro);
+}
+
+/* Is the host file behind a synthesized name ours to open with O_NOATIME? The
+ * kernel grants the flag to the file's owner (or CAP_FOWNER), which for the
+ * global files is root and for a process's own entries is that process — a
+ * question the fake identity has no say in, since it is asked of the real
+ * inode. Answered from a stat of the host name so a non-dumpable process's
+ * root-owned entries are judged right too. */
+static int noatime_allowed(const char *host) {
+    unsigned euid = (unsigned)sys_geteuid();
+    if (euid == 0)
+        return 1;
+    char st[128];
+    if (CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, host, st, 0, 0, 0) != 0)
+        return 1; /* cannot tell: let the open stand rather than invent EPERM */
+    return *(unsigned *)(st + 24) == euid; /* st_uid */
 }
 
 /* ---- path classification ------------------------------------------------ */
@@ -932,12 +1006,43 @@ int cng_procfs_open(const char *canon, long gflags, long *ret) {
             return 0;
     }
 
-    if ((gflags & 3) != CNG_O_RDONLY) {
+    /* The flags, judged the way build_open_flags() and do_open() judge them
+     * and in that order (every answer below was measured on the host against
+     * the real file). Three of them are not ours to answer at all, and return 0
+     * so the real open does: O_PATH, which the kernel takes as "open the name,
+     * ignore every other flag" — the guest gets an fd on the real inode that
+     * cannot be read from anyway, and the content a memfd would hold never
+     * comes into it (the old code built one and handed over a *readable* fd);
+     * O_DIRECTORY and __O_TMPFILE, which fail on a regular file (ENOTDIR, or
+     * EINVAL for the combinations build_open_flags refuses first, and the
+     * running kernel is the one that knows which — O_CREAT|O_DIRECTORY became
+     * EINVAL in 6.3); and O_CREAT|O_EXCL, which is EEXIST on a name that is
+     * there. Each of those used to open the memfd as if nothing had been
+     * asked. Then the ones we do answer: write intent (a non-read access mode,
+     * or O_TRUNC, which build_open_flags folds into MAY_WRITE) is EACCES on a
+     * 0444 file, O_NOATIME is the owner's, and O_DIRECT is EINVAL on an inode
+     * with no direct_IO — which a memfd does have on a current kernel, so it
+     * cannot be left to the reopen to refuse. */
+    if (gflags & CNG_O_PATH)
+        return 0;
+    if (gflags & (CNG_O_DIRECTORY | CNG___O_TMPFILE))
+        return 0;
+    if ((gflags & (CNG_O_CREAT | CNG_O_EXCL)) == (CNG_O_CREAT | CNG_O_EXCL))
+        return 0;
+    /* /proc/mounts itself is a symlink (to self/mounts): O_NOFOLLOW on that
+     * spelling is ELOOP, which only the real open can say. */
+    if (!leaf && kind == PF_MOUNTS && (gflags & CNG_O_NOFOLLOW))
+        return 0;
+    if ((gflags & CNG_O_ACCMODE) != CNG_O_RDONLY || (gflags & CNG_O_TRUNC)) {
         *ret = -EACCES;
         return 1;
     }
-    if (gflags & CNG_O_DIRECTORY) {
-        *ret = -ENOTDIR;
+    if ((gflags & CNG_O_NOATIME) && !noatime_allowed(host)) {
+        *ret = -EPERM;
+        return 1;
+    }
+    if (gflags & CNG_O_DIRECT) {
+        *ret = -EINVAL;
         return 1;
     }
 
@@ -991,6 +1096,7 @@ int cng_procfs_open(const char *canon, long gflags, long *ret) {
         return 0;
     }
 
+    synth_seal((int)fd, gflags); /* read-only from here, like the real file */
     sys_lseek((int)fd, 0, CNG_SEEK_SET);
     if (!(gflags & CNG_O_CLOEXEC))
         sys_fcntl((int)fd, CNG_F_SETFD, 0); /* the guest did not ask for it */

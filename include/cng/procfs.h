@@ -14,8 +14,13 @@
  * which ps/top read to name the user.
  *
  * An open of one of those names is diverted to an anonymous in-memory file
- * holding the guest view. Everything else under /proc stays host passthrough,
- * including stat() of these paths (readers open and read them).
+ * holding the guest view, handed over as a read-only description with the
+ * guest's status flags on it (what the real file gives) and judged by the same
+ * open-flag rules the kernel applies to the real file: write intent is
+ * EACCES, O_DIRECT EINVAL, O_NOATIME the owner's, and O_PATH, O_DIRECTORY,
+ * O_TMPFILE and O_CREAT|O_EXCL are left to the real open, whose answer needs
+ * no content. Everything else under /proc stays host passthrough, including
+ * stat() of these paths (readers open and read them).
  *
  * Ported from arm64chroot's sys_procfs.c. What differs is what does NOT need
  * synthesizing here: the guest is a real host process, so its status, stat,
