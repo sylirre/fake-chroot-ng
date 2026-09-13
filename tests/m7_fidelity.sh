@@ -31,6 +31,14 @@ check_contains "capget reports full set under fake-root" "cap_eff=ffffffff" "$ou
 # a v1 header buys one data block, never the two a v2/v3 caller sized for.
 check_contains "capget negotiates the capability header version" \
     "cap_ver probe=0 got=20080522 bad=-22 v1=0 v1_spill=0" "$out"
+# (uid_t)-1 is INVALID_UID to setuid/setgid, refused with EINVAL before any
+# privilege question, and a setgroups list carrying it is EINVAL with the set
+# untouched. The "leave unchanged" -1 belongs to setre*id/setres*id and to
+# setfsuid, which must still take it. The blind install left 4294967295 as
+# every id of the process.
+check_contains "setuid/setgid/setgroups refuse the invalid id, the keep forms take it" \
+    "invalid_id setuid=-22 setgid=-22 setgroups=-22 ngroups=0 keep=0/0/0 uid=0 gid=0 -> OK" \
+    "$out"
 check_contains "privilege drop is real and irreversible" \
     "setuid_drop rc=0 uid=1000 regain=-1" "$out"
 check_contains "setuid-root shows setuid exec as root:root" \

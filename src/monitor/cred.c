@@ -107,8 +107,14 @@ static int in_gset(const struct cng_cred *c, unsigned v) {
 }
 
 /* setuid(2): privileged sets all four; unprivileged may set euid/fsuid only to
- * its real or saved uid. setgid(2) is the exact mirror. */
+ * its real or saved uid. setgid(2) is the exact mirror. (uid_t)-1 is not an id
+ * at all here — it is INVALID_UID, refused with EINVAL before any privilege
+ * question is asked (measured; the "leave unchanged" reading of -1 belongs to
+ * the setreuid/setresuid family only, and was being applied to these two,
+ * which installed 4294967295 as every id). */
 static long do_setuid(struct cng_cred *c, unsigned u) {
+    if (u == ID_KEEP)
+        return -EINVAL;
     if (cred_priv(c)) {
         c->ruid = c->euid = c->suid = c->fsuid = u;
         return 0;
@@ -120,6 +126,8 @@ static long do_setuid(struct cng_cred *c, unsigned u) {
     return -EPERM;
 }
 static long do_setgid(struct cng_cred *c, unsigned g) {
+    if (g == ID_KEEP)
+        return -EINVAL;
     if (cred_priv(c)) {
         c->rgid = c->egid = c->sgid = c->fsgid = g;
         return 0;
@@ -240,6 +248,12 @@ static long do_setgroups(struct cng_cred *c, int n, const unsigned *g) {
     unsigned got[CNG_NGROUPS_MAX];
     if (n && cng_user_copyin(got, g, (unsigned long)n * sizeof *got) < 0)
         return -EFAULT;
+    /* ...and validated as a whole before any of it is installed, the way
+     * groups_from_user() does: (gid_t)-1 is INVALID_GID, and a list carrying
+     * one is EINVAL with the set left as it was. */
+    for (int i = 0; i < n; i++)
+        if (got[i] == ID_KEEP)
+            return -EINVAL;
     for (int i = 0; i < n; i++)
         c->groups[i] = got[i];
     c->ngroups = n;

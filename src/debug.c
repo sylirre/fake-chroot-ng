@@ -1130,6 +1130,32 @@ int cng_cmd_faketest(int argc, char **argv, char **envp, unsigned long *auxv) {
                 (int)cpn, negotiated, (int)cbad, (int)cv1,
                 v1data[3] != 0xeeeeeeeeu);
 
+    /* (uid_t)-1 is not an id: setuid and setgid refuse it with EINVAL before
+     * any privilege question — even for root, which is what we are here — and
+     * a setgroups list carrying it is EINVAL with the set left alone. The -1
+     * that means "leave unchanged" belongs to setre*id/setres*id (which must
+     * still take it) and to setfsuid, which reports the current id for it.
+     * The blind install left 4294967295 as every id. */
+    {
+        long eu = cng_dispatch(__NR_setuid, -1L, 0, 0, 0, 0, 0, 1);
+        long eg = cng_dispatch(__NR_setgid, -1L, 0, 0, 0, 0, 0, 1);
+        unsigned bad[2] = {5, (unsigned)-1};
+        long es = cng_dispatch(__NR_setgroups, 2, (long)bad, 0, 0, 0, 0, 1);
+        long ng = cng_dispatch(__NR_getgroups, 0, 0, 0, 0, 0, 0, 1);
+        long kr = cng_dispatch(__NR_setreuid, -1L, -1L, 0, 0, 0, 0, 1);
+        long ks = cng_dispatch(__NR_setresgid, -1L, -1L, -1L, 0, 0, 0, 1);
+        long kf = cng_dispatch(__NR_setfsuid, -1L, 0, 0, 0, 0, 0, 1);
+        long u = cng_dispatch(__NR_getuid, 0, 0, 0, 0, 0, 0, 1);
+        long g = cng_dispatch(__NR_getgid, 0, 0, 0, 0, 0, 0, 1);
+        int ok = eu == -EINVAL && eg == -EINVAL && es == -EINVAL && ng == 0 &&
+                 kr == 0 && ks == 0 && kf == 0 && u == 0 && g == 0;
+        cng_dprintf(1,
+                    "invalid_id setuid=%d setgid=%d setgroups=%d ngroups=%d "
+                    "keep=%d/%d/%d uid=%d gid=%d -> %s\n",
+                    (int)eu, (int)eg, (int)es, (int)ng, (int)kr, (int)ks,
+                    (int)kf, (int)u, (int)g, ok ? "OK" : "FAIL");
+    }
+
     /* A privilege drop is real and, for the resulting non-root id, irreversible:
      * setuid(1000) succeeds, getuid then reports 1000, and setuid(0) is EPERM. */
     long su = cng_dispatch(__NR_setuid, 1000, 0, 0, 0, 0, 0, 1);
