@@ -1319,37 +1319,6 @@ static long pt_traceme(void) {
     return 0;
 }
 
-/* Thread group of host task `tid`, from /proc/<tid>/status. -1 if gone. */
-static s32 pt_tgid_of(s32 tid) {
-    char path[64];
-    cng_snprintf(path, sizeof path, "/proc/%d/status", (int)tid);
-    long fd = sys_openat(CNG_AT_FDCWD, path, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
-    if (fd < 0)
-        return -1;
-    char buf[512]; /* Tgid: is within the first few lines */
-    long n = sys_read((int)fd, buf, sizeof buf - 1);
-    sys_close((int)fd);
-    if (n <= 0)
-        return -1;
-    buf[n] = 0;
-    for (char *p = buf; *p;) {
-        if (!strncmp(p, "Tgid:", 5)) {
-            p += 5;
-            while (*p == ' ' || *p == '\t')
-                p++;
-            s32 v = 0;
-            while (*p >= '0' && *p <= '9')
-                v = v * 10 + (*p++ - '0');
-            return v;
-        }
-        char *nl = strchr(p, '\n');
-        if (!nl)
-            break;
-        p = nl + 1;
-    }
-    return -1;
-}
-
 /* ---- tracer: the guest's ptrace(2) ---- */
 
 long cng_pt_syscall(long req, long pid, u64 addr, u64 data) {
@@ -1369,7 +1338,7 @@ long cng_pt_syscall(long req, long pid, u64 addr, u64 data) {
         if (!cng_procreg_has((int)pid)) {
             /* Not a guest pid: it may be a secondary thread's tid, whose thread
              * group must itself be a live guest process. */
-            tgid = pt_tgid_of((s32)pid);
+            tgid = (s32)cng_proc_tgid((int)pid);
             if (tgid <= 0 || !cng_procreg_has((int)tgid))
                 return -ESRCH;
         }

@@ -127,6 +127,53 @@ u64 cng_proc_starttime(int pid, int *zombie_out) {
     return 0;
 }
 
+/* Thread group of host task `tid`, from the Tgid: line of its status file.
+ * -1 if it is gone or unreadable. Opened dir-then-openat for the same reason as
+ * the starttime above. */
+int cng_proc_tgid(int tid) {
+    if (tid <= 0)
+        return -1;
+    char path[32];
+    cng_snprintf(path, sizeof path, "/proc/%d", tid);
+    long dfd = sys_openat(CNG_AT_FDCWD, path,
+                          CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
+    if (dfd < 0)
+        return -1;
+    long fd = sys_openat((int)dfd, "status", CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    sys_close((int)dfd);
+    if (fd < 0)
+        return -1;
+    char buf[512]; /* Tgid: is within the first few lines */
+    long n = sys_read((int)fd, buf, sizeof buf - 1);
+    sys_close((int)fd);
+    if (n <= 0)
+        return -1;
+    buf[n] = '\0';
+    for (const char *p = buf; *p;) {
+        if (!strncmp(p, "Tgid:", 5)) {
+            p += 5;
+            while (*p == ' ' || *p == '\t')
+                p++;
+            int v = 0;
+            while (*p >= '0' && *p <= '9')
+                v = v * 10 + (*p++ - '0');
+            return v > 0 ? v : -1;
+        }
+        const char *nl = strchr(p, '\n');
+        if (!nl)
+            break;
+        p = nl + 1;
+    }
+    return -1;
+}
+
+int cng_procreg_has_task(int tid) {
+    if (cng_procreg_has(tid))
+        return 1;
+    int tgid = cng_proc_tgid(tid);
+    return tgid > 0 && tgid != tid && cng_procreg_has(tgid);
+}
+
 /* Byte size of the shared region, for whoever creates the backing (the broker
  * daemon, or the file / anonymous tiers below). */
 unsigned long cng_procreg_table_size(void) {

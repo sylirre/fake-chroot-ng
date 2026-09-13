@@ -103,6 +103,13 @@ void cng_procreg_set_cwd(const char *cwd_guest);
  * other-pid handlers in procfs.c. Our own pid always counts. */
 int cng_procreg_has(int pid);
 
+/* Is `tid` a task of a guest process — the process itself, or one of its
+ * threads? The kernel finds a task by any tid it has (kill, ptrace, capget all
+ * do), so the questions those answer about "a guest" have to as well; the
+ * registry itself is keyed by thread-group leader. A secondary thread costs a
+ * read of its status file. */
+int cng_procreg_has_task(int tid);
+
 /* Snapshot `pid`'s payload. Returns 1 on a fresh hit, 0 on miss or when the
  * entry is stale (the pid was recycled by the host — detected by comparing the
  * recorded /proc/<pid>/stat starttime). */
@@ -115,6 +122,10 @@ int cng_procreg_get(int pid, struct cng_procsnap *out);
  * Shared with broker.c, which has no other way to tell a live guest from a dead
  * one. */
 u64 cng_proc_starttime(int pid, int *zombie_out);
+
+/* The thread group host task `tid` belongs to (its Tgid: line), or -1 if it is
+ * gone or /proc is unreadable. */
+int cng_proc_tgid(int tid);
 
 /* The shared region's byte size, for whoever creates the backing — including
  * the broker daemon, which sizes its table memfd from this. */

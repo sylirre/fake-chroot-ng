@@ -137,6 +137,15 @@ check_contains "status Uid/Gid remapped under --fake-id" \
 # reported. One process, two answers, is a thing the kernel cannot do.
 check_contains "status carries the live credential set, not the startup one" \
     "proctest status live: uid=11/12/13 gid=21/22/23 groups=3 -> OK" "$out"
+# capget names a task and the kernel looks it up: 0 and the caller's own tid
+# are the caller, any other pid is found — any thread, not only a leader — or
+# is ESRCH. The fake set used to be synthesized for every non-negative pid, so a
+# pid that named nothing was described as fully capable. Another guest process
+# is described as its status file describes it, under the configured identity;
+# a host process is whatever the kernel says of it.
+check_contains "capget by pid: ourselves and a guest faked, the rest the kernel's" \
+    "proctest capget by pid: self=0/ffffffff tid=0/ffffffff guest=0/ffffffff dead=-3 host=0 neg=-22 none=-3 -> OK" \
+    "$out"
 check_contains "--no-proc disables passthrough and synthesis" \
     "proctest no-proc -> OK" "$out"
 rm -rf "$PT" "$PTB"

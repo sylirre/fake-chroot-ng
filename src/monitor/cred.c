@@ -16,6 +16,7 @@
  * cng_cred_handle's !fake_id branch is reached only via an -R trampoline.
  */
 #include "cng/monitor.h"
+#include "cng/procreg.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
 #include "cng/uapi.h"
@@ -255,8 +256,13 @@ static long do_getgroups(const struct cng_cred *c, int size, unsigned *g) {
     return n;
 }
 
+static long reissue_cred(long nr, long a0, long a1, long a2, long a3, long a4,
+                         long a5);
+
 /* capget/capset: the guest's own capability view. Under fake-root the full set
  * is reported and any change accepted; otherwise none / EPERM, like the host.
+ * Another task's set is the kernel's to report, except a guest process's (see
+ * do_capget).
  * The header selects v1 (one 32-bit data block) or v2/v3 (two). The pointers
  * are the guest's, so header and payload cross through cng_user_copyin/copyout
  * — read where they lie, the version that selects the block count need not
@@ -309,7 +315,26 @@ static long do_capget(struct cap_header *hdr, struct cap_data *data) {
         return (!data && r == -EINVAL) ? 0 : r;
     if (h.pid < 0)
         return -EINVAL;
-    unsigned all = cng_fake_root() ? 0xffffffffu : 0u;
+    /* Whose set? cap_get_target_pid() takes 0 and the caller's own tid as the
+     * caller, and looks every other pid up as a task — any thread, not only a
+     * group leader — answering ESRCH for one that is not there. The fake set
+     * used to be synthesized for every non-negative pid, so a pid that named
+     * nothing was described as fully capable (measured: ESRCH, with a pid that
+     * exists answered and a bad data pointer only then EFAULT). Our own
+     * threads are told apart with tgkill(sig 0), which is ESRCH unless the tid
+     * is ours. Another guest process is described the way its status file is:
+     * as running under the configured identity, so fully capable when that is
+     * root (the registry carries no live credential set). Anything else —
+     * a host process, or a pid that is not there — is the kernel's to answer,
+     * and it answers from the guest's own pointers exactly as it would have. */
+    unsigned all;
+    if (h.pid == 0 ||
+        CNG_SYS(__NR_tgkill, sys_getpid(), h.pid, 0, 0, 0, 0) == 0)
+        all = cng_fake_root() ? 0xffffffffu : 0u;
+    else if (cng_procreg_has_task(h.pid))
+        all = cng_g_fake_uid == 0 ? 0xffffffffu : 0u;
+    else
+        return reissue_cred(__NR_capget, (long)hdr, (long)data, 0, 0, 0, 0);
     struct cap_data blocks[2];
     for (int i = 0; i < n; i++) {
         blocks[i].effective = all;

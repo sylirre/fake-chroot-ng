@@ -5329,6 +5329,70 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
         cng_cred_seed(); /* leave the set as the later blocks found it */
     }
 
+    /* 8c) capget names a task, and the kernel looks it up: 0 and the caller's
+     *     own tid are the caller, any other pid is found (any thread, not only
+     *     a leader) or is ESRCH. The fake set used to be synthesized for every
+     *     non-negative pid, so a pid that named nothing was fully capable.
+     *     Under fake-root here: ourselves and our own tid get the full set,
+     *     another guest process is described as running under the configured
+     *     identity (root, so full) — for as long as it lives, then ESRCH like
+     *     any pid that is gone — a host process is whatever the kernel says of
+     *     it, a negative pid EINVAL, and a pid that is not there ESRCH. */
+    {
+        cng_g_fake_id = 1;
+        cng_g_fake_uid = 0;
+        cng_g_fake_gid = 0;
+        cng_g_host_uid = (unsigned)sys_getuid();
+        cng_g_host_gid = (unsigned)sys_getgid();
+        cng_cred_seed();
+        unsigned hdr[2], dat[6];
+        long self_r, tid_r, kid_r, dead_r, host_r, neg_r, none_r;
+        unsigned self_e, tid_e, kid_e;
+#define PT_CAPGET(pid_, out_)                                                   \
+        (hdr[0] = 0x20080522u, hdr[1] = (unsigned)(pid_), memset(dat, 0, sizeof dat), \
+         (out_) = cng_dispatch(__NR_capget, (long)hdr, (long)dat, 0, 0, 0, 0, 1), \
+         dat[0])
+        self_e = PT_CAPGET(0, self_r);
+        tid_e = PT_CAPGET(sys_gettid(), tid_r);
+        long kid = sys_fork();
+        if (kid == 0) {
+            struct cng_timespec nap = {5, 0};
+            CNG_SYS(__NR_nanosleep, &nap, 0, 0, 0, 0, 0);
+            sys_exit_group(0);
+        }
+        int ok = kid > 0;
+        kid_e = 0;
+        kid_r = dead_r = -1;
+        if (kid > 0) {
+            cng_procreg_fork((int)kid);
+            kid_e = PT_CAPGET(kid, kid_r);
+            CNG_SYS(__NR_kill, kid, 9, 0, 0, 0, 0);
+            sys_wait4((int)kid, 0, 0, 0);
+            PT_CAPGET(kid, dead_r);
+        }
+        PT_CAPGET(CNG_SYS(__NR_getppid, 0, 0, 0, 0, 0, 0), host_r);
+        PT_CAPGET(-1, neg_r);
+        /* a pid that is certainly not there: just under pid_max's ceiling,
+         * walked down until the kernel agrees nothing owns it */
+        long none = 0x3ffff0;
+        while (CNG_SYS(__NR_kill, none, 0, 0, 0, 0, 0) != -ESRCH)
+            none--;
+        PT_CAPGET(none, none_r);
+#undef PT_CAPGET
+        ok &= self_r == 0 && self_e == 0xffffffffu && tid_r == 0 &&
+              tid_e == 0xffffffffu && kid_r == 0 && kid_e == 0xffffffffu &&
+              dead_r == -ESRCH && host_r == 0 && neg_r == -EINVAL &&
+              none_r == -ESRCH;
+        cng_dprintf(1,
+                    "proctest capget by pid: self=%ld/%x tid=%ld/%x guest=%ld/%x "
+                    "dead=%ld host=%ld neg=%ld none=%ld -> %s\n",
+                    self_r, self_e, tid_r, tid_e, kid_r, kid_e, dead_r, host_r,
+                    neg_r, none_r, ok ? "OK" : "FAIL");
+        fails += !ok;
+        cng_g_fake_id = 0;
+        cng_cred_seed();
+    }
+
     /* 9) --no-proc turns all of it off. */
     {
         cng_g_no_proc = 1;
