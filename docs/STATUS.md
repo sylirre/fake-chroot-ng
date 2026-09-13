@@ -526,8 +526,14 @@ vfork/`posix_spawn` child-stack handling.
   untranslation, and an empty-cwd snapshot now answering `/` instead of
   falling through to the host readlink).
   Accepted divergences: `stat()` of a synthesized name reports the host file,
-  which on Android is the one being denied; `readlink` of a synthesized fd shows
-  `memfd:cng-proc`; `/proc/version` passes through (arm64chroot must keep it in
+  which on Android is the one being denied — and so does the fd: `fstat`, the
+  by-fd `newfstatat`/`statx`, `fstatfs`, the `/proc/self/fd` link and a stat
+  through it all describe the real file (the memfd is named after it, so a
+  dup'd, inherited or reopened fd finds its way back; a held entry of a
+  process that is gone reads as a generic /proc regular file, where the kernel
+  would still have the pinned inode); `mmap` of such an fd works read-only
+  where the real file answers `ENODEV`, and `fsync` returns 0 where it is
+  `EINVAL`; `/proc/version` passes through (arm64chroot must keep it in
   step with the kernel identity its `uname` fakes; chroot-ng fakes neither);
   an explicit `-b DIR:/proc` outranks the synthesis (the user overriding the
   view — arm64chroot keys its synthesis on the guest path, so there it outlives

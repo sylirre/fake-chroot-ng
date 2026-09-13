@@ -19,8 +19,16 @@
  * open-flag rules the kernel applies to the real file: write intent is
  * EACCES, O_DIRECT EINVAL, O_NOATIME the owner's, and O_PATH, O_DIRECTORY,
  * O_TMPFILE and O_CREAT|O_EXCL are left to the real open, whose answer needs
- * no content. Everything else under /proc stays host passthrough, including
- * stat() of these paths (readers open and read them).
+ * no content. The fd's own account of itself is the real file's too: fstat
+ * (and the by-fd forms of newfstatat and statx), fstatfs, the /proc/self/fd
+ * link's text and a stat through that link all name and describe the /proc
+ * file, not the memfd behind it — found again from the memfd's name, which
+ * follows the inode through dup, fork, exec and a reopen. What still shows the
+ * memfd through: mmap of the fd succeeds read-only where the real file
+ * answers ENODEV, and fsync returns 0 where it is EINVAL; trapping mmap and
+ * fsync wholesale for those is not worth what they would cost. Everything
+ * else under /proc stays host passthrough, including stat() of these paths
+ * (readers open and read them).
  *
  * Ported from arm64chroot's sys_procfs.c. What differs is what does NOT need
  * synthesizing here: the guest is a real host process, so its status, stat,
@@ -70,5 +78,25 @@ int cng_procfs_open(const char *canon, long gflags, long *ret);
  * explicit offset, or -1 to use the description's current one. A no-op for any
  * fd that is not a tracked synthesized file. */
 void cng_procfs_pre_read(int fd, long off);
+
+/* The fstat family on a synthesized fd. The kernel has just filled `stat` /
+ * `statx` — for the memfd behind fd `fd`, or for whatever the name at (dirfd,
+ * path) resolved to, which for a stat through /proc/<pid>/fd/N is that memfd
+ * too. When that is one of ours, the buffer is refilled from the real /proc
+ * file and 1 returned; 0 leaves it as the kernel wrote it. A file whose
+ * process is gone gets the attributes every /proc regular file has. `flags`
+ * and `mask` are the guest's statx arguments. fstatfs is answered outright
+ * with procfs's statfs: 1 with `buf` filled, 0 when the fd is not one of
+ * ours, -errno. cng_procfs_link_name turns the memfd's link text ("/memfd:
+ * cng-proc:/proc/N/cmdline (deleted)") into the file's name, for readlink of
+ * the fd links. */
+int cng_procfs_fix_fd(int fd, void *stat);
+int cng_procfs_fix_path(long dirfd, const char *path, void *stat);
+int cng_procfs_fix_fd_statx(int fd, unsigned flags, unsigned mask, void *statx);
+int cng_procfs_fix_path_statx(long dirfd, const char *path, unsigned flags,
+                              unsigned mask, void *statx);
+int cng_procfs_fstatfs(int fd, void *buf);
+int cng_procfs_fix_path_statfs(long dirfd, const char *path, void *buf);
+int cng_procfs_link_name(const char *tgt, char *out, size_t sz);
 
 #endif /* CNG_PROCFS_H */

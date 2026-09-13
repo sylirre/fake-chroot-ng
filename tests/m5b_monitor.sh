@@ -560,9 +560,12 @@ check_contains "the rest of prctl stays untrapped" \
     "bpftest prctl PR_SET_VMA runs native: ALLOW -> OK" "$out"
 # fstat/fchmod are trapped only where they have something to do: under a fake
 # identity, where fstat must remap ownership the way stat does and fchmod needs
-# the same fail-soft. Off, an ordinary fstat must not pay for a trap.
-check_contains "the fake-id set adds fstat and fchmod, and only then" \
-    "bpftest fake-id: fstat_off=1 fstat_on=1 fchmod_on=1 -> OK" "$out"
+# the same fail-soft; and with the /proc synthesis on, where the memfd behind a
+# synthesized fd must not answer fstat/fstatfs for the real file. With both
+# off, an ordinary fstat must not pay for a trap.
+check_contains "fstat is trapped for fake-id and /proc synthesis, and only then" \
+    "bpftest fake-id: fstat_off=1 fstat_proc=1 fstat_on=1 fchmod_on=1 -> OK" \
+    "$out"
 # SysV sem/msg are emulated from the same broker as shm, so they trap rather
 # than being refused -- and they trap unconditionally, so the guest gets its own
 # namespace whatever the host's own IPC would have allowed.

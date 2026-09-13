@@ -312,8 +312,8 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
     uint32_t gate_end_lo = (uint32_t)ge;
 
     /* Build the trapped syscall list (path set + SysV IPC set, plus the id set
-     * when faking, plus the two conditional entries below). */
-    int nr[NPATH + NIPC + NID + 2];
+     * when faking, plus the three conditional entries below). */
+    int nr[NPATH + NIPC + NID + 3];
     int nsys = 0;
     for (int i = 0; i < NPATH; i++)
         nr[nsys++] = path_syscalls[i];
@@ -325,10 +325,16 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
     /* fstat: under -l it must report the emulated st_nlink; under --fake-id it
      * needs the same ownership remap stat() gets, or stat("f") and
      * fstat(open("f")) disagree about who owns the very same file — which is
-     * exactly the comparison an installer makes before deciding to chown.
-     * Listed once for either. */
-    if (cng_g_l2s || cng_g_fake_id)
+     * exactly the comparison an installer makes before deciding to chown; and
+     * with the /proc synthesis on, an fd it handed out is a memfd whose own
+     * stat (0777, no links, the content's size, tmpfs) is not the real file's,
+     * which stat() of the path reports. Listed once for whichever applies —
+     * only --no-proc without -l or -u leaves an ordinary fstat untrapped.
+     * fstatfs is the same story for the filesystem behind the fd. */
+    if (cng_g_l2s || cng_g_fake_id || !cng_g_no_proc)
         nr[nsys++] = __NR_fstat;
+    if (!cng_g_no_proc)
+        nr[nsys++] = __NR_fstatfs;
     /* getdents64 does three jobs, and it has to be trapped for any one of them:
      * it hides the l2s backing files, it filters host processes out of a /proc
      * listing (what `ls /proc` and `ps` actually read), and it splices in the

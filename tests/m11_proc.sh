@@ -115,6 +115,15 @@ check_contains "a synthesized fd is read-only, with the guest's status flags" \
 check_contains "synthesized /proc opens judge their flags as the kernel does" \
     "proctest open flags: trunc=-13 creat_excl=-17 dir=-20 direct=-22 noatime=" \
     "$out"
+# The fd described the memfd behind it: fstat, newfstatat/statx by fd and
+# fstatfs answered 0777, no links, the content's size and tmpfs where stat() of
+# the same path (host passthrough) says the real /proc file, and its fd link
+# read "/memfd:cng-proc (deleted)". Now the real file's — found again from the
+# memfd's name, so a dup'd fd and a stat through the link agree too, and a
+# held entry of a process that is gone still reads as a /proc regular file.
+check_contains "a synthesized fd stats as the real /proc file, and outlives it" \
+    "proctest synth fd stat: fstat=1 statx=1 fstatfs=1 outlives=1 link=1 dup=1 plain=1 -> OK" \
+    "$out"
 check_contains "stat falls back to synthesis where the host denies it" \
     "proctest stat:" "$out"
 check_contains "maps leaks no host path" "proctest maps:" "$out"
@@ -304,6 +313,32 @@ if [ "$m11_ready" -eq 1 ]; then
 
     # comm is the guest program, not chroot-ng (PR_SET_NAME, not synthesis).
     m11_sh "comm names the guest program" "busybox" 'cat /proc/self/comm'
+
+    # What a synthesized fd says about itself. The shell's redirection is the
+    # common way one reaches a program: the shell opens the file, dup2()s it
+    # onto 0 and closes the original, so the program's fstat(0) is of a dup'd
+    # fd. That used to describe the memfd behind it — 0777, no links, the
+    # content's size — where stat of the path says the real file; and the fd
+    # link read "/memfd:cng-proc (deleted)". busybox stat -L on the link is a
+    # stat through it, which lands on the same memfd. Every answer here is what
+    # the kernel gives for the real file, compared against the path form.
+    m11_sh "a redirected synthesized fd stats as the real file (mode links size)" \
+        "same" \
+        'a=$(stat -c "%f %h %s %d %i" /proc/$$/mounts);
+         b=$(stat -L -c "%f %h %s %d %i" /dev/stdin < /proc/$$/mounts);
+         [ "$a" = "$b" ] && echo same || echo "$a | $b"'
+    m11_sh "...and for a root-owned global file" "same" \
+        'a=$(stat -c "%f %h %s %d %i %u" /proc/loadavg);
+         b=$(stat -L -c "%f %h %s %d %i %u" /dev/stdin < /proc/loadavg);
+         [ "$a" = "$b" ] && echo same || echo "$a | $b"'
+    m11_sh "the fd link of a synthesized file names the file" \
+        "/proc/loadavg" 'readlink /proc/self/fd/0 < /proc/loadavg'
+    m11_sh "...and a process entry by its number" "ok" \
+        'exec 3< /proc/self/status; [ "$(readlink /proc/self/fd/3)" = "/proc/$$/status" ] && echo ok || readlink /proc/self/fd/3'
+    m11_sh "the filesystem behind a synthesized fd is proc" "same" \
+        'a=$(stat -f -c "%t %T" /proc/$$/mounts);
+         b=$(stat -L -f -c "%t %T" /dev/stdin < /proc/$$/mounts);
+         [ "$a" = "$b" ] && echo same || echo "$a | $b"'
 
     # Binding the host /proc at /proc is a common habit from proot; it must not
     # hand the guest the host's process list back. The hidden view keys on where

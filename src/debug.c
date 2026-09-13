@@ -5567,6 +5567,151 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
         fails += !ok;
     }
 
+    /* 5c) what the fd says about itself is what the path says: fstat, the
+     *     AT_EMPTY_PATH forms of newfstatat and statx, and fstatfs on a
+     *     synthesized fd used to describe the memfd behind it — 0777, no
+     *     links, the content's size, a tmpfs inode — where stat() of the path
+     *     (host passthrough) reports the real /proc file. Each answer is
+     *     compared with the path form on the same name, for a root-owned
+     *     global file and one of our own entries. Then a held /proc/<pid>
+     *     file after its process is gone: the kernel's pinned inode keeps
+     *     answering (measured) where a re-stat of the path is ENOENT, so the
+     *     fd must still describe a /proc regular file — 0444, one link, no
+     *     size, procfs's device, the same owner. An ordinary fd is untouched. */
+    {
+        static const char *const names[] = {"/proc/loadavg",
+                                            "/proc/self/cmdline",
+                                            "/proc/self/mounts"};
+        int st_ok = 1, sx_ok = 1, fs_ok = 1;
+        for (int k = 0; k < 3; k++) {
+            char ps[144], fs[144], px[256], fx[256], pf[120], ff[120];
+            long fd = pt_open(names[k]);
+            long r1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD,
+                                   (long)names[k], (long)ps, 0, 0, 0, 0);
+            long r2 = fd >= 0 ? cng_dispatch(__NR_fstat, fd, (long)fs, 0, 0,
+                                             0, 0, 0)
+                              : -1;
+            /* fstat and newfstatat(fd, "", AT_EMPTY_PATH) must say the same */
+            char es[144];
+            long r2b = fd >= 0 ? cng_dispatch(__NR_newfstatat, fd, (long)"",
+                                              (long)es, CNG_AT_EMPTY_PATH, 0, 0,
+                                              0)
+                               : -1;
+            long r3 = cng_dispatch(__NR_statx, CNG_AT_FDCWD, (long)names[k], 0,
+                                   CNG_STATX_BASIC_STATS | 0x1000, (long)px, 0,
+                                   0);
+            long r4 = fd >= 0 ? cng_dispatch(__NR_statx, fd, (long)"",
+                                             CNG_AT_EMPTY_PATH,
+                                             CNG_STATX_BASIC_STATS | 0x1000,
+                                             (long)fx, 0, 0)
+                              : -1;
+            long r5 = cng_dispatch(__NR_statfs, (long)names[k], (long)pf, 0, 0,
+                                   0, 0, 0);
+            long r6 = fd >= 0 ? cng_dispatch(__NR_fstatfs, fd, (long)ff, 0, 0,
+                                             0, 0, 0)
+                              : -1;
+            if (fd >= 0)
+                sys_close((int)fd);
+            /* the whole struct: dev, ino, mode, nlink, uid, gid, size,
+             * blksize, blocks and the times */
+            st_ok &= r1 == 0 && r2 == 0 && r2b == 0 &&
+                     !memcmp(ps, fs, 120) && !memcmp(fs, es, 120);
+            /* statx: everything but the spare tail */
+            sx_ok &= r3 == 0 && r4 == 0 && !memcmp(px, fx, 152);
+            fs_ok &= r5 == 0 && r6 == 0 && !memcmp(pf, ff, 120);
+        }
+        /* a held entry outlives its process */
+        long kid = sys_fork();
+        if (kid == 0) {
+            struct cng_timespec nap = {5, 0};
+            CNG_SYS(__NR_nanosleep, &nap, 0, 0, 0, 0, 0);
+            sys_exit_group(0);
+        }
+        int keep_ok = 0;
+        if (kid > 0) {
+            cng_procreg_fork((int)kid);
+            char kp[64];
+            cng_snprintf(kp, sizeof kp, "/proc/%ld/cmdline", kid);
+            char before[144], after[144], gone[144];
+            long kfd = pt_open(kp);
+            long rb = kfd >= 0 ? cng_dispatch(__NR_fstat, kfd, (long)before, 0,
+                                              0, 0, 0, 0)
+                               : -1;
+            CNG_SYS(__NR_kill, kid, 9, 0, 0, 0, 0);
+            sys_wait4((int)kid, 0, 0, 0);
+            long ra = kfd >= 0 ? cng_dispatch(__NR_fstat, kfd, (long)after, 0,
+                                              0, 0, 0, 0)
+                               : -1;
+            long rg = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)kp,
+                                   (long)gone, 0, 0, 0, 0);
+            if (kfd >= 0)
+                sys_close((int)kfd);
+            char pst[144];
+            long rp = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD,
+                                   (long)"/proc", (long)pst, 0, 0, 0, 0);
+            keep_ok = rb == 0 && ra == 0 && rp == 0 && rg == -ENOENT &&
+                      ST_MODE(after) == (0100000 | 0444) &&
+                      *(unsigned *)(after + 20) == 1 &&        /* st_nlink */
+                      *(long long *)(after + 48) == 0 &&       /* st_size */
+                      *(int *)(after + 56) == 1024 &&          /* st_blksize */
+                      !memcmp(after, pst, 8) &&                /* st_dev */
+                      !memcmp(after + 24, before + 24, 8);     /* uid, gid */
+        }
+        /* the fd's link names the file, a stat through it describes the
+         * file, and a dup of the fd is the same fd */
+        int link_ok = 0, dup_ok = 0;
+        {
+            char ps[144], ls[144], ds[144], lk[64], tg[CNG_PATH_MAX];
+            long fd = pt_open("/proc/self/mounts");
+            long r1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD,
+                                   (long)"/proc/self/mounts", (long)ps, 0, 0,
+                                   0, 0);
+            cng_snprintf(lk, sizeof lk, "/proc/self/fd/%ld", fd);
+            long rl = fd >= 0 ? cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD,
+                                             (long)lk, (long)tg, sizeof tg - 1,
+                                             0, 0, 0)
+                              : -1;
+            if (rl > 0)
+                tg[rl] = '\0';
+            char want[64];
+            cng_snprintf(want, sizeof want, "/proc/%d/mounts",
+                         (int)sys_getpid());
+            long r2 = fd >= 0 ? cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD,
+                                             (long)lk, (long)ls, 0, 0, 0, 0)
+                              : -1;
+            long d = fd >= 0 ? CNG_SYS(__NR_dup, fd, 0, 0, 0, 0, 0) : -1;
+            long r3 = d >= 0 ? cng_dispatch(__NR_fstat, d, (long)ds, 0, 0, 0,
+                                            0, 0)
+                             : -1;
+            if (d >= 0)
+                sys_close((int)d);
+            if (fd >= 0)
+                sys_close((int)fd);
+            link_ok = r1 == 0 && rl > 0 && !strcmp(tg, want) && r2 == 0 &&
+                      !memcmp(ps, ls, 120);
+            dup_ok = r1 == 0 && r3 == 0 && !memcmp(ps, ds, 120);
+        }
+        /* an ordinary fd is left to the kernel */
+        long ofd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/",
+                                CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+        char os[144], ok_[144];
+        long ro1 = ofd >= 0 ? cng_dispatch(__NR_fstat, ofd, (long)os, 0, 0, 0,
+                                           0, 0)
+                            : -1;
+        long ro2 = ofd >= 0 ? CNG_SYS(__NR_fstat, ofd, ok_, 0, 0, 0, 0) : -1;
+        if (ofd >= 0)
+            sys_close((int)ofd);
+        int plain_ok = ro1 == 0 && ro2 == 0 && !memcmp(os, ok_, 120);
+        int ok = st_ok && sx_ok && fs_ok && keep_ok && link_ok && dup_ok &&
+                 plain_ok;
+        cng_dprintf(1,
+                    "proctest synth fd stat: fstat=%d statx=%d fstatfs=%d "
+                    "outlives=%d link=%d dup=%d plain=%d -> %s\n",
+                    st_ok, sx_ok, fs_ok, keep_ok, link_ok, dup_ok, plain_ok,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
     /* 6) maps: the guest's own mappings, with no host path left in them. */
     {
         long fd = pt_open("/proc/self/maps");
@@ -6213,20 +6358,32 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
         fails += !ok;
     }
 
-    /* The --fake-id set is conditional, and this is the only place its effect on
-     * the filter can be seen: with the identity on, fstat joins the trapped set
-     * (stat and fstat must agree about ownership) along with fchmod (a chmod on
-     * a descriptor needs the same fail-soft the path form gets); with it off both
-     * stay untrapped, so an ordinary fstat costs nothing. Rebuilds the filter, so
-     * it runs after every case above. */
+    /* fstat is trapped only where it has something to do, and this is the only
+     * place that can be seen. Under --fake-id it joins the trapped set (stat
+     * and fstat must agree about ownership) along with fchmod (a chmod on a
+     * descriptor needs the same fail-soft the path form gets); with the /proc
+     * synthesis on it is trapped too, since an fd that synthesis hands out is a
+     * memfd whose own stat is not the real file's, and so is fstatfs. With the
+     * identity off and --no-proc, an ordinary fstat costs nothing. Rebuilds
+     * the filter, so it runs after every case above. */
     {
-        int was = cng_g_fake_id;
+        int was = cng_g_fake_id, was_np = cng_g_no_proc;
         u32 d[16];
         int bad = 0;
         cng_g_fake_id = 0;
+        cng_g_no_proc = 1;
         int n0 = cng_build_seccomp(f, CNG_SECCOMP_MAX_INSNS);
         bpf_data(d, __NR_fstat, 0x1000, 3);
         int off_ok = n0 > 0 && bpf_run(f, n0, d, &bad) == CNG_SECCOMP_RET_ALLOW;
+        bpf_data(d, __NR_fstatfs, 0x1000, 3);
+        off_ok &= n0 > 0 && bpf_run(f, n0, d, &bad) == CNG_SECCOMP_RET_ALLOW;
+        cng_g_no_proc = 0;
+        int np = cng_build_seccomp(f, CNG_SECCOMP_MAX_INSNS);
+        bpf_data(d, __NR_fstat, 0x1000, 3);
+        int proc_ok = np > 0 && bpf_run(f, np, d, &bad) == CNG_SECCOMP_RET_TRAP;
+        bpf_data(d, __NR_fstatfs, 0x1000, 3);
+        proc_ok &= np > 0 && bpf_run(f, np, d, &bad) == CNG_SECCOMP_RET_TRAP;
+        cng_g_no_proc = 1;
         cng_g_fake_id = 1;
         int n1 = cng_build_seccomp(f, CNG_SECCOMP_MAX_INSNS);
         bpf_data(d, __NR_fstat, 0x1000, 3);
@@ -6234,11 +6391,12 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
         bpf_data(d, __NR_fchmod, 0x1000, 3);
         int ch_ok = n1 > 0 && bpf_run(f, n1, d, &bad) == CNG_SECCOMP_RET_TRAP;
         cng_g_fake_id = was;
-        int ok2 = !bad && off_ok && on_ok && ch_ok;
+        cng_g_no_proc = was_np;
+        int ok2 = !bad && off_ok && proc_ok && on_ok && ch_ok;
         cng_dprintf(1,
-                    "bpftest fake-id: fstat_off=%d fstat_on=%d fchmod_on=%d "
-                    "-> %s\n",
-                    off_ok, on_ok, ch_ok, ok2 ? "OK" : "FAIL");
+                    "bpftest fake-id: fstat_off=%d fstat_proc=%d fstat_on=%d "
+                    "fchmod_on=%d -> %s\n",
+                    off_ok, proc_ok, on_ok, ch_ok, ok2 ? "OK" : "FAIL");
         fails += !ok2;
     }
 

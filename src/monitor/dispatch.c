@@ -37,6 +37,7 @@ const char *cng_g_exe_guest = "/";
  * has to come back out of a guest buffer and go back into it. */
 #define STAT_BUF_SIZE  128
 #define STATX_BUF_SIZE 256
+#define STATFS_BUF_SIZE 120
 #define STAT_MODE_OFF  16
 #define STAT_UID_OFF   24
 #define STAT_GID_OFF   28
@@ -3051,7 +3052,12 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * answer it already earned. So whenever there is an edit to make, the
          * kernel fills a struct of ours and the guest gets it in one copy;
          * where there is none, it fills the guest's directly as before. */
-        int bounce = a2 && (cng_g_l2s || cng_g_fake_id);
+        /* The fstat-by-fd form, newfstatat(fd, "", AT_EMPTY_PATH): an l2s
+         * backing file's link count and a synthesized /proc fd's stat are both
+         * keyed on the fd, not the name. */
+        int byfd = ((int)a3 & CNG_AT_EMPTY_PATH) && a1 &&
+                   !((const char *)a1)[0];
+        int bounce = a2 && (cng_g_l2s || cng_g_fake_id || !cng_g_no_proc);
         char sb[STAT_BUF_SIZE];
         long ob = bounce ? (long)sb : a2;
         if (cng_g_l2s && a2) {
@@ -3069,11 +3075,16 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         if (p == XLATE_TOOLONG)
             return -ENAMETOOLONG;
         long r = reissue(a0, (long)p, ob, a3, a4, a5, __NR_newfstatat);
-        if (r == 0 && cng_g_l2s && a2 && ((int)a3 & CNG_AT_EMPTY_PATH)) {
-            const char *gp = (const char *)a1; /* fstat-by-fd form */
-            if (!gp || !gp[0])
-                cng_l2s_fix_fd(a0, sb);
+        /* A synthesized /proc fd, asked about by fd or through its own fd link
+         * (stat -L /proc/self/fd/N lands on the memfd the same way). */
+        if (r == 0 && !cng_g_no_proc && a2) {
+            if (byfd)
+                cng_procfs_fix_fd((int)a0, sb);
+            else if (deref)
+                cng_procfs_fix_path(a0, p, sb);
         }
+        if (r == 0 && byfd && a2 && cng_g_l2s)
+            cng_l2s_fix_fd(a0, sb);
         if (r == 0 && cng_g_fake_id && a2)
             stat_remap(sb);
         if (r == 0 && bounce && cng_user_copyout((void *)a2, sb, sizeof sb) < 0)
@@ -3082,7 +3093,9 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     }
     case __NR_statx: {
         /* Bounced on the same terms as newfstatat above. */
-        int bounce = a4 && (cng_g_l2s || cng_g_fake_id);
+        int byfd = ((int)a2 & CNG_AT_EMPTY_PATH) && a1 &&
+                   !((const char *)a1)[0];
+        int bounce = a4 && (cng_g_l2s || cng_g_fake_id || !cng_g_no_proc);
         char sx[STATX_BUF_SIZE];
         long ob = bounce ? (long)sx : a4;
         if (cng_g_l2s && a4) {
@@ -3100,11 +3113,16 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         if (p == XLATE_TOOLONG)
             return -ENAMETOOLONG;
         long r = reissue(a0, (long)p, a2, a3, ob, a5, __NR_statx);
-        if (r == 0 && cng_g_l2s && a4 && ((int)a2 & CNG_AT_EMPTY_PATH)) {
-            const char *gp = (const char *)a1; /* fstat-by-fd form */
-            if (!gp || !gp[0])
-                cng_l2s_fix_fd_statx(a0, sx);
+        if (r == 0 && !cng_g_no_proc && a4) {
+            if (byfd)
+                cng_procfs_fix_fd_statx((int)a0, (unsigned)a2, (unsigned)a3,
+                                        sx);
+            else if (deref)
+                cng_procfs_fix_path_statx(a0, p, (unsigned)a2, (unsigned)a3,
+                                          sx);
         }
+        if (r == 0 && byfd && a4 && cng_g_l2s)
+            cng_l2s_fix_fd_statx(a0, sx);
         if (r == 0 && cng_g_fake_id && a4)
             statx_remap(sx);
         if (r == 0 && bounce && cng_user_copyout((void *)a4, sx, sizeof sx) < 0)
@@ -3234,8 +3252,12 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                     }
                     if (tl > 0 && (size_t)tl < sizeof tgt && tgt[0] == '/') {
                         tgt[tl] = '\0';
+                        /* A synthesized /proc file's fd is a memfd named after
+                         * it: the link says so, not "memfd:... (deleted)". */
                         if (cng_fs_untranslate(cng_g_fs, tgt, guest,
-                                               sizeof guest) == 0) {
+                                               sizeof guest) == 0 ||
+                            (!cng_g_no_proc &&
+                             cng_procfs_link_name(tgt, guest, sizeof guest))) {
                             size_t gl = strlen(guest);
                             if (gl > (size_t)bufsiz)
                                 gl = (size_t)bufsiz;
@@ -3303,12 +3325,16 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_fstat: {
         /* Bounced whenever anything here is going to edit the answer — see
          * newfstatat above for why the guest's buffer is not the place to do
-         * that. With nothing to edit, the kernel fills it directly. */
-        int bounce = a1 && (cng_g_l2s || cng_g_fake_id);
+         * that. With nothing to edit, the kernel fills it directly. A
+         * synthesized /proc fd answers with the real file's stat first, then
+         * takes the fake-id remap stat() of its path gets. */
+        int bounce = a1 && (cng_g_l2s || cng_g_fake_id || !cng_g_no_proc);
         char sb[STAT_BUF_SIZE];
         long r = reissue(a0, bounce ? (long)sb : a1, a2, a3, a4, a5,
                          __NR_fstat);
         if (r == 0 && bounce) {
+            if (!cng_g_no_proc)
+                cng_procfs_fix_fd((int)a0, sb);
             if (cng_g_l2s)
                 cng_l2s_fix_fd(a0, sb);
             if (cng_g_fake_id)
@@ -3317,6 +3343,22 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 return -EFAULT;
         }
         return r;
+    }
+
+    /* fstatfs: a synthesized /proc fd is a memfd on the kernel's internal
+     * tmpfs, and said so — TMPFS_MAGIC where statfs of the path says
+     * PROC_SUPER_MAGIC. Answered with procfs's own statfs for one of ours. */
+    case __NR_fstatfs: {
+        if (!cng_g_no_proc && a1) {
+            char fb[STATFS_BUF_SIZE];
+            int k = cng_procfs_fstatfs((int)a0, fb);
+            if (k < 0)
+                return k;
+            if (k == 1)
+                return cng_user_copyout((void *)a1, fb, sizeof fb) < 0 ? -EFAULT
+                                                                       : 0;
+        }
+        return reissue(a0, a1, a2, a3, a4, a5, __NR_fstatfs);
     }
 
     case __NR_getdents64:
@@ -4107,6 +4149,20 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             long ro = ro_refusal_name(CNG_AT_FDCWD, (const char *)a0, p, 0);
             if (ro)
                 return ro;
+        }
+        if (nr == __NR_statfs && !cng_g_no_proc && a1) {
+            /* A statfs through a synthesized fd's own link (stat -f -L
+             * /dev/stdin) lands on the memfd's tmpfs; the file is on procfs. */
+            char fb[STATFS_BUF_SIZE];
+            long r = reissue((long)p, (long)fb, a2, a3, a4, a5, nr);
+            if (r == 0) {
+                int k = cng_procfs_fix_path_statfs(CNG_AT_FDCWD, p, fb);
+                if (k < 0)
+                    return k;
+                if (cng_user_copyout((void *)a1, fb, sizeof fb) < 0)
+                    return -EFAULT;
+            }
+            return r;
         }
         return reissue((long)p, a1, a2, a3, a4, a5, nr);
     }

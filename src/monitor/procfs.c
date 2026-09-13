@@ -738,9 +738,26 @@ void cng_procfs_pre_read(int fd, long off) {
 /* Anonymous backing for a synthesized view, moved into the reserved high fd
  * range when the file needs refresh-on-rewind (that range is what the seccomp
  * filter traps the read family on). Returns the fd, or -1. Writable at this
- * point — the content still has to go in; synth_seal() makes it the guest's. */
-static long synth_memfd(int refreshable) {
-    long fd = sys_memfd_create("cng-proc", CNG_MFD_CLOEXEC);
+ * point — the content still has to go in; synth_seal() makes it the guest's.
+ *
+ * The memfd is named after the file it stands in for — "cng-proc:/proc/<pid>/
+ * cmdline", the spelling the kernel's own fd link would carry — because the
+ * name is the one thing about a memfd that survives everything an fd goes
+ * through: dup, inheritance across fork, a reopen through /proc/self/fd/N,
+ * and another process's look at our fd links all reach the same inode, and
+ * /proc/self/fd/N reads "/memfd:cng-proc:/proc/<pid>/cmdline (deleted)" for
+ * every one of them. That is how the fstat family and the fd links find their
+ * way back to the real file (synth_name_of). */
+#define SYNTH_TAG     "cng-proc:"
+#define SYNTH_TAG_LEN 9
+#define SYNTH_LINK_HEAD "/memfd:" SYNTH_TAG
+#define SYNTH_LINK_HEAD_LEN (7 + SYNTH_TAG_LEN)
+#define SYNTH_LINK_TAIL " (deleted)"
+#define SYNTH_LINK_TAIL_LEN 10
+static long synth_memfd(int refreshable, const char *name) {
+    char tag[SYNTH_TAG_LEN + CNG_PATH_MAX];
+    cng_snprintf(tag, sizeof tag, SYNTH_TAG "%s", name);
+    long fd = sys_memfd_create(tag, CNG_MFD_CLOEXEC);
     if (fd < 0)
         return -1;
     if (refreshable && cng_g_synth_fd_base > 0) {
@@ -1048,7 +1065,22 @@ int cng_procfs_open(const char *canon, long gflags, long *ret) {
 
     int refreshable =
         (kind == PF_LOADAVG || kind == PF_UPTIME || kind == PF_STAT);
-    long fd = synth_memfd(refreshable);
+    /* The name the kernel's fd link would show: a process's entries by number
+     * (self resolved, thread-self as the task entry), /proc/mounts as the
+     * self/mounts it links to, the global files as themselves. */
+    char link[CNG_PATH_MAX];
+    if (leaf) {
+        if (!strncmp(canon + 6, "thread-self/", 12))
+            cng_snprintf(link, sizeof link, "/proc/%d/task/%ld/%s", pid,
+                         sys_gettid(), leaf);
+        else
+            cng_snprintf(link, sizeof link, "/proc/%d/%s", pid, leaf);
+    } else if (kind == PF_MOUNTS) {
+        cng_snprintf(link, sizeof link, "/proc/%d/mounts", (int)sys_getpid());
+    } else {
+        cng_strlcpy(link, canon, sizeof link);
+    }
+    long fd = synth_memfd(refreshable, link);
     if (fd < 0)
         return 0; /* no memfd: degrade to host passthrough */
 
@@ -1109,6 +1141,199 @@ int cng_procfs_open(const char *canon, long gflags, long *ret) {
         cng_dprintf(2, "[cng] procfs %s -> fd %ld (kind %d)\n", canon, fd, kind);
     *ret = fd;
     return 1;
+}
+
+/* ---- the fd's own account of itself --------------------------------------- */
+
+/* The device memfds live on: the kernel's internal tmpfs, one for the whole
+ * system, so a stat that lands on it is a memfd's and nothing else's. Learned
+ * from a probe once; 0 where memfd_create is refused, when no synthesized fd
+ * can exist either. */
+static unsigned long g_memfd_dev;
+static int g_memfd_dev_known;
+static unsigned long memfd_dev(void) {
+    if (!__atomic_load_n(&g_memfd_dev_known, __ATOMIC_ACQUIRE)) {
+        unsigned long dev = 0;
+        long fd = sys_memfd_create("cng-probe", CNG_MFD_CLOEXEC);
+        if (fd >= 0) {
+            char st[128];
+            if (sys_fstat((int)fd, st) == 0)
+                dev = *(unsigned long *)(st + STAT_DEV_OFF);
+            sys_close((int)fd);
+        }
+        g_memfd_dev = dev;
+        __atomic_store_n(&g_memfd_dev_known, 1, __ATOMIC_RELEASE);
+    }
+    return g_memfd_dev;
+}
+
+int cng_procfs_link_name(const char *tgt, char *out, size_t sz) {
+    if (strncmp(tgt, SYNTH_LINK_HEAD, SYNTH_LINK_HEAD_LEN))
+        return 0;
+    size_t n = strlen(tgt);
+    if (n < SYNTH_LINK_HEAD_LEN + 1 + SYNTH_LINK_TAIL_LEN ||
+        strcmp(tgt + n - SYNTH_LINK_TAIL_LEN, SYNTH_LINK_TAIL))
+        return 0;
+    size_t pl = n - SYNTH_LINK_HEAD_LEN - SYNTH_LINK_TAIL_LEN;
+    if (pl >= sz)
+        return 0;
+    memcpy(out, tgt + SYNTH_LINK_HEAD_LEN, pl);
+    out[pl] = '\0';
+    return 1;
+}
+
+/* The /proc file behind the link at (dirfd, path) — /proc/self/fd/N for an fd
+ * of ours, or wherever a guest's stat landed on a memfd — or 0. */
+static int synth_name_at(long dirfd, const char *path, char *out, size_t sz) {
+    char tgt[CNG_PATH_MAX];
+    long n = sys_readlinkat((int)dirfd, path, tgt, sizeof tgt - 1);
+    if (n <= 0)
+        return 0;
+    tgt[n] = '\0';
+    return cng_procfs_link_name(tgt, out, sz);
+}
+
+static int synth_name_of(int fd, char *out, size_t sz) {
+    char link[40];
+    cng_snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+    return synth_name_at(CNG_AT_FDCWD, link, out, sz);
+}
+
+/* What every regular file under /proc has in common, put on a stat that could
+ * not be taken from the file itself: the kernel keeps a held inode answering
+ * after its process is gone, and there is no path left to ask for one of
+ * those. So the procfs mount's own identity carries 0444 (0400 for environ and
+ * auxv, which are the owner's alone), one link, size 0, 1 KiB blocks, and the
+ * memfd's inode number in place of one nobody can look up any more. A
+ * process's entries are its owner's, and every guest process runs as us. */
+#define ST_U32(b, o) (*(unsigned *)((b) + (o)))
+#define ST_S64(b, o) (*(long long *)((b) + (o)))
+static unsigned proc_mode_of(const char *name) {
+    const char *b = strrchr(name, '/');
+    b = b ? b + 1 : name;
+    return 0100000u | (!strcmp(b, "environ") || !strcmp(b, "auxv") ? 0400u
+                                                                     : 0444u);
+}
+static int proc_owned(const char *name) {
+    return name[6] >= '0' && name[6] <= '9'; /* "/proc/<pid>/..." */
+}
+static int synth_stat_gone(const char *name, unsigned long memfd_ino, char *st) {
+    if (CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, "/proc", st, 0, 0, 0) != 0)
+        return 0;
+    ST_U32(st, 16) = proc_mode_of(name);
+    ST_U32(st, 20) = 1;
+    ST_U32(st, 24) = proc_owned(name) ? (unsigned)sys_getuid() : 0;
+    ST_U32(st, 28) = proc_owned(name) ? (unsigned)sys_getgid() : 0;
+    *(unsigned long *)(st + STAT_INO_OFF) = memfd_ino;
+    ST_S64(st, 48) = 0;
+    *(int *)(st + 56) = 1024;
+    ST_S64(st, 64) = 0;
+    return 1;
+}
+static int synth_statx_gone(const char *name, unsigned long long memfd_ino,
+                            unsigned flags, unsigned mask, char *sx) {
+    if (CNG_SYS(__NR_statx, CNG_AT_FDCWD, "/proc", flags, mask, sx, 0) != 0)
+        return 0;
+    ST_U32(sx, 4) = 1024;
+    ST_U32(sx, 16) = 1;
+    ST_U32(sx, 20) = proc_owned(name) ? (unsigned)sys_getuid() : 0;
+    ST_U32(sx, 24) = proc_owned(name) ? (unsigned)sys_getgid() : 0;
+    *(unsigned short *)(sx + 28) = (unsigned short)proc_mode_of(name);
+    *(unsigned long long *)(sx + 32) = memfd_ino;
+    ST_S64(sx, 40) = 0;
+    ST_S64(sx, 48) = 0;
+    return 1;
+}
+
+int cng_procfs_fix_fd(int fd, void *stat) {
+    char *st = (char *)stat;
+    if (fd < 0 || *(unsigned long *)(st + STAT_DEV_OFF) != memfd_dev() ||
+        !memfd_dev())
+        return 0;
+    char name[CNG_PATH_MAX];
+    if (!synth_name_of(fd, name, sizeof name))
+        return 0; /* a memfd, but not one of ours */
+    unsigned long ino = *(unsigned long *)(st + STAT_INO_OFF);
+    if (CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, name, st, 0, 0, 0) == 0)
+        return 1;
+    return synth_stat_gone(name, ino, st);
+}
+
+int cng_procfs_fix_path(long dirfd, const char *path, void *stat) {
+    char *st = (char *)stat;
+    if (*(unsigned long *)(st + STAT_DEV_OFF) != memfd_dev() || !memfd_dev())
+        return 0;
+    char name[CNG_PATH_MAX];
+    if (!synth_name_at(dirfd, path, name, sizeof name))
+        return 0;
+    unsigned long ino = *(unsigned long *)(st + STAT_INO_OFF);
+    if (CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, name, st, 0, 0, 0) == 0)
+        return 1;
+    return synth_stat_gone(name, ino, st);
+}
+
+/* statx's dev is major/minor; stat's encoding has major in bits 8..19 and
+ * 32 up, minor in 0..7 and 20..31. */
+static unsigned long statx_dev(const char *sx) {
+    unsigned long maj = ST_U32(sx, 136), min = ST_U32(sx, 140);
+    return (min & 0xff) | ((maj & 0xfff) << 8) | ((min & ~0xffUL) << 12) |
+           ((maj & ~0xfffUL) << 32);
+}
+
+static int fix_statx(long dirfd, const char *path, int fd, unsigned flags,
+                     unsigned mask, char *sx) {
+    if (statx_dev(sx) != memfd_dev() || !memfd_dev())
+        return 0;
+    char name[CNG_PATH_MAX];
+    int ours = fd >= 0 ? synth_name_of(fd, name, sizeof name)
+                       : synth_name_at(dirfd, path, name, sizeof name);
+    if (!ours)
+        return 0;
+    unsigned long long ino = *(unsigned long long *)(sx + 32);
+    /* The guest's own flags, less the lookup ones: the name is followed to the
+     * file whatever the guest said about symlinks or empty paths, and the sync
+     * flags (AT_STATX_*) are what remains. */
+    flags &= ~(unsigned)(CNG_AT_SYMLINK_NOFOLLOW | CNG_AT_EMPTY_PATH |
+                         CNG_AT_NO_AUTOMOUNT);
+    if (CNG_SYS(__NR_statx, CNG_AT_FDCWD, name, flags, mask, sx, 0) == 0)
+        return 1;
+    return synth_statx_gone(name, ino, flags, mask, sx);
+}
+
+int cng_procfs_fix_fd_statx(int fd, unsigned flags, unsigned mask,
+                            void *statx) {
+    return fd < 0 ? 0 : fix_statx(CNG_AT_FDCWD, 0, fd, flags, mask, statx);
+}
+
+int cng_procfs_fix_path_statx(long dirfd, const char *path, unsigned flags,
+                              unsigned mask, void *statx) {
+    return fix_statx(dirfd, path, -1, flags, mask, statx);
+}
+
+int cng_procfs_fstatfs(int fd, void *buf) {
+    char st[128];
+    if (fd < 0 || sys_fstat(fd, st) != 0 ||
+        *(unsigned long *)(st + STAT_DEV_OFF) != memfd_dev() || !memfd_dev())
+        return 0;
+    char name[CNG_PATH_MAX];
+    if (!synth_name_of(fd, name, sizeof name))
+        return 0;
+    /* One procfs; the mount the file is on is the one /proc is. */
+    long r = CNG_SYS(__NR_statfs, "/proc", buf, 0, 0, 0, 0);
+    return r == 0 ? 1 : (int)r;
+}
+
+#define TMPFS_MAGIC 0x01021994L
+int cng_procfs_fix_path_statfs(long dirfd, const char *path, void *buf) {
+    /* statfs names no inode, so the filesystem type is the first cut: only a
+     * name that landed on a tmpfs can have landed on a memfd. */
+    if (*(long *)((char *)buf + STATFS_TYPE_OFF) != TMPFS_MAGIC)
+        return 0;
+    char name[CNG_PATH_MAX];
+    if (!synth_name_at(dirfd, path, name, sizeof name))
+        return 0;
+    long r = CNG_SYS(__NR_statfs, "/proc", buf, 0, 0, 0, 0);
+    return r == 0 ? 1 : (int)r;
 }
 
 /* ---- setup --------------------------------------------------------------- */
