@@ -3246,6 +3246,223 @@ int cng_cmd_stackswtest(int argc, char **argv, char **envp, unsigned long *auxv)
     return fails ? 1 : 0;
 }
 
+/* _sigsystest — the guest's view of SIGSYS, whose real disposition is the
+ * monitor's for the life of the process.
+ *
+ * rt_sigaction(SIGSYS) is answered from ptsig.c's mirror with the kernel's own
+ * argument checks — it used to be a bare 0: sigsetsize unchecked, a bad
+ * pointer never EFAULT, and a query that never showed the handler the guest had
+ * just installed — and the real handler must be untouched by any of it. A
+ * SIGSYS that is not a seccomp trap (tgkill here) then goes to that mirrored
+ * disposition, where it used to be consumed by our handler and nothing
+ * happened: the default action kills the process (core-dump class, so the
+ * parent sees WIFSIGNALED with SIGSYS), SIG_IGN drops it, a handler runs with
+ * the guest's siginfo, under sa_mask (SIGSYS itself is the one bit that cannot
+ * be added: a masked seccomp SIGSYS force-kills), and SA_RESETHAND puts the
+ * default back before the handler runs, so the second one kills. Each delivery
+ * runs in a child, since two of the four outcomes are the child's death. Every
+ * answer here is the host kernel's for the same calls on an unmonitored process
+ * (measured). */
+struct dbg_ksigaction {
+    void *handler;
+    unsigned long flags;
+    void *restorer;
+    unsigned long mask;
+};
+
+static volatile int *g_sst_page; /* MAP_SHARED: what a child's handler saw */
+
+static void sst_handler(int sig, cng_siginfo_t *si, void *uc) {
+    (void)uc;
+    unsigned long cur = 0;
+    CNG_SYS(__NR_rt_sigprocmask, 0 /*SIG_BLOCK*/, 0, &cur, sizeof cur, 0, 0);
+    g_sst_page[0]++;
+    g_sst_page[1] = sig;
+    g_sst_page[2] = si->si_code;
+    g_sst_page[3] = (cur & (1UL << (CNG_SIGUSR1 - 1))) != 0; /* sa_mask applied */
+    g_sst_page[4] = (cur & (1UL << (CNG_SIGSYS - 1))) != 0;  /* never blocked */
+}
+
+static long sst_sigaction(int sig, const struct dbg_ksigaction *a,
+                          struct dbg_ksigaction *o, long sz) {
+    return cng_dispatch(__NR_rt_sigaction, sig, (long)a, (long)o, sz, 0, 0, 1);
+}
+
+/* Run `fn` in a child with the SIGSYS handler installed; returns the wait
+ * status, or -1. */
+static int sst_child(void (*fn)(void)) {
+    long kid = sys_fork();
+    if (kid == 0) {
+        fn();
+        sys_exit_group(99);
+    }
+    if (kid < 0)
+        return -1;
+    int st = -1;
+    sys_wait4((int)kid, &st, 0, 0);
+    return st;
+}
+
+static void sst_raise(void) {
+    CNG_SYS(__NR_tgkill, sys_getpid(), sys_gettid(), CNG_SIGSYS, 0, 0, 0);
+}
+static void sst_dfl(void) { sst_raise(); }
+static void sst_ign(void) {
+    struct dbg_ksigaction a = {(void *)1, 0, 0, 0};
+    sst_sigaction(CNG_SIGSYS, &a, 0, 8);
+    sst_raise();
+    sys_exit_group(42);
+}
+static void sst_handled(void) {
+    struct dbg_ksigaction a = {(void *)sst_handler, CNG_SA_SIGINFO, 0,
+                               1UL << (CNG_SIGUSR1 - 1)};
+    sst_sigaction(CNG_SIGSYS, &a, 0, 8);
+    sst_raise();
+    /* back from the handler: the mask is the guest's own again */
+    unsigned long cur = 0;
+    CNG_SYS(__NR_rt_sigprocmask, 0, 0, &cur, sizeof cur, 0, 0);
+    g_sst_page[5] = (cur & (1UL << (CNG_SIGUSR1 - 1))) == 0;
+    sys_exit_group(43);
+}
+static void sst_resethand(void) {
+    struct dbg_ksigaction a = {(void *)sst_handler, CNG_SA_SIGINFO | CNG_SA_RESETHAND,
+                               0, 0};
+    sst_sigaction(CNG_SIGSYS, &a, 0, 8);
+    sst_raise(); /* runs the handler, and resets */
+    struct dbg_ksigaction o;
+    memset(&o, 0xee, sizeof o);
+    sst_sigaction(CNG_SIGSYS, 0, &o, 8);
+    g_sst_page[6] = o.handler == 0 && o.flags == 0; /* SIG_DFL now */
+    sst_raise(); /* kills */
+    sys_exit_group(44);
+}
+
+int cng_cmd_sigsystest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    static struct cng_fs fs;
+    cng_fs_init(&fs, "/");
+    cng_g_fs = &fs;
+    int fails = 0;
+
+    if (cng_sigsys_install_only() < 0) {
+        cng_dprintf(1, "sigsys: setup failed -> FAIL\n");
+        return 1;
+    }
+    struct dbg_ksigaction real_before, real_after, o;
+    CNG_SYS(__NR_rt_sigaction, CNG_SIGSYS, 0, &real_before, 8, 0, 0);
+
+    /* 1) the sigaction answers, in the kernel's order: sigsetsize first (even
+     *    with bad pointers), then act's EFAULT, then oact's. */
+    {
+        struct dbg_ksigaction a = {(void *)1, 0, 0, 0};
+        long sz = sst_sigaction(CNG_SIGSYS, (void *)1, (void *)1, 4);
+        long ef_act = sst_sigaction(CNG_SIGSYS, (void *)1, 0, 8);
+        long ef_old = sst_sigaction(CNG_SIGSYS, 0, (void *)1, 8);
+        memset(&o, 0xee, sizeof o);
+        long q0 = sst_sigaction(CNG_SIGSYS, 0, &o, 8);
+        int dfl0 = o.handler == 0 && o.flags == 0 && o.mask == 0;
+        long s1 = sst_sigaction(CNG_SIGSYS, &a, &o, 8); /* old = DFL */
+        int old_dfl = o.handler == 0;
+        memset(&o, 0xee, sizeof o);
+        long q1 = sst_sigaction(CNG_SIGSYS, 0, &o, 8);
+        int ign1 = o.handler == (void *)1;
+        struct dbg_ksigaction h = {(void *)sst_handler,
+                                   CNG_SA_SIGINFO | CNG_SA_RESTART, 0, 0x55};
+        long s2 = sst_sigaction(CNG_SIGSYS, &h, &o, 8); /* old = IGN */
+        int old_ign = o.handler == (void *)1;
+        memset(&o, 0xee, sizeof o);
+        long q2 = sst_sigaction(CNG_SIGSYS, 0, &o, 8);
+        int h2 = o.handler == (void *)sst_handler &&
+                 o.flags == (CNG_SA_SIGINFO | CNG_SA_RESTART) && o.mask == 0x55;
+        /* the real disposition is still ours, whatever the guest asked */
+        CNG_SYS(__NR_rt_sigaction, CNG_SIGSYS, 0, &real_after, 8, 0, 0);
+        int kept = real_after.handler == real_before.handler &&
+                   real_after.handler != (void *)sst_handler &&
+                   real_after.handler != 0;
+        int ok = sz == -EINVAL && ef_act == -EFAULT && ef_old == -EFAULT &&
+                 q0 == 0 && dfl0 && s1 == 0 && old_dfl && q1 == 0 && ign1 &&
+                 s2 == 0 && old_ign && q2 == 0 && h2 && kept;
+        cng_dprintf(1,
+                    "sigsys sigaction: size=%ld act=%ld oact=%ld dfl=%d "
+                    "ign=%d handler=%d real_kept=%d -> %s\n",
+                    sz, ef_act, ef_old, q0 == 0 && dfl0 && old_dfl,
+                    q1 == 0 && ign1 && old_ign, q2 == 0 && h2, kept,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 2) the exec reset: a handler goes back to default, SIG_IGN stays but
+     *    loses its flags and mask — flush_signal_handlers' rule. */
+    {
+        struct dbg_ksigaction a = {(void *)1, CNG_SA_RESTART, 0, 0x7};
+        sst_sigaction(CNG_SIGSYS, &a, 0, 8);
+        cng_pt_sig_exec_reset();
+        memset(&o, 0xee, sizeof o);
+        sst_sigaction(CNG_SIGSYS, 0, &o, 8);
+        int ign_bare = o.handler == (void *)1 && o.flags == 0 && o.mask == 0;
+        struct dbg_ksigaction h = {(void *)sst_handler, CNG_SA_SIGINFO, 0, 0};
+        sst_sigaction(CNG_SIGSYS, &h, 0, 8);
+        cng_pt_sig_exec_reset();
+        memset(&o, 0xee, sizeof o);
+        sst_sigaction(CNG_SIGSYS, 0, &o, 8);
+        int dfl = o.handler == 0 && o.flags == 0 && o.mask == 0;
+        int ok = ign_bare && dfl;
+        cng_dprintf(1, "sigsys exec reset: ign_bare=%d handler_dfl=%d -> %s\n",
+                    ign_bare, dfl, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 3) delivery of a tgkill'd SIGSYS, per disposition. */
+    g_sst_page = sys_mmap(0, 4096, CNG_PROT_READ | CNG_PROT_WRITE,
+                          CNG_MAP_SHARED | CNG_MAP_ANONYMOUS, -1, 0);
+    if (g_sst_page == CNG_MAP_FAILED || cng_is_err((long)g_sst_page)) {
+        cng_dprintf(1, "sigsys: no shared page -> FAIL\n");
+        return 1;
+    }
+    {
+        int st = sst_child(sst_dfl);
+        int killed = st >= 0 && (st & 0x7f) == CNG_SIGSYS;
+        cng_dprintf(1, "sigsys default action: status=0x%x killed_by_sigsys=%d -> %s\n",
+                    st, killed, killed ? "OK" : "FAIL");
+        fails += !killed;
+
+        st = sst_child(sst_ign);
+        int ignored = st >= 0 && (st & 0x7f) == 0 && ((st >> 8) & 0xff) == 42;
+        cng_dprintf(1, "sigsys ignored: status=0x%x survived=%d -> %s\n", st,
+                    ignored, ignored ? "OK" : "FAIL");
+        fails += !ignored;
+
+        memset((void *)g_sst_page, 0, 4096);
+        st = sst_child(sst_handled);
+        int ran = g_sst_page[0] == 1 && g_sst_page[1] == CNG_SIGSYS &&
+                  g_sst_page[2] == -6 /* SI_TKILL */ && g_sst_page[3] == 1 &&
+                  g_sst_page[4] == 0 && g_sst_page[5] == 1;
+        int ok = st >= 0 && (st & 0x7f) == 0 && ((st >> 8) & 0xff) == 43 && ran;
+        cng_dprintf(1,
+                    "sigsys handled: status=0x%x runs=%d sig=%d code=%d "
+                    "sa_mask=%d sigsys_unblocked=%d mask_back=%d -> %s\n",
+                    st, g_sst_page[0], g_sst_page[1], g_sst_page[2],
+                    g_sst_page[3], !g_sst_page[4], g_sst_page[5],
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+
+        memset((void *)g_sst_page, 0, 4096);
+        st = sst_child(sst_resethand);
+        ok = st >= 0 && (st & 0x7f) == CNG_SIGSYS && g_sst_page[0] == 1 &&
+             g_sst_page[6] == 1;
+        cng_dprintf(1,
+                    "sigsys resethand: status=0x%x runs=%d reset=%d "
+                    "second_kills=%d -> %s\n",
+                    st, g_sst_page[0], g_sst_page[6],
+                    st >= 0 && (st & 0x7f) == CNG_SIGSYS, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+    return fails ? 1 : 0;
+}
+
 /* _nesttest — a SIGSYS arriving while the handler already runs on the scratch
  * stack must not land on the frame of the one that put it there.
  *
@@ -3291,7 +3508,10 @@ int cng_cmd_nesttest(int argc, char **argv, char **envp, unsigned long *auxv) {
     long kid = sys_fork();
     if (kid == 0) {
         cng_g_sigsys_nest = 1;
-        CNG_SYS(__NR_tgkill, sys_getpid(), sys_gettid(), CNG_SIGSYS, 0, 0, 0);
+        /* A seccomp-looking SIGSYS, not a tgkill'd one: a guest-directed SIGSYS
+         * is now delivered to the guest's disposition before the handler
+         * switches stacks, and the stack switch is the thing under test. */
+        cng_sigsys_fabricate();
         /* Reaching this line at all means the outer frame was still the outer
          * frame when its sigreturn read it. */
         unsigned long o = cng_g_sigsys_frame[0], n = cng_g_sigsys_frame[1];

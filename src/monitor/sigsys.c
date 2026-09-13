@@ -216,8 +216,10 @@ static int sigsys_syscall(struct cng_ucontext *uc, long nr) {
 void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si) {
     unsigned long long *r = uc->uc_mcontext.regs;
 
-    /* Only seccomp traps are ours to emulate; a guest-directed kill(SIGSYS)
-     * (si_code != SYS_SECCOMP) is left alone. */
+    /* Only seccomp traps are ours to emulate. A guest-directed SIGSYS never
+     * gets this far — sigsys_handler delivers it to the guest's own disposition
+     * before switching stacks — so this is a guard for a caller handing the
+     * body a frame of its own making, which leaves it untouched. */
     if (si->si_code != CNG_SYS_SECCOMP)
         return;
 
@@ -484,9 +486,28 @@ static void sigsys_on_scratch(void *ucv, void *si) {
     if (cng_g_sigsys_nest) {
         cng_g_sigsys_nest = 0;
         cng_g_sigsys_frame[0] = (unsigned long)uc;
-        CNG_SYS(__NR_tgkill, sys_getpid(), sys_gettid(), CNG_SIGSYS, 0, 0, 0);
+        cng_sigsys_fabricate();
     }
     cng_sigsys_body(uc, si);
+}
+
+/* Queue a SIGSYS at this thread that the handler takes for a seccomp trap of
+ * the gate's own svc: si_code SYS_SECCOMP (which the kernel lets a task send
+ * itself) and a call address inside the gate, so the body's gate-net answers
+ * it with -ENOSYS in x0 and dispatches nothing. A tgkill'd SIGSYS will not do:
+ * that is a guest-directed signal now, delivered to the guest's disposition
+ * before the handler ever switches stacks, and what the nesttest has to reach
+ * is the stack switch. */
+void cng_sigsys_fabricate(void) {
+    cng_siginfo_t si;
+    memset(&si, 0, sizeof si);
+    si.si_signo = CNG_SIGSYS;
+    si.si_code = CNG_SYS_SECCOMP;
+    si._u._sigsys.call_addr = (void *)__cng_gate_start;
+    si._u._sigsys.syscall = -1; /* no real number: nothing is marked blocked */
+    si._u._sigsys.arch = 0xC00000B7u; /* AUDIT_ARCH_AARCH64 */
+    CNG_SYS(__NR_rt_tgsigqueueinfo, sys_getpid(), sys_gettid(), CNG_SIGSYS, &si,
+            0, 0);
 }
 
 /* A stack for a call that cannot have this thread's slot: the table is full of
@@ -517,6 +538,17 @@ static void scr_temp_free(unsigned long base) {
  * re-switch, clobbering the outer dispatcher frame. */
 static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {
     (void)sig;
+    /* A SIGSYS that is not a seccomp trap is the guest's signal — kill(2),
+     * tgkill, sigqueue — and goes to the guest's own disposition, from the
+     * frame the kernel built and on the stack it chose, with no scratch stack
+     * and none of the bookkeeping below: a handler the guest installed may
+     * siglongjmp out and never come back, which a busy flag or a disarmed
+     * alt-stack would not survive. It used to be consumed here and nothing
+     * happened, where the default action is a core dump. */
+    if (si->si_code != CNG_SYS_SECCOMP) {
+        cng_pt_deliver_sigsys(si, ucv);
+        return;
+    }
     long tid = sys_gettid();
     int i = cng_scratch_slot(tid);
     if (i < 0 || cng_scr[i].busy) {

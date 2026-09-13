@@ -445,6 +445,35 @@ check_contains "a nested SIGSYS frame does not land on the outer one" \
 check_contains "...and the outer handler still returns through its own frame" \
     "nest: child status 0 -> OK" "$out"
 
+# The guest's view of SIGSYS, whose real disposition is the monitor's for the
+# life of the process. rt_sigaction(SIGSYS) used to be answered with a bare 0 —
+# no sigsetsize check, no EFAULT for a bad pointer, and a query that never saw
+# the handler the guest had installed — and a SIGSYS that was not a seccomp
+# trap was consumed by our handler: kill -SYS did nothing, where the kernel's
+# default action is a core dump. Now the call is answered from ptsig.c's mirror
+# with the kernel's own checks and order (size, then act, then oact), the real
+# handler is never touched by it, and a tgkill'd SIGSYS goes to the mirrored
+# disposition: default kills (WIFSIGNALED, SIGSYS), SIG_IGN drops, a handler
+# runs with its siginfo under sa_mask — SIGSYS itself being the one bit that
+# cannot be added, since a masked seccomp SIGSYS force-kills — with the guest's
+# own mask back afterwards, and SA_RESETHAND puts the default back so the second
+# one kills. The emulated execve resets the mirror as the kernel resets
+# dispositions: handlers to default, SIG_IGN kept but stripped of flags and mask.
+out=$(run -t sigsystest 2>&1); rc=$?
+check "sigsystest exit 0" 0 "$rc"
+check_contains "rt_sigaction(SIGSYS) is answered from the mirror with the kernel's checks" \
+    "sigsys sigaction: size=-22 act=-14 oact=-14 dfl=1 ign=1 handler=1 real_kept=1 -> OK" "$out"
+check_contains "the emulated execve resets the SIGSYS disposition as the kernel would" \
+    "sigsys exec reset: ign_bare=1 handler_dfl=1 -> OK" "$out"
+check_contains "a guest-directed SIGSYS takes the default action: death" \
+    "sigsys default action: status=0x1f killed_by_sigsys=1 -> OK" "$out"
+check_contains "...is dropped under SIG_IGN" \
+    "sigsys ignored: status=0x2a00 survived=1 -> OK" "$out"
+check_contains "...runs the guest's handler under its sa_mask" \
+    "sigsys handled: status=0x2b00 runs=1 sig=31 code=-6 sa_mask=1 sigsys_unblocked=1 mask_back=1 -> OK" "$out"
+check_contains "...and SA_RESETHAND puts the default back for the next one" \
+    "sigsys resethand: status=0x1f runs=1 reset=1 second_kills=1 -> OK" "$out"
+
 # ...and what runs there must not itself scale with the guest's argv. The
 # emulated execve accepts a quarter of RLIMIT_STACK of arguments (megabytes),
 # and the guest-stack builder used to collect one address per entry in a VLA of

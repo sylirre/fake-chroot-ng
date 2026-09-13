@@ -71,6 +71,7 @@ typedef void (*cng_sighandler_t)(int, cng_siginfo_t *, void *);
 #define CNG_SA_ONSTACK  0x08000000u
 #define CNG_SA_RESTART  0x10000000u
 #define CNG_SA_NODEFER  0x40000000u
+#define CNG_SA_RESETHAND 0x80000000u
 #define CNG_SA_RESTORER 0x04000000u
 
 /* si_code for a seccomp trap (asm-generic). */

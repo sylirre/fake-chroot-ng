@@ -383,6 +383,10 @@ int cng_sigsys_install_only(void);
  * cng_g_sigsys_frame[outer, nested]; they must not be the same one. */
 extern int cng_g_sigsys_nest;
 extern unsigned long cng_g_sigsys_frame[2];
+/* Queue a SIGSYS at the calling thread that the handler takes for a seccomp
+ * trap from the gate (answered -ENOSYS, nothing dispatched): how a test raises
+ * one where no filter will, now that a plain kill(SIGSYS) is the guest's. */
+void cng_sigsys_fabricate(void);
 
 /* Core SIGSYS logic (exposed for testing): given the trapped signal context and
  * info, either translate+dispatch the guest syscall, or — when the trap is

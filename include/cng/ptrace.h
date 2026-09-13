@@ -279,6 +279,10 @@ int cng_pt_step_hit(u64 pc);
  * keep our own handler installed instead. Returns 1 if it fully handled the
  * call (result in *out), 0 to let the dispatcher re-issue it. */
 int cng_pt_sigaction(int sig, u64 act, u64 oact, u64 sz, long *out);
+/* Deliver a SIGSYS that is not a seccomp trap (kill, tgkill, sigqueue) to the
+ * guest's mirrored disposition, through the tracer's stop if the task is
+ * traced. Called by the SIGSYS handler, on the frame the kernel built. */
+void cng_pt_deliver_sigsys(cng_siginfo_t *si, void *uc);
 /* Install our handler for every catchable signal (entering traced state) or
  * put the guest's own dispositions back (leaving it). */
 void cng_pt_sig_trace_enter(void);

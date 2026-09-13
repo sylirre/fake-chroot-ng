@@ -4061,17 +4061,25 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         return 0;
     }
 
-    /* Protect our SIGSYS handler: ignore guest attempts to replace it, and
-     * strip SIGSYS from any handler's sa_mask so it can't be masked while a
-     * guest handler runs. Kernel struct sigaction: handler,flags,restorer,mask
-     * (mask at offset 24). */
+    /* Protect our SIGSYS handler: the guest's disposition for SIGSYS lives in
+     * ptsig.c's mirror and never reaches the kernel (it is answered and
+     * delivered from there, with the kernel's own argument checks), and SIGSYS
+     * is stripped from every other handler's sa_mask so it can't be masked
+     * while a guest handler runs. Kernel struct sigaction:
+     * handler,flags,restorer,mask (mask at offset 24). */
     case __NR_rt_sigaction: {
-        if ((int)a0 == CNG_SIGSYS)
-            return 0;
+        /* The kernel refuses a sigsetsize that is not its own before it looks
+         * at anything else, pointers included, and that verdict is the same
+         * for every signal — so a call with the wrong size goes straight to
+         * it, untouched: the copy-in below would have answered EFAULT for a
+         * bad act pointer where the kernel answers EINVAL (measured). */
+        if ((unsigned long)a3 != sizeof(cng_sigset_t))
+            return cng_syscall6(a0, a1, a2, a3, a4, a5, __NR_rt_sigaction);
         /* While the task is traced, ptsig.c owns the real disposition of every
          * signal (a tracee must stop before its own handler runs), and it owns
-         * the kick signal's slot always. It answers from its mirror of what the
-         * guest asked for; otherwise it just records and lets this through. */
+         * SIGSYS's and the kick signal's slot always. It answers from its
+         * mirror of what the guest asked for; otherwise it just records and
+         * lets this through. */
         long ptr;
         if (cng_pt_sigaction((int)a0, (u64)a1, (u64)a2, (u64)a3, &ptr))
             return ptr;

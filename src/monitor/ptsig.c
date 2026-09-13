@@ -3,8 +3,13 @@
 /* Signal mediation for traced tasks, and the reserved kick signal.
  *
  * Everything else in the monitor lets the guest's signals reach the guest's own
- * handlers untouched — that is the cheapest and most faithful thing to do. A
- * ptrace tracee cannot work that way: the kernel stops a traced task *before*
+ * handlers untouched — that is the cheapest and most faithful thing to do. Two
+ * signals cannot: SIGSYS, whose real disposition is the monitor's for the life
+ * of the process, and the kick signal below. For those the guest's rt_sigaction
+ * is answered from a mirror of what it asked for, and a delivery that is the
+ * guest's (a kill(SIGSYS), a kick-numbered signal without our magic) is run
+ * from that mirror by the handler that received it. A ptrace tracee cannot
+ * work that way either: the kernel stops a traced task *before*
  * delivering any signal to it, lets the tracer see it, and lets the tracer
  * suppress it, substitute another, or read the registers at the point of the
  * fault. gdb is built out of exactly that: a breakpoint is a `brk` the tracer
@@ -92,10 +97,16 @@ static void pt_die_by_signal(int sig) {
     CNG_SYS(__NR_exit_group, sig & 0x7f, 0, 0, 0, 0, 0);
 }
 
-/* Run the guest's disposition for `sig` now that the tracer has approved it. */
-static void pt_deliver_to_guest(int sig, cng_siginfo_t *si, void *uc) {
+/* Run the guest's disposition for `sig` now that the tracer has approved it
+ * (or there is none to ask). Reached from three handlers of ours standing in
+ * for the guest's: the trace hook, the kick handler forwarding a guest-directed
+ * signal of its number, and the SIGSYS handler for a SIGSYS that is not a
+ * seccomp trap. */
+static void pt_deliver_to_guest(int sig, cng_siginfo_t *si, void *ucv) {
+    struct cng_ucontext *uc = ucv;
     void *h = g_disp_set[sig] ? g_disp[sig].handler : 0;
     unsigned long flags = g_disp_set[sig] ? g_disp[sig].flags : 0;
+    unsigned long smask = g_disp_set[sig] ? g_disp[sig].mask.sig[0] : 0;
     if (h == (void *)1) /* SIG_IGN */
         return;
     if (!h) {           /* SIG_DFL */
@@ -106,10 +117,53 @@ static void pt_deliver_to_guest(int sig, cng_siginfo_t *si, void *uc) {
         pt_die_by_signal(sig);
         return;
     }
+    /* What get_signal() does on the way to a handler. SA_RESETHAND puts the
+     * default back before the handler runs, so a second arrival takes the
+     * default action — and the mirror is the only record there is of it here,
+     * since the real disposition is ours. The handler then runs under the mask
+     * the kernel would have computed: the guest's own (the frame's, which
+     * sigreturn restores) plus sa_mask plus the signal itself unless
+     * SA_NODEFER — except SIGSYS, which is never blocked (a masked seccomp
+     * SIGSYS force-kills), so a SIGSYS handler is re-enterable by another
+     * kill(SIGSYS) where the kernel would have queued it. The live mask until
+     * here was whichever of our handlers the signal reached: right already for
+     * the trace hook, which mirrors the guest's flags and mask into the real
+     * sigaction, and everything-blocked for the other two. */
+    if (flags & CNG_SA_RESETHAND) {
+        g_disp_set[sig] = 0;
+        memset(&g_disp[sig], 0, sizeof g_disp[sig]);
+    }
+    unsigned long m = uc->uc_sigmask.sig[0] | smask;
+    if (!(flags & CNG_SA_NODEFER))
+        m |= 1UL << (sig - 1);
+    m &= ~(1UL << (CNG_SIGSYS - 1));
+    CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, &m, 0, sizeof m, 0, 0);
     if (flags & CNG_SA_SIGINFO)
         ((void (*)(int, cng_siginfo_t *, void *))h)(sig, si, uc);
     else
         ((void (*)(int))h)(sig);
+}
+
+/* A SIGSYS that is not a seccomp trap — kill(2), tgkill, sigqueue, whoever —
+ * reaching the monitor's handler, which owns the real disposition of SIGSYS
+ * for the life of the process. It used to be swallowed there: the signal was
+ * consumed and nothing happened, where the kernel's default action for SIGSYS
+ * is a core dump and a guest may have installed a handler or SIG_IGN through
+ * rt_sigaction (answered from the mirror, see cng_pt_sigaction). Delivered the
+ * way the trace hook delivers any other signal: a traced task reports the
+ * signal-delivery-stop first and the tracer may suppress or substitute it. */
+void cng_pt_deliver_sigsys(cng_siginfo_t *si, void *ucv) {
+    struct cng_ucontext *uc = ucv;
+    struct cng_uregs *r = cng_pt_uregs(uc);
+    cng_pt_set_frame(r, uc);
+    int deliver = cng_pt_report_signal(r, CNG_SIGSYS, si->si_code, 0);
+    if (deliver == 0)
+        return;
+    if (deliver != CNG_SIGSYS) {
+        CNG_SYS(__NR_tgkill, sys_getpid(), sys_gettid(), deliver, 0, 0, 0);
+        return;
+    }
+    pt_deliver_to_guest(CNG_SIGSYS, si, uc);
 }
 
 /* si_addr of a fault siginfo (offset 16 on arm64: after signo/errno/code and
@@ -303,10 +357,16 @@ void cng_pt_sig_trace_leave(void) {
 void cng_pt_sig_exec_reset(void) {
     for (int s = 1; s <= PT_NSIG; s++) {
         /* Caught signals become SIG_DFL, ignored ones stay ignored — the
-         * kernel's rule, applied to our record of them. */
-        if (g_disp_set[s] && g_disp[s].handler != (void *)1) {
-            g_disp_set[s] = 0;
+         * kernel's rule (flush_signal_handlers), applied to our record of
+         * them. The flags, mask and restorer go in both cases: an ignored
+         * signal's sigaction reads back as a bare SIG_IGN after an exec. */
+        if (g_disp_set[s]) {
+            int ign = g_disp[s].handler == (void *)1;
             memset(&g_disp[s], 0, sizeof g_disp[s]);
+            if (ign)
+                g_disp[s].handler = (void *)1;
+            else
+                g_disp_set[s] = 0;
         }
         g_hooked[s] = 0;
     }
@@ -318,7 +378,19 @@ void cng_pt_sig_exec_reset(void) {
 int cng_pt_sigaction(int sig, u64 act, u64 oact, u64 sz, long *out) {
     if (sig < 1 || sig > PT_NSIG || sz != sizeof(cng_sigset_t))
         return 0; /* not ours to model: let the kernel answer */
-    int mine = g_hooked[sig] || sig == cng_g_kicksig;
+    /* Two signals are ours by number, for the life of the process, and are
+     * answered from the mirror alone: the real disposition is the monitor's
+     * and the guest's request must never reach the kernel. SIGSYS is the
+     * monitor itself — it used to be answered with a bare 0 before any of
+     * this, so a bad pointer was never EFAULT, a query never saw the handler
+     * the guest had installed, and (with the delivery side swallowing every
+     * non-seccomp SIGSYS) the handler never ran. The kick signal is ours only
+     * while ptrace is enabled: with --no-ptrace its handler is not installed,
+     * so a guest disposition for that number has to go to the kernel like any
+     * other, or a guest handler for SIGRTMAX silently never ran. */
+    int by_number = sig == CNG_SIGSYS ||
+                    (sig == cng_g_kicksig && !cng_g_no_ptrace);
+    int mine = g_hooked[sig] || by_number;
 
     struct pt_ksigaction nd;
     if (act) {
@@ -380,10 +452,11 @@ int cng_pt_sigaction(int sig, u64 act, u64 oact, u64 sz, long *out) {
                 g_hooked[sig] = 0;
                 pt_restore_guest(sig);
             }
-        } else if (sig != cng_g_kicksig) {
-            /* The kick signal is ours by number, not by hook: its own handler
-             * stays installed and must not be replaced. Everything else here we
-             * either already hooked, or just took back above. */
+        } else if (!by_number) {
+            /* The kick signal and SIGSYS are ours by number, not by hook:
+             * their own handlers stay installed and must not be replaced.
+             * Everything else here we either already hooked, or just took
+             * back above. */
             g_hooked[sig] = 1;
             pt_install(sig, pt_trace_handler); /* re-mirror flags/mask */
         }
