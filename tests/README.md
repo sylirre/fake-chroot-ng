@@ -53,7 +53,10 @@ since the noexec `.so` path only exists for a guest whose own `ld.so` maps
 libraries.
 
 Rootfs images are searched in `$CNG_ROOTFS_DIR`, `tests/.cache/rootfs/`,
-`$HOME/arm64chroot/tests/.cache/rootfs/` and `$HOME/arm64-rootfs/`.
+`$HOME/arm64chroot/tests/.cache/rootfs/` and `$HOME/arm64-rootfs/`. The suite
+only ever calls `bin/busybox` inside the Alpine one, so a stock minirootfs
+tarball is enough: that is what CI (`.github/workflows/tests.yml`, a hosted
+Linux AArch64 runner) unpacks into `tests/.cache/rootfs/alpine`.
 
 ## Adding a milestone script
 

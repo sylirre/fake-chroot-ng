@@ -6,3 +6,6 @@
 *.d
 *.tmp
 tests/artifacts/
+
+# Rootfs images the test harness looks for (tests/lib.sh), fetched by CI.
+/tests/.cache/

@@ -1,0 +1,98 @@
+# Build chroot-ng and run the test suite on every push, on a GitHub-hosted
+# Linux AArch64 runner.
+#
+# Why AArch64 and not the usual x86_64 box: the binary is an AArch64 program and
+# so is every guest the suite builds. On x86_64 both would run under qemu-user,
+# which does not apply a guest's seccomp filter, so the in-process SIGSYS tier
+# -- the one a device actually uses -- would be inert and only -R svc-rewriting
+# would be exercised (see tests/README.md). Native AArch64 makes it live.
+#
+# tests/lib.sh resolves everything host-dependent (no emulator, native gcc as the
+# guest toolchain, static-PIE guests) and prints what it found at the top of the
+# log. What it cannot find on its own is a guest userland: the Alpine legs need
+# a minirootfs at tests/.cache/rootfs/alpine, which is fetched here (~3.5 MB,
+# pinned by hash, cached between runs). No Debian image and no arm64chroot
+# oracle, so the differential l2s legs (M10 and friends) report as skipped; the
+# summary line counts them separately from passes.
+
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch supersedes a run still in flight.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ALPINE_BRANCH: v3.20
+  ALPINE_VER: 3.20.3
+  ALPINE_SHA256: 041fa34a81788242df9e78fa69b97ab45b8ec47ddbf88864755610414a7bf3de
+
+jobs:
+  test:
+    name: build + test (native AArch64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # The image ships gcc 12/13/14, make and curl; the Makefile picks the
+      # native `cc` when no aarch64-linux-gnu- cross toolchain is present, and
+      # tests/lib.sh probes the same compiler for guests. Nothing to install.
+      - name: Toolchain
+        run: |
+          cc --version
+          make --version
+          uname -srm
+
+      - name: Restore Alpine minirootfs tarball
+        id: alpine
+        uses: actions/cache@v6
+        with:
+          path: tests/.cache/rootfs/downloads
+          key: alpine-minirootfs-${{ env.ALPINE_VER }}-aarch64-${{ env.ALPINE_SHA256 }}
+
+      - name: Fetch Alpine minirootfs tarball
+        if: steps.alpine.outputs.cache-hit != 'true'
+        run: |
+          tb="alpine-minirootfs-${ALPINE_VER}-aarch64.tar.gz"
+          mkdir -p tests/.cache/rootfs/downloads
+          curl -fsSL --retry 3 -o "tests/.cache/rootfs/downloads/$tb" \
+            "https://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}/releases/aarch64/$tb"
+
+      # Extracted fresh every run: the tarball is the durable thing, the tree is
+      # cheap to rebuild and a rootfs restored from a cache would have to be
+      # trusted to keep every mode bit and symlink intact.
+      - name: Unpack Alpine rootfs
+        run: |
+          tb="alpine-minirootfs-${ALPINE_VER}-aarch64.tar.gz"
+          echo "${ALPINE_SHA256}  tests/.cache/rootfs/downloads/$tb" | sha256sum -c -
+          rm -rf tests/.cache/rootfs/alpine
+          mkdir -p tests/.cache/rootfs/alpine
+          tar -xzf "tests/.cache/rootfs/downloads/$tb" -C tests/.cache/rootfs/alpine --no-same-owner
+          test -x tests/.cache/rootfs/alpine/bin/busybox
+
+      # Warnings are defects here (see AGENTS.md), so they fail the build. Set
+      # through the environment, not the make command line: a command-line
+      # CFLAGS would override the Makefile's own `+=` additions as well.
+      - name: Build
+        env:
+          CFLAGS: -O2 -g -Werror
+        run: make -j"$(nproc)"
+
+      # The capability probe on the runner's kernel. Its exit status is 1 when a
+      # hard prerequisite of the in-process design fails, so a runner image that
+      # regresses shows up here by name rather than as a wall of test failures.
+      - name: Probe host capabilities
+        run: make probe
+
+      - name: Test
+        run: make test
