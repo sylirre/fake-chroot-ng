@@ -459,6 +459,10 @@ check_contains "...and the outer handler still returns through its own frame" \
 # own mask back afterwards, and SA_RESETHAND puts the default back so the second
 # one kills. The emulated execve resets the mirror as the kernel resets
 # dispositions: handlers to default, SIG_IGN kept but stripped of flags and mask.
+# The two deaths are compared with the host's own for a plain SIG_DFL SIGSYS
+# rather than pinned to a status: the 0x80 core-dumped bit in it is the host's
+# core policy (a pipe core_pattern dumps under RLIMIT_CORE 0, a file one does
+# not), which the leg used to assume was "no core" from the dev host's settings.
 out=$(run -t sigsystest 2>&1); rc=$?
 check "sigsystest exit 0" 0 "$rc"
 check_contains "rt_sigaction(SIGSYS) is answered from the mirror with the kernel's checks" \
@@ -466,13 +470,13 @@ check_contains "rt_sigaction(SIGSYS) is answered from the mirror with the kernel
 check_contains "the emulated execve resets the SIGSYS disposition as the kernel would" \
     "sigsys exec reset: ign_bare=1 handler_dfl=1 -> OK" "$out"
 check_contains "a guest-directed SIGSYS takes the default action: death" \
-    "sigsys default action: status=0x1f killed_by_sigsys=1 -> OK" "$out"
+    "sigsys default action: killed_by_sigsys=1 as_kernel=1" "$out"
 check_contains "...is dropped under SIG_IGN" \
     "sigsys ignored: status=0x2a00 survived=1 -> OK" "$out"
 check_contains "...runs the guest's handler under its sa_mask" \
     "sigsys handled: status=0x2b00 runs=1 sig=31 code=-6 sa_mask=1 sigsys_unblocked=1 mask_back=1 -> OK" "$out"
 check_contains "...and SA_RESETHAND puts the default back for the next one" \
-    "sigsys resethand: status=0x1f runs=1 reset=1 second_kills=1 -> OK" "$out"
+    "sigsys resethand: runs=1 reset=1 second_kills=1 as_kernel=1" "$out"
 
 # ...and what runs there must not itself scale with the guest's argv. The
 # emulated execve accepts a quarter of RLIMIT_STACK of arguments (megabytes),

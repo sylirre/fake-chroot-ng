@@ -3476,7 +3476,9 @@ int cng_cmd_stackswtest(int argc, char **argv, char **envp, unsigned long *auxv)
  * SIGSYS that is not a seccomp trap (tgkill here) then goes to that mirrored
  * disposition, where it used to be consumed by our handler and nothing
  * happened: the default action kills the process (core-dump class, so the
- * parent sees WIFSIGNALED with SIGSYS), SIG_IGN drops it, a handler runs with
+ * parent sees WIFSIGNALED with SIGSYS — and the same wait status a plain
+ * SIG_DFL death gets on this host, which a sibling child measures, since the
+ * core-dumped bit in it is host policy), SIG_IGN drops it, a handler runs with
  * the guest's siginfo, under sa_mask (SIGSYS itself is the one bit that cannot
  * be added: a masked seccomp SIGSYS force-kills), and SA_RESETHAND puts the
  * default back before the handler runs, so the second one kills. Each delivery
@@ -3527,6 +3529,20 @@ static void sst_raise(void) {
     CNG_SYS(__NR_tgkill, sys_getpid(), sys_gettid(), CNG_SIGSYS, 0, 0, 0);
 }
 static void sst_dfl(void) { sst_raise(); }
+/* The host's own answer for the default action: the real disposition put back
+ * to SIG_DFL, then the same tgkill. Death by SIGSYS is a core-dump class exit,
+ * and whether a core is actually written — which the wait status reports in
+ * its 0x80 bit — is the host's policy, not ours: a pipe core_pattern (Ubuntu's
+ * apport, as on a hosted CI runner) dumps with RLIMIT_CORE at 0 and answers
+ * 0x9f where a `core` file pattern under the same limit answers 0x1f. The
+ * emulated default action is a re-raise under SIG_DFL, so it must come out
+ * bit for bit as this does. */
+static void sst_kernel_dfl(void) {
+    struct dbg_ksigaction dfl;
+    memset(&dfl, 0, sizeof dfl);
+    CNG_SYS(__NR_rt_sigaction, CNG_SIGSYS, &dfl, 0, 8, 0, 0);
+    sst_raise();
+}
 static void sst_ign(void) {
     struct dbg_ksigaction a = {(void *)1, 0, 0, 0};
     sst_sigaction(CNG_SIGSYS, &a, 0, 8);
@@ -3643,11 +3659,16 @@ int cng_cmd_sigsystest(int argc, char **argv, char **envp, unsigned long *auxv) 
         return 1;
     }
     {
+        int ref = sst_child(sst_kernel_dfl);
         int st = sst_child(sst_dfl);
         int killed = st >= 0 && (st & 0x7f) == CNG_SIGSYS;
-        cng_dprintf(1, "sigsys default action: status=0x%x killed_by_sigsys=%d -> %s\n",
-                    st, killed, killed ? "OK" : "FAIL");
-        fails += !killed;
+        int as_kernel = st == ref;
+        cng_dprintf(1,
+                    "sigsys default action: killed_by_sigsys=%d as_kernel=%d "
+                    "(status=0x%x kernel=0x%x) -> %s\n",
+                    killed, as_kernel, st, ref,
+                    killed && as_kernel ? "OK" : "FAIL");
+        fails += !(killed && as_kernel);
 
         st = sst_child(sst_ign);
         int ignored = st >= 0 && (st & 0x7f) == 0 && ((st >> 8) & 0xff) == 42;
@@ -3671,13 +3692,14 @@ int cng_cmd_sigsystest(int argc, char **argv, char **envp, unsigned long *auxv) 
 
         memset((void *)g_sst_page, 0, 4096);
         st = sst_child(sst_resethand);
-        ok = st >= 0 && (st & 0x7f) == CNG_SIGSYS && g_sst_page[0] == 1 &&
-             g_sst_page[6] == 1;
+        ok = st >= 0 && (st & 0x7f) == CNG_SIGSYS && st == ref &&
+             g_sst_page[0] == 1 && g_sst_page[6] == 1;
         cng_dprintf(1,
-                    "sigsys resethand: status=0x%x runs=%d reset=%d "
-                    "second_kills=%d -> %s\n",
-                    st, g_sst_page[0], g_sst_page[6],
-                    st >= 0 && (st & 0x7f) == CNG_SIGSYS, ok ? "OK" : "FAIL");
+                    "sigsys resethand: runs=%d reset=%d second_kills=%d "
+                    "as_kernel=%d (status=0x%x) -> %s\n",
+                    g_sst_page[0], g_sst_page[6],
+                    st >= 0 && (st & 0x7f) == CNG_SIGSYS, st == ref, st,
+                    ok ? "OK" : "FAIL");
         fails += !ok;
     }
     return fails ? 1 : 0;
