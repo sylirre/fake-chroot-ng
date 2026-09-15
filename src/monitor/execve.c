@@ -371,6 +371,103 @@ void cng_timer_forget(int id) {
         }
 }
 
+/* rseq registrations, for the same reason. A real execve drops the thread's
+ * rseq area with the address space (rseq_execve); ours kept it, so the kernel
+ * went on writing cpu ids into the old program's TCB — on every return to user
+ * mode after a preemption, through the notify-resume path — long after the
+ * heap it sat in had been wound back. A program that reached its next syscall
+ * quickly survived by accident: the new image's own TCB grew back over the
+ * same addresses. One that parked in between, a ptrace tracee at its exec
+ * stop, was killed by the kernel's forced SIGSEGV (SI_KERNEL, no address),
+ * which no handler can catch and no tracer sees. Measured on a 6.8 kernel
+ * with a glibc static-pie guest; qemu-user never registers (rseq is ENOSYS
+ * there), which is how it stayed hidden.
+ *
+ * Unregistering needs the exact area, length and signature registered, which
+ * nothing reports, so they are caught as they go by (dispatch traps rseq for
+ * this) and given back before the exec takes the address space apart. Per
+ * thread, keyed by tid, lock-free the way the scratch table is. A fork child
+ * inherits the forking thread's registration and nothing else (rseq_fork), so
+ * the child re-keys that one entry to its own tid and drops the rest — the
+ * same sampling the no_new_privs bit gets, since in the child gettid answers
+ * a tid this table has never seen. There is no thread-exit hook, so an exited
+ * thread's entry stays until its tid is reclaimed; at the exec, which is
+ * single-threaded, every entry is simply tried — the kernel checks all three
+ * values against the caller's own registration, so only that one succeeds
+ * and a stale entry answers EINVAL. A full table means a registration outlives
+ * the exec, as every one did before. */
+#define CNG_RSEQ_MAX 256
+#define CNG_RSEQ_FLAG_UNREGISTER 1
+static struct {
+    long tid;
+    unsigned long area, len;
+    unsigned int sig;
+} g_rseq[CNG_RSEQ_MAX];
+
+static int rseq_slot(long tid) {
+    for (int i = 0; i < CNG_RSEQ_MAX; i++)
+        if (__atomic_load_n(&g_rseq[i].tid, __ATOMIC_ACQUIRE) == tid)
+            return i;
+    return -1;
+}
+
+/* Claim a slot for `tid`: a free one, else one whose thread has exited (the
+ * tid probe is tgkill(0), ESRCH for a tid this thread group no longer has). */
+static int rseq_claim(long tid) {
+    long pid = sys_getpid();
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < CNG_RSEQ_MAX; i++) {
+            long cur = __atomic_load_n(&g_rseq[i].tid, __ATOMIC_ACQUIRE);
+            if (cur == 0 ||
+                (pass && cur != tid &&
+                 CNG_SYS(__NR_tgkill, pid, cur, 0, 0, 0, 0) == -ESRCH)) {
+                if (__atomic_compare_exchange_n(&g_rseq[i].tid, &cur, tid, 0,
+                                                __ATOMIC_ACQ_REL,
+                                                __ATOMIC_RELAXED))
+                    return i;
+            }
+        }
+    return -1;
+}
+
+void cng_rseq_note(unsigned long area, unsigned long len, unsigned int sig) {
+    long tid = sys_gettid();
+    int i = rseq_slot(tid);
+    if (i < 0)
+        i = rseq_claim(tid);
+    if (i < 0)
+        return;
+    g_rseq[i].area = area;
+    g_rseq[i].len = len;
+    g_rseq[i].sig = sig;
+}
+
+void cng_rseq_forget(void) {
+    int i = rseq_slot(sys_gettid());
+    if (i >= 0)
+        __atomic_store_n(&g_rseq[i].tid, 0, __ATOMIC_RELEASE);
+}
+
+int cng_rseq_fork_prepare(void) {
+    return rseq_slot(sys_gettid());
+}
+
+void cng_rseq_fork_child(int keep) {
+    long tid = sys_gettid();
+    for (int i = 0; i < CNG_RSEQ_MAX; i++)
+        __atomic_store_n(&g_rseq[i].tid, i == keep ? tid : 0, __ATOMIC_RELAXED);
+}
+
+static void cng_rseq_exec_reset(void) {
+    for (int i = 0; i < CNG_RSEQ_MAX; i++) {
+        if (!g_rseq[i].tid)
+            continue;
+        CNG_SYS(__NR_rseq, g_rseq[i].area, g_rseq[i].len,
+                CNG_RSEQ_FLAG_UNREGISTER, g_rseq[i].sig, 0, 0);
+        g_rseq[i].tid = 0;
+    }
+}
+
 /* ---- the address space of the program being replaced --------------------
  *
  * A real execve throws the whole mm away. Ours cannot: the monitor's code, its
@@ -1078,7 +1175,15 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
      * down first and the interpreter second, which is also the only safe order:
      * the program is MAP_FIXED at a fixed vaddr while the interpreter is
      * kernel-placed, so mapping the interpreter first risks the kernel putting
-     * it inside the span the program is about to claim. */
+     * it inside the span the program is about to claim.
+     *
+     * The rseq registration goes first of all: it is the one piece of the old
+     * program's state the kernel writes into on its own, and the first mapping
+     * below may already land on the area (an ET_EXEC program registering a
+     * static one, replaced by the next image at the same vaddr). Nothing after
+     * this line can fail non-fatally, so there is no registration to give
+     * back. */
+    cng_rseq_exec_reset();
     rc = cng_elf_map(&pplan, 0, &prog);
     cng_elf_plan_release(&pplan);
     if (rc != CNG_LOAD_OK)
@@ -1197,7 +1302,8 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
     /* ...and neither do POSIX timers, the clear_child_tid futex, the robust
      * futex list, or the heap. A real execve drops all four with the address
      * space; ours keeps the address space, so each is state of a program that no
-     * longer exists, pointing into memory the new one now owns. */
+     * longer exists, pointing into memory the new one now owns. (The rseq area
+     * is the fifth, unregistered at the point of no return above.) */
     cng_exec_reset();
 
     /* setuid/setgid-on-exec against the fake credential set (--setuid-root /

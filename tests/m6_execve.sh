@@ -200,13 +200,25 @@ if guest_cc_report "$ER/hello" tests/guests/hello.c; then
         "emulate_execve failed x0=-22" "$(exectest -B /hello 2>&1)"
 
     # --- M17-10: state a real execve drops with the address space ------------
-    # Ours keeps the address space, so the heap and any POSIX timer outlive the
-    # program that owned them — a timer would go on firing into a program that
-    # never armed it. -R arms both before the emulation and reports afterwards.
+    # Ours keeps the address space, so the heap, any POSIX timer and the rseq
+    # registration outlive the program that owned them — a timer would go on
+    # firing into a program that never armed it, and the kernel would go on
+    # writing cpu ids into a TCB the next program no longer has (a forced
+    # SIGSEGV once the heap is wound back from under it, which is how a
+    # ptrace tracee died at its exec stop on a real kernel). -R arms all three
+    # before the emulation and reports afterwards. rseq is ENOSYS under
+    # qemu-user, so that part is only measured on a native host.
     out=$(exectest -R /hello 2>&1); rc=$?
     check "exec resets the state that would have died with the image" 0 $rc
     check_contains "the heap is wound back and the timer deleted" \
-        "execreset: brk_back=1 timer_created=1 timer_gone=1 -> OK" "$out"
+        "execreset: brk_back=1 timer_created=1 timer_gone=1" "$out"
+    if [ "$CNG_NATIVE" = 1 ]; then
+        check_contains "...and the rseq area unregistered" \
+            "rseq_registered=1 rseq_gone=1 -> OK" "$out"
+    else
+        check_contains "...and there was no rseq area to unregister here" \
+            "rseq_registered=0 rseq_gone=0 -> OK" "$out"
+    fi
 fi
 rm -rf "$ER"
 

@@ -1310,16 +1310,26 @@ vfork/`posix_spawn` child-stack handling.
     are measured with the M17-7 helpers, one probe per page rather than per
     element, with `E2BIG` at the kernel's own `MAX_ARG_STRLEN`.
   - **State that outlived the image.** A real execve drops POSIX timers, the
-    `clear_child_tid` futex, the robust futex list and the heap along with the
-    address space. We keep the address space, so all four survived: a timer went
-    on firing into a program that never armed it, and `clear_child_tid` still
-    pointed at the dead libc's TCB — an address the kernel writes a zero to and
-    futex-wakes on thread exit, landing in whatever the new program put there.
-    Timer ids are recorded as they are handed out (`timer_create`/`timer_delete`
-    join the trapped set; nothing enumerates a process's timers, and the id in
-    `/proc/self/timers` is the kernel's, not the one a guest under an emulator
-    holds). The break is wound back to what it was before the first guest
-    program ran, which also stops an exec chain accumulating every heap in it.
+    `clear_child_tid` futex, the robust futex list, the rseq registration and
+    the heap along with the address space. We keep the address space, so all
+    five survived: a timer went on firing into a program that never armed it,
+    and `clear_child_tid` still pointed at the dead libc's TCB — an address the
+    kernel writes a zero to and futex-wakes on thread exit, landing in whatever
+    the new program put there. Timer ids are recorded as they are handed out
+    (`timer_create`/`timer_delete` join the trapped set; nothing enumerates a
+    process's timers, and the id in `/proc/self/timers` is the kernel's, not
+    the one a guest under an emulator holds). The break is wound back to what
+    it was before the first guest program ran, which also stops an exec chain
+    accumulating every heap in it. The rseq area is the same shape with a
+    sharper edge — the kernel writes cpu ids into it on its own, on every
+    return to user mode after a preemption, and once the heap it sat in was
+    wound back that write was a forced `SIGSEGV` (`SI_KERNEL`, no address, no
+    handler consulted) — and it went unseen for as long as every exec was
+    measured under qemu-user, which has no rseq: the first native run killed
+    a ptrace tracee parked at its exec stop. `rseq` joins the trapped set, the
+    area/length/signature are recorded per thread as the guest registers, and
+    the registration is dropped at the point of no return, before anything is
+    unmapped.
   - **Tests:** 18 new legs in `m6_execve.sh` on an extended `-t exectest`, whose
     new flags (`-D` dirfd, `-e` AT_EMPTY_PATH, `-N` nofollow, `-B` bad flag,
     `-R` state probe) are the only way to reach the execveat forms under qemu. A

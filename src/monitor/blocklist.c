@@ -54,6 +54,16 @@ static const int probe_set[] = {
      * traps once per exec and is answered by the gate-net, which is the nested
      * delivery the design goes out of its way not to need. */
     __NR_set_robust_list,
+    /* And this one, which the same reset issues to drop the old program's
+     * rseq registration — only ever with the parameters of a registration
+     * that went through, so a host that refuses rseq is never asked to
+     * unregister; but the -t drivers record a registration through the
+     * dispatcher with no handler behind them, and reissue() must know. (The
+     * probe's arguments, -1 for an area and 0 for a length, are refused
+     * EINVAL before anything is registered.) */
+#ifdef __NR_rseq
+    __NR_rseq,
+#endif
 #ifdef __NR_fchmodat2
     __NR_fchmodat2,
 #endif

@@ -78,6 +78,13 @@ static const int path_syscalls[] = {
      * space; ours keeps the address space, and nothing enumerates a process's
      * timers, so the id has to be caught as it is handed out (dispatch.c). */
     __NR_timer_create, __NR_timer_delete,
+    /* rseq: likewise. A real exec drops the thread's registration; ours has to
+     * unregister it, which takes the exact area, length and signature the
+     * guest gave — recorded as it registers (dispatch.c), or the kernel goes
+     * on writing cpu ids into a TCB the next program no longer has. */
+#ifdef __NR_rseq
+    __NR_rseq,
+#endif
     /* uname: the host's release describes the device, not the rootfs, and on
      * Android carries vendor suffixes that identify it. Faked to a fixed
      * identity that /proc/version repeats verbatim (procfs.c). */

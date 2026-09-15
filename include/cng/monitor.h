@@ -190,6 +190,17 @@ extern unsigned long cng_g_brk0;
 void cng_timer_note(int id);
 void cng_timer_forget(int id);
 
+/* Record / forget the calling thread's rseq registration. A real execve drops
+ * it with the address space; ours has to unregister it, which takes the exact
+ * area, length and signature, so the dispatcher hands them over as the guest
+ * registers (see the table in execve.c). */
+void cng_rseq_note(unsigned long area, unsigned long len, unsigned int sig);
+void cng_rseq_forget(void);
+/* Across a trapped fork: the forking thread's entry, sampled before the clone,
+ * is the one the child inherits and re-keys to its own tid. */
+int cng_rseq_fork_prepare(void);
+void cng_rseq_fork_child(int keep);
+
 /* Close every FD_CLOEXEC descriptor, as a real execve would (emulated execve
  * does not, so fork/exec launchers' O_CLOEXEC notify pipes must be closed here
  * or the parent blocks). Exposed for testing. */

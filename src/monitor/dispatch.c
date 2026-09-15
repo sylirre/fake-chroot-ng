@@ -2475,12 +2475,15 @@ void cng_clone_convert(struct cng_uregs *ur) {
      * forking task's, so it is sampled before the fork: in the child, gettid
      * answers a tid the table has never seen. */
     int nnp = cng_nnp_get();
+    /* Same for the rseq registration the child inherits (execve.c). */
+    int rseq_keep = cng_rseq_fork_prepare();
     long flags = (long)(orig_flags &
                         ~(unsigned long)(CNG_CLONE_VM | CNG_CLONE_VFORK));
     long ret = cng_syscall6(flags, 0, (long)ur->x[2], (long)ur->x[3],
                             (long)ur->x[4], (long)ur->x[5], __NR_clone);
     if (ret == 0) {
         cng_nnp_fork_child(nnp); /* one task, holding what we held */
+        cng_rseq_fork_child(rseq_keep);
         /* The child inherited both the mappings and the attach list, so the
          * broker must count those attaches again (shm.c). */
         cng_shm_fork_child();
@@ -4438,6 +4441,26 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             cng_timer_forget((int)a0);
         return r;
     }
+
+    /* rseq: the same story with a sharper edge. The registered area is memory
+     * the kernel writes into by itself, on the way back to user mode, and a
+     * real execve unregisters it with the address space; ours must do it by
+     * hand, with the exact area, length and signature — so they are recorded
+     * here (per thread; see the table in execve.c). The call itself runs as
+     * the kernel answers it, EBUSY, EINVAL and all. */
+#ifdef __NR_rseq
+    case __NR_rseq: {
+        long r = reissue(a0, a1, a2, a3, a4, a5, nr);
+        if (r == 0) {
+            if (a2 & 1 /*RSEQ_FLAG_UNREGISTER*/)
+                cng_rseq_forget();
+            else
+                cng_rseq_note((unsigned long)a0, (unsigned long)a1,
+                              (unsigned int)a3);
+        }
+        return r;
+    }
+#endif
 
     /* prctl: the four ops that describe OUR confinement rather than the guest's.
      * Only these are trapped (seccomp.c tests args[0] in BPF); every other op is

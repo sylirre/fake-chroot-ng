@@ -2413,11 +2413,18 @@ int cng_cmd_exectest(int argc, char **argv, char **envp, unsigned long *auxv) {
         gpath = "";
         xflags |= CNG_AT_EMPTY_PATH;
     }
-    /* -R: the state a real execve drops with the address space. Grow the heap
-     * and arm a POSIX timer the way a running program would, then report
-     * whether the emulation undid both — the reset happens at the commit point,
-     * so it is only observable from here, before we enter the new program. */
-    int tid = 0, have_timer = 0;
+    /* -R: the state a real execve drops with the address space. Grow the heap,
+     * arm a POSIX timer and register an rseq area the way a running program
+     * would, then report whether the emulation undid all three — the reset
+     * happens at the commit point, so it is only observable from here, before
+     * we enter the new program. */
+    int tid = 0, have_timer = 0, have_rseq = 0;
+    /* struct rseq: 32 bytes, 32-aligned; the signature is any word. */
+    static struct {
+        unsigned int cpu_id_start, cpu_id;
+        unsigned long long rseq_cs;
+        unsigned int flags;
+    } __attribute__((aligned(32))) rs_old, rs_new;
     if (probe_reset) {
         long b = CNG_SYS(__NR_brk, 0, 0, 0, 0, 0, 0);
         if (b > 0) {
@@ -2428,6 +2435,11 @@ int cng_cmd_exectest(int argc, char **argv, char **envp, unsigned long *auxv) {
          * syscall here would be a timer the emulation never saw. */
         have_timer = cng_dispatch(__NR_timer_create, 0 /*CLOCK_REALTIME*/, 0,
                                   (long)&tid, 0, 0, 0, 1) == 0;
+        /* Likewise the rseq area, which is recorded the same way. A kernel or
+         * emulator without rseq (qemu-user answers ENOSYS) leaves nothing to
+         * drop, and that is not a failure. */
+        have_rseq = cng_dispatch(__NR_rseq, (long)&rs_old, 32, 0, 0x53053053,
+                                 0, 0, 1) == 0;
     }
 
     static struct cng_ucontext uc;
@@ -2440,11 +2452,19 @@ int cng_cmd_exectest(int argc, char **argv, char **envp, unsigned long *auxv) {
          * which keeps its own timer table. */
         int gone = have_timer &&
                    CNG_SYS(__NR_timer_delete, tid, 0, 0, 0, 0, 0) < 0;
+        /* The registration is gone when a fresh area can be registered: the
+         * kernel refuses a second registration (EINVAL for another area, EBUSY
+         * for the same) for as long as the first stands. */
+        int rseq_gone = have_rseq &&
+                        CNG_SYS(__NR_rseq, (long)&rs_new, 32, 0, 0x53053053,
+                                0, 0) == 0;
         int brk_back = ((unsigned long)b == cng_g_brk0);
-        int ok = brk_back && (!have_timer || gone);
-        cng_dprintf(1, "execreset: brk_back=%d timer_created=%d timer_gone=%d "
-                       "-> %s\n",
-                    brk_back, have_timer, gone, ok ? "OK" : "FAIL");
+        int ok = brk_back && (!have_timer || gone) && (!have_rseq || rseq_gone);
+        cng_dprintf(1,
+                    "execreset: brk_back=%d timer_created=%d timer_gone=%d "
+                    "rseq_registered=%d rseq_gone=%d -> %s\n",
+                    brk_back, have_timer, gone, have_rseq, rseq_gone,
+                    ok ? "OK" : "FAIL");
         return ok ? 0 : 1;
     }
     unsigned long entry = (unsigned long)uc.uc_mcontext.pc;
