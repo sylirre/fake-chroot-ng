@@ -1,7 +1,7 @@
 /* The shm corner cases that are easy to get subtly wrong, each printed as the
  * errno name so the emulation and the real thing can be diffed.
  *
- * Three of these caught real divergences when this was ported:
+ * Four of these caught real divergences:
  *   - SHM_EXEC is a *permission* request, not just a mapping flag: attaching a
  *     0600 segment with it must fail EACCES (no execute bit), the way the
  *     kernel checks S_IXUGO. The broker's permission triad had no execute leg.
@@ -9,6 +9,11 @@
  *     EINVAL; there is nothing to pin here, but refusing is the wrong answer.
  *   - SHM_RND turns an unaligned address into a rounded one, so the failure
  *     that follows is EPERM from the mapping, not EINVAL from the check.
+ *   - SHM_REMAP without an address is EINVAL: there is nothing to replace, and
+ *     do_shmat() refuses before it looks the segment up. qemu-user's own shmat
+ *     attaches anyway, which is why the reference for this program is a host
+ *     build (tests/m12_shm.sh) and why the first native run was the one to
+ *     notice.
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE   /* SHM_EXEC, SHM_LOCK */
@@ -29,7 +34,7 @@ int main(void) {
     if (id < 0) { perror("shmget"); return 1; }
     void *r;
 
-    /* SHM_REMAP with no address: nothing to replace, so it is a plain attach. */
+    /* SHM_REMAP with no address: nothing to replace, so the kernel refuses. */
     r = shmat(id, NULL, SHM_REMAP);
     printf("remap_no_addr=%s\n", r_of(r));
     if (r != (void *)-1) shmdt(r);

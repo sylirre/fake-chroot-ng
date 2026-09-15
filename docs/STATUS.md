@@ -596,15 +596,22 @@ vfork/`posix_spawn` child-stack handling.
     checks `S_IXUGO` — the broker's permission triad grew an execute leg for
     it; and `SHM_LOCK`/`SHM_UNLOCK` succeed for the owner rather than answering
     `EINVAL` (there is nothing to pin here, but refusing is the wrong answer).
+    A third only a real kernel could show: `SHM_REMAP` without an address is
+    `EINVAL` (nothing to replace; `do_shmat` refuses before it looks the
+    segment up), where qemu's own `shmat` attaches anyway — and so did the
+    emulation, until the first native run. The address rules now come first,
+    in the kernel's order, ahead of the broker's lookup and permission check.
   - **Tested differentially.** `tests/guests/shm_sysv.c` and `shm_stat.c`
     (arm64chroot's own, written for exactly this comparison) plus `shm_exec.c`
-    and `shm_edge.c` run once under the emulation and once straight under
-    qemu-aarch64, where the same code gets the genuine article — the host
-    kernel's `shmget`/`shmctl` and qemu's own `shmat`; stdout must match byte
-    for byte, over both backing tiers. `-t shmtest` covers the dispatcher level
-    in ten groups including a real fork and a real broker, and
-    `tests/guests/shm_key.c` pins the namespace scope, which is the one part
-    with no counterpart to diff against.
+    run once under the emulation and once straight under qemu-aarch64, where
+    the same code gets the genuine article — the host kernel's
+    `shmget`/`shmctl` and qemu's own `shmat`; stdout must match byte for byte,
+    over both backing tiers. `shm_edge.c`, like the `SHM_REMAP` and
+    attachment-table programs, is refereed by a host-native build instead,
+    since its attach-side answers are the ones qemu makes up. `-t shmtest`
+    covers the dispatcher level in ten groups including a real fork and a
+    real broker, and `tests/guests/shm_key.c` pins the namespace scope, which
+    is the one part with no counterpart to diff against.
 
 - [x] **M13 — `-b SRC:DST[:ro]`: oracle-compatible bind syntax + read-only binds**
   `-b` took `GUEST:HOST`; arm64chroot takes `SRC:DST` — host first. Same flag,

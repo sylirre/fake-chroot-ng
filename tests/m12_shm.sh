@@ -181,7 +181,7 @@ m12_kbase=
 m12_ready=0
 if guest_xlate_ready "SysV shm differential"; then
     m12_ready=1
-    for p in shm_sysv shm_stat shm_exec shm_edge shm_key; do
+    for p in shm_sysv shm_stat shm_exec shm_key; do
         guest_cc "$SG/$p" "tests/guests/$p.c" || m12_ready=0
     done
     if [ "$m12_ready" = 0 ]; then
@@ -218,100 +218,81 @@ if [ "$m12_ready" = 1 ]; then
     # The emulated execve keeps the address space, so it has to drop attaches
     # itself; a real execve gets it for free by replacing the address space.
     shm_diff "m12 execve detaches attachments as a real one does" shm_exec
-    # The corner cases, each of which had a divergence when this was ported:
-    # SHM_EXEC's permission check, SHM_LOCK, SHM_RND's rounding. See shm_edge.c.
-    shm_diff "m12 shmat/shmctl corner cases match the real kernel" shm_edge
-
-    # SHM_REMAP has its own program because qemu-aarch64 cannot referee it: it
-    # tracks attachments in a table of its own keyed by start address and
-    # detaches the whole recorded region, which is the very mistake under test.
-    # Measured with no chroot-ng in the picture — one page remapped over the
-    # front of a 16-page attachment, then shmdt: the kernel keeps the covered
-    # segment's nattch at 1 and leaves the tail mapped, qemu-user reports 0 and
-    # unmaps all 64 KiB. So the reference side is a host build, as M18 does for
-    # ptrace and M22 for msgsnd.
-    RM_ORACLE=$SG/shm_remap
-    rm_ready=1
-    if ! guest_cc "$SG/shm_remap" tests/guests/shm_remap.c; then
-        rm_ready=0
-        skip "m12 SHM_REMAP: the guest program does not build here"
-    elif [ -n "$QEMU" ]; then
-        rm_ready=0
-        for _c in ${HOSTCC:-} cc gcc clang; do
-            have "$_c" || continue
-            if "$_c" -O2 -o "$SG/rm_host" tests/guests/shm_remap.c 2>/dev/null
-            then
-                RM_ORACLE=$SG/rm_host
-                rm_ready=1
-                break
+    # Three legs whose reference cannot be qemu-aarch64: it implements shmat
+    # and shmdt itself (it has to manage the guest address space), so on those
+    # it referees its own reading of the rules rather than the kernel's. Their
+    # oracle is a host-native build of the same program instead, as M18 does
+    # for ptrace and M22 for msgsnd; on a host that runs the guest build
+    # directly it is that build, with no chroot-ng in the way. What they print
+    # is protocol only (errno names, counts), so the comparison holds across
+    # architectures.
+    #
+    # m12_host_diff <desc> <prog> <fail-desc> <timeout>: build both sides, run
+    # both, and compare stdout. A side that cannot be built is a skip.
+    m12_host_diff() {
+        _oracle=$SG/$2
+        if ! guest_cc "$SG/$2" "tests/guests/$2.c"; then
+            skip "m12 $2: the guest program does not build here"
+            return
+        fi
+        if [ -n "$QEMU" ]; then
+            _oracle=
+            for _c in ${HOSTCC:-} cc gcc clang; do
+                have "$_c" || continue
+                if "$_c" -O2 -o "$SG/$2.host" "tests/guests/$2.c" 2>/dev/null
+                then
+                    _oracle=$SG/$2.host
+                    break
+                fi
+            done
+            if [ -z "$_oracle" ]; then
+                skip "m12 $2: no host compiler for the differential oracle"
+                return
             fi
-        done
-        [ "$rm_ready" = 1 ] ||
-            skip "m12 SHM_REMAP: no host compiler for the differential oracle"
-    fi
-    if [ "$rm_ready" = 1 ]; then
+        fi
         if [ -n "$TIMEOUT" ]; then
-            rm_k=$("$TIMEOUT" 60 "$RM_ORACLE" 2>/dev/null)
+            _k=$("$TIMEOUT" "$4" "$_oracle" 2>/dev/null)
         else
-            rm_k=$("$RM_ORACLE" 2>/dev/null)
+            _k=$("$_oracle" 2>/dev/null)
         fi
         # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
-        rm_e=$(run_t 60 $GUEST_BINDS -R "$SG" /shm_remap 2>/dev/null)
-        if [ "$rm_k" = "$rm_e" ]; then
+        _e=$(run_t "$4" $GUEST_BINDS -R "$SG" "/$2" 2>/dev/null)
+        if [ "$_k" = "$_e" ]; then
             pass=$((pass + 1))
-            printf '  ok   m12 SHM_REMAP retires what it replaced\n'
+            printf '  ok   %s\n' "$1"
         else
             fail=$((fail + 1))
-            printf '  FAIL m12 SHM_REMAP bookkeeping diverges from the kernel\n'
-            printf '    kernel: %s\n' "$(echo "$rm_k" | tr '\n' '|')"
-            printf '    cng   : %s\n' "$(echo "$rm_e" | tr '\n' '|')"
+            printf '  FAIL %s\n' "$3"
+            printf '    kernel: %s\n' "$(echo "$_k" | tr '\n' '|')"
+            printf '    cng   : %s\n' "$(echo "$_e" | tr '\n' '|')"
         fi
-    fi
+    }
+
+    # The corner cases, each of which had a divergence when this was ported:
+    # SHM_EXEC's permission check, SHM_LOCK, SHM_RND's rounding. See shm_edge.c.
+    # A host oracle because of SHM_REMAP without an address: the kernel refuses
+    # it (nothing to replace), qemu-user attaches anyway, and so did the
+    # emulation while qemu was the referee — the first native run caught it.
+    m12_host_diff "m12 shmat/shmctl corner cases match the real kernel" \
+        shm_edge "m12 shmat/shmctl corner cases diverge from the kernel" 60
+
+    # SHM_REMAP: qemu tracks attachments in a table of its own keyed by start
+    # address and detaches the whole recorded region, which is the very mistake
+    # under test. Measured with no chroot-ng in the picture — one page remapped
+    # over the front of a 16-page attachment, then shmdt: the kernel keeps the
+    # covered segment's nattch at 1 and leaves the tail mapped, qemu-user
+    # reports 0 and unmaps all 64 KiB.
+    m12_host_diff "m12 SHM_REMAP retires what it replaced" \
+        shm_remap "m12 SHM_REMAP bookkeeping diverges from the kernel" 60
 
     # Both tables the emulation tracks attachments in used to be fixed-size, and
     # neither limit exists in the kernel: 128 attachments per process (past which
     # shmdt answered EINVAL for an address the kernel detaches) and 32 attaching
     # processes per segment (past which a dead attacher's count stayed on nattch
-    # for good). qemu-aarch64 cannot referee this — its own shm bookkeeping is 32
-    # regions wide — so the reference side is a host build, as SHM_REMAP's leg
-    # above and M22's msgsnd ordering are.
-    MANY_ORACLE=$SG/shm_many
-    many_ready=1
-    if ! guest_cc "$SG/shm_many" tests/guests/shm_many.c; then
-        many_ready=0
-        skip "m12 attachment tables: the guest program does not build here"
-    elif [ -n "$QEMU" ]; then
-        many_ready=0
-        for _c in ${HOSTCC:-} cc gcc clang; do
-            have "$_c" || continue
-            if "$_c" -O2 -o "$SG/many_host" tests/guests/shm_many.c 2>/dev/null
-            then
-                MANY_ORACLE=$SG/many_host
-                many_ready=1
-                break
-            fi
-        done
-        [ "$many_ready" = 1 ] ||
-            skip "m12 attachment tables: no host compiler for the differential oracle"
-    fi
-    if [ "$many_ready" = 1 ]; then
-        if [ -n "$TIMEOUT" ]; then
-            many_k=$("$TIMEOUT" 120 "$MANY_ORACLE" 2>/dev/null)
-        else
-            many_k=$("$MANY_ORACLE" 2>/dev/null)
-        fi
-        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
-        many_e=$(run_t 120 $GUEST_BINDS -R "$SG" /shm_many 2>/dev/null)
-        if [ "$many_k" = "$many_e" ]; then
-            pass=$((pass + 1))
-            printf '  ok   m12 attachment tracking has no limit the kernel does not\n'
-        else
-            fail=$((fail + 1))
-            printf '  FAIL m12 attachment tracking runs out where the kernel does not\n'
-            printf '    kernel: %s\n' "$(echo "$many_k" | tr '\n' '|')"
-            printf '    cng   : %s\n' "$(echo "$many_e" | tr '\n' '|')"
-        fi
-    fi
+    # for good). qemu's own shm bookkeeping is 32 regions wide, so it cannot
+    # referee this either.
+    m12_host_diff "m12 attachment tracking has no limit the kernel does not" \
+        shm_many "m12 attachment tracking runs out where the kernel does not" 120
 
     # ...and again over the file-backed tier, which must be indistinguishable
     # from the memfd one (only the broker's backing differs).

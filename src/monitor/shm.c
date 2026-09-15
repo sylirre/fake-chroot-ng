@@ -214,6 +214,28 @@ static long do_shmget(s32 key, u64 size, s32 shmflg) {
 }
 
 static long do_shmat(s32 shmid, u64 shmaddr, s32 shmflg) {
+    /* The address rules come first, before the segment is so much as looked
+     * up: do_shmat() judges them ahead of shm_obtain_object_check() and
+     * ipcperms(), so an unaligned address on a segment the caller may not
+     * attach is EINVAL, not EACCES. SHMLBA is the page size on arm64, and the
+     * guest runs on our pages, so SHM_RND rounds to cng_page_size. SHM_REMAP
+     * needs an address to replace something at: with none — given, or left
+     * once the rounding took it to zero — the kernel refuses rather than
+     * attach wherever it likes. This used to fall through to a plain attach,
+     * which was the only answer qemu-user's own shmat could referee. */
+    u64 addr = shmaddr;
+    if (addr) {
+        if (addr & (cng_page_size - 1)) {
+            if (!(shmflg & CNG_SHM_RND))
+                return -EINVAL;
+            addr = cng_page_down(addr);
+            if (!addr && (shmflg & CNG_SHM_REMAP))
+                return -EINVAL;
+        }
+    } else if (shmflg & CNG_SHM_REMAP) {
+        return -EINVAL;
+    }
+
     int readonly = (shmflg & CNG_SHM_RDONLY) ? 1 : 0;
     /* SHM_EXEC is a permission request, not just a mapping flag: it needs
      * execute permission on the segment the way SHM_RDONLY needs read and a
@@ -233,24 +255,15 @@ static long do_shmat(s32 shmid, u64 shmaddr, s32 shmflg) {
     int prot = CNG_PROT_READ | (readonly ? 0 : CNG_PROT_WRITE) |
                ((shmflg & CNG_SHM_EXEC) ? CNG_PROT_EXEC : 0);
 
-    /* SHMLBA is the page size on arm64, and the guest runs on our pages, so
-     * SHM_RND rounds to cng_page_size. */
-    u64 addr = shmaddr;
+    /* SHM_REMAP is MAP_FIXED, and the monitor lives in the guest's own address
+     * space: an attach placed over chroot-ng's image would replace the code
+     * that is running the attach. The kernel has no such range to protect, so
+     * there is no errno to copy — EINVAL is what shmat already answers for an
+     * address it will not honor, and it is what a plain (non-REMAP) attach
+     * here produces anyway, since the range is taken. */
     long err = len ? 0 : -EINVAL;
-    if (!err && addr) {
-        if (shmflg & CNG_SHM_RND)
-            addr = cng_page_down(addr);
-        if (addr & (cng_page_size - 1))
-            err = -EINVAL;
-        /* SHM_REMAP is MAP_FIXED, and the monitor lives in the guest's own
-         * address space: an attach placed over chroot-ng's image would replace
-         * the code that is running the attach. The kernel has no such range to
-         * protect, so there is no errno to copy — EINVAL is what shmat already
-         * answers for an address it will not honor, and it is what a plain
-         * (non-REMAP) attach here produces anyway, since the range is taken. */
-        else if (cng_hits_image(addr, len))
-            err = -EINVAL;
-    }
+    if (!err && addr && cng_hits_image(addr, len))
+        err = -EINVAL;
 
     void *p = CNG_MAP_FAILED;
     if (!err) {
