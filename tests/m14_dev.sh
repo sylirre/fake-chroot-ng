@@ -33,8 +33,8 @@ else
         esac
     }
 
-    # ls /dev must show the whitelist. The Alpine rootfs physically contains
-    # only "null", so anything beyond it came from the injection.
+    # ls /dev must show the whitelist. A minirootfs ships no device nodes (its
+    # dev/ is empty), so everything listed came from the injection.
     #
     # ...as far as this host can supply it: the injection stats the host node
     # and leaves out what it cannot see, because listing a name that then does
@@ -75,9 +75,15 @@ else
         esac
     done
 
-    # Deduped against the physical dirent: the rootfs ships a real /dev/null,
-    # which must appear once, not twice.
-    got=$(run -R "$M14_ALPINE" /bin/busybox sh -c \
+    # Deduped against the physical dirent: a rootfs that does ship its own
+    # /dev/null must list it once, not twice. The minirootfs has none, and an
+    # unprivileged mknod is refused, so plant one in a copy — a regular file
+    # does, the splice keys on the name — beside an entry the whitelist has no
+    # word for, which is what tells the rootfs directory's own listing apart
+    # from the injected one below.
+    M14P=$(mktemp -d); cp -a "$M14_ALPINE/." "$M14P"
+    : > "$M14P/dev/null"; : > "$M14P/dev/m14-physical"
+    got=$(run -R "$M14P" /bin/busybox sh -c \
         'ls /dev | grep -c "^null$"' 2>/dev/null)
     check "m14 a physically-present node is not duplicated" 1 "$got"
 
@@ -111,15 +117,19 @@ else
         skip "device-containment leg: this host has no non-whitelisted /dev node to try"
     fi
 
-    # --no-dev turns the whole zone off: /dev is the rootfs directory only.
-    got=$(run -R --no-dev "$M14_ALPINE" /bin/busybox sh -c \
+    # --no-dev turns the whole zone off: /dev is the rootfs directory only, so
+    # the guest's listing of it is the host's listing of the same directory —
+    # the planted entries and nothing else.
+    got=$(run -R --no-dev "$M14P" /bin/busybox sh -c \
         'ls /dev | tr "\n" " "' 2>/dev/null)
-    check_contains "m14 --no-dev lists only the rootfs /dev" "null" "$got"
+    check "m14 --no-dev lists only the rootfs /dev" \
+        "$(LC_ALL=C ls "$M14P/dev" | tr '\n' ' ')" "$got"
     case " $got " in
     *" zero "*) fail=$((fail + 1))
         echo "  FAIL m14 --no-dev still injected nodes"; echo "    got: $got" ;;
     *) pass=$((pass + 1)); echo "  ok   m14 --no-dev injects nothing" ;;
     esac
+    rm -rf "$M14P"
 
     # The zone is governed by --no-dev, not by --no-proc: `fd` and the std*
     # aliases name the host fd table, which is a host object whatever /proc the
