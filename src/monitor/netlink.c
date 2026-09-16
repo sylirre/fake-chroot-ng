@@ -43,6 +43,7 @@
 #include "cng/path.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
+#include "cng/tab.h"
 #include "cng/uapi.h"
 
 #include "cng/broker.h" /* cng_broker_env: no getenv in a freestanding build */
@@ -115,10 +116,9 @@ int cng_nl_deny_audit = 0;
 #define SIOCGIFTXQLEN_  0x8942
 #define SIOCGIFMAP_     0x8970
 
-#define NL_SLOTS 4
-/* Per-slot reply capacity, matching the oracle's NL_REPLY_MAX. A synthesized
+/* Reply assembly capacity, matching the oracle's NL_REPLY_MAX. A synthesized
  * link dump is ~100 bytes per interface, so this holds dozens with room for
- * the terminator. */
+ * the terminator. Assembly space is the caller's, on the scratch stack. */
 #define NL_REPLY_MAX 8192
 
 struct nlmsghdr_ {
@@ -145,14 +145,24 @@ struct sockaddr_nl_ {
  * closed this fd and opened something else on the same number would have its
  * I/O quietly diverted here.
  *
- * `scratch` is assembly space for relayed and synthesized reply datagrams. */
+ * `state` is the slot's claim: NL_FREE is a slot nobody holds (a fresh table
+ * element is all zero, so this is also the state an fd of 0 must never be
+ * mistaken for), NL_CLAIMED one a socket() call is filling or emptying, and
+ * NL_LIVE one whose fds are published. The table grows a page at a time
+ * (cng_tab) and there is no limit on the sockets it holds: there was one, at
+ * four, and the fifth concurrent emulated socket was handed the host's own
+ * refusal — a resolver with one per thread reaches that on a device where
+ * rtnetlink is denied. Two threads opening sockets at once used to pick the
+ * same free slot; the claim is a compare-and-swap now. */
+enum { NL_FREE = 0, NL_CLAIMED = 1, NL_LIVE = 2 };
+
 struct nl_slot {
+    int state;
     int fd, monfd, hostfd;
     unsigned long long ino;
-    unsigned char scratch[NL_REPLY_MAX];
 };
 
-static struct nl_slot g_slots[NL_SLOTS];
+static struct cng_tab g_slots = CNG_TAB_INIT(struct nl_slot);
 
 static unsigned long long fd_ino(int fd) {
     char st[144];
@@ -161,18 +171,41 @@ static unsigned long long fd_ino(int fd) {
     return *(unsigned long long *)(st + 8); /* st_ino */
 }
 
+/* Is this live slot's fd still the socket it was handed out as? */
+static int slot_current(const struct nl_slot *s) {
+    unsigned long long ino = fd_ino(s->fd);
+    return ino && ino == s->ino;
+}
+
+/* Give a slot back: its pair peer and relay socket are ours to close. The
+ * caller holds the claim. */
+static void slot_release(struct nl_slot *s) {
+    if (s->monfd >= 0)
+        sys_close(s->monfd);
+    if (s->hostfd >= 0)
+        sys_close(s->hostfd);
+    s->fd = s->monfd = s->hostfd = -1;
+    __atomic_store_n(&s->state, NL_FREE, __ATOMIC_RELEASE);
+}
+
 static struct nl_slot *slot_of(int fd) {
     if (fd < 0)
         return 0;
-    for (int i = 0; i < NL_SLOTS; i++) {
-        if (g_slots[i].fd != fd)
+    struct cng_tab_iter it;
+    for (struct nl_slot *s = cng_tab_first(&g_slots, &it); s;
+         s = cng_tab_next(&g_slots, &it)) {
+        if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) != NL_LIVE ||
+            s->fd != fd)
             continue;
-        unsigned long long ino = fd_ino(fd);
-        if (!ino || ino != g_slots[i].ino) {
-            g_slots[i].fd = -1; /* recycled behind our back: not ours */
-            return 0;
-        }
-        return &g_slots[i];
+        if (slot_current(s))
+            return s;
+        /* Recycled behind our back: not ours. Whoever claims it first gives
+         * it back; a claim that fails is a socket() call already doing so. */
+        int live = NL_LIVE;
+        if (__atomic_compare_exchange_n(&s->state, &live, NL_CLAIMED, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            slot_release(s);
+        return 0;
     }
     return 0;
 }
@@ -717,29 +750,31 @@ static void push_msgs(struct nl_slot *s, const unsigned char *b, long len) {
  * runs until its NLMSG_DONE; a single get expects exactly one reply. If the
  * host goes quiet (SO_RCVTIMEO) the guest still gets a terminator — a dump
  * that simply stops mid-stream would hang every netlink client ever written. */
-static void pump(struct nl_slot *s, unsigned seq, unsigned pid, int is_dump) {
+static void pump(struct nl_slot *s, unsigned seq, unsigned pid, int is_dump,
+                 unsigned char *scratch) {
     int done = 0;
     for (int rounds = 0; !done && rounds < 256; rounds++) {
-        long r = CNG_SYS(__NR_recvfrom, s->hostfd, (long)s->scratch,
-                         NL_REPLY_MAX, 0, 0, 0);
+        long r = CNG_SYS(__NR_recvfrom, s->hostfd, (long)scratch, NL_REPLY_MAX,
+                         0, 0, 0);
         if (r <= 0)
             break;
-        done = fix_pid(s->scratch, r, pid);
-        push(s, s->scratch, r);
+        done = fix_pid(scratch, r, pid);
+        push(s, scratch, r);
         if (!is_dump)
             return;
     }
     if (!done) {
-        long n = is_dump ? put_done(s->scratch, seq, pid)
-                         : put_error(s->scratch, 0, NL_REPLY_MAX, seq, pid, 0);
-        push(s, s->scratch, n);
+        long n = is_dump ? put_done(scratch, seq, pid)
+                         : put_error(scratch, 0, NL_REPLY_MAX, seq, pid, 0);
+        push(s, scratch, n);
     }
 }
 
 /* Serve one guest request: relay it when the host will answer, synthesize when
- * it will not, ack everything else. Replies land in the pair as datagrams. */
+ * it will not, ack everything else. Replies land in the pair as datagrams,
+ * assembled in `scratch` (NL_REPLY_MAX bytes of the caller's). */
 static void process_request(struct nl_slot *s, const unsigned char *req,
-                            long rlen) {
+                            long rlen, unsigned char *scratch) {
     if (!req || rlen < (long)sizeof(struct nlmsghdr_))
         return;
     const struct nlmsghdr_ *rh = (const struct nlmsghdr_ *)req;
@@ -759,7 +794,7 @@ static void process_request(struct nl_slot *s, const unsigned char *req,
             if (cng_g_debug)
                 cng_dprintf(2, "[cng] nl send fd=%d type=%u -> relayed\n",
                             s->fd, type);
-            pump(s, seq, pid, is_dump);
+            pump(s, seq, pid, is_dump, scratch);
             return;
         }
         /* The host refuses to answer this query — on Android RTM_GETLINK is
@@ -769,21 +804,21 @@ static void process_request(struct nl_slot *s, const unsigned char *req,
          * total silence. */
         long off = 0;
         if (type == RTM_GETLINK_)
-            off = synth_links(s->scratch, NL_REPLY_MAX - 24, req, rl, seq, pid,
+            off = synth_links(scratch, NL_REPLY_MAX - 24, req, rl, seq, pid,
                               is_dump);
         else if (type == RTM_GETADDR_)
-            off = synth_addrs(s->scratch, NL_REPLY_MAX - 24, req, rl, seq, pid,
+            off = synth_addrs(scratch, NL_REPLY_MAX - 24, req, rl, seq, pid,
                               is_dump);
         /* RTM_GETROUTE with no relay: an empty dump, as the oracle serves. */
         if (is_dump)
-            off += put_done(s->scratch + off, seq, pid);
+            off += put_done(scratch + off, seq, pid);
         if (off > 0) {
             if (cng_g_debug)
                 cng_dprintf(2,
                             "[cng] nl send fd=%d type=%u -> synthesized %ld "
                             "bytes (relay fd=%d sendto=%ld)\n",
                             s->fd, type, off, s->hostfd, sr);
-            push_msgs(s, s->scratch, off);
+            push_msgs(s, scratch, off);
             return;
         }
         /* Non-dump GETROUTE (or an unparseable request): ack it below, which
@@ -791,20 +826,20 @@ static void process_request(struct nl_slot *s, const unsigned char *req,
     }
 
     if (is_dump) {
-        push(s, s->scratch, put_done(s->scratch, seq, pid));
+        push(s, scratch, put_done(scratch, seq, pid));
         return;
     }
     /* Anything else gets a success ack, which is what lets bubblewrap's
      * loopback_setup() (RTM_NEWADDR/RTM_NEWLINK) proceed instead of aborting. */
-    struct nlmsghdr_ *o = (struct nlmsghdr_ *)s->scratch;
+    struct nlmsghdr_ *o = (struct nlmsghdr_ *)scratch;
     o->len = (unsigned)(sizeof *o + 4 + sizeof *o);
     o->type = NLMSG_ERROR_;
     o->flags = 0;
     o->seq = seq;
     o->pid = pid;
-    *(int *)(s->scratch + sizeof *o) = 0; /* error == 0 => ack */
-    memcpy(s->scratch + sizeof *o + 4, req, sizeof *o);
-    push(s, s->scratch, (long)o->len);
+    *(int *)(scratch + sizeof *o) = 0; /* error == 0 => ack */
+    memcpy(scratch + sizeof *o + 4, req, sizeof *o);
+    push(s, scratch, (long)o->len);
 }
 
 /* Requests the guest wrote with plain write(2)/send(2) — syscalls left
@@ -814,14 +849,14 @@ static void process_request(struct nl_slot *s, const unsigned char *req,
  * waiting in the pair before the real recv runs. The 256-byte cap is the
  * oracle's own request cap; a GET request is routed on its header and family
  * byte, both well inside it. */
-static void drain_requests(struct nl_slot *s) {
+static void drain_requests(struct nl_slot *s, unsigned char *scratch) {
     unsigned char req[256];
     for (int i = 0; i < 32; i++) {
         long r = CNG_SYS(__NR_recvfrom, s->monfd, (long)req, sizeof req,
                          MSG_DONTWAIT_, 0, 0);
         if (r <= 0)
             break;
-        process_request(s, req, r);
+        process_request(s, req, r, scratch);
     }
 }
 
@@ -852,22 +887,32 @@ long cng_nl_socket(long domain, long type, long protocol) {
         return -EINVAL;
     if (sotype != SOCK_RAW_ && sotype != SOCK_DGRAM_)
         return -ESOCKTNOSUPPORT;
-    int free_slot = -1;
-    for (int i = 0; i < NL_SLOTS; i++) {
-        if (g_slots[i].fd < 0 || !fd_ino(g_slots[i].fd) ||
-            fd_ino(g_slots[i].fd) != g_slots[i].ino) {
-            free_slot = i;
-            break;
+    /* A slot: a free one, or a live one whose fd the guest has since closed
+     * and reused (its pair peer and relay socket are still ours to give back),
+     * or a new one at the end of the table. Each is taken with a CAS, so two
+     * threads opening sockets at once cannot share one. */
+    struct nl_slot *s = 0;
+    for (unsigned long i = 0; !s; i++) {
+        struct nl_slot *c = cng_tab_at(&g_slots, i);
+        if (!c)
+            return -1; /* no page for the record: the host's own refusal */
+        int st = __atomic_load_n(&c->state, __ATOMIC_ACQUIRE);
+        if (st == NL_FREE) {
+            if (__atomic_compare_exchange_n(&c->state, &st, NL_CLAIMED, 0,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+                s = c;
+        } else if (st == NL_LIVE && !slot_current(c)) {
+            if (__atomic_compare_exchange_n(&c->state, &st, NL_CLAIMED, 0,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+                slot_release(c);
+                st = NL_FREE;
+                if (__atomic_compare_exchange_n(&c->state, &st, NL_CLAIMED, 0,
+                                                __ATOMIC_ACQ_REL,
+                                                __ATOMIC_RELAXED))
+                    s = c;
+            }
         }
     }
-    if (free_slot < 0)
-        return -1; /* table full: hand back the host's own refusal */
-    struct nl_slot *s = &g_slots[free_slot];
-    /* Claiming a stale slot: its pair peer and relay socket are still ours. */
-    if (s->fd >= 0 && s->monfd >= 0)
-        sys_close(s->monfd);
-    if (s->fd >= 0 && s->hostfd >= 0)
-        sys_close(s->hostfd);
     /* A connected AF_UNIX datagram socketpair stands in: the guest gets one
      * end (so close/dup/poll/fcntl all behave), we keep the other to deliver
      * replies and to catch requests written with untrapped write(2). The
@@ -875,12 +920,16 @@ long cng_nl_socket(long domain, long type, long protocol) {
     int sv[2] = {-1, -1};
     if (CNG_SYS(__NR_socketpair, CNG_AF_UNIX,
                 SOCK_DGRAM_ | (type & ~(long)SOCK_TYPE_MASK), 0, (long)sv, 0,
-                0) < 0)
+                0) < 0) {
+        s->fd = s->monfd = s->hostfd = -1;
+        __atomic_store_n(&s->state, NL_FREE, __ATOMIC_RELEASE);
         return -1;
+    }
     s->fd = sv[0];
     s->monfd = sv[1];
     s->ino = fd_ino(sv[0]);
     s->hostfd = (int)open_hostfd();
+    __atomic_store_n(&s->state, NL_LIVE, __ATOMIC_RELEASE);
     if (cng_g_debug)
         cng_dprintf(2,
                     "[cng] netlink: emulating fd %d (host denies rtnetlink), "
@@ -959,8 +1008,9 @@ int cng_nl_send(int fd, const void *buf, long len, long *out) {
         return 1;
     }
     *out = len; /* the guest's request is always "sent" in full */
-    drain_requests(s); /* older write()-submitted requests keep their order */
-    process_request(s, req, n);
+    unsigned char scratch[NL_REPLY_MAX]; /* 8 KiB of the scratch stack */
+    drain_requests(s, scratch); /* older write()-submitted requests keep their order */
+    process_request(s, req, n, scratch);
     return 1;
 }
 
@@ -970,7 +1020,8 @@ int cng_nl_recv(int fd, void *buf, long len, long flags, long *out) {
         return 0;
     /* A request submitted with an untrapped write(2) is processed here, so its
      * reply datagrams are in the pair before the real receive below runs. */
-    drain_requests(s);
+    unsigned char scratch[NL_REPLY_MAX];
+    drain_requests(s, scratch);
     /* The real receive, against the guest's own end of the pair, with the
      * guest's own flags: MSG_PEEK, MSG_TRUNC, O_NONBLOCK and blocking are all
      * the kernel's genuine article — which is how glibc sizes a dump before
@@ -1030,8 +1081,10 @@ int cng_nl_bind(int fd) { return slot_of(fd) != 0; }
 
 void cng_nl_poke(int fd) {
     struct nl_slot *s = slot_of(fd);
-    if (s)
-        drain_requests(s);
+    if (s) {
+        unsigned char scratch[NL_REPLY_MAX];
+        drain_requests(s, scratch);
+    }
 }
 
 /* ---- the SIOCGIF* family -------------------------------------------------
@@ -1285,10 +1338,3 @@ int cng_nl_ioctl(int fd, unsigned long req, void *arg, long *out) {
     return 1;
 }
 
-void cng_nl_init(void) {
-    for (int i = 0; i < NL_SLOTS; i++) {
-        g_slots[i].fd = -1;
-        g_slots[i].monfd = -1;
-        g_slots[i].hostfd = -1;
-    }
-}

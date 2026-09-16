@@ -36,8 +36,6 @@ extern int cng_nl_deny_getlink;
  * the rtnetlink knobs above — it does not imply CNG_NETLINK_FORCE_BLOCK. */
 extern int cng_nl_deny_audit;
 
-void cng_nl_init(void);
-
 /* 1 if `fd` is one of our emulated netlink sockets. */
 int cng_nl_is_fake(int fd);
 

@@ -308,7 +308,6 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
     if (workdir && set_workdir(&g_fs, workdir) < 0)
         return 1;
 
-    cng_nl_init();
     if (cng_broker_env("CNG_NETLINK_FORCE_BLOCK"))
         cng_nl_force_block = 1;
     if (cng_broker_env("CNG_NETLINK_NO_RELAY")) {

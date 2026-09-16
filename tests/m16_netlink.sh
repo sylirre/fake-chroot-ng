@@ -333,6 +333,25 @@ else
         skip "audit interface legs: could not build tests/guests/auditsock.c"
     fi
 
+    # --- 4. more emulated sockets than the table used to hold --------------
+    # Four slots, and the fifth concurrent socket fell through to the host's
+    # own refusal — on a device, where the shim exists because the host
+    # refuses. The guest holds twelve open at once, closes and reopens them,
+    # then has four threads open three each at the same moment (the claim
+    # race). On a host that grants rtnetlink a fallen-through socket is a real
+    # one and works, so the guest's own counts cannot tell; the emulator's
+    # debug log names every socket it stands in for, and all 36 must be there.
+    if guest_cc "$M16D/nlmany" tests/guests/nlmany.c -pthread; then
+        cp "$M16D/nlmany" "$R/bin/nlmany"
+        many=$(CNG_DEBUG=1 CNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nlmany 2>"$M16D/nlmany.err")
+        check_contains "m16 twelve emulated sockets at once, reopened, and from four threads" \
+            "many: opened=12 dumps=12 reopened=12 redumps=12 threaded=1" "$many"
+        check "m16 ...and every one of the 36 was the emulation's" \
+            36 "$(grep -c 'netlink: emulating fd' "$M16D/nlmany.err")"
+    else
+        skip "many-socket leg: could not build tests/guests/nlmany.c with -pthread"
+    fi
+
     rm -rf "$R"
 fi
 rm -rf "$M16D"
