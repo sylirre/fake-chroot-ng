@@ -105,6 +105,25 @@ if [ "$m10_ready" -eq 1 ]; then
         'cd /tmp; cp /bin/busybox f1; ln f1 f2; cmp f1 f2 && echo cmp-ok;
          stat -c %h f2'
 
+    # A group whose data file cannot be opened. The marker update used to be
+    # serialized by an flock on the data file itself, opened for reading, so a
+    # mode 0000 or 0200 file — which packages do ship — ran the update
+    # unlocked, and two links or unlinks of the group at once could leave
+    # st_nlink wrong or a backing file behind. The lock is a file of our own
+    # in the store now; the group's own modes are irrelevant to it.
+    l2s_diff "ln and rm of an unreadable and a write-only file" \
+        'cd /tmp; echo hi>a; chmod 000 a; ln a b; ln b c; stat -c "%h %a" a b c;
+         rm b; stat -c %h a c; echo w>w; chmod 200 w; ln w w2; rm w;
+         stat -c "%h %a" w2; chmod 644 w2; cat w2'
+    # ...and the emulator says so itself: an update it had to run unlocked is
+    # logged, and there must be none.
+    REM=$(mktemp -d); cp -a "$M10_ALPINE/." "$REM"
+    err=$(CNG_DEBUG=1 run -R -l "$REM" /bin/sh -c \
+        'cd /tmp; echo hi>a; chmod 000 a; ln a b; ln b c; rm b; rm c' 2>&1 >/dev/null)
+    check_absent "m10 the marker update of an unreadable group was locked" \
+        "unlocked update" "$err"
+    rm -rf "$REM"
+
     # Persistence: links made in one session must look identical in the
     # next (fresh process, same rootfs) — the on-disk store alone carries
     # the state.

@@ -240,16 +240,56 @@ static int find_marker(const char *dir, unsigned long long ino,
 
 /* ---- marker locking ----------------------------------------------------- */
 
+static int l2s_store_dir(char *out, size_t sz);
+
 /* Serialize the marker's read-modify-write (find + rename/unlink) across
- * processes sharing the rootfs: an exclusive flock on the data file. Best
- * effort — callers proceed unlocked when the open or lock fails (the lock
- * narrows the race window, it is not a correctness guarantee the scheme
- * otherwise relies on). Returns the locked fd, or -1. */
+ * processes sharing the rootfs, and across threads of one: an exclusive flock,
+ * held for the update. Returns the locked fd, or -1.
+ *
+ * The lock used to be taken on the data file, opened for reading, and a data
+ * file that could not be opened that way — mode 0200, mode 0000, both of which
+ * a package can ship — left the update running unlocked, so two links or
+ * unlinks of the group at once could leave st_nlink wrong or a backing file
+ * behind. The lock is now a file of our own in the store, ".l2s/.lock" under
+ * the rootfs, created 0600 in a directory we made 0700: openable by us
+ * whatever mode the group's own files carry, and one lock per rootfs is the
+ * right scope, since that is what the store is. The data file (either way it
+ * can be opened) and then its directory stand in only where the store cannot
+ * be had at all — a rootfs on which nothing can be created, where no link is
+ * going to be made either. Proceeding unlocked is the last resort and is
+ * logged, since it is the one outcome the scheme's counts cannot survive. */
 static long l2s_lock(const char *data) {
-    long fd = sys_openat(CNG_AT_FDCWD, data, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    char lk[CNG_PATH_MAX];
+    long fd = -1;
+    if (l2s_store_dir(lk, sizeof lk) == 0) {
+        size_t n = strlen(lk);
+        if (n + 7 < sizeof lk) {
+            memcpy(lk + n, "/.lock", 7);
+            fd = sys_openat(CNG_AT_FDCWD, lk,
+                            CNG_O_RDWR | CNG_O_CREAT | CNG_O_CLOEXEC, 0600);
+        }
+    }
     if (fd < 0)
+        fd = sys_openat(CNG_AT_FDCWD, data, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    if (fd < 0)
+        fd = sys_openat(CNG_AT_FDCWD, data, CNG_O_WRONLY | CNG_O_CLOEXEC, 0);
+    if (fd < 0) {
+        l2s_dirname(data, lk, sizeof lk);
+        fd = sys_openat(CNG_AT_FDCWD, lk,
+                        CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
+    }
+    if (fd < 0) {
+        L2S_LOG("[cng] l2s: no lock to be had for %s (%ld): unlocked update\n",
+                data, fd);
         return -1;
-    if (CNG_SYS(__NR_flock, (int)fd, 2 /* LOCK_EX */, 0, 0, 0, 0) < 0) {
+    }
+    long r;
+    do {
+        r = CNG_SYS(__NR_flock, (int)fd, 2 /* LOCK_EX */, 0, 0, 0, 0);
+    } while (r == -EINTR);
+    if (r < 0) {
+        L2S_LOG("[cng] l2s: flock for %s refused (%ld): unlocked update\n",
+                data, r);
         sys_close((int)fd);
         return -1;
     }
