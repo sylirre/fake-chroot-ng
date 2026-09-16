@@ -9,7 +9,10 @@
  *   argv[1]  socket path (or abstract name with argv[2])
  *   argv[2]  "abstract" to use an abstract name (leading NUL) instead, where
  *            there is no filesystem node to contain and the per-rootfs tag has
- *            to be invisible to the guest on readback.
+ *            to be invisible to the guest on readback; "peer" to bind nothing
+ *            and only connect to a socket another process holds, printing what
+ *            getpeername reports of it — the readback by a process that never
+ *            bound the name and recorded nothing about it.
  *   argv[3]  seconds to hold the bound socket before exiting, so another
  *            invocation can try the same name (abstract-namespace isolation) or
  *            the host can inspect it.
@@ -53,6 +56,7 @@ int main(int argc, char **argv) {
     }
     const char *path = argv[1];
     int abstract = argc > 2 && argv[2][0] == 'a';
+    int peer = argc > 2 && argv[2][0] == 'p';
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof addr);
@@ -63,6 +67,23 @@ int main(int argc, char **argv) {
         n = sizeof addr.sun_path - 1 - off;
     memcpy(addr.sun_path + off, path, n);
     socklen_t alen = (socklen_t)(sizeof(sa_family_t) + off + n + (abstract ? 0 : 1));
+
+    struct sockaddr_un got;
+    if (peer) {
+        int cli = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (connect(cli, (struct sockaddr *)&addr, alen) < 0) {
+            perror("connect");
+            return 1;
+        }
+        printf("connect: ok\n");
+        socklen_t plen = sizeof got;
+        memset(&got, 0, sizeof got);
+        if (getpeername(cli, (struct sockaddr *)&got, &plen) < 0)
+            perror("getpeername");
+        else
+            show("getpeername", &got, plen);
+        return 0;
+    }
 
     int srv = socket(AF_UNIX, SOCK_STREAM, 0);
     if (srv < 0) {
@@ -81,7 +102,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    struct sockaddr_un got;
     socklen_t glen = sizeof got;
     memset(&got, 0, sizeof got);
     if (getsockname(srv, (struct sockaddr *)&got, &glen) < 0)

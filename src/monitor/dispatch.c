@@ -2334,11 +2334,11 @@ static unsigned long mmsg_take(struct cng_mmsghdr *dst,
  * bounce buffer, and hand the result to the guest. `al` is what the kernel
  * reported; it cannot exceed the buffer (the kernel bounds every address by
  * sockaddr_storage), but it is clamped rather than trusted. */
-static long sun_deliver(char *ab, unsigned al, long aa, long alp) {
+static long sun_deliver(int own, char *ab, unsigned al, long aa, long alp) {
     long got = (long)al;
     if (got > CNG_SOCKADDR_MAX)
         got = CNG_SOCKADDR_MAX;
-    cng_sun_out(ab, &got);
+    cng_sun_out(own, ab, &got);
     return addr_out(ab, got, aa, alp);
 }
 
@@ -3657,7 +3657,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         long al = is_send ? a5 : a2;   /* addrlen */
         struct cng_sun_xlate x;
         long r;
-        int sx = cng_sun_in(&x, (const void *)aa, al, nr != __NR_bind);
+        int sx = cng_sun_in(&x, nr == __NR_bind ? (int)a0 : -1,
+                            (const void *)aa, al, nr != __NR_bind);
         if (sx > 0) {
             if (is_send)
                 r = reissue(a0, a1, a2, a3, (long)x.buf, x.len, nr);
@@ -3698,7 +3699,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         long r;
         x.dirfd = -1; /* a NULL msghdr never reaches cng_sun_in, and cng_sun_done
                        * must not then close whatever the stack held */
-        int sx = a1 ? cng_sun_in(&x, mh.name, (long)mh.namelen, 1) : 0;
+        int sx = a1 ? cng_sun_in(&x, -1, mh.name, (long)mh.namelen, 1) : 0;
         if (sx > 0) {
             mh.name = x.buf;
             mh.namelen = (unsigned)x.len;
@@ -3773,7 +3774,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             for (; j < got; j++) {
                 struct cng_msghdr mh = win[j].hdr;
                 struct cng_sun_xlate x;
-                int sx = cng_sun_in(&x, mh.name, (long)mh.namelen, 1);
+                int sx = cng_sun_in(&x, -1, mh.name, (long)mh.namelen, 1);
                 if (sx > 0) {
                     mh.name = x.buf;
                     mh.namelen = (unsigned)x.len;
@@ -3845,7 +3846,10 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                          : reissue(a0, (long)ab, (long)&al, a3, a4, a5, nr);
         if (r < 0)
             return r;
-        long e = sun_deliver(ab, al, aa, alp);
+        /* getsockname is the one call whose answer is the socket's OWN
+         * address; every other one names some other socket's. */
+        long e = sun_deliver(nr == __NR_getsockname ? (int)a0 : -1, ab, al, aa,
+                             alp);
         if (e) {
             /* accept has already created the descriptor. The kernel drops it
              * when the address writeback fails rather than returning an fd the
@@ -3904,7 +3908,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         back.flags = mh.flags;
         if (cng_user_copyout(g, &back, sizeof back) < 0)
             return -EFAULT;
-        long e = sun_deliver(ab, mh.namelen, (long)snap.name, (long)&g->namelen);
+        long e = sun_deliver(-1, ab, mh.namelen, (long)snap.name,
+                             (long)&g->namelen);
         return e ? e : r;
     }
 
@@ -4033,7 +4038,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 break;
             }
             if (snap.name) {
-                long e = sun_deliver(ab, mh.namelen, (long)snap.name,
+                long e = sun_deliver(-1, ab, mh.namelen, (long)snap.name,
                                      (long)&m->hdr.namelen);
                 if (e) {
                     r = e; /* the message is consumed either way, as it is

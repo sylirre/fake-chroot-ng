@@ -33,10 +33,14 @@ struct cng_sun_xlate {
  * — which is also the answer for an address that cannot be read, so the kernel
  * gets to fault on the guest's own pointer rather than the handler dying on it
  * — and a negative errno when the address is a pathname that needed containing
- * and could not be expressed. That last case must be answered, never passed
+ * and could not be expressed. `fd` is the socket being bound (bind is the call
+ * that establishes what a later getsockname reports, and the readback of a
+ * name that had to be respelled is keyed on the socket's identity), -1 for
+ * the calls that name something someone else bound. That last case must be answered, never passed
  * through: the guest's own sun_path names a host location. Always pair with
  * cng_sun_done(). */
-int cng_sun_in(struct cng_sun_xlate *x, const void *addr, long alen, int follow);
+int cng_sun_in(struct cng_sun_xlate *x, int fd, const void *addr, long alen,
+               int follow);
 
 /* Would cng_sun_in() rewrite this address? Lets the mmsg array forms re-issue a
  * batch of ordinary (UDP) messages whole, and take one apart only when a message
@@ -49,7 +53,8 @@ void cng_sun_done(struct cng_sun_xlate *x);
 /* Map a sockaddr the kernel just wrote back into guest terms, in place
  * (getsockname/getpeername/accept/accept4/recvfrom/recvmsg): strip the rootfs
  * prefix from a pathname, strip our tag from an abstract name. `*alen` is the
- * kernel's returned length and is updated. */
-void cng_sun_out(void *addr, long *alen);
+ * kernel's returned length and is updated. `fd` is the socket whose OWN address
+ * this is (getsockname), -1 when it is some other socket's. */
+void cng_sun_out(int fd, void *addr, long *alen);
 
 #endif /* CNG_UNIXSOCK_H */

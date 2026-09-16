@@ -80,6 +80,33 @@ else
         "getsockname: /run/s.sock" "$out"
     check_absent "m15 ...with none of our own /proc/self/fd spelling in it" \
         "/proc/self/fd/" "$out"
+    # ...to a process that never bound it, too. A name under the rootfs is
+    # respelled so that the spelling carries the guest path itself — the rootfs
+    # directory as a /proc/self/fd handle and the guest's own path beneath it —
+    # so a peer's getpeername takes the name straight off the string, with no
+    # record of the binder's to consult. It used to answer the internal
+    # spelling, "/proc/self/fd/5/s.sock", for exactly this reader.
+    m15run -R "$DEEP" /bin/uxsock /run/s.sock x 4 >/dev/null 2>&1 &
+    m15bg=$!
+    sleep 2
+    out=$(m15run -R "$DEEP" /bin/uxsock /run/s.sock peer 2>&1)
+    wait $m15bg 2>/dev/null
+    check_contains "m15 a peer process reads the name back as the guest bound it" \
+        "getpeername: /run/s.sock" "$out"
+
+    # A name under a BIND, where the spelling cannot carry the guest name (the
+    # readback would need to know which bind), is remembered by the binding
+    # process instead, keyed by the socket's own identity. The record used to
+    # be eight entries in a ring: the ninth fallback bind overwrote the first's,
+    # and its getsockname handed the guest the internal spelling.
+    if guest_cc "$M15D/uxmany" tests/guests/uxmany.c; then
+        cp "$M15D/uxmany" "$R1/bin/uxmany"; mkdir -p "$R1/mnt"
+        out=$(m15run -R -b "$DEEP/run:/mnt" "$R1" /bin/uxmany /mnt 12 2>&1)
+        check_contains "m15 twelve fallback binds under a bind all read back" \
+            "many: bound=12 ok=12 internal=0" "$out"
+    else
+        skip "m15 many-fallback leg: could not build tests/guests/uxmany.c"
+    fi
 
     # --- abstract namespace ----------------------------------------------
     out=$(m15run -R "$R1" /bin/uxsock myabs abstract 2>&1)

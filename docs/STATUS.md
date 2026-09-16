@@ -815,10 +815,16 @@ vfork/`posix_spawn` child-stack handling.
     created — while `connect`/`sendto` follow it. `sendmsg` copies the 56-byte
     `msghdr` to swap `msg_name`, leaving the guest's struct alone.
   - **The 108-byte problem.** `sun_path` is fixed at 108 bytes and the rootfs
-    prefix frequently overflows it. The socket is then bound relative to an
-    `O_DIRECTORY` handle on its parent — `/proc/self/fd/<n>/<basename>` — so only
-    the basename has to fit. The fd is closed by `cng_sun_done` *after* the
-    syscall, since the kernel resolves through it.
+    prefix frequently overflows it. A name under the rootfs is then spelled
+    `/proc/self/fd/<root>/./<guest path>` — the rootfs directory as the handle
+    and the guest's own canonical path beneath it — so the stored string
+    carries the guest name and *any* reader (a peer's `getpeername`, an
+    inherited socket) takes it straight off the string. A name under a bind, or
+    one too long even so, is bound relative to a handle on its parent
+    (`/proc/self/fd/<n>/<basename>`) and the binding process remembers the pair,
+    keyed by the socket's inode for its own `getsockname` and by the spelling
+    for other readers, in a table that grows. The fd is closed by
+    `cng_sun_done` *after* the syscall, since the kernel resolves through it.
   - **Out** (`getsockname`/`getpeername`/`accept`/`accept4`/`recvfrom`/`recvmsg`):
     `cng_sun_out` maps the host path back to guest spelling in place and rewrites
     the in/out `addrlen`.

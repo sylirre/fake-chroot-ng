@@ -34,6 +34,7 @@
 #include "cng/path.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
+#include "cng/tab.h"
 #include "cng/uapi.h"
 #include "cng/unixsock.h"
 
@@ -140,74 +141,156 @@ int cng_sun_needed(const void *addr, long alen) {
     return fam == CNG_AF_UNIX;
 }
 
-/* What a socket bound through one of the two irreversible fallbacks reads back
- * as — the over-long pathname, which is bound through /proc/self/fd, and the
- * over-long abstract name, which is bound through its digest.
+/* What a socket bound through one of the irreversible fallbacks reads back as.
  *
  * The kernel stores sun_path exactly as it was handed in — measured: bind
  * through "/proc/self/fd/3/s.sock" and getsockname returns that same string,
- * before and after fd 3 is closed. So a socket bound either way reads back as
- * our own internal spelling: not the name the guest asked for, naming nothing by
- * the time the guest can look (cng_sun_done closed the fd), and the one thing in
- * this module that cng_fs_untranslate cannot map, since it matches neither a
- * bind's host prefix nor the rootfs. That breaks what this module is for and
- * what README.md promises of it — "a program comparing the readback against what
- * it bound still agrees".
+ * before and after fd 3 is closed. So a socket bound through a fallback reads
+ * back as our own internal spelling: not the name the guest asked for, naming
+ * nothing by the time the guest can look (cng_sun_done closed the fd), and the
+ * one thing in this module that cng_fs_untranslate cannot map, since it matches
+ * neither a bind's host prefix nor the rootfs. That breaks what this module is
+ * for and what README.md promises of it — "a program comparing the readback
+ * against what it bound still agrees".
  *
- * The guest's own name always fits in sun_path, having arrived in one, so the
- * answer is simply to remember it. Recorded as the fallback is applied, and
- * consulted on the way back out.
+ * Three answers, in the order they are tried on the way back out:
  *
- * Keyed on the stored spelling, which is all the readback carries, and by
- * length rather than as a C string: an abstract name begins with a NUL and may
- * carry more. Two pathname sockets bound through the fallback with the same
- * basename, in different directories, landing on the same fd number would
- * collide — and the fd is closed right after the bind, so consecutive fallbacks
- * do tend to reuse the number, which leaves the basename doing the work. The
- * answer is then one plausible guest path instead of another, where before it
- * was our /proc/self/fd spelling either way. Two abstract names cannot collide
- * unless their 64-bit hashes do.
+ *  - a pathname under the rootfs is spelled so that the spelling carries the
+ *    guest name itself: "/proc/self/fd/<root>/./<guest path>", the rootfs
+ *    directory as the fd and the guest's own path beneath it (sun_spell_root).
+ *    The kernel resolves the "." and the guest path as host components — they
+ *    are the same components — and ANY process that reads the address back,
+ *    the binder, a peer, a process that inherited or was handed the socket,
+ *    takes the guest name straight off the string with nothing to look up;
+ *  - what fits nowhere — a pathname under a bind, a guest path too long to
+ *    ride with the prefix, an over-long abstract name reduced to its digest —
+ *    is remembered here as it is bound, keyed by the socket's own identity
+ *    (its inode in sockfs) for the getsockname of the socket itself, the one
+ *    call whose answer is by definition its own address: dup'd, inherited,
+ *    it is the same socket and the same inode. That answer cannot collide;
+ *  - by the stored spelling, for a reader without the socket — getpeername,
+ *    accept, recvfrom — which is all the readback carries. Two pathname
+ *    sockets bound through the bind fallback with the same basename, in
+ *    different directories, on the same fd number could collide there, and
+ *    the answer is then one plausible guest path instead of another, where
+ *    before it was our /proc/self/fd spelling either way. Two abstract names
+ *    cannot collide unless their 64-bit hashes do.
  *
- * `slen` is the entry's validity flag and is written last: a reader either sees
- * an entry whose guest name is already there, or does not match it at all. */
-#define SUN_FB_MAX 8
-static struct {
+ * The table grows (cng_tab); it was eight entries in a ring, so the ninth
+ * fallback bind of a process overwrote the first's answer. Entries are taken
+ * by a CAS on `state`, and `slen` is written last: a reader either sees an
+ * entry whose guest name is already there, or does not match it at all. The
+ * name is kept by length rather than as a C string: an abstract name begins
+ * with a NUL and may carry more. */
+struct sun_fb {
+    int state; /* 0 free, 1 being written, 2 published */
+    unsigned glen;
+    unsigned slen;
+    unsigned long long ino; /* the bound socket's sockfs inode, 0 if unknown */
     char stored[SUN_PATH_MAX];
     char guest[SUN_PATH_MAX];
-    unsigned glen;
-    unsigned slen; /* 0 while the entry is unused or half-written */
-} g_sun_fb[SUN_FB_MAX];
-static unsigned g_sun_fb_next;
+};
 
-static void sun_fb_note(const void *stored, unsigned slen, const void *guest,
-                        unsigned glen) {
+static struct cng_tab g_sun_fb = CNG_TAB_INIT(struct sun_fb);
+
+static unsigned long long sock_ino(int fd) {
+    char st[144];
+    if (fd < 0 || CNG_SYS(__NR_fstat, fd, (long)st, 0, 0, 0, 0) != 0)
+        return 0;
+    return *(unsigned long long *)(st + 8); /* st_ino */
+}
+
+static void sun_fb_note(int fd, const void *stored, unsigned slen,
+                        const void *guest, unsigned glen) {
     if (!slen || slen > SUN_PATH_MAX || glen > SUN_PATH_MAX)
         return;
-    unsigned i = __atomic_fetch_add(&g_sun_fb_next, 1, __ATOMIC_RELAXED) %
-                 SUN_FB_MAX;
-    __atomic_store_n(&g_sun_fb[i].slen, 0u, __ATOMIC_RELEASE);
-    memcpy(g_sun_fb[i].guest, guest, glen);
-    g_sun_fb[i].glen = glen;
-    memcpy(g_sun_fb[i].stored, stored, slen);
-    __atomic_store_n(&g_sun_fb[i].slen, slen, __ATOMIC_RELEASE);
+    unsigned long long ino = sock_ino(fd);
+    for (unsigned long i = 0;; i++) {
+        struct sun_fb *e = cng_tab_at(&g_sun_fb, i);
+        if (!e)
+            return; /* no page for the record: the readback stays ours */
+        int st = __atomic_load_n(&e->state, __ATOMIC_ACQUIRE);
+        if (st != 0 ||
+            !__atomic_compare_exchange_n(&e->state, &st, 1, 0,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            continue;
+        __atomic_store_n(&e->slen, 0u, __ATOMIC_RELEASE);
+        memcpy(e->guest, guest, glen);
+        e->glen = glen;
+        memcpy(e->stored, stored, slen);
+        e->ino = ino;
+        __atomic_store_n(&e->slen, slen, __ATOMIC_RELEASE);
+        __atomic_store_n(&e->state, 2, __ATOMIC_RELEASE);
+        return;
+    }
 }
 
 /* The guest name for a stored spelling, into `out` (SUN_PATH_MAX bytes), or -1
- * when this is not one of ours. */
-static int sun_fb_lookup(const void *stored, unsigned slen, void *out) {
-    for (int i = 0; i < SUN_FB_MAX; i++) {
-        if (__atomic_load_n(&g_sun_fb[i].slen, __ATOMIC_ACQUIRE) != slen)
+ * when this is not one of ours. `ino` (0: unknown) is the socket the answer is
+ * the own address of, and an entry recorded for it wins over one that merely
+ * carries the same spelling. */
+static int sun_fb_lookup(unsigned long long ino, const void *stored,
+                         unsigned slen, void *out) {
+    struct sun_fb *by_str = 0;
+    struct cng_tab_iter it;
+    for (struct sun_fb *e = cng_tab_first(&g_sun_fb, &it); e;
+         e = cng_tab_next(&g_sun_fb, &it)) {
+        if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) != 2 ||
+            __atomic_load_n(&e->slen, __ATOMIC_ACQUIRE) != slen ||
+            memcmp(e->stored, stored, slen) != 0)
             continue;
-        if (memcmp(g_sun_fb[i].stored, stored, slen) != 0)
-            continue;
-        unsigned n = g_sun_fb[i].glen;
-        memcpy(out, g_sun_fb[i].guest, n);
-        return (int)n;
+        if (ino && e->ino == ino) {
+            by_str = e;
+            break;
+        }
+        if (!by_str)
+            by_str = e;
     }
-    return -1;
+    if (!by_str)
+        return -1;
+    unsigned n = by_str->glen;
+    memcpy(out, by_str->guest, n);
+    return (int)n;
 }
 
-int cng_sun_in(struct cng_sun_xlate *x, const void *addr, long alen,
+/* The self-describing spelling for a pathname under the rootfs (see the
+ * readback note above): "/proc/self/fd/<root>/./<guest path>", with the
+ * rootfs directory held open as <root> for the syscall and the guest's own
+ * canonical path — symlink-free, since `host` was resolved — beneath it. The
+ * "." is the mark the readback recognizes the form by; the kernel resolves it
+ * to nothing. 1 with x filled, 0 when this name is not one it can carry (under
+ * a bind, or too long even so: the caller's fallback takes it), or -errno. */
+static int sun_spell_root(struct cng_sun_xlate *x, const char *host) {
+    char canon[CNG_PATH_MAX], again[CNG_PATH_MAX];
+    int mnt = CNG_MOUNT_ROOTFS;
+    if (!cng_g_fs || cng_fs_untranslate(cng_g_fs, host, canon, sizeof canon) != 0 ||
+        cng_fs_translate_mnt(cng_g_fs, canon, again, sizeof again, &mnt) != 0 ||
+        mnt != CNG_MOUNT_ROOTFS || canon[0] != '/' || canon[1] == '\0' ||
+        strcmp(again, host) != 0)
+        return 0;
+    const char *root = cng_g_fs->rootfs[0] ? cng_g_fs->rootfs : "/";
+    long rfd = sys_openat(CNG_AT_FDCWD, root,
+                          CNG_O_PATH | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
+    if (rfd < 0)
+        return 0;
+    char pfx[64];
+    size_t pl = fd_dir_prefix((int)rfd, pfx, sizeof pfx);
+    size_t gl = strlen(canon + 1);
+    if (pl + 2 + gl + 1 > SUN_PATH_MAX) {
+        sys_close((int)rfd);
+        return 0;
+    }
+    char *out = x->buf;
+    memcpy(out + SUN_HDR, pfx, pl);
+    memcpy(out + SUN_HDR + pl, "./", 2);
+    memcpy(out + SUN_HDR + pl + 2, canon + 1, gl + 1);
+    x->len = (long)(SUN_HDR + pl + 2 + gl + 1);
+    x->dirfd = (int)rfd;
+    x->applied = 1;
+    return 1;
+}
+
+int cng_sun_in(struct cng_sun_xlate *x, int fd, const void *addr, long alen,
                int follow) {
     x->applied = 0;
     x->dirfd = -1;
@@ -279,7 +362,7 @@ int cng_sun_in(struct cng_sun_xlate *x, const void *addr, long alen,
         /* Only where the name is being created (bind), as for the pathname
          * fallback: a connect names something someone else bound. */
         if (!follow)
-            sun_fb_note(out + SUN_HDR, (unsigned)(x->len - SUN_HDR), gp,
+            sun_fb_note(fd, out + SUN_HDR, (unsigned)(x->len - SUN_HDR), gp,
                         (unsigned)plen);
         return 1;
     }
@@ -314,10 +397,7 @@ int cng_sun_in(struct cng_sun_xlate *x, const void *addr, long alen,
         return 1;
     }
 
-    /* The rootfs prefix pushed the translated name past sun_path. Open the
-     * parent directory and name the socket relative to that fd, so only the
-     * basename has to fit: /proc/self/fd/<n>/<basename>. The fd is closed by
-     * cng_sun_done once the syscall has run.
+    /* The rootfs prefix pushed the translated name past sun_path.
      *
      * Every way out of here below is an error, never a 0. A 0 means "nothing to
      * translate" and sends the caller's own address to the kernel — which for a
@@ -325,6 +405,13 @@ int cng_sun_in(struct cng_sun_xlate *x, const void *addr, long alen,
      * host filesystem. That is the containment gone: a bind creates the inode
      * outside the rootfs and a connect reaches a host daemon, in exactly the
      * case the rootfs prefix is longest. */
+    int sr = sun_spell_root(x, host);
+    if (sr)
+        return sr;
+
+    /* Open the parent directory and name the socket relative to that fd, so
+     * only the basename has to fit: /proc/self/fd/<n>/<basename>. The fd is
+     * closed by cng_sun_done once the syscall has run. */
     size_t cut = hl;
     while (cut > 0 && host[cut - 1] != '/')
         cut--;
@@ -334,33 +421,48 @@ int cng_sun_in(struct cng_sun_xlate *x, const void *addr, long alen,
     memcpy(parent, host, cut - 1); /* drop the '/' itself */
     parent[cut - 1] = '\0';
     const char *base = host + cut;
-    long fd = sys_openat(CNG_AT_FDCWD, parent[0] ? parent : "/",
-                         CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
-    if (fd < 0)
-        return (int)fd; /* the parent's own errno: ENOENT, EACCES, ... */
+    long dfd = sys_openat(CNG_AT_FDCWD, parent[0] ? parent : "/",
+                          CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
+    if (dfd < 0)
+        return (int)dfd; /* the parent's own errno: ENOENT, EACCES, ... */
     char pfx[64];
-    size_t pl = fd_dir_prefix((int)fd, pfx, sizeof pfx);
+    size_t pl = fd_dir_prefix((int)dfd, pfx, sizeof pfx);
     size_t bl = strlen(base);
     if (pl + bl + 1 > SUN_PATH_MAX) {
-        sys_close((int)fd);
+        sys_close((int)dfd);
         return -ENAMETOOLONG;
     }
     memcpy(out + SUN_HDR, pfx, pl);
     memcpy(out + SUN_HDR + pl, base, bl + 1);
     x->len = (long)(SUN_HDR + pl + bl + 1);
-    x->dirfd = (int)fd;
+    x->dirfd = (int)dfd;
     x->applied = 1;
     /* Only where the name is being created — !follow is exactly bind, the one
      * call that establishes what a later getsockname has to report. A connect
      * or a sendto names something someone else bound, and its readback is that
      * binding's to answer. */
     if (!follow)
-        sun_fb_note(out + SUN_HDR, (unsigned)(pl + bl), guest,
+        sun_fb_note(fd, out + SUN_HDR, (unsigned)(pl + bl), guest,
                     (unsigned)strlen(guest));
     return 1;
 }
 
-void cng_sun_out(void *addr, long *alen) {
+/* Is `p` (NUL-terminated) the self-describing spelling? Then the guest path
+ * begins at the byte after "./", and this returns its offset; else 0. */
+static long sun_root_form(const char *p) {
+    if (strncmp(p, "/proc/self/fd/", 14) != 0)
+        return 0;
+    long i = 14;
+    if (p[i] < '0' || p[i] > '9')
+        return 0;
+    while (p[i] >= '0' && p[i] <= '9')
+        i++;
+    if (p[i] != '/' || p[i + 1] != '.' || p[i + 2] != '/')
+        return 0;
+    return i + 3;
+}
+
+void cng_sun_out(int fd, void *addr, long *alen) {
     if (!addr || !alen || *alen < SUN_HDR + 1)
         return;
     unsigned short fam;
@@ -391,7 +493,7 @@ void cng_sun_out(void *addr, long *alen) {
         abs_tag_kind(tag, 'H');
         if (plen == 1 + ABS_DIG_LEN && memcmp(p + 1, tag, ABS_TAG_LEN) == 0) {
             char g[SUN_PATH_MAX];
-            int n = sun_fb_lookup(p, (unsigned)plen, g);
+            int n = sun_fb_lookup(sock_ino(fd), p, (unsigned)plen, g);
             if (n > 0) {
                 memcpy(p, g, (size_t)n);
                 *alen = SUN_HDR + n;
@@ -407,11 +509,16 @@ void cng_sun_out(void *addr, long *alen) {
         n = SUN_PATH_MAX;
     memcpy(hostp, p, (size_t)n);
     hostp[n] = '\0';
-    if (cng_fs_untranslate(cng_g_fs, hostp, guest, sizeof guest) != 0) {
+    long rf = sun_root_form(hostp);
+    if (rf) {
+        /* The self-describing spelling: the guest name is on the string. */
+        guest[0] = '/';
+        cng_strlcpy(guest + 1, hostp + rf, sizeof guest - 1);
+    } else if (cng_fs_untranslate(cng_g_fs, hostp, guest, sizeof guest) != 0) {
         /* ...unless it is one of our own fallback spellings, which no prefix
          * matches and which the guest must never be shown (see sun_fb_note). */
         char fb[SUN_PATH_MAX];
-        int gl = sun_fb_lookup(hostp, (unsigned)strlen(hostp), fb);
+        int gl = sun_fb_lookup(sock_ino(fd), hostp, (unsigned)strlen(hostp), fb);
         if (gl < 0)
             return; /* outside the guest view: leave it alone */
         memcpy(guest, fb, (size_t)gl);
