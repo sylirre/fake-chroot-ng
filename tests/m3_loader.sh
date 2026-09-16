@@ -58,6 +58,33 @@ else
     skip "ET_EXEC leg: no -static -no-pie AArch64 toolchain"
 fi
 
+# Two PT_LOADs sharing one host page. An object linked for a 4 KiB max page
+# size on a 16 KiB kernel — Android's 16 KiB migration — can put its text and
+# its data into the same host page, and the anonymous strategy is the only one
+# that runs it at all. The final protections are applied per host page as the
+# union of the segments touching it; applied per segment, the last one to touch
+# the page won, and text lost execute or data lost write. The guest is a
+# freestanding page of text beside a page of data. Under qemu-user the host
+# page size is chosen with QEMU_PAGESIZE (the -p option), which is how a 16 KiB
+# host is had here; a native host ignores it and runs at its own page size,
+# which on a 16 KiB device is exactly the case under test.
+if [ -n "$GUESTCC" ] &&
+    $GUESTCC -nostdlib -static -Wl,-z,max-page-size=4096 \
+        -Wl,-T,tests/guests/pageshare.ld -o "$GDIR/pageshare" \
+        tests/guests/pageshare.S 2>"$GUEST_CC_LOG"; then
+    out=$(run / "$GDIR/pageshare" 2>&1); rc=$?
+    check "shared-page guest runs at the host page size" 0 $rc
+    check_contains "shared-page guest wrote its data" "shared!" "$out"
+    out=$(QEMU_PAGESIZE=16384 run / "$GDIR/pageshare" 2>&1); rc=$?
+    check "shared-page guest runs on a 16 KiB page host" 0 $rc
+    check_contains "text kept execute and data kept write on the shared page" \
+        "shared!" "$out"
+    out=$(QEMU_PAGESIZE=16384 run -R / "$GDIR/pageshare" 2>&1); rc=$?
+    check "shared-page guest runs on a 16 KiB page host under -R" 0 $rc
+else
+    skip "shared-page leg: no AArch64 toolchain for a freestanding guest"
+fi
+
 # A PT_LOAD whose file part reaches past its memory part is malformed, and
 # fs/binfmt_elf.c refuses it outright: "p_filesz must always be <= p_memsz", and
 # -EINVAL for a header saying otherwise (measured on the host — the exec fails

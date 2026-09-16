@@ -47,9 +47,10 @@ vfork/`posix_spawn` child-stack handling.
   - ET_EXEC guests at a fixed vaddr that collides with the non-PIE loader
     (0x400000) are unsupported; Android guests are PIE so this is moot. Fixing
     needs a static-PIE self-relocating loader.
-  - Per-segment `mprotect` is page-granular; assumes segments don't share a
-    page (true for max-page-size-aligned AArch64 ELFs). Add per-page perm-union
-    if a counterexample appears.
+  - Final protections are applied per host page as the union of every segment
+    touching it (RWX where text and data share a page). The counterexample is
+    a 4 KiB-max-page-size object on a 16 KiB kernel — Android's 16 KiB
+    migration — which the anonymous strategy is the only way to run at all.
 
 - [x] **M4 — `ul_exec` loader: dynamic binaries**
   Load `PT_INTERP` (`ld.so`) at its own base, set `AT_BASE`/`AT_ENTRY`/`AT_PHDR`,

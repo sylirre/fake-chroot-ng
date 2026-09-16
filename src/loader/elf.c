@@ -113,23 +113,70 @@ static int map_anon(int fd, const Elf64_Ehdr *eh, const Elf64_Phdr *ph,
         }
     }
 
+    /* Final protections, per host page rather than per segment.
+     *
+     * A segment's protection can only be applied to whole pages, and two
+     * segments can share one: an object linked for a 4 KiB max page size on a
+     * 16 KiB kernel — the whole of Android's 16 KiB migration, and precisely
+     * the object this anonymous strategy exists to run at all — puts its text
+     * and its data into the same 16 KiB page whenever they are less than a
+     * page apart in the file. Applied one segment at a time, the last one to
+     * touch the page won: text that shared a page with .data lost execute and
+     * faulted on its first instruction, or .data that shared one with text
+     * lost write, depending only on the segment order in the header
+     * (measured under qemu-user with -p 16384). The kernel's own loader never
+     * meets the case, since it refuses such an object outright.
+     *
+     * So every distinct page boundary any segment contributes splits the
+     * span into runs, and each run gets the union of the protections of the
+     * segments covering it — RWX where text and data meet, which is what a
+     * loader that has to honor both asks for. A run no segment covers is a
+     * gap and is left as the reservation made it. */
+    unsigned long edge[2 * MAX_PHDR];
+    int nedge = 0;
     for (int i = 0; i < eh->e_phnum; i++) {
         if (ph[i].p_type != PT_LOAD)
             continue;
-        unsigned long ps = cng_page_down(bias + ph[i].p_vaddr);
-        unsigned long pe = cng_page_up(bias + ph[i].p_vaddr + ph[i].p_memsz);
-        long mr = sys_mprotect((void *)ps, pe - ps, prot_of(ph[i].p_flags));
+        unsigned long e[2] = {
+            cng_page_down(bias + ph[i].p_vaddr),
+            cng_page_up(bias + ph[i].p_vaddr + ph[i].p_memsz)};
+        for (int k = 0; k < 2; k++) {
+            int j = 0;
+            while (j < nedge && edge[j] < e[k])
+                j++;
+            if (j < nedge && edge[j] == e[k])
+                continue;
+            for (int m = nedge; m > j; m--)
+                edge[m] = edge[m - 1];
+            edge[j] = e[k];
+            nedge++;
+        }
+    }
+    for (int r = 0; r + 1 < nedge; r++) {
+        unsigned long ps = edge[r], pe = edge[r + 1];
+        int prot = 0, covered = 0;
+        for (int i = 0; i < eh->e_phnum; i++) {
+            if (ph[i].p_type != PT_LOAD)
+                continue;
+            if (cng_page_down(bias + ph[i].p_vaddr) <= ps &&
+                cng_page_up(bias + ph[i].p_vaddr + ph[i].p_memsz) >= pe) {
+                prot |= prot_of(ph[i].p_flags);
+                covered = 1;
+            }
+        }
+        if (!covered)
+            continue;
+        long mr = sys_mprotect((void *)ps, pe - ps, prot);
         if (mr < 0) {
             sys_munmap(seg, span + pool_extra);
-            if (mr == -EACCES && (ph[i].p_flags & PF_X))
+            if (mr == -EACCES && (prot & CNG_PROT_EXEC))
                 return CNG_LOAD_EEXEC; /* execmem denied */
             cng_dprintf(2, "chroot-ng: load: mprotect(%lx len=%lu prot=%d)"
                            " errno=%d\n",
-                        ps, (unsigned long)(pe - ps), prot_of(ph[i].p_flags),
-                        (int)-mr);
+                        ps, (unsigned long)(pe - ps), prot, (int)-mr);
             return CNG_LOAD_EMAP;
         }
-        if (ph[i].p_flags & PF_X)
+        if (prot & CNG_PROT_EXEC)
             cng_flush_icache((void *)ps, (void *)pe);
     }
     *bias_out = bias;
