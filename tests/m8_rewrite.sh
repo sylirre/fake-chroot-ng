@@ -65,6 +65,15 @@ case "$rwout" in
     check_contains "a site is patched in read-only text and runs from there" \
         "rwtest lazy: sites=2 patched=2 repeat=0 nonsvc=0 pid=ok openat=ok -> OK" \
         "$rwout"
+    # The mapping a site traps out of is remembered so no later trap out of it
+    # pays for /proc/self/maps again; the table was 32 fixed entries and the
+    # 33rd mapping was never remembered, which put every trap out of it — and
+    # out of every mapping after it — back on the maps read. Sixty distinct
+    # executable mappings, each patched and each run through its trampoline.
+    out=$(run_t 60 -t lazytest 2>&1); rc=$?
+    check "the lazy rewriter remembers more than 32 mappings" 0 $rc
+    check_contains "...every one patched and running through its pool" \
+        "60 mappings: 60 patched, 60 ran through their trampolines -> OK" "$out"
     ;;
 esac
 

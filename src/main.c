@@ -66,6 +66,7 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_shmtest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_tabtest(int argc, char **argv, char **envp, unsigned long *auxv);
+int cng_cmd_lazytest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_ipctest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_faulttest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_prctltest(int argc, char **argv, char **envp, unsigned long *auxv);
@@ -100,7 +101,7 @@ static const struct test_entry g_tests[] = {
     {"shmtest", cng_cmd_shmtest},       {"ipctest", cng_cmd_ipctest},
     {"faulttest", cng_cmd_faulttest},
     {"prctltest", cng_cmd_prctltest}, {"selfproc", cng_cmd_selfproc},
-    {"tabtest", cng_cmd_tabtest},
+    {"tabtest", cng_cmd_tabtest},     {"lazytest", cng_cmd_lazytest},
 };
 
 static int dispatch_test(const char *name, int argc, char **argv, char **envp,

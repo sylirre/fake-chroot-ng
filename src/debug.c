@@ -7921,3 +7921,64 @@ int cng_cmd_tabtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     cng_dprintf(1, "tabtest: %d failure(s)\n", fails);
     return fails ? 1 : 0;
 }
+
+/* _lazytest — the lazy rewriter's region table. The first trap out of a
+ * mapping pays for a read of /proc/self/maps and the mapping is remembered so
+ * no later trap out of it does; the table was 32 fixed entries and the 33rd
+ * mapping was not remembered at all, so every trap out of it read the file
+ * again. Sixty distinct executable mappings, each with one svc site, each
+ * patched through the entry point the SIGSYS body calls with the site the
+ * CPU trapped from; then every patched site is called, so the trampoline it
+ * branches to is proven to run the syscall. */
+int cng_cmd_lazytest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    static struct cng_fs fs;
+    cng_fs_init(&fs, "/");
+    cng_g_fs = &fs;
+    cng_g_rewrite = 1;
+
+    enum { N = 60 };
+    unsigned long pg = cng_page_size;
+    /* A run of pages with a hole after each, so the kernel keeps them as N
+     * separate mappings rather than merging neighbours of one protection. */
+    void *span = sys_mmap(0, pg * 2 * N, CNG_PROT_NONE,
+                          CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (span == CNG_MAP_FAILED || cng_is_err((long)span)) {
+        cng_dprintf(1, "lazytest: mmap failed\n");
+        return 1;
+    }
+    unsigned long site[N];
+    int mapped = 0, patched = 0, ran = 0;
+    long pid = sys_getpid();
+    for (int i = 0; i < N; i++) {
+        unsigned long p = (unsigned long)span + pg * 2 * (unsigned long)i;
+        sys_munmap((void *)(p + pg), pg); /* the hole */
+        if (sys_mprotect((void *)p, pg, CNG_PROT_READ | CNG_PROT_WRITE) != 0)
+            break;
+        uint32_t *code = (uint32_t *)p;
+        code[0] = 0xD2801588u; /* mov x8, #172 (getpid) */
+        code[1] = 0xD4000001u; /* svc #0 */
+        code[2] = 0xD65F03C0u; /* ret */
+        if (sys_mprotect((void *)p, pg, CNG_PROT_READ | CNG_PROT_EXEC) != 0)
+            break;
+        cng_flush_icache((void *)p, (void *)(p + 12));
+        site[i] = p + 4;
+        mapped++;
+    }
+    for (int i = 0; i < mapped; i++)
+        patched += cng_rewrite_site(site[i]) == 1;
+    for (int i = 0; i < mapped; i++) {
+        if (*(uint32_t *)site[i] == 0xD4000001u)
+            continue; /* still an svc: not patched, not ours to call */
+        long (*fn)(void) = (long (*)(void))(site[i] - 4);
+        ran += fn() == pid;
+    }
+    int ok = mapped == N && patched == N && ran == N;
+    cng_dprintf(1, "lazytest %d mappings: %d patched, %d ran through their "
+                   "trampolines -> %s\n",
+                N, patched, ran, ok ? "OK" : "FAIL");
+    return ok ? 0 : 1;
+}
