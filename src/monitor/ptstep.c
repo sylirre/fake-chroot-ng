@@ -29,13 +29,11 @@
 
 #define PT_STEP_BRK 0xD420FFE0u /* brk #0x7ff */
 
-/* One step is in flight at a time. A multithreaded tracee stepping two threads
- * at once would need one of these per task; single-stepping is a one-thread
- * activity in every debugger that exists, so this stays process-global and the
- * limitation is documented rather than paid for. */
-static u64 g_step_addr;
-static u32 g_step_orig;
-static int g_step_live;
+/* The step in flight is per task (cng_pt_step_self): it used to be one
+ * process-global record, so two traced threads stepped at once overwrote each
+ * other's — the second plant lost the first's original word, the first's
+ * breakpoint was then reported as a guest SIGTRAP at an address the tracer
+ * had never poked, and the `brk` stayed in the text for good. */
 
 static u64 sext(u64 v, int bits) {
     u64 m = 1ULL << (bits - 1);
@@ -121,30 +119,84 @@ u64 cng_pt_next_pc(const struct cng_uregs *r) {
     return pc + 4;
 }
 
+/* Two threads stepped through the same instruction want the same word
+ * planted. The second finds a `brk` of ours there already, and takes the
+ * original from the sibling's record rather than refusing: both records are
+ * then live on the address, each thread's own hit is its own, and the word
+ * goes back only when the last of them is unplanted (step_unplant). A `brk`
+ * of ours that no live sibling accounts for is a stale one and is refused,
+ * since the original is not to be had. */
 int cng_pt_step_plant(struct cng_uregs *r) {
+    struct cng_pt_step *st = cng_pt_step_self(1);
+    if (!st)
+        return -1;
     cng_pt_step_clear();
     u64 next = cng_pt_next_pc(r);
-    if (!next ||
-        cng_user_copyin(&g_step_orig, (const void *)next, sizeof g_step_orig) < 0)
+    if (!next)
         return -1;
-    if (g_step_orig == PT_STEP_BRK)
-        return -1; /* already ours: refuse rather than lose the original */
-    u32 brk = PT_STEP_BRK;
-    if (cng_pt_poke_text(next, &brk, 4) < 0)
-        return -1;
-    g_step_addr = next;
-    g_step_live = 1;
-    return 0;
+    for (int spin = 0;; spin++) {
+        u32 word;
+        if (cng_user_copyin(&word, (const void *)next, sizeof word) < 0)
+            return -1;
+        if (word != PT_STEP_BRK) {
+            st->orig = word;
+            st->addr = next;
+            u32 brk = PT_STEP_BRK;
+            if (cng_pt_poke_text(next, &brk, 4) < 0)
+                return -1;
+            __atomic_store_n(&st->live, 1, __ATOMIC_RELEASE);
+            return 0;
+        }
+        u32 orig;
+        if (!cng_pt_step_shared(next, &orig)) {
+            /* A `brk` of ours that no live record accounts for is either a
+             * sibling's in the act of being taken down — its record is
+             * already gone and the word is about to follow — or a stale one.
+             * The first resolves in a moment; the second never does, and is
+             * refused rather than have the original guessed at. */
+            if (spin < 1000) {
+                CNG_SYS(__NR_sched_yield, 0, 0, 0, 0, 0, 0);
+                continue;
+            }
+            return -1;
+        }
+        st->orig = orig;
+        st->addr = next;
+        __atomic_store_n(&st->live, 1, __ATOMIC_RELEASE);
+        /* The sibling can have taken the word back between the copy and the
+         * publication above; ours is live now, so plant it again if so. */
+        if (cng_user_copyin(&word, (const void *)next, sizeof word) < 0)
+            return -1;
+        if (word != PT_STEP_BRK) {
+            u32 brk = PT_STEP_BRK;
+            if (cng_pt_poke_text(next, &brk, 4) < 0)
+                return -1;
+        }
+        return 0;
+    }
+}
+
+/* Take this task's record down and, when no sibling's live record still
+ * stands on the address, the word with it. Two tasks unplanting the same
+ * address at once each restore the same original, which is harmless. */
+static void step_unplant(struct cng_pt_step *st) {
+    if (!__atomic_load_n(&st->live, __ATOMIC_ACQUIRE))
+        return;
+    u64 addr = st->addr;
+    u32 orig = st->orig;
+    __atomic_store_n(&st->live, 0, __ATOMIC_RELEASE);
+    if (!cng_pt_step_shared(addr, 0))
+        cng_pt_poke_text(addr, &orig, 4);
+    st->addr = 0;
 }
 
 void cng_pt_step_clear(void) {
-    if (!g_step_live)
-        return;
-    g_step_live = 0;
-    cng_pt_poke_text(g_step_addr, &g_step_orig, 4);
-    g_step_addr = 0;
+    struct cng_pt_step *st = cng_pt_step_self(0);
+    if (st)
+        step_unplant(st);
 }
 
 int cng_pt_step_hit(u64 pc) {
-    return g_step_live && pc == g_step_addr;
+    struct cng_pt_step *st = cng_pt_step_self(0);
+    return st && __atomic_load_n(&st->live, __ATOMIC_ACQUIRE) && pc == st->addr;
 }

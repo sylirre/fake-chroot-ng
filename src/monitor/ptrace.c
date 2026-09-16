@@ -129,6 +129,7 @@ struct pt_self {
     int in_stop;             /* re-entrancy guard */
     int traceall;            /* the trap-everything filter is installed here */
     int tracer_armed;        /* the tracer filter is installed here */
+    struct cng_pt_step bkpt; /* the single-step breakpoint this task planted */
 };
 #define PT_SELF_N 128
 static struct pt_self g_self[PT_SELF_N];
@@ -377,12 +378,69 @@ static struct pt_self *pt_self_get(int create) {
                 s->active = s->armed = s->step = 0;
                 s->entry_seen = s->skip_exit_stop = s->in_stop = 0;
                 s->traceall = s->tracer_armed = 0;
+                memset(&s->bkpt, 0, sizeof s->bkpt);
                 return s;
             }
             k--; /* lost the race for this slot; re-probe it */
         }
     }
     return 0;
+}
+
+struct cng_pt_step *cng_pt_step_self(int create) {
+    struct pt_self *s = pt_self_get(create);
+    return s ? &s->bkpt : 0;
+}
+
+int cng_pt_step_shared(u64 addr, u32 *orig) {
+    long tid = sys_gettid(), pid = sys_getpid();
+    for (int i = 0; i < PT_SELF_N; i++) {
+        long t = __atomic_load_n(&g_self[i].tid, __ATOMIC_ACQUIRE);
+        if (!t || t == tid)
+            continue;
+        struct cng_pt_step *st = &g_self[i].bkpt;
+        if (!__atomic_load_n(&st->live, __ATOMIC_ACQUIRE) || st->addr != addr)
+            continue;
+        if (CNG_SYS(__NR_tgkill, pid, t, 0, 0, 0, 0) == -ESRCH) {
+            /* The task that planted it is gone. Its record is the only
+             * account of the original there is: put it back and take the
+             * record down, the way its own next stop would have. */
+            int one = 1;
+            if (__atomic_compare_exchange_n(&st->live, &one, 0, 0,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+                cng_pt_poke_text(st->addr, &st->orig, 4);
+            continue;
+        }
+        if (orig)
+            *orig = st->orig;
+        return 1;
+    }
+    return 0;
+}
+
+void cng_pt_step_mask(u64 addr, void *buf, unsigned long len) {
+    for (int i = 0; i < PT_SELF_N; i++) {
+        if (!__atomic_load_n(&g_self[i].tid, __ATOMIC_ACQUIRE) ||
+            !__atomic_load_n(&g_self[i].bkpt.live, __ATOMIC_ACQUIRE))
+            continue;
+        u64 a = g_self[i].bkpt.addr;
+        u32 orig = g_self[i].bkpt.orig;
+        /* The four bytes of the word, wherever they fall in the window. */
+        for (unsigned k = 0; k < 4; k++)
+            if (a + k >= addr && a + k < addr + len)
+                ((u8 *)buf)[a + k - addr] = (u8)(orig >> (8 * k));
+    }
+}
+
+void cng_pt_step_clear_all(void) {
+    for (int i = 0; i < PT_SELF_N; i++) {
+        struct cng_pt_step *st = &g_self[i].bkpt;
+        if (!g_self[i].tid || !st->live)
+            continue;
+        st->live = 0;
+        cng_pt_poke_text(st->addr, &st->orig, 4);
+        st->addr = 0;
+    }
 }
 
 int cng_pt_active(void) {
@@ -685,12 +743,54 @@ static int pt_prot_of(u64 addr) {
 /* Write `len` bytes at `addr` the way PTRACE_POKETEXT does: through a
  * write-protected mapping (a breakpoint lands in read-only text), and coherent
  * with the instruction stream afterwards. Returns 0 or -EIO. */
+/* One poke into protected text at a time, process-wide. The write is a
+ * three-step dance — make the page writable, store, put it back — and two
+ * tasks dancing on the same page at once stepped on each other: one restored
+ * read-only between the other's mprotect and its store, which came back EIO,
+ * or read the page's protection while the other had it writable and left it
+ * so. Two threads single-stepped through the same instruction do exactly this.
+ * Held by tid so a task that holds it can poke again from a handler, and taken
+ * over from a task that died holding it. */
+static long g_poke_owner;
+static int g_poke_depth;
+
+static void pt_poke_lock(void) {
+    long me = sys_gettid(), cur;
+    for (int spin = 0;; spin++) {
+        cur = __atomic_load_n(&g_poke_owner, __ATOMIC_ACQUIRE);
+        if (cur == me) {
+            g_poke_depth++;
+            return;
+        }
+        long none = 0;
+        if (cur == 0 &&
+            __atomic_compare_exchange_n(&g_poke_owner, &none, me, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            g_poke_depth = 1;
+            return;
+        }
+        if (spin > 100 && cur &&
+            CNG_SYS(__NR_tgkill, sys_getpid(), cur, 0, 0, 0, 0) == -ESRCH)
+            __atomic_compare_exchange_n(&g_poke_owner, &cur, 0, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+        CNG_SYS(__NR_sched_yield, 0, 0, 0, 0, 0, 0);
+    }
+}
+
+static void pt_poke_unlock(void) {
+    if (--g_poke_depth == 0)
+        __atomic_store_n(&g_poke_owner, 0, __ATOMIC_RELEASE);
+}
+
 long cng_pt_poke_text(u64 addr, const void *src, unsigned len) {
     unsigned char word[8];
     if (len > sizeof word || cng_user_copyin(word, src, len) < 0)
         return -EIO;
-    if (cng_user_copyout((void *)addr, word, len) == 0) {
+    pt_poke_lock();
+    long w = cng_user_copyout((void *)addr, word, len);
+    if (w == 0) {
         cng_flush_icache((void *)addr, (void *)(addr + len));
+        pt_poke_unlock();
         return 0;
     }
     /* The page this lands in, at whatever the page size is here: mprotect takes
@@ -703,11 +803,14 @@ long cng_pt_poke_text(u64 addr, const void *src, unsigned len) {
     if (prot < 0)
         prot = CNG_PROT_READ | CNG_PROT_EXEC;
     if (sys_mprotect((void *)page, (size_t)(end - page),
-                     prot | CNG_PROT_READ | CNG_PROT_WRITE) < 0)
+                     prot | CNG_PROT_READ | CNG_PROT_WRITE) < 0) {
+        pt_poke_unlock();
         return -EIO;
-    long w = cng_user_copyout((void *)addr, word, len);
+    }
+    w = cng_user_copyout((void *)addr, word, len);
     cng_flush_icache((void *)addr, (void *)(addr + len));
     sys_mprotect((void *)page, (size_t)(end - page), prot);
+    pt_poke_unlock();
     return w < 0 ? -EIO : 0;
 }
 
@@ -823,6 +926,7 @@ static int pt_service_loop(struct pt_self *s, struct cng_uregs *r,
         case PT_CMD_PEEK: {
             u64 w = 0;
             e->result = pt_copy_out(e->addr, (u8 *)&w, 8) == 8 ? 0 : -EIO;
+            cng_pt_step_mask(e->addr, &w, 8); /* no task's step brk is shown */
             memcpy(e->data, &w, 8);
             e->rlen = 8;
             break;
@@ -833,6 +937,7 @@ static int pt_service_loop(struct pt_self *s, struct cng_uregs *r,
         case PT_CMD_READ: {
             u32 n = e->arg > PT_MBOX ? PT_MBOX : (u32)e->arg;
             e->rlen = pt_copy_out(e->addr, e->data, n);
+            cng_pt_step_mask(e->addr, e->data, e->rlen);
             e->result = (s64)e->rlen;
             break;
         }
@@ -1119,8 +1224,10 @@ void cng_pt_fork_child(struct cng_uregs *r, int event) {
      * Cleared here, before the table wipe below, while the inherited addresses
      * still describe this process's own text. Ahead of the `!g_tab` return too:
      * an untraced child of a traced parent is exactly the case that has nobody
-     * left to fix it up later. */
-    cng_pt_step_clear();
+     * left to fix it up later. Every task's, not the forking one's alone: the
+     * text is a copy of the whole process's, breakpoints of every stepping
+     * thread included, and none of those threads exists here. */
+    cng_pt_step_clear_all();
     if (!g_tab)
         return;
     /* The per-task table came across the fork describing the *parent's*

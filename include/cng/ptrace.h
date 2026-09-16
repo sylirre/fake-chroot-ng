@@ -274,14 +274,37 @@ void cng_pt_arm_tracee(void);
 int cng_pt_traceall(void);
 
 /* ---- single-step (ptstep.c) ---- */
+/* One step in flight, per task: the breakpoint planted at the instruction the
+ * stepping task will reach next, and the word it displaced. Kept in the
+ * task's own tracee-side record (ptrace.c), so two traced threads stepped at
+ * once each have their own. */
+struct cng_pt_step {
+    u64 addr;
+    u32 orig;
+    int live;
+};
+/* This task's step, created on demand; 0 when the task has no record. */
+struct cng_pt_step *cng_pt_step_self(int create);
 /* Next PC after the instruction at r->pc, evaluated against the frame's
  * registers and PSTATE. Returns 0 if the instruction cannot be decoded. */
 u64 cng_pt_next_pc(const struct cng_uregs *r);
 /* Plant / remove the temporary breakpoint that implements one step. */
 int cng_pt_step_plant(struct cng_uregs *r);
 void cng_pt_step_clear(void);
-/* Is `pc` our own step breakpoint (rather than one the tracer poked)? */
+/* Remove every task's step breakpoint: a fork child's text is a copy that
+ * carries them, and none of the tasks that planted them exist there. */
+void cng_pt_step_clear_all(void);
+/* Is `pc` this task's own step breakpoint (rather than one the tracer poked)? */
 int cng_pt_step_hit(u64 pc);
+/* Does another task hold a live step on `addr`? Its original word into *orig
+ * if asked for. A record whose task has exited is taken down on the way (the
+ * word restored) and does not count: nothing else would ever clear it. The
+ * text is shared, so a thread that runs through a stepping sibling's next
+ * instruction traps on it, and this is how that trap is told apart. */
+int cng_pt_step_shared(u64 addr, u32 *orig);
+/* Show `len` bytes at `addr`, already read into `buf`, as they are without any
+ * task's planted breakpoint: what a tracer's PEEKTEXT must see. */
+void cng_pt_step_mask(u64 addr, void *buf, unsigned long len);
 
 /* ---- signal disposition mirror (ptsig.c) ---- */
 /* Record what the guest asked rt_sigaction for and, when the task is traced,

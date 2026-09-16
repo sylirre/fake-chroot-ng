@@ -191,6 +191,17 @@ static void pt_trace_handler(int sig, cng_siginfo_t *si, void *ucv) {
         cng_pt_step_report(r);
         return;
     }
+    /* A sibling's step breakpoint: the text is shared, so a thread that runs
+     * through the instruction a stepping thread is about to reach traps on
+     * it, and it is neither a guest SIGTRAP nor this task's step. The kernel,
+     * stepping in hardware, has no such word in the text at all. Wait for the
+     * stepping task to take it back — it does so at its very next stop — and
+     * resume at the same pc, which then executes the original instruction. */
+    if (sig == SIG_TRAP_ && cng_pt_step_shared(r->pc, 0)) {
+        while (cng_pt_step_shared(r->pc, 0))
+            CNG_SYS(__NR_sched_yield, 0, 0, 0, 0, 0, 0);
+        return;
+    }
     int code = si->si_code;
     u64 addr = sig_is_fault(sig) ? pt_si_addr(si) : 0;
     int deliver = cng_pt_report_signal(r, sig, code, addr);

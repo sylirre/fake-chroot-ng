@@ -22,6 +22,7 @@
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <unistd.h>
 
 #ifndef NT_PRSTATUS
@@ -683,9 +684,109 @@ static int sc_step(void) {
     return 0;
 }
 
+/* Two threads of one tracee single-stepped at the same time. The emulation's
+ * step is a breakpoint planted at the next instruction, and the record of it
+ * used to be one per process: the second thread's plant lost the first's
+ * original word, and the first was then stopped at a `brk` nobody could take
+ * back. Both threads run the same loop, so each also runs through the other's
+ * planted instruction, which is the case that must wait rather than trap. Each
+ * step is issued to both before either is waited for, three rounds, and the
+ * pc of each must have moved on every round. */
+static volatile int g_spin;
+
+static void *step2_thr(void *arg) {
+    int fd = (int)(long)arg;
+    pid_t me = (pid_t)syscall(SYS_gettid);
+    ssize_t ignore = write(fd, &me, sizeof me);
+    (void)ignore;
+    for (;;) {
+        g_spin++;
+        usleep(1000);
+    }
+    return 0;
+}
+
+static int sc_step2(void) {
+    int fds[2];
+    if (pipe(fds) != 0)
+        return 1;
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(fds[0]);
+        pthread_t t;
+        pthread_create(&t, 0, step2_thr, (void *)(long)fds[1]);
+        pid_t me = (pid_t)syscall(SYS_gettid);
+        ssize_t ignore = write(fds[1], &me, sizeof me);
+        (void)ignore;
+        for (;;) {
+            g_spin++;
+            usleep(1000);
+        }
+    }
+    close(fds[1]);
+    pid_t tid[2];
+    for (int k = 0; k < 2; k++) {
+        ssize_t n = read(fds[0], &tid[k], sizeof tid[k]);
+        (void)n;
+    }
+    if (tid[0] > tid[1]) {
+        pid_t x = tid[0];
+        tid[0] = tid[1];
+        tid[1] = x;
+    }
+    int st;
+    for (int k = 0; k < 2; k++) {
+        if (ptrace(PTRACE_ATTACH, tid[k], 0, 0) != 0) {
+            printf("attach %d failed %d\n", k, errno);
+            kill(pid, SIGKILL);
+            return 1;
+        }
+        if (waitpid(tid[k], &st, __WALL) != tid[k] || !WIFSTOPPED(st)) {
+            printf("attach %d: no stop\n", k);
+            kill(pid, SIGKILL);
+            return 1;
+        }
+    }
+    unsigned long long prev[2] = {0, 0};
+    int moved[2] = {0, 0};
+    for (int i = 0; i < 3; i++) {
+        for (int k = 0; k < 2; k++)
+            if (ptrace(PTRACE_SINGLESTEP, tid[k], 0, 0) != 0) {
+                printf("singlestep %d failed %d\n", k, errno);
+                kill(pid, SIGKILL);
+                return 1;
+            }
+        for (int k = 0; k < 2; k++) {
+            if (waitpid(tid[k], &st, __WALL) != tid[k] || !WIFSTOPPED(st) ||
+                WSTOPSIG(st) != SIGTRAP) {
+                printf("bad step %d ", k);
+                show(st);
+                kill(pid, SIGKILL);
+                return 1;
+            }
+            struct uregs r;
+            if (getregs(tid[k], &r) != 0) {
+                printf("getregs %d failed\n", k);
+                kill(pid, SIGKILL);
+                return 1;
+            }
+            if (R_PC(r) != prev[k])
+                moved[k]++;
+            prev[k] = R_PC(r);
+        }
+    }
+    printf("stepped %d %d\n", moved[0], moved[1]);
+    for (int k = 0; k < 2; k++)
+        printf("detach %d %s\n", k,
+               ptrace(PTRACE_DETACH, tid[k], 0, 0) == 0 ? "ok" : "failed");
+    kill(pid, SIGKILL);
+    wait_for(pid, &st);
+    show(st);
+    return 0;
+}
+
 /* PTRACE_ATTACH to a running process that is not our child's tracer-to-be:
  * here a child that is already running a loop. */
-static volatile int g_spin;
 
 static int sc_attach(void) {
     int fds[2];
@@ -1299,6 +1400,8 @@ int main(int argc, char **argv) {
         return sc_break();
     if (!strcmp(s, "step"))
         return sc_step();
+    if (!strcmp(s, "step2"))
+        return sc_step2();
     if (!strcmp(s, "attach"))
         return sc_attach();
     if (!strcmp(s, "vmrw"))

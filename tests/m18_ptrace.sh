@@ -137,6 +137,11 @@ else
     # single-stepping (which no hardware here can do for us).
     pt_case break
     pt_case step
+    # Two threads of one tracee stepped at the same time, through the same
+    # code. The step record used to be one per process, so the second plant
+    # lost the first's original word; and a thread running through a sibling's
+    # planted instruction must wait for it rather than take the trap.
+    pt_case step2
     # PTRACE_ATTACH to a process that is already running, and DETACH.
     pt_case attach
     # process_vm_readv against a stopped tracee — strace's fast path, served
