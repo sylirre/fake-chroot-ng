@@ -17,7 +17,8 @@
  *
  * Anything else is the guest's, and an exec is where it goes. Getting that
  * wrong unmaps the monitor out from under itself, so the registry is
- * fail-closed: if a record does not fit, or the floor could not be read,
+ * fail-closed: if a record could not be kept (the registry grows a page at a
+ * time, and the host refused one), or the floor could not be read,
  * cng_own_ready() answers no and the reclaim does not run at all.
  */
 #ifndef CNG_OWNMAP_H

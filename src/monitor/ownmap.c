@@ -8,25 +8,29 @@
  */
 #include "cng/ownmap.h"
 #include "cng/syscall.h"
+#include "cng/tab.h"
 #include "cng/uapi.h"
 
 #include <asm/unistd.h>
 
-/* Sized for the floor (about twenty-five mappings on a device: our own image,
- * the stack, heap, vdso/vvar, the first program and its stack, the pools the
- * loader made) plus every long-lived region the monitor maps afterwards, of
- * which there are a dozen. The scratch stacks are NOT in here — sigsys.c
- * already records all 256 of them with their bounds, and asking that table is
- * both cheaper and immune to the two drifting apart. */
-#define OWN_MAX 96
-
-/* lo is the claim (a mapping can never be at 0, so 0 means the slot is free)
+/* The registry grows as it is written to (cng_tab): the floor takes about
+ * twenty-five records on a device, the monitor's long-lived regions a dozen
+ * more, and the tables that grow — a shm attach list, the ptrace registry,
+ * every chunk of every cng_tab including this one — add a record apiece with
+ * no ceiling. There was one, at 96, and the 97th record disarmed the reclaim
+ * for the rest of the process's life. The scratch stacks are NOT in here —
+ * sigsys.c already records all 256 of them with their bounds, and asking that
+ * table is both cheaper and immune to the two drifting apart.
+ *
+ * lo is the claim (a mapping can never be at 0, so 0 means the slot is free)
  * and hi is the publication: a reader that sees a non-zero hi is guaranteed to
  * see the lo that goes with it. Slots are reused, because the argv snapshot
  * takes one per exec and gives it back again. */
-static struct own_range {
+struct own_range {
     unsigned long lo, hi;
-} g_own[OWN_MAX];
+};
+
+static struct cng_tab g_own = CNG_TAB_INIT(struct own_range);
 
 static int g_own_floored;
 static int g_own_lost; /* a record did not fit, or the floor did not read */
@@ -36,20 +40,24 @@ static void own_lose(void) { __atomic_store_n(&g_own_lost, 1, __ATOMIC_RELEASE);
 static int own_add(unsigned long lo, unsigned long hi) {
     if (hi <= lo)
         return 0;
-    for (int i = 0; i < OWN_MAX; i++) {
+    for (unsigned long i = 0;; i++) {
+        struct own_range *r = cng_tab_at(&g_own, i);
+        if (!r) {
+            /* The host would not give the page. Every later answer would be
+             * "not ours" for a region that is, so the reclaim stops rather
+             * than acting on a table it has outgrown. */
+            own_lose();
+            return -1;
+        }
         unsigned long expect = 0;
-        if (__atomic_load_n(&g_own[i].lo, __ATOMIC_RELAXED))
+        if (__atomic_load_n(&r->lo, __ATOMIC_RELAXED))
             continue;
-        if (!__atomic_compare_exchange_n(&g_own[i].lo, &expect, lo, 0,
+        if (!__atomic_compare_exchange_n(&r->lo, &expect, lo, 0,
                                          __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
             continue;
-        __atomic_store_n(&g_own[i].hi, hi, __ATOMIC_RELEASE);
+        __atomic_store_n(&r->hi, hi, __ATOMIC_RELEASE);
         return 0;
     }
-    /* Out of slots. Every later answer would be "not ours" for a region that
-     * is, so the reclaim stops rather than acting on a table it has outgrown. */
-    own_lose();
-    return -1;
 }
 
 void *cng_own_map(void *p, unsigned long len) {
@@ -61,22 +69,26 @@ void *cng_own_map(void *p, unsigned long len) {
 
 void cng_own_drop(void *p, unsigned long len) {
     unsigned long lo = (unsigned long)p, hi = lo + len;
-    for (int i = 0; i < OWN_MAX; i++) {
-        if (__atomic_load_n(&g_own[i].hi, __ATOMIC_ACQUIRE) != hi ||
-            __atomic_load_n(&g_own[i].lo, __ATOMIC_RELAXED) != lo)
+    struct cng_tab_iter it;
+    for (struct own_range *r = cng_tab_first(&g_own, &it); r;
+         r = cng_tab_next(&g_own, &it)) {
+        if (__atomic_load_n(&r->hi, __ATOMIC_ACQUIRE) != hi ||
+            __atomic_load_n(&r->lo, __ATOMIC_RELAXED) != lo)
             continue;
-        __atomic_store_n(&g_own[i].hi, 0, __ATOMIC_RELEASE);
-        __atomic_store_n(&g_own[i].lo, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&r->hi, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&r->lo, 0, __ATOMIC_RELEASE);
         return;
     }
 }
 
 int cng_own_hit(unsigned long lo, unsigned long hi) {
-    for (int i = 0; i < OWN_MAX; i++) {
-        unsigned long h = __atomic_load_n(&g_own[i].hi, __ATOMIC_ACQUIRE);
+    struct cng_tab_iter it;
+    for (struct own_range *r = cng_tab_first(&g_own, &it); r;
+         r = cng_tab_next(&g_own, &it)) {
+        unsigned long h = __atomic_load_n(&r->hi, __ATOMIC_ACQUIRE);
         if (!h)
             continue;
-        unsigned long l = __atomic_load_n(&g_own[i].lo, __ATOMIC_RELAXED);
+        unsigned long l = __atomic_load_n(&r->lo, __ATOMIC_RELAXED);
         if (lo < h && l < hi)
             return 1;
     }
@@ -190,7 +202,7 @@ static int floor_seen(unsigned long lo, unsigned long hi, const char *path,
         return 0;
     }
     if (last[1] && own_add(last[0], last[1]) != 0)
-        return 1; /* out of slots: own_add has already disarmed the reclaim */
+        return 1; /* no page for it: own_add has already disarmed the reclaim */
     last[0] = lo;
     last[1] = hi;
     return 0;

@@ -514,6 +514,19 @@ else
 fi
 rm -rf "$ECM"
 
+# The registry the sweep asks "was this ever ours?" used to hold 96 records and
+# fail closed at the 97th: cng_own_ready() went false for good and the reclaim
+# sat out every later exec of that process. A shm attach list or the ptrace
+# registry adds a record per page it grows by, so the count was reachable. The
+# registry now sits on a table that grows a page at a time (tab.c); the
+# self-test drives both well past the old ceiling.
+out=$(run_t 60 -t tabtest 2>&1); rc=$?
+check "the own-map registry grows past 96 records and stays armed" 0 $rc
+check_contains "growing table: elements stable and in order" \
+    "stable and in order -> OK" "$out"
+check_contains "growing table: every record found, half dropped" \
+    "half dropped, still armed -> OK" "$out"
+
 # ...and the same chain with a guest whose OWN ld.so maps its libraries. That
 # memory is not the loader's and no recorded extent describes it, so it is the
 # half the sweep exists for — and the half that used to hurt. Measured on an

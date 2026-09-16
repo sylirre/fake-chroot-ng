@@ -20,6 +20,8 @@
 #include "cng/seccomp.h"
 #include "cng/shm.h"
 #include "cng/sysvipc.h"
+#include "cng/tab.h"
+#include "cng/ownmap.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
 #include "cng/uapi.h"
@@ -7831,5 +7833,91 @@ int cng_cmd_ipctest(int argc, char **argv, char **envp, unsigned long *auxv) {
     }
 
     cng_dprintf(1, "ipctest: %d failure(s)\n", fails);
+    return fails ? 1 : 0;
+}
+
+/* _tabtest — the growing table (tab.c) and the own-map registry on top of it.
+ * The registry used to be 96 fixed slots, and the 97th record disarmed the
+ * exec reclaim for good; the table it sits on now grows a page at a time, so
+ * this drives it well past several pages and asks the registry every question
+ * the sweep asks. */
+int cng_cmd_tabtest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    int fails = 0;
+
+    /* 1) elements are stable, zero on first reach, and the iteration covers
+     *    exactly what was reached, in order, across chunk boundaries. */
+    {
+        struct big {
+            unsigned long a, b, c;
+        };
+        struct cng_tab t = CNG_TAB_INIT(struct big);
+        const unsigned long N = 5000; /* ~30 pages of 4 KiB */
+        int ok = 1;
+        struct big *first = cng_tab_at(&t, 0);
+        for (unsigned long i = 0; i < N && ok; i++) {
+            struct big *e = cng_tab_at(&t, i);
+            ok = e && e->a == 0 && e->b == 0 && e->c == 0;
+            if (ok) {
+                e->a = i + 1;
+                e->c = ~i;
+            }
+        }
+        ok = ok && cng_tab_at(&t, 0) == first && cng_tab_peek(&t, N - 1) &&
+             ((struct big *)cng_tab_peek(&t, N - 1))->a == N;
+        /* peek maps nothing: past the end is 0, and the walk stops there */
+        unsigned long len = 0;
+        struct cng_tab_iter it;
+        for (struct big *e = cng_tab_first(&t, &it); e; e = cng_tab_next(&t, &it))
+            len++;
+        ok = ok && cng_tab_peek(&t, len) == 0 && len >= N &&
+             cng_tab_at(&t, N - 1) == cng_tab_peek(&t, N - 1);
+        unsigned long seen = 0, i2 = 0;
+        for (struct big *e = cng_tab_first(&t, &it); e; e = cng_tab_next(&t, &it), i2++)
+            if (i2 < N && e->a == i2 + 1 && e->c == ~i2)
+                seen++;
+        ok = ok && seen == N;
+        cng_dprintf(1, "tabtest %lu elements over %lu slots, stable and in order -> %s\n",
+                    N, len, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 2) the registry: far more records than the old table held, every one
+     *    found by the sweep's question, every one droppable, and the reclaim
+     *    still armed at the end. The ranges are fictitious — the registry
+     *    records, it does not map — and lie above anything the process maps. */
+    {
+        cng_own_floor();
+        int ok = cng_own_ready();
+        const unsigned long N = 3000, base = 0x7e0000000000UL, pg = 4096;
+        for (unsigned long i = 0; i < N; i++)
+            cng_own_map((void *)(base + i * 2 * pg), pg);
+        ok = ok && cng_own_ready();
+        unsigned long hits = 0, misses = 0;
+        for (unsigned long i = 0; i < N; i++) {
+            hits += cng_own_hit(base + i * 2 * pg, base + i * 2 * pg + pg) == 1;
+            misses += cng_own_hit(base + i * 2 * pg + pg, base + (i + 1) * 2 * pg) == 0;
+        }
+        ok = ok && hits == N && misses == N;
+        for (unsigned long i = 0; i < N; i += 2)
+            cng_own_drop((void *)(base + i * 2 * pg), pg);
+        unsigned long kept = 0, gone = 0;
+        for (unsigned long i = 0; i < N; i++) {
+            int h = cng_own_hit(base + i * 2 * pg, base + i * 2 * pg + pg);
+            if (i & 1)
+                kept += h == 1;
+            else
+                gone += h == 0;
+        }
+        ok = ok && kept == N / 2 && gone == N / 2 && cng_own_ready();
+        cng_dprintf(1, "tabtest %lu own-map records, all found, half dropped, still armed -> %s\n",
+                    N, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    cng_dprintf(1, "tabtest: %d failure(s)\n", fails);
     return fails ? 1 : 0;
 }
