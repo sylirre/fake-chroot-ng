@@ -1933,8 +1933,13 @@ int cng_cmd_faulttest(int argc, char **argv, char **envp, unsigned long *auxv) {
 
     /* getgroups writes only what it has: with no supplementary groups the bad
      * pointer is never touched, so seed one and ask again. */
-    cng_g_cred.ngroups = 1;
-    cng_g_cred.groups[0] = 42;
+    {
+        struct cng_cred_write w;
+        struct cng_cred *c = cng_cred_write_begin(&w);
+        c->ngroups = 1;
+        c->groups[0] = 42;
+        cng_cred_write_end(&w, 1);
+    }
     long rg = cng_dispatch(__NR_getgroups, 4, (long)bad, 0, 0, 0, 0, 1);
     int okgg = (rg == -EFAULT);
     cng_dprintf(1, "faulttest getgroups=%d want=%d -> %s\n", (int)rg,

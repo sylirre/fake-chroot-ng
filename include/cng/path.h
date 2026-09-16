@@ -64,6 +64,24 @@ int cng_dev_shm_ok(void);
 
 /* 0, or -1 when the rootfs path does not fit fs->rootfs: it is refused rather
  * than truncated, since a short prefix roots the guest somewhere else. */
+/* The published view (see path.c): cng_g_fs points at it. Readers take a
+ * sequence and the pointer, work, and re-check the sequence — a change means a
+ * writer swapped the view meanwhile and the work is redone. The path functions
+ * below do this themselves when handed the view; a caller reading fields of
+ * its own (a walk of the binds) does it like so:
+ *     const struct cng_fs *v;
+ *     do { unsigned s = cng_fs_read_begin(&v); ... v->binds ... }
+ *     while (cng_fs_read_retry(s));
+ * A private struct — one cng_fs_publish has not been given — is read and
+ * written in place. */
+unsigned cng_fs_read_begin(const struct cng_fs **fs);
+int cng_fs_read_retry(unsigned s);
+struct cng_fs *cng_fs_publish(const struct cng_fs *src);
+/* The cwd (never empty: "/" at least) and the rootfs of the view, copied out
+ * under the protocol above. Returns strlen of the source. */
+size_t cng_fs_cwd(char *out, size_t sz);
+size_t cng_fs_rootfs(char *out, size_t sz);
+
 int cng_fs_init(struct cng_fs *fs, const char *rootfs);
 int cng_fs_add_bind(struct cng_fs *fs, const char *guest, const char *host,
                     int ro);

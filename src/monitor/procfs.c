@@ -209,7 +209,33 @@ static const char *mnt_esc(const char *p, char *out, size_t sz) {
  * what precedes it. The root's major:minor is real, so tools cross-referencing
  * stat().st_dev find it. */
 static void put_mounts(int fd, int fmt) {
-    const char *root = cng_g_fs->rootfs[0] ? cng_g_fs->rootfs : "/";
+    /* A snapshot of the view: the table is emitted to the file as it is
+     * walked, and a chroot on another thread replaces the view whole while a
+     * reader may still be looking at the old one — a snapshot taken under the
+     * view's protocol is emitted from start to end as one thing. */
+    static struct cng_bind binds[CNG_MAX_BINDS];
+    static long snap_owner;
+    char rootbuf[CNG_PATH_MAX];
+    int nb;
+    /* The snapshot is static (50 KiB, more than a stack here should carry)
+     * and so is taken one reader at a time. */
+    long me = sys_gettid();
+    for (long none = 0;
+         !__atomic_compare_exchange_n(&snap_owner, &none, me, 0,
+                                      __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+         none = 0)
+        CNG_SYS(__NR_sched_yield, 0, 0, 0, 0, 0, 0);
+    const struct cng_fs *v;
+    do {
+        unsigned seq = cng_fs_read_begin(&v);
+        cng_strlcpy(rootbuf, v->rootfs, sizeof rootbuf);
+        nb = v->nbinds;
+        for (int i = 0; i < nb; i++)
+            binds[i] = v->binds[i];
+        if (!cng_fs_read_retry(seq))
+            break;
+    } while (1);
+    const char *root = rootbuf[0] ? rootbuf : "/";
     const char *fstype = rootfs_fstype(root);
     unsigned long maj = 0, min = 0;
     char st[128];
@@ -221,7 +247,6 @@ static void put_mounts(int fd, int fmt) {
     /* Room for the worst case: a guest path of nothing but characters that
      * escape to four bytes each. */
     char esc[4 * CNG_PATH_MAX];
-    int nb = cng_g_fs->nbinds;
     int proc_row = !cng_g_no_proc;
     int dev_row = !cng_g_no_dev;
     /* ...and the tmpfs at /dev/shm only where the guest actually has one. The
@@ -250,16 +275,16 @@ static void put_mounts(int fd, int fmt) {
         for (int i = 0; i < nb; i++) {
             unsigned long bmaj = maj, bmin = min;
             char bst[128];
-            if (CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, cng_g_fs->binds[i].host,
+            if (CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, binds[i].host,
                         bst, 0, 0, 0) == 0) {
                 unsigned long d = *(unsigned long *)(bst + STAT_DEV_OFF);
                 bmaj = dev_major(d);
                 bmin = dev_minor(d);
             }
-            const char *rw = cng_g_fs->binds[i].ro ? "ro" : "rw";
+            const char *rw = binds[i].ro ? "ro" : "rw";
             cng_dprintf(fd, "%d 1 %lu:%lu / %s %s,relatime - %s " MNT_DEV " %s\n",
                         id++, bmaj, bmin,
-                        mnt_esc(cng_g_fs->binds[i].guest, esc, sizeof esc), rw,
+                        mnt_esc(binds[i].guest, esc, sizeof esc), rw,
                         fstype, rw);
         }
     } else if (fmt == MNT_MOUNTSTATS) {
@@ -279,7 +304,7 @@ static void put_mounts(int fd, int fmt) {
         }
         for (int i = 0; i < nb; i++)
             cng_dprintf(fd, "device " MNT_DEV " mounted on %s with fstype %s\n",
-                        mnt_esc(cng_g_fs->binds[i].guest, esc, sizeof esc),
+                        mnt_esc(binds[i].guest, esc, sizeof esc),
                         fstype);
     } else {
         cng_dprintf(fd, MNT_DEV " / %s rw,relatime 0 0\n", fstype);
@@ -296,9 +321,10 @@ static void put_mounts(int fd, int fmt) {
         }
         for (int i = 0; i < nb; i++)
             cng_dprintf(fd, MNT_DEV " %s %s %s,relatime 0 0\n",
-                        mnt_esc(cng_g_fs->binds[i].guest, esc, sizeof esc),
-                        fstype, cng_g_fs->binds[i].ro ? "ro" : "rw");
+                        mnt_esc(binds[i].guest, esc, sizeof esc),
+                        fstype, binds[i].ro ? "ro" : "rw");
     }
+    __atomic_store_n(&snap_owner, 0, __ATOMIC_RELEASE);
 }
 
 /* ---- loadavg / uptime / stat -------------------------------------------- */
@@ -505,12 +531,19 @@ static int put_status(int fd, const char *host, int self) {
         int is_uid = !strncmp(line, "Uid:", 4);
         if (is_uid || !strncmp(line, "Gid:", 4)) {
             if (self) {
-                const struct cng_cred *c = &cng_g_cred;
+                const struct cng_cred *c;
+                unsigned id[4];
+                do {
+                    unsigned s = cng_cred_read_begin(&c);
+                    id[0] = is_uid ? c->ruid : c->rgid;
+                    id[1] = is_uid ? c->euid : c->egid;
+                    id[2] = is_uid ? c->suid : c->sgid;
+                    id[3] = is_uid ? c->fsuid : c->fsgid;
+                    if (!cng_cred_read_retry(s))
+                        break;
+                } while (1);
                 cng_dprintf(fd, "%s\t%u\t%u\t%u\t%u\n", is_uid ? "Uid:" : "Gid:",
-                            is_uid ? c->ruid : c->rgid,
-                            is_uid ? c->euid : c->egid,
-                            is_uid ? c->suid : c->sgid,
-                            is_uid ? c->fsuid : c->fsgid);
+                            id[0], id[1], id[2], id[3]);
                 continue;
             }
             const char *p = line + 4;
@@ -538,8 +571,21 @@ static int put_status(int fd, const char *host, int self) {
              * like the one every other status file has. Measured on the host. */
             cng_dprintf(fd, "Groups:\t");
             if (self) {
-                for (int i = 0; i < cng_g_cred.ngroups; i++)
-                    cng_dprintf(fd, "%u ", cng_g_cred.groups[i]);
+                /* The count and the list as one thing: a setgroups on another
+                 * thread publishes a whole new set, never edits this one. */
+                unsigned got[CNG_NGROUPS_MAX];
+                int n;
+                const struct cng_cred *c;
+                do {
+                    unsigned s = cng_cred_read_begin(&c);
+                    n = c->ngroups;
+                    for (int i = 0; i < n; i++)
+                        got[i] = c->groups[i];
+                    if (!cng_cred_read_retry(s))
+                        break;
+                } while (1);
+                for (int i = 0; i < n; i++)
+                    cng_dprintf(fd, "%u ", got[i]);
             } else {
                 const char *p = line + 7;
                 for (;;) {
@@ -1399,7 +1445,11 @@ void cng_procfs_publish_stack(unsigned long guest_sp) {
     if (alen > CNG_PROCREG_AUXV)
         alen = 0; /* an over-long block is better omitted than truncated */
 
-    cng_procreg_publish(argv, envp, auxv, alen, cng_g_exe_guest,
-                        cng_g_fs ? cng_g_fs->cwd : "/");
+    char cwd[CNG_PATH_MAX];
+    if (cng_g_fs)
+        cng_fs_cwd(cwd, sizeof cwd);
+    else
+        cng_strlcpy(cwd, "/", sizeof cwd);
+    cng_procreg_publish(argv, envp, auxv, alen, cng_g_exe_guest, cwd);
     set_comm(cng_g_exe_guest);
 }

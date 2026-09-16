@@ -29,9 +29,69 @@ unsigned cng_g_fake_uid = 0;
 unsigned cng_g_fake_gid = 0;
 unsigned cng_g_host_uid = 0;
 unsigned cng_g_host_gid = 0;
-struct cng_cred cng_g_cred;
 int cng_g_setuid_root = 0;
 int cng_g_setgid_root = 0;
+
+/* ---- the published set ---------------------------------------------------
+ *
+ * The set is read by every credential syscall, by the stat remap and the
+ * fake-root checks, and rewritten by the setters — from any thread, and the
+ * setters are what libc's setxid broadcast calls on EVERY thread at once. It
+ * was one struct edited field by field: a getgroups running beside a
+ * setgroups could read the new count with the old list, a getresuid the new
+ * euid with the old suid. The kernel replaces a task's cred as one object
+ * (commit_creds); this does the same thing the fs view does (path.c): two
+ * buffers, the active one never written, a writer copies it into the other,
+ * changes that and swaps the pointer, and a reader re-checks the sequence
+ * after its read. cng_g_cred is the pointer. */
+static struct cng_cred g_cred_buf[2];
+const struct cng_cred *cng_g_cred = &g_cred_buf[0];
+static unsigned g_cred_seq;
+static long g_cred_owner;
+
+unsigned cng_cred_read_begin(const struct cng_cred **c) {
+    unsigned s = __atomic_load_n(&g_cred_seq, __ATOMIC_ACQUIRE);
+    *c = __atomic_load_n(&cng_g_cred, __ATOMIC_ACQUIRE);
+    return s;
+}
+
+int cng_cred_read_retry(unsigned s) {
+    return __atomic_load_n(&g_cred_seq, __ATOMIC_ACQUIRE) != s;
+}
+
+struct cng_cred *cng_cred_write_begin(struct cng_cred_write *w) {
+    unsigned long all = ~0UL;
+    CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, &all, &w->mask, 8, 0, 0);
+    long me = sys_gettid();
+    for (int spin = 0;; spin++) {
+        long none = 0;
+        if (__atomic_compare_exchange_n(&g_cred_owner, &none, me, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            break;
+        if (spin > 100 && none &&
+            CNG_SYS(__NR_tgkill, sys_getpid(), none, 0, 0, 0, 0) == -ESRCH)
+            __atomic_compare_exchange_n(&g_cred_owner, &none, 0, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+        CNG_SYS(__NR_sched_yield, 0, 0, 0, 0, 0, 0);
+    }
+    const struct cng_cred *src = __atomic_load_n(&cng_g_cred, __ATOMIC_ACQUIRE);
+    w->dst = src == &g_cred_buf[0] ? &g_cred_buf[1] : &g_cred_buf[0];
+    /* The ids and the groups it has; the buffers start zeroed. */
+    memcpy(w->dst, src, (unsigned long)&((struct cng_cred *)0)->groups);
+    for (int i = 0; i < src->ngroups; i++)
+        w->dst->groups[i] = src->groups[i];
+    w->dst->ngroups = src->ngroups;
+    return w->dst;
+}
+
+void cng_cred_write_end(struct cng_cred_write *w, int commit) {
+    if (commit) {
+        __atomic_store_n(&cng_g_cred, w->dst, __ATOMIC_RELEASE);
+        __atomic_fetch_add(&g_cred_seq, 1, __ATOMIC_RELEASE);
+    }
+    __atomic_store_n(&g_cred_owner, 0, __ATOMIC_RELEASE);
+    CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, &w->mask, 0, 8, 0, 0);
+}
 
 /* AArch64 struct stat field offsets (st_mode/st_uid/st_gid). */
 #define ST_MODE_OFF 16
@@ -39,10 +99,12 @@ int cng_g_setgid_root = 0;
 #define ST_GID_OFF  28
 
 void cng_cred_seed(void) {
-    struct cng_cred *c = &cng_g_cred;
+    struct cng_cred_write w;
+    struct cng_cred *c = cng_cred_write_begin(&w);
     c->ruid = c->euid = c->suid = c->fsuid = cng_g_fake_uid;
     c->rgid = c->egid = c->sgid = c->fsgid = cng_g_fake_gid;
     c->ngroups = 0;
+    cng_cred_write_end(&w, 1);
 }
 
 void cng_cred_setup(unsigned host_uid, unsigned host_gid) {
@@ -61,7 +123,8 @@ void cng_cred_setup(unsigned host_uid, unsigned host_gid) {
 void cng_cred_exec(const char *host) {
     if (!cng_g_fake_id)
         return;
-    struct cng_cred *c = &cng_g_cred;
+    struct cng_cred_write w;
+    struct cng_cred *c = cng_cred_write_begin(&w);
     if (host && (cng_g_setuid_root || cng_g_setgid_root)) {
         unsigned char st[128]; /* AArch64 struct stat is 128 bytes */
         if (cng_syscall6(CNG_AT_FDCWD, (long)host, (long)st, 0, 0, 0,
@@ -92,6 +155,7 @@ void cng_cred_exec(const char *host) {
      * it either. */
     c->suid = c->fsuid = c->euid;
     c->sgid = c->fsgid = c->egid;
+    cng_cred_write_end(&w, 1);
 }
 
 #define ID_KEEP ((unsigned)-1) /* setres*id / setre*id "leave unchanged" */
@@ -259,13 +323,24 @@ static long do_setgroups(struct cng_cred *c, int n, const unsigned *g) {
     c->ngroups = n;
     return 0;
 }
-static long do_getgroups(const struct cng_cred *c, int size, unsigned *g) {
-    int n = c->ngroups;
+static long do_getgroups(int size, unsigned *g) {
+    /* The count and the list as one thing (see the published set above). */
+    unsigned got[CNG_NGROUPS_MAX];
+    int n;
+    const struct cng_cred *c;
+    do {
+        unsigned s = cng_cred_read_begin(&c);
+        n = c->ngroups;
+        for (int i = 0; i < n; i++)
+            got[i] = c->groups[i];
+        if (!cng_cred_read_retry(s))
+            break;
+    } while (1);
     if (size == 0)
         return n;
     if (size < n)
         return -EINVAL;
-    if (n && cng_user_copyout(g, c->groups, (unsigned long)n * sizeof *g) < 0)
+    if (n && cng_user_copyout(g, got, (unsigned long)n * sizeof *g) < 0)
         return -EFAULT;
     return n;
 }
@@ -387,9 +462,20 @@ static long reissue_cred(long nr, long a0, long a1, long a2, long a3, long a4,
     return cng_syscall6(a0, a1, a2, a3, a4, a5, nr);
 }
 
+/* A setter: run it against a copy of the set and publish the copy if it
+ * succeeded, so the set changes as one object or not at all. */
+#define CRED_SET(call)                                                        \
+    do {                                                                      \
+        struct cng_cred_write w;                                              \
+        struct cng_cred *c = cng_cred_write_begin(&w);                        \
+        long r_ = (call);                                                     \
+        cng_cred_write_end(&w, r_ >= 0);                                      \
+        return r_;                                                            \
+    } while (0)
+
 long cng_cred_handle(long nr, long a0, long a1, long a2, long a3, long a4,
                      long a5) {
-    struct cng_cred *c = &cng_g_cred;
+    const struct cng_cred *c = cng_g_cred;
 
     if (!cng_g_fake_id) {
         /* Reached only via an -R trampoline (these are trapped only under
@@ -435,8 +521,15 @@ long cng_cred_handle(long nr, long a0, long a1, long a2, long a3, long a4,
     case __NR_getresuid:
     case __NR_getresgid: {
         int u = (nr == __NR_getresuid);
-        unsigned r_ = u ? c->ruid : c->rgid, e_ = u ? c->euid : c->egid,
-                 s_ = u ? c->suid : c->sgid;
+        unsigned r_, e_, s_;
+        do {
+            unsigned seq = cng_cred_read_begin(&c);
+            r_ = u ? c->ruid : c->rgid;
+            e_ = u ? c->euid : c->egid;
+            s_ = u ? c->suid : c->sgid;
+            if (!cng_cred_read_retry(seq))
+                break;
+        } while (1);
         if (cng_user_copyout((void *)a0, &r_, sizeof r_) < 0 ||
             cng_user_copyout((void *)a1, &e_, sizeof e_) < 0 ||
             cng_user_copyout((void *)a2, &s_, sizeof s_) < 0)
@@ -444,25 +537,25 @@ long cng_cred_handle(long nr, long a0, long a1, long a2, long a3, long a4,
         return 0;
     }
     case __NR_setuid:
-        return do_setuid(c, (unsigned)a0);
+        CRED_SET(do_setuid(c, (unsigned)a0));
     case __NR_setgid:
-        return do_setgid(c, (unsigned)a0);
+        CRED_SET(do_setgid(c, (unsigned)a0));
     case __NR_setreuid:
-        return do_setreuid(c, (unsigned)a0, (unsigned)a1);
+        CRED_SET(do_setreuid(c, (unsigned)a0, (unsigned)a1));
     case __NR_setregid:
-        return do_setregid(c, (unsigned)a0, (unsigned)a1);
+        CRED_SET(do_setregid(c, (unsigned)a0, (unsigned)a1));
     case __NR_setresuid:
-        return do_setresuid(c, (unsigned)a0, (unsigned)a1, (unsigned)a2);
+        CRED_SET(do_setresuid(c, (unsigned)a0, (unsigned)a1, (unsigned)a2));
     case __NR_setresgid:
-        return do_setresgid(c, (unsigned)a0, (unsigned)a1, (unsigned)a2);
+        CRED_SET(do_setresgid(c, (unsigned)a0, (unsigned)a1, (unsigned)a2));
     case __NR_setfsuid:
-        return do_setfsuid(c, (unsigned)a0);
+        CRED_SET(do_setfsuid(c, (unsigned)a0));
     case __NR_setfsgid:
-        return do_setfsgid(c, (unsigned)a0);
+        CRED_SET(do_setfsgid(c, (unsigned)a0));
     case __NR_setgroups:
-        return do_setgroups(c, (int)a0, (const unsigned *)a1);
+        CRED_SET(do_setgroups(c, (int)a0, (const unsigned *)a1));
     case __NR_getgroups:
-        return do_getgroups(c, (int)a0, (unsigned *)a1);
+        return do_getgroups((int)a0, (unsigned *)a1);
     case __NR_capget:
         return do_capget((struct cap_header *)a0, (struct cap_data *)a1);
     case __NR_capset:

@@ -355,6 +355,11 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
      * directly), mirroring the emulated-execve path. */
     cng_cred_exec(host_prog);
 
+    /* The view is complete: publish it. From here every reader sees it through
+     * the sequence protocol and every chdir/chroot replaces it whole rather
+     * than editing it under them (path.c). g_fs itself is not looked at again. */
+    cng_g_fs = cng_fs_publish(&g_fs);
+
     /* The floor: every mapping that exists at this moment is ours or the
      * kernel's, because nothing of the guest has been mapped yet. An emulated
      * execve gives back what is NOT in it (the sweep in execve.c), so where
@@ -453,7 +458,7 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
                      cng_g_rewrite || cng_g_l2s || cng_g_no_ptrace ||
                      cng_g_shared_proc;
     if (want_xlate) {
-        int mrc = cng_install_monitor(&g_fs);
+        int mrc = cng_install_monitor(cng_g_fs);
         if (mrc < 0)
             cng_dprintf(2,
                         "chroot-ng: warning: could not install seccomp monitor "

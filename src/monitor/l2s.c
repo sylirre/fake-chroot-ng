@@ -310,8 +310,7 @@ static void l2s_unlock(long fd) {
  * never sees the store (getdents hides it, the path guard denies it).
  * Returns 0 or -errno. */
 static int l2s_store_dir(char *out, size_t sz) {
-    const char *root = cng_g_fs ? cng_g_fs->rootfs : "";
-    size_t n = cng_strlcpy(out, root, sz);
+    size_t n = cng_g_fs ? cng_fs_rootfs(out, sz) : cng_strlcpy(out, "", sz);
     if (n + 6 >= sz)
         return -ENAMETOOLONG;
     cng_strlcpy(out + n, "/.l2s", sz - n);

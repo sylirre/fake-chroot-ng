@@ -76,7 +76,20 @@ extern unsigned cng_g_fake_uid;          /* configured id = stat remap target */
 extern unsigned cng_g_fake_gid;          /* (fixed; live ids live in cng_g_cred) */
 extern unsigned cng_g_host_uid;          /* real invoking uid, captured at start */
 extern unsigned cng_g_host_gid;          /* real invoking gid */
-extern struct cng_cred cng_g_cred;       /* live credential set */
+/* The live credential set, published as one object: cng_g_cred points at the
+ * active copy, which is never written. A reader of more than one field takes
+ * the sequence and the pointer and re-checks the sequence after (a setter on
+ * another thread swapped the set meanwhile); a writer edits a copy and
+ * publishes it. See cred.c. */
+extern const struct cng_cred *cng_g_cred;
+unsigned cng_cred_read_begin(const struct cng_cred **c);
+int cng_cred_read_retry(unsigned s);
+struct cng_cred_write {
+    struct cng_cred *dst;
+    unsigned long mask;
+};
+struct cng_cred *cng_cred_write_begin(struct cng_cred_write *w);
+void cng_cred_write_end(struct cng_cred_write *w, int commit);
 extern const char *cng_g_exe_guest;
 
 /* Show setuid/setgid *executables* as owned by root (uid/gid 0), and — on exec —
@@ -120,7 +133,7 @@ long cng_cred_handle(long nr, long a0, long a1, long a2, long a3, long a4,
 /* True when a fake identity is active AND its effective uid is 0: root's DAC
  * bypass applies (ownership/mode changes and denied access() checks are faked). */
 static inline int cng_fake_root(void) {
-    return cng_g_fake_id && cng_g_cred.euid == 0;
+    return cng_g_fake_id && cng_g_cred->euid == 0;
 }
 
 /* Remap a host-side owner for stat results: a file owned by the real invoking

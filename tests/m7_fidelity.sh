@@ -239,3 +239,28 @@ elif guest_cc_report "$EXG/exeprobe" tests/guests/exeprobe.c; then
         "exe=$(pwd -P)/$EXG/exeprobe" "$out"
 fi
 rm -rf "$EXD"
+
+# --- process-wide emulated state read while another thread changes it -------
+# The kernel replaces a task's cwd, root and credentials as one object, so a
+# concurrent reader sees the old or the new. The emulation kept each as a struct
+# edited in place: a getcwd racing a chdir copied out half of one directory name
+# and half of another (measured: "/b" for a cwd that was "/a" or "/bbb...b"),
+# and a getgroups racing a setgroups read the new count with the old list. Each
+# is now published whole (path.c, cred.c), and the guest counts every answer
+# that was neither the old state nor the new: 15-25 torn cwds and ~3200 torn
+# group lists per run before, none after.
+VRD=$(mktemp -d)
+if ! guest_xlate_ready "view-race legs"; then
+    :
+elif guest_cc "$VRD/viewrace" tests/guests/viewrace.c -pthread; then
+    mkdir -p "$VRD/root/bin"; cp "$VRD/viewrace" "$VRD/root/bin/viewrace"
+    out=$(run_t 120 -R "$VRD/root" /bin/viewrace cwd 2>/dev/null)
+    check_contains "a getcwd racing a chdir sees one directory or the other" \
+        "viewrace cwd: writer=ok torn=0" "$out"
+    out=$(run_t 120 -R -u "$VRD/root" /bin/viewrace groups 2>/dev/null)
+    check_contains "a getgroups racing a setgroups sees one list or the other" \
+        "viewrace groups: writer=ok torn=0" "$out"
+else
+    skip "view-race legs: could not build tests/guests/viewrace.c with -pthread"
+fi
+rm -rf "$VRD"

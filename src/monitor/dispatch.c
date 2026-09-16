@@ -26,7 +26,7 @@
 
 #include <asm/unistd.h>
 
-struct cng_fs *cng_g_fs = 0;
+/* cng_g_fs, the published fs view, lives in path.c. */
 
 /* The fake-identity globals (cng_g_fake_id, cng_g_cred, ...) live in cred.c. */
 const char *cng_g_exe_guest = "/";
@@ -460,9 +460,14 @@ static int dent_present(long dirfd, const char *name, const char *buf,
 static long inject_dents(long dirfd, const char *gdir, char *buf, long used,
                          long cap) {
     long added = 0;
+    const struct cng_fs *v;
+    unsigned seq;
+again:
+    added = 0;
+    seq = cng_fs_read_begin(&v);
     /* Bind mount points whose parent is exactly this directory. */
-    for (int i = 0; i < cng_g_fs->nbinds; i++) {
-        const char *g = cng_g_fs->binds[i].guest;
+    for (int i = 0; i < v->nbinds; i++) {
+        const char *g = v->binds[i].guest;
         const char *slash = 0;
         for (const char *p = g; *p; p++)
             if (*p == '/')
@@ -487,8 +492,8 @@ static long inject_dents(long dirfd, const char *gdir, char *buf, long used,
         unsigned long long ino = 0xffffffffULL - (unsigned)i;
         unsigned char type = CNG_DT_DIR;
         char st[144];
-        if (CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD,
-                    (long)cng_g_fs->binds[i].host, (long)st, 0, 0, 0) == 0) {
+        if (CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, (long)v->binds[i].host,
+                    (long)st, 0, 0, 0) == 0) {
             ino = *(unsigned long long *)(st + 8);
             type = (unsigned char)((*(unsigned *)(st + STAT_MODE_OFF) >> 12) &
                                    0xf);
@@ -496,9 +501,13 @@ static long inject_dents(long dirfd, const char *gdir, char *buf, long used,
         long k = put_dent(buf, used + added, cap, base, ino, type,
                           0x7fffffff00000000LL + i);
         if (!k)
-            return added;
+            break;
         added += k;
     }
+    /* The binds walked above are the view's own; a chroot meanwhile has
+     * replaced it, and the entries were built from a table since compacted. */
+    if (cng_fs_read_retry(seq))
+        goto again;
     /* /dev whitelist, when this is the guest's own /dev (a -b for /dev makes
      * that directory's real contents authoritative, and cng_fs_translate would
      * have matched the bind first, so gdir would not be "/dev" here). */
@@ -613,12 +622,12 @@ int cng_resolve_lim(const char *path, int deref_final, char *out, size_t outsz,
         lim->err = -EXDEV;
         return -EXDEV;
     }
-    const char *base = scoped                  ? lim->scope
-                       : path[0] == '/'        ? "/"
-                       : cng_g_fs->cwd[0] != 0 ? cng_g_fs->cwd
-                                               : "/";
-    if (cng_strlcpy(canon, base, sizeof canon) >= sizeof canon ||
-        cng_strlcpy(rest, path, sizeof rest) >= sizeof rest)
+    /* The cwd is copied out under the view's protocol (a chdir on another
+     * thread replaces the view whole; it never edits the one being read). */
+    size_t bl = scoped            ? cng_strlcpy(canon, lim->scope, sizeof canon)
+                : path[0] == '/'  ? cng_strlcpy(canon, "/", sizeof canon)
+                                  : cng_fs_cwd(canon, sizeof canon);
+    if (bl >= sizeof canon || cng_strlcpy(rest, path, sizeof rest) >= sizeof rest)
         return -ENAMETOOLONG;
 
     /* "This must be a directory" — a trailing slash or "/." — which the walk
@@ -636,7 +645,7 @@ int cng_resolve_lim(const char *path, int deref_final, char *out, size_t outsz,
     int start = CNG_MOUNT_ROOTFS;
     if (lim && lim->no_xdev)
         start = mount_of(lim->xdev_base && lim->xdev_base[0] ? lim->xdev_base
-                                                             : base);
+                                                             : canon);
 
     int nlinks = 0;
     char *p = rest;
@@ -931,13 +940,23 @@ static int name_may_overlay(const char *name) {
         for (int i = 0; i < cng_dev_nnodes; i++)
             if (strcmp(name, cng_dev_nodes[i].name) == 0)
                 return 1;
-    for (int i = 0; cng_g_fs && i < cng_g_fs->nbinds; i++) {
-        const char *g = cng_g_fs->binds[i].guest;
-        const char *s = strrchr(g, '/');
-        if (s && s[1] && strcmp(s + 1, name) == 0)
-            return 1;
-    }
-    return 0;
+    if (!cng_g_fs)
+        return 0;
+    const struct cng_fs *v;
+    int hit;
+    do {
+        unsigned seq = cng_fs_read_begin(&v);
+        hit = 0;
+        for (int i = 0; i < v->nbinds && !hit; i++) {
+            const char *g = v->binds[i].guest;
+            const char *s = strrchr(g, '/');
+            if (s && s[1] && strcmp(s + 1, name) == 0)
+                hit = 1;
+        }
+        if (!cng_fs_read_retry(seq))
+            break;
+    } while (1);
+    return hit;
 }
 
 /* Is any bind in the view read-only? The :ro refusal is keyed on the resolved
@@ -951,10 +970,19 @@ static int name_may_overlay(const char *name) {
  * asked for :ro pays for one per relative name. Sessions without one, which is
  * the default, are untouched. */
 static int fs_has_ro(void) {
-    for (int i = 0; cng_g_fs && i < cng_g_fs->nbinds; i++)
-        if (cng_g_fs->binds[i].ro)
-            return 1;
-    return 0;
+    if (!cng_g_fs)
+        return 0;
+    const struct cng_fs *v;
+    int ro;
+    do {
+        unsigned seq = cng_fs_read_begin(&v);
+        ro = 0;
+        for (int i = 0; i < v->nbinds && !ro; i++)
+            ro = v->binds[i].ro != 0;
+        if (!cng_fs_read_retry(seq))
+            break;
+    } while (1);
+    return ro;
 }
 
 /* Is the first component of `path` all digits — the only shape that can name a
@@ -1065,13 +1093,26 @@ static int guest_under(const char *x, const char *base) {
  * pids), so a dirfd inside one is looking at a directory whose entries the
  * kernel and the guest do not agree about. */
 static int scope_overlay(const char *gdir) {
-    for (int i = 0; cng_g_fs && i < cng_g_fs->nbinds; i++) {
-        const char *bg = cng_g_fs->binds[i].guest;
-        /* Strictly below: a dirfd on the bind's own mount point already IS the
-         * bind — its host directory is the bound one — so everything the
-         * kernel can reach under it is what the guest sees there. Only a mount
-         * point *inside* the scope makes the two trees differ. */
-        if (guest_under(bg, gdir) && strcmp(bg, gdir) != 0)
+    if (cng_g_fs) {
+        const struct cng_fs *v;
+        int hit;
+        do {
+            unsigned seq = cng_fs_read_begin(&v);
+            hit = 0;
+            for (int i = 0; i < v->nbinds && !hit; i++) {
+                const char *bg = v->binds[i].guest;
+                /* Strictly below: a dirfd on the bind's own mount point
+                 * already IS the bind — its host directory is the bound one —
+                 * so everything the kernel can reach under it is what the
+                 * guest sees there. Only a mount point *inside* the scope
+                 * makes the two trees differ. */
+                if (guest_under(bg, gdir) && strcmp(bg, gdir) != 0)
+                    hit = 1;
+            }
+            if (!cng_fs_read_retry(seq))
+                break;
+        } while (1);
+        if (hit)
             return 1;
     }
     /* The zones, unlike a bind, are not a directory handed over whole: their
@@ -1091,7 +1132,7 @@ int cng_scope_needs_walk(long dirfd, char *gdir, size_t sz) {
     if (dfd == CNG_AT_FDCWD) {
         /* The virtual cwd, which is the guest's own answer — the host cwd is
          * only its translation and would have to be mapped back. */
-        if (cng_strlcpy(gdir, cng_g_fs->cwd[0] ? cng_g_fs->cwd : "/", sz) >= sz)
+        if (cng_fs_cwd(gdir, sz) >= sz)
             return 0;
     } else {
         char hdir[CNG_PATH_MAX];
@@ -1408,20 +1449,18 @@ static long proc_self_fixup(const char *canon, char *buf, unsigned long bufsz) {
         return -1;
 
     const char *val = 0;
-    char own[CNG_PROCREG_PATH + 1];
+    char own[CNG_PROCREG_PATH + 1], cwd[CNG_PATH_MAX];
+    if (rest[0] == 'c')
+        cng_fs_cwd(cwd, sizeof cwd);
     if (proc_pid_prefix(canon, 1)) { /* self / thread-self */
-        val = rest[0] == 'e' ? cng_g_exe_guest
-              : rest[0] == 'c' ? cng_g_fs->cwd
-                               : "/";
+        val = rest[0] == 'e' ? cng_g_exe_guest : rest[0] == 'c' ? cwd : "/";
     } else {
         const char *q = canon + 6;
         long pid = parse_int_run(&q);
         if (pid < 0)
             return -1; /* no process is numbered that high */
         if (pid == sys_getpid()) {
-            val = rest[0] == 'e' ? cng_g_exe_guest
-                  : rest[0] == 'c' ? cng_g_fs->cwd
-                                   : "/";
+            val = rest[0] == 'e' ? cng_g_exe_guest : rest[0] == 'c' ? cwd : "/";
         } else if (rest[0] == 'r') {
             val = "/"; /* every guest process shares this session's root */
         } else {
@@ -1572,7 +1611,9 @@ static int fd_is_rootfs_root(long fd) {
     if (n <= 0)
         return 0;
     hp[n] = '\0';
-    const char *root = cng_g_fs->rootfs[0] ? cng_g_fs->rootfs : "/";
+    char root[CNG_PATH_MAX];
+    if (!cng_fs_rootfs(root, sizeof root))
+        cng_strlcpy(root, "/", sizeof root);
     return strcmp(hp, root) == 0;
 }
 
@@ -4190,7 +4231,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             if (cng_fs_untranslate(cng_g_fs, hp, gc, sizeof gc) == 0 ||
                 cng_fs_abscanon(cng_g_fs, gp, gc, sizeof gc) == 0) {
                 cng_fs_set_cwd(cng_g_fs, gc);
-                cng_procreg_set_cwd(cng_g_fs->cwd); /* /proc/<pid>/cwd */
+                cng_fs_cwd(gc, sizeof gc);
+                cng_procreg_set_cwd(gc); /* /proc/<pid>/cwd */
             }
         }
         return r;
@@ -4206,7 +4248,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             if (sys_getcwd(hc, sizeof hc) > 0 &&
                 cng_fs_untranslate(cng_g_fs, hc, gc, sizeof gc) == 0) {
                 cng_fs_set_cwd(cng_g_fs, gc);
-                cng_procreg_set_cwd(cng_g_fs->cwd);
+                cng_fs_cwd(gc, sizeof gc);
+                cng_procreg_set_cwd(gc);
             }
         }
         return r;
@@ -4215,13 +4258,14 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_getcwd: {
         char *buf = (char *)a0;
         unsigned long size = (unsigned long)a1;
-        size_t len = strlen(cng_g_fs->cwd) + 1;
+        char cwd[CNG_PATH_MAX];
+        size_t len = cng_fs_cwd(cwd, sizeof cwd) + 1;
         /* ERANGE is decided before the buffer is touched, as the kernel does —
          * which also keeps the write probe's zeroing invisible: it only ever
          * runs immediately before the copy that overwrites it. */
         if (len > size)
             return -ERANGE;
-        if (cng_user_copyout(buf, cng_g_fs->cwd, len) < 0)
+        if (cng_user_copyout(buf, cwd, len) < 0)
             return -EFAULT;
         return (long)len;
     }

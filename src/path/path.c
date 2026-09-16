@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
 #include "cng/path.h"
+#include "cng/monitor.h" /* cng_g_fs */
 #include "cng/broker.h" /* cng_broker_env: no getenv in a freestanding build */
 #include "cng/procreg.h"
 #include "cng/rt.h"
@@ -290,6 +291,127 @@ static int canon_host_root(char *dst, size_t dstsz, const char *src) {
     return normalize_root(dst, dstsz, src);
 }
 
+/* ---- the published view ------------------------------------------------
+ *
+ * cng_g_fs is read by every path syscall and rewritten by chdir, fchdir and
+ * chroot, from any thread. The kernel takes its cwd and root under a lock and
+ * a path walk sees one or the other; here the cwd was a char array overwritten
+ * in place while another thread was copying it out, and a chroot compacted the
+ * bind table in place under a walk of it — a torn cwd is a different
+ * directory, and a torn bind a different host tree.
+ *
+ * So the view is published, not edited. Two buffers: the active one is what
+ * cng_g_fs points at and is never written; a writer copies it into the other,
+ * changes that, and swaps the pointer, bumping a sequence number after. A
+ * reader takes the sequence, the pointer, does its work, and re-reads the
+ * sequence: unchanged means no swap happened, so the buffer it read was the
+ * active one throughout and untouched. Changed means a swap did happen and a
+ * second writer may since have started on the buffer it read — the work is
+ * redone. Readers never wait; a writer waits only for another writer.
+ *
+ * The writer runs with every signal blocked. On the -R tier the dispatcher
+ * runs on the guest's own mask, and a guest handler delivered inside the copy
+ * that itself called chdir would take the lock its own thread holds. The lock
+ * is by tid, and one whose holder is gone — a fork child inherits it from the
+ * thread that held it in the parent — is taken over.
+ *
+ * A struct that is not one of the two buffers is private: the initial view
+ * cng_run builds before anything else runs, a self-test's own. Those are read
+ * and written in place, as before, and cng_fs_publish makes one the view. */
+struct cng_fs *cng_g_fs = 0;
+
+static struct cng_fs g_fs_view[2];
+static unsigned g_fs_seq;
+static long g_fs_owner;
+
+static int fs_live(const struct cng_fs *fs) {
+    return fs == &g_fs_view[0] || fs == &g_fs_view[1];
+}
+
+/* The used part of `src` into `dst`: the rootfs, the binds it has, the cwd.
+ * The buffers are static and start zeroed, so every string in them keeps a
+ * NUL within its bounds whatever prefix has been copied over it. */
+static void fs_copy(struct cng_fs *dst, const struct cng_fs *src) {
+    cng_strlcpy(dst->rootfs, src->rootfs, sizeof dst->rootfs);
+    for (int i = 0; i < src->nbinds; i++)
+        dst->binds[i] = src->binds[i];
+    dst->nbinds = src->nbinds;
+    cng_strlcpy(dst->cwd, src->cwd, sizeof dst->cwd);
+}
+
+unsigned cng_fs_read_begin(const struct cng_fs **fs) {
+    unsigned s = __atomic_load_n(&g_fs_seq, __ATOMIC_ACQUIRE);
+    *fs = __atomic_load_n(&cng_g_fs, __ATOMIC_ACQUIRE);
+    return s;
+}
+
+int cng_fs_read_retry(unsigned s) {
+    return __atomic_load_n(&g_fs_seq, __ATOMIC_ACQUIRE) != s;
+}
+
+struct cng_fs *cng_fs_publish(const struct cng_fs *src) {
+    fs_copy(&g_fs_view[0], src);
+    __atomic_store_n(&cng_g_fs, &g_fs_view[0], __ATOMIC_RELEASE);
+    return &g_fs_view[0];
+}
+
+struct fs_write {
+    struct cng_fs *dst;
+    unsigned long mask;
+};
+
+static struct cng_fs *fs_write_begin(struct fs_write *w) {
+    unsigned long all = ~0UL;
+    CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, &all, &w->mask, 8, 0, 0);
+    long me = sys_gettid();
+    for (int spin = 0;; spin++) {
+        long none = 0;
+        if (__atomic_compare_exchange_n(&g_fs_owner, &none, me, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            break;
+        if (spin > 100 && none &&
+            CNG_SYS(__NR_tgkill, sys_getpid(), none, 0, 0, 0, 0) == -ESRCH)
+            __atomic_compare_exchange_n(&g_fs_owner, &none, 0, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+        CNG_SYS(__NR_sched_yield, 0, 0, 0, 0, 0, 0);
+    }
+    const struct cng_fs *src = __atomic_load_n(&cng_g_fs, __ATOMIC_ACQUIRE);
+    w->dst = src == &g_fs_view[0] ? &g_fs_view[1] : &g_fs_view[0];
+    fs_copy(w->dst, src);
+    return w->dst;
+}
+
+static void fs_write_end(struct fs_write *w) {
+    __atomic_store_n(&cng_g_fs, w->dst, __ATOMIC_RELEASE);
+    __atomic_fetch_add(&g_fs_seq, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_fs_owner, 0, __ATOMIC_RELEASE);
+    CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, &w->mask, 0, 8, 0, 0);
+}
+
+size_t cng_fs_cwd(char *out, size_t sz) {
+    const struct cng_fs *v;
+    size_t n;
+    do {
+        unsigned s = cng_fs_read_begin(&v);
+        n = cng_strlcpy(out, v->cwd[0] ? v->cwd : "/", sz);
+        if (!cng_fs_read_retry(s))
+            break;
+    } while (1);
+    return n;
+}
+
+size_t cng_fs_rootfs(char *out, size_t sz) {
+    const struct cng_fs *v;
+    size_t n;
+    do {
+        unsigned s = cng_fs_read_begin(&v);
+        n = cng_strlcpy(out, v->rootfs, sz);
+        if (!cng_fs_read_retry(s))
+            break;
+    } while (1);
+    return n;
+}
+
 int cng_fs_init(struct cng_fs *fs, const char *rootfs) {
     memset(fs, 0, sizeof *fs);
     int r = canon_host_root(fs->rootfs, sizeof fs->rootfs, rootfs ? rootfs : "/");
@@ -323,7 +445,7 @@ int cng_fs_add_bind(struct cng_fs *fs, const char *guest, const char *host,
     return 0;
 }
 
-int cng_fs_host_ro(const struct cng_fs *fs, const char *host) {
+static int host_ro_1(const struct cng_fs *fs, const char *host) {
     int best = -1;
     size_t blen = 0;
     for (int i = 0; i < fs->nbinds; i++) {
@@ -336,6 +458,17 @@ int cng_fs_host_ro(const struct cng_fs *fs, const char *host) {
         }
     }
     return best >= 0 && fs->binds[best].ro;
+}
+
+int cng_fs_host_ro(const struct cng_fs *fs, const char *host) {
+    if (!fs_live(fs))
+        return host_ro_1(fs, host);
+    for (;;) {
+        unsigned s = cng_fs_read_begin(&fs);
+        int r = host_ro_1(fs, host);
+        if (!cng_fs_read_retry(s))
+            return r;
+    }
 }
 
 /* Rebase a canonical guest path onto a new root: under root "/a", "/a/b"
@@ -353,8 +486,8 @@ static int rebase(char *dst, size_t dstsz, const char *p, const char *root,
     return 1;
 }
 
-void cng_fs_chroot(struct cng_fs *fs, const char *guest_root,
-                   const char *host_root) {
+static void chroot_1(struct cng_fs *fs, const char *guest_root,
+                     const char *host_root) {
     char root[CNG_PATH_MAX];
     if (cng_path_canon(guest_root, root, sizeof root) < 0)
         return;
@@ -389,11 +522,32 @@ void cng_fs_chroot(struct cng_fs *fs, const char *guest_root,
     normalize_root(fs->rootfs, sizeof fs->rootfs, host_root);
 }
 
-void cng_fs_set_cwd(struct cng_fs *fs, const char *guest_cwd) {
+void cng_fs_chroot(struct cng_fs *fs, const char *guest_root,
+                   const char *host_root) {
+    if (!fs_live(fs)) {
+        chroot_1(fs, guest_root, host_root);
+        return;
+    }
+    struct fs_write w;
+    chroot_1(fs_write_begin(&w), guest_root, host_root);
+    fs_write_end(&w);
+}
+
+static void set_cwd_1(struct cng_fs *fs, const char *guest_cwd) {
     char canon[CNG_PATH_MAX];
     if (guest_cwd[0] == '/' &&
         cng_path_canon(guest_cwd, canon, sizeof canon) == 0)
         cng_strlcpy(fs->cwd, canon, sizeof fs->cwd);
+}
+
+void cng_fs_set_cwd(struct cng_fs *fs, const char *guest_cwd) {
+    if (!fs_live(fs)) {
+        set_cwd_1(fs, guest_cwd);
+        return;
+    }
+    struct fs_write w;
+    set_cwd_1(fs_write_begin(&w), guest_cwd);
+    fs_write_end(&w);
 }
 
 int cng_path_canon(const char *abs, char *out, size_t outsz) {
@@ -457,8 +611,8 @@ int cng_path_wants_dir(const char *path) {
     return want;
 }
 
-int cng_fs_abscanon(const struct cng_fs *fs, const char *path, char *out,
-                    size_t outsz) {
+static int abscanon_1(const struct cng_fs *fs, const char *path, char *out,
+                      size_t outsz) {
     /* Every copy here is checked, because a cut path is a different path — the
      * same reason cng_fs_translate_mnt refuses one rather than shortening it.
      * The joins were unchecked, and cng_strlcpy truncates: a cwd within a
@@ -489,17 +643,29 @@ int cng_fs_abscanon(const struct cng_fs *fs, const char *path, char *out,
     return cng_path_canon(tmp, out, outsz);
 }
 
+int cng_fs_abscanon(const struct cng_fs *fs, const char *path, char *out,
+                    size_t outsz) {
+    if (!fs_live(fs))
+        return abscanon_1(fs, path, out, outsz);
+    for (;;) {
+        unsigned s = cng_fs_read_begin(&fs);
+        int r = abscanon_1(fs, path, out, outsz);
+        if (!cng_fs_read_retry(s))
+            return r;
+    }
+}
+
 int cng_fs_translate(const struct cng_fs *fs, const char *path, char *out,
                      size_t outsz) {
     return cng_fs_translate_mnt(fs, path, out, outsz, 0);
 }
 
-int cng_fs_translate_mnt(const struct cng_fs *fs, const char *path, char *out,
-                         size_t outsz, int *mount_out) {
+static int translate_mnt_1(const struct cng_fs *fs, const char *path,
+                           char *out, size_t outsz, int *mount_out) {
     char canon[CNG_PATH_MAX];
     if (mount_out)
         *mount_out = CNG_MOUNT_ROOTFS;
-    if (cng_fs_abscanon(fs, path, canon, sizeof canon) < 0)
+    if (abscanon_1(fs, path, canon, sizeof canon) < 0)
         return -1;
 
     /* Longest-prefix bind match. */
@@ -570,6 +736,18 @@ int cng_fs_translate_mnt(const struct cng_fs *fs, const char *path, char *out,
     return 0;
 }
 
+int cng_fs_translate_mnt(const struct cng_fs *fs, const char *path, char *out,
+                         size_t outsz, int *mount_out) {
+    if (!fs_live(fs))
+        return translate_mnt_1(fs, path, out, outsz, mount_out);
+    for (;;) {
+        unsigned s = cng_fs_read_begin(&fs);
+        int r = translate_mnt_1(fs, path, out, outsz, mount_out);
+        if (!cng_fs_read_retry(s))
+            return r;
+    }
+}
+
 /* Does `host` start with the host prefix `pfx` (of length `len`) at a component
  * boundary? A zero-length prefix is the identity rootfs, which covers the whole
  * filesystem and so matches everything. */
@@ -578,8 +756,8 @@ static int host_under(const char *host, const char *pfx, size_t len) {
                         (host[len] == '/' || host[len] == '\0'));
 }
 
-int cng_fs_untranslate(const struct cng_fs *fs, const char *host, char *out,
-                       size_t outsz) {
+static int untranslate_1(const struct cng_fs *fs, const char *host, char *out,
+                         size_t outsz) {
     /* Longest host-prefix match, with the rootfs standing in the same contest as
      * the binds rather than being consulted only after they all miss.
      *
@@ -627,4 +805,16 @@ int cng_fs_untranslate(const struct cng_fs *fs, const char *host, char *out,
     if (out[0] == '\0')
         cng_strlcpy(out, "/", outsz);
     return 0;
+}
+
+int cng_fs_untranslate(const struct cng_fs *fs, const char *host, char *out,
+                       size_t outsz) {
+    if (!fs_live(fs))
+        return untranslate_1(fs, host, out, outsz);
+    for (;;) {
+        unsigned s = cng_fs_read_begin(&fs);
+        int r = untranslate_1(fs, host, out, outsz);
+        if (!cng_fs_read_retry(s))
+            return r;
+    }
 }

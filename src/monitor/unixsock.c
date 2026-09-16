@@ -64,9 +64,10 @@ int cng_g_share_abstract = 0;
 
 static int abs_tag_kind(char *out, char kind) {
     static const char hex[] = "0123456789abcdef";
-    u32 h = cng_broker_key_hash(cng_g_fs && cng_g_fs->rootfs[0]
-                                    ? cng_g_fs->rootfs
-                                    : "/");
+    char root[CNG_PATH_MAX];
+    if (!cng_g_fs || !cng_fs_rootfs(root, sizeof root))
+        cng_strlcpy(root, "/", sizeof root);
+    u32 h = cng_broker_key_hash(root);
     out[0] = 0x01;
     out[1] = 'c';
     out[2] = 'n';
@@ -268,7 +269,9 @@ static int sun_spell_root(struct cng_sun_xlate *x, const char *host) {
         mnt != CNG_MOUNT_ROOTFS || canon[0] != '/' || canon[1] == '\0' ||
         strcmp(again, host) != 0)
         return 0;
-    const char *root = cng_g_fs->rootfs[0] ? cng_g_fs->rootfs : "/";
+    char root[CNG_PATH_MAX];
+    if (!cng_fs_rootfs(root, sizeof root))
+        cng_strlcpy(root, "/", sizeof root);
     long rfd = sys_openat(CNG_AT_FDCWD, root,
                           CNG_O_PATH | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
     if (rfd < 0)

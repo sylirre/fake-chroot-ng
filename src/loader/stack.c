@@ -145,10 +145,16 @@ unsigned long cng_build_stack(int argc, char **argv, char **envp,
      * derives libc.secure from exactly this comparison. */
     unsigned long a_uid, a_euid, a_gid, a_egid;
     if (cng_g_fake_id) {
-        a_uid = cng_g_cred.ruid;
-        a_euid = cng_g_cred.euid;
-        a_gid = cng_g_cred.rgid;
-        a_egid = cng_g_cred.egid;
+        const struct cng_cred *c;
+        do {
+            unsigned s = cng_cred_read_begin(&c);
+            a_uid = c->ruid;
+            a_euid = c->euid;
+            a_gid = c->rgid;
+            a_egid = c->egid;
+            if (!cng_cred_read_retry(s))
+                break;
+        } while (1);
     } else {
         a_uid = auxval(host_auxv, AT_UID);
         a_euid = auxval(host_auxv, AT_EUID);

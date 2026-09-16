@@ -102,8 +102,9 @@ static unsigned broker_addr(struct cng_sockaddr_un *a, u32 hash, u64 sess) {
 /* This process's namespace: per-rootfs under --shared-proc (the same daemon
  * procreg.c fetches its table from), else per-invocation. */
 unsigned cng_broker_self_addr(struct cng_sockaddr_un *a) {
-    if (cng_g_shared_proc && cng_g_fs && cng_g_fs->rootfs[0])
-        return broker_addr(a, cng_broker_key_hash(cng_g_fs->rootfs), 0);
+    char root[CNG_PATH_MAX];
+    if (cng_g_shared_proc && cng_g_fs && cng_fs_rootfs(root, sizeof root))
+        return broker_addr(a, cng_broker_key_hash(root), 0);
     return broker_addr(a, 0, session());
 }
 
@@ -1163,8 +1164,19 @@ int cng_broker_open(struct cng_breq *q) {
     /* The daemon has no other way to know who is asking, and the permission
      * checks are against the guest's (possibly faked) identity, not the host's. */
     q->pid = (s32)sys_getpid();
-    q->uid = cng_g_fake_id ? cng_g_cred.euid : (u32)sys_geteuid();
-    q->gid = cng_g_fake_id ? cng_g_cred.egid : (u32)sys_getegid();
+    if (cng_g_fake_id) {
+        const struct cng_cred *c;
+        do {
+            unsigned s = cng_cred_read_begin(&c);
+            q->uid = c->euid;
+            q->gid = c->egid;
+            if (!cng_cred_read_retry(s))
+                break;
+        } while (1);
+    } else {
+        q->uid = (u32)sys_geteuid();
+        q->gid = (u32)sys_getegid();
+    }
     struct cng_sockaddr_un a;
     unsigned al = ipc_addr(&a);
     return broker_connect(&a, al);
