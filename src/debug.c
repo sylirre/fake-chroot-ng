@@ -2420,7 +2420,15 @@ int cng_cmd_exectest(int argc, char **argv, char **envp, unsigned long *auxv) {
      * would, then report whether the emulation undid all three — the reset
      * happens at the commit point, so it is only observable from here, before
      * we enter the new program. */
-    int tid = 0, have_timer = 0, have_rseq = 0;
+    /* Timers: a hundred through the dispatcher — past the 64 the old record
+     * held — and one raw, which the emulation never saw handed out and which
+     * only the kernel's own list (/proc/self/timers) can find. Under qemu-user
+     * the ids in that list are not the ones a guest holds, and the emulator
+     * allows a process 32 timers in all, so the count actually armed is
+     * reported and the full hundred, like the raw one, is asserted on a
+     * native host (tests/m6_execve.sh). */
+    enum { NTIMERS = 100 };
+    int tid[NTIMERS], tid_raw = 0, ntimers = 0, have_raw = 0, have_rseq = 0;
     /* struct rseq: 32 bytes, 32-aligned; the signature is any word. */
     static struct {
         unsigned int cpu_id_start, cpu_id;
@@ -2433,10 +2441,13 @@ int cng_cmd_exectest(int argc, char **argv, char **envp, unsigned long *auxv) {
             cng_g_brk0 = (unsigned long)b;
             CNG_SYS(__NR_brk, b + (1 << 20), 0, 0, 0, 0, 0);
         }
-        /* Through the dispatcher, which is where the id gets recorded — a raw
-         * syscall here would be a timer the emulation never saw. */
-        have_timer = cng_dispatch(__NR_timer_create, 0 /*CLOCK_REALTIME*/, 0,
-                                  (long)&tid, 0, 0, 0, 1) == 0;
+        /* ...and one raw first: a timer the emulation never saw. */
+        have_raw = CNG_SYS(__NR_timer_create, 0, 0, (long)&tid_raw, 0, 0, 0) == 0;
+        /* Through the dispatcher, which is where the id gets recorded. */
+        while (ntimers < NTIMERS &&
+               cng_dispatch(__NR_timer_create, 0 /*CLOCK_REALTIME*/, 0,
+                            (long)&tid[ntimers], 0, 0, 0, 1) == 0)
+            ntimers++;
         /* Likewise the rseq area, which is recorded the same way. A kernel or
          * emulator without rseq (qemu-user answers ENOSYS) leaves nothing to
          * drop, and that is not a failure. */
@@ -2449,11 +2460,14 @@ int cng_cmd_exectest(int argc, char **argv, char **envp, unsigned long *auxv) {
     cng_emulate_execve(&uc, dirfd, gpath, gargv, envp, xflags);
     if (probe_reset) {
         long b = CNG_SYS(__NR_brk, 0, 0, 0, 0, 0, 0);
-        /* The timer is gone when deleting it again is refused. Counting
+        /* A timer is gone when deleting it again is refused. Counting
          * /proc/self/timers would answer a different question under an emulator,
          * which keeps its own timer table. */
-        int gone = have_timer &&
-                   CNG_SYS(__NR_timer_delete, tid, 0, 0, 0, 0, 0) < 0;
+        int gone = ntimers > 0;
+        for (int i = 0; i < ntimers; i++)
+            gone &= CNG_SYS(__NR_timer_delete, tid[i], 0, 0, 0, 0, 0) < 0;
+        int raw_gone = have_raw &&
+                       CNG_SYS(__NR_timer_delete, tid_raw, 0, 0, 0, 0, 0) < 0;
         /* The registration is gone when a fresh area can be registered: the
          * kernel refuses a second registration (EINVAL for another area, EBUSY
          * for the same) for as long as the first stands. */
@@ -2461,11 +2475,11 @@ int cng_cmd_exectest(int argc, char **argv, char **envp, unsigned long *auxv) {
                         CNG_SYS(__NR_rseq, (long)&rs_new, 32, 0, 0x53053053,
                                 0, 0) == 0;
         int brk_back = ((unsigned long)b == cng_g_brk0);
-        int ok = brk_back && (!have_timer || gone) && (!have_rseq || rseq_gone);
+        int ok = brk_back && gone && (!have_rseq || rseq_gone);
         cng_dprintf(1,
-                    "execreset: brk_back=%d timer_created=%d timer_gone=%d "
-                    "rseq_registered=%d rseq_gone=%d -> %s\n",
-                    brk_back, have_timer, gone, have_rseq, rseq_gone,
+                    "execreset: brk_back=%d timers_created=%d timers_gone=%d "
+                    "unseen_timer_gone=%d rseq_registered=%d rseq_gone=%d -> %s\n",
+                    brk_back, ntimers, gone, raw_gone, have_rseq, rseq_gone,
                     ok ? "OK" : "FAIL");
         return ok ? 0 : 1;
     }

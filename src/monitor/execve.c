@@ -38,6 +38,7 @@
 #include "cng/rt.h"
 #include "cng/shm.h"
 #include "cng/syscall.h"
+#include "cng/tab.h"
 #include "cng/uapi.h"
 #include "cng/ucontext.h"
 
@@ -347,28 +348,101 @@ static long exec_args_take(struct exec_args *a, const char *path, char **argv,
 unsigned long cng_g_brk0 = 0;
 
 /* POSIX timers the guest created. There is no syscall that enumerates a
- * process's timers, and the id the guest was handed is the only handle there is,
- * so they are recorded as they are created (dispatch traps timer_create and
- * timer_delete for exactly this) and deleted at the next exec. /proc/self/timers
- * lists them too, but the number in that file is the kernel's own id, which is
- * not what a guest under an emulator holds — recording what we handed out is
- * both simpler and true on every tier. Best-effort: a full table just means a
- * timer outlives the exec, as it did before. */
-#define CNG_TIMERS_MAX 64
-static int g_timers[CNG_TIMERS_MAX];
-static int g_ntimers;
+ * process's timers, so they are deleted at the next exec from two records:
+ *
+ *  - /proc/self/timers, the kernel's own list, read at the exec. Complete on
+ *    every real kernel, whatever was or was not seen being created;
+ *  - the ids the guest was handed, recorded as they are handed out (dispatch
+ *    traps timer_create and timer_delete for exactly this). Under qemu-user
+ *    the id a guest holds is the emulator's own (a magic word over an index),
+ *    not the number in that file, so the file's ids cannot be deleted there
+ *    and this record is what does it.
+ *
+ * The record was a 64-entry array with a plain count, so the 65th timer
+ * outlived the exec and two threads creating timers at once could lose one
+ * another's entry. It is now a table that grows (cng_tab) whose slots are
+ * claimed lock-free: `live` is the claim and the publication, `id` is written
+ * between the two. A forget takes any one live slot carrying the id — two
+ * slots can carry the same id when the kernel reuses one straight after a
+ * delete, and a forget racing the new create may then remove either; one
+ * record with that id remains, and the exec deletes what it names, which is
+ * the timer that is live. */
+struct timer_rec {
+    int id;
+    int live;
+};
+
+static struct cng_tab g_timers = CNG_TAB_INIT(struct timer_rec);
 
 void cng_timer_note(int id) {
-    if (g_ntimers < CNG_TIMERS_MAX)
-        g_timers[g_ntimers++] = id;
+    for (unsigned long i = 0;; i++) {
+        struct timer_rec *r = cng_tab_at(&g_timers, i);
+        if (!r)
+            return; /* no page for the record: /proc/self/timers still has it */
+        int expect = 0;
+        if (__atomic_load_n(&r->live, __ATOMIC_RELAXED) ||
+            !__atomic_compare_exchange_n(&r->live, &expect, 1, 0,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            continue;
+        r->id = id;
+        __atomic_store_n(&r->live, 2, __ATOMIC_RELEASE); /* id is in place */
+        return;
+    }
 }
 
 void cng_timer_forget(int id) {
-    for (int i = 0; i < g_ntimers; i++)
-        if (g_timers[i] == id) {
-            g_timers[i] = g_timers[--g_ntimers];
+    struct cng_tab_iter it;
+    for (struct timer_rec *r = cng_tab_first(&g_timers, &it); r;
+         r = cng_tab_next(&g_timers, &it)) {
+        int two = 2;
+        if (__atomic_load_n(&r->live, __ATOMIC_ACQUIRE) != 2 || r->id != id)
+            continue;
+        if (__atomic_compare_exchange_n(&r->live, &two, 0, 0, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_RELAXED))
             return;
+    }
+}
+
+/* Delete every timer the kernel lists for this process, then every one the
+ * record still holds. Each line of /proc/self/timers that names one reads
+ * "ID: <n>"; nothing else in the file is needed. */
+static void cng_timers_exec_reset(void) {
+    long fd = sys_openat(CNG_AT_FDCWD, "/proc/self/timers",
+                         CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    if (fd >= 0) {
+        char buf[1024];
+        long n, keep = 0;
+        while ((n = sys_read((int)fd, buf + keep, sizeof buf - 1 - (size_t)keep)) >
+               0) {
+            n += keep;
+            buf[n] = '\0';
+            char *p = buf, *nl;
+            while ((nl = strchr(p, '\n'))) {
+                *nl = '\0';
+                if (!strncmp(p, "ID: ", 4)) {
+                    long id = 0;
+                    for (const char *d = p + 4; *d >= '0' && *d <= '9'; d++)
+                        id = id * 10 + (*d - '0');
+                    CNG_SYS(__NR_timer_delete, id, 0, 0, 0, 0, 0);
+                }
+                p = nl + 1;
+            }
+            keep = (long)strlen(p);
+            if (keep >= (long)sizeof buf - 1)
+                keep = 0; /* a line longer than the buffer: not one of ours */
+            else
+                memmove(buf, p, (size_t)keep);
         }
+        sys_close((int)fd);
+    }
+    struct cng_tab_iter it;
+    for (struct timer_rec *r = cng_tab_first(&g_timers, &it); r;
+         r = cng_tab_next(&g_timers, &it)) {
+        if (__atomic_load_n(&r->live, __ATOMIC_ACQUIRE) != 2)
+            continue;
+        CNG_SYS(__NR_timer_delete, r->id, 0, 0, 0, 0, 0);
+        __atomic_store_n(&r->live, 0, __ATOMIC_RELEASE);
+    }
 }
 
 /* rseq registrations, for the same reason. A real execve drops the thread's
@@ -781,9 +855,7 @@ void cng_exec_generation(const struct cng_loaded *prog,
  * brk simply leaves the heap where it was. */
 static void cng_exec_reset(void) {
     cng_rewrite_lazy_reset(); /* the sites those pools branch from are gone */
-    for (int i = 0; i < g_ntimers; i++)
-        CNG_SYS(__NR_timer_delete, g_timers[i], 0, 0, 0, 0, 0);
-    g_ntimers = 0;
+    cng_timers_exec_reset();
     CNG_SYS(__NR_set_tid_address, 0, 0, 0, 0, 0, 0);
     /* Android blocks set_robust_list (measured: SIGSYS from the zygote filter on
      * Android 13), and a syscall we know is refused is not one to issue — the

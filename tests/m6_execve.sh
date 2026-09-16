@@ -208,11 +208,22 @@ if guest_cc_report "$ER/hello" tests/guests/hello.c; then
     # ptrace tracee died at its exec stop on a real kernel). -R arms all three
     # before the emulation and reports afterwards. rseq is ENOSYS under
     # qemu-user, so that part is only measured on a native host.
+    # The timers are a hundred armed through the dispatcher — the record used
+    # to hold 64, and the 65th outlived the exec — plus one armed raw, which the
+    # emulation never saw handed out: only the kernel's own list
+    # (/proc/self/timers) finds that one. Under qemu-user the ids in that list
+    # are the emulator's, not the guest's, and the emulator allows 32 timers in
+    # all, so the hundred and the unseen one are asserted natively.
     out=$(exectest -R /hello 2>&1); rc=$?
     check "exec resets the state that would have died with the image" 0 $rc
-    check_contains "the heap is wound back and the timer deleted" \
-        "execreset: brk_back=1 timer_created=1 timer_gone=1" "$out"
+    check_contains "the heap is wound back and every recorded timer deleted" \
+        "execreset: brk_back=1 timers_created=" "$out"
+    check_contains "...every one of them" "timers_gone=1" "$out"
     if [ "$CNG_NATIVE" = 1 ]; then
+        check_contains "...a hundred of them, past the old record's 64" \
+            "timers_created=100" "$out"
+        check_contains "...a timer the emulation never saw handed out too" \
+            "unseen_timer_gone=1" "$out"
         check_contains "...and the rseq area unregistered" \
             "rseq_registered=1 rseq_gone=1 -> OK" "$out"
     else
