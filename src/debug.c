@@ -7013,6 +7013,70 @@ int cng_cmd_shmtest(int argc, char **argv, char **envp, unsigned long *auxv) {
         fails += !(ok && ok2 && ok3);
     }
 
+    /* 0e) A short send completed against a peer that has gone must answer -1
+     *     and nothing else. The first sendmsg carries MSG_NOSIGNAL; the
+     *     completion of a short one used a plain write(2), which is exactly
+     *     where a dead peer raises SIGPIPE — and SIGPIPE's default action is
+     *     the death of the process, the daemon included.
+     *
+     *     A stream socket takes a send short only when a signal lands after
+     *     some of it has gone, so that is staged: a sender with the smallest
+     *     buffer the kernel allows and a payload many times larger. The peer
+     *     waits until bytes have reached it — the sender is then blocked
+     *     mid-send — and sends SIGUSR1, which makes that sendmsg return the
+     *     part that went. The sender is now in the completion. The peer then
+     *     reads a little, so the completion's own write makes progress, and
+     *     shuts its reading side down: that write returns what it managed
+     *     and the NEXT one meets the dead peer with nothing sent — precisely
+     *     the call that raises SIGPIPE. (A close with unread bytes queued
+     *     answers ECONNRESET instead, and raises nothing, which is why the
+     *     drain and the shutdown are both needed.) Before the fix the test
+     *     binary died here. */
+    {
+        int sv[2] = {-1, -1};
+        int ok = CNG_SYS(__NR_socketpair, CNG_AF_UNIX, CNG_SOCK_STREAM, 0,
+                         (long)sv, 0, 0) == 0;
+        int one = 1;
+        ok = ok && CNG_SYS(__NR_setsockopt, sv[1], CNG_SOL_SOCKET,
+                           CNG_SO_SNDBUF, &one, sizeof one, 0) == 0;
+        long kid = ok ? sys_fork() : -1;
+        if (kid == 0) {
+            sys_close(sv[1]);
+            struct cng_pollfd pf = {sv[0], CNG_POLLIN, 0};
+            struct cng_timespec lim = {5, 0};
+            CNG_SYS(__NR_ppoll, &pf, 1, &lim, 0, 8 /*sigsetsize*/, 0);
+            CNG_SYS(__NR_kill, sys_getppid(), CNG_SIGUSR1, 0, 0, 0, 0);
+            struct cng_timespec nap = {0, 50 * 1000 * 1000};
+            CNG_SYS(__NR_nanosleep, &nap, 0, 0, 0, 0, 0);
+            char sink[4096];
+            for (long got = 0; got < 16384;) {
+                long n = sys_read(sv[0], sink, sizeof sink);
+                if (n <= 0)
+                    break;
+                got += n;
+            }
+            CNG_SYS(__NR_shutdown, sv[0], 0 /*SHUT_RD*/, 0, 0, 0, 0);
+            CNG_SYS(__NR_nanosleep, &nap, 0, 0, 0, 0, 0);
+            sys_close(sv[0]);
+            sys_exit_group(0);
+        }
+        if (sv[0] >= 0)
+            sys_close(sv[0]);
+        ok = ok && kid > 0 && cng_sig_install(CNG_SIGUSR1, sigtest_handler) == 0;
+        g_sig_ran = 0;
+        static char big[256 * 1024];
+        long r = ok ? cng_broker_send(sv[1], big, sizeof big, -1) : 0;
+        int st = 0;
+        if (kid > 0)
+            sys_wait4((int)kid, &st, 0, 0);
+        if (sv[1] >= 0)
+            sys_close(sv[1]);
+        ok = ok && r == -1 && g_sig_ran;
+        cng_dprintf(1, "shmtest short send to a gone peer is -1, not SIGPIPE -> %s\n",
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
 
     /* 1) create, attach, and see the memory. */
     long id = shm_call(__NR_shmget, 0 /*IPC_PRIVATE*/, SHMT_SZ,

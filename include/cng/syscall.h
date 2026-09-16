@@ -67,6 +67,9 @@ static inline long sys_munmap(void *a, size_t l) {
 static inline long sys_getpid(void) {
     return CNG_SYS(__NR_getpid, 0, 0, 0, 0, 0, 0);
 }
+static inline long sys_getppid(void) {
+    return CNG_SYS(__NR_getppid, 0, 0, 0, 0, 0, 0);
+}
 static inline long sys_getcwd(char *buf, unsigned long size) {
     return CNG_SYS(__NR_getcwd, buf, size, 0, 0, 0, 0);
 }

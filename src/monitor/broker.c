@@ -231,13 +231,13 @@ int cng_broker_send(int sock, const void *data, unsigned len, int fd) {
         return -1;
     /* A stream socket may take less than the whole payload; on a local socket
      * with an empty buffer it never does, but a short write must not desync the
-     * protocol. The ancillary fd went with the first byte either way. */
-    while ((unsigned)r < len) {
-        long w = cng_write_all(sock, (const char *)data + r, len - (unsigned)r);
-        if (w <= 0)
-            return -1;
-        r += w;
-    }
+     * protocol. The ancillary fd went with the first byte either way. The rest
+     * goes with MSG_NOSIGNAL like the first part did: this completion used a
+     * plain write(2), so the one rare path through here could raise the SIGPIPE
+     * the comment above promises never arrives. */
+    if ((unsigned)r < len &&
+        cng_broker_write_full(sock, (const char *)data + r, len - (unsigned)r) != 0)
+        return -1;
     return 0;
 }
 

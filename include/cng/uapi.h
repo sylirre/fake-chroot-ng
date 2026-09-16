@@ -165,6 +165,7 @@ struct cng_open_how {
 #define CNG_SO_RCVTIMEO  20 /* SO_RCVTIMEO_OLD: takes the 64-bit timeval */
 #define CNG_SO_SNDTIMEO  21 /* SO_SNDTIMEO_OLD, likewise */
 #define CNG_SO_PEERCRED  17
+#define CNG_SO_SNDBUF    7
 #define CNG_SO_DOMAIN    39 /* the socket's own address family, in one call */
 #define CNG_SCM_RIGHTS   1
 #define CNG_MSG_NOSIGNAL 0x4000
