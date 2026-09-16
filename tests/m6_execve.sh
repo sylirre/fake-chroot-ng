@@ -475,6 +475,45 @@ else
 fi
 rm -rf "$ECD"
 
+# ...and the same chain by a program with far more mappings than one sweep
+# pass holds. The sweep collects a table's worth of victims per walk of
+# /proc/self/maps and walks again while a pass fills it; the passes were capped
+# at eight of forty-eight, so the 385th reclaimable mapping and everything after
+# it survived every exec — a JIT, a program that dlopens by the hundred, an
+# allocator that reserves by the arena. This guest maps 1500 pages that cannot
+# merge (3001 VMAs with the gaps between them) and execs itself six times;
+# under the cap that leaked 68 MB, against a kernel run that gains nothing.
+ECM=$(mktemp -d)
+if ! guest_xlate_ready "many-mapping exec chain"; then
+    :
+elif ! guest_cc_report "$ECM/manymaps" tests/guests/manymaps.c; then
+    :
+elif elf_has_interp "$ECM/manymaps"; then
+    skip "many-mapping exec chain: needs a static guest (the dynamic form's binds are covered below)"
+else
+    em_k=$(emu_t 90 "$ECM/manymaps" 1500 6 2>/dev/null)
+    em_g=$(CNG_EXEC_RECLAIM_FORCE=1 run_t 90 -R "$ECM" /manymaps 1500 6 2>/dev/null)
+    case "$em_k$em_g" in
+    *growth_kb=*growth_kb=*)
+        em_kn=${em_k##*growth_kb=}
+        em_gn=${em_g##*growth_kb=}
+        if [ "$em_gn" -le $((em_kn + 8192)) ]; then
+            pass=$((pass + 1))
+            printf '  ok   an exec chain gives back more mappings than one pass holds (%s kB over 6, kernel %s kB)\n' \
+                "$em_gn" "$em_kn"
+        else
+            fail=$((fail + 1))
+            printf '  FAIL an exec chain leaks past the sweep ceiling: %s kB over 6 execs, kernel %s kB\n' \
+                "$em_gn" "$em_kn"
+        fi
+        ;;
+    *)
+        skip "many-mapping exec chain: no reference run ($(echo "$em_k$em_g" | tr '\n' '|'))"
+        ;;
+    esac
+fi
+rm -rf "$ECM"
+
 # ...and the same chain with a guest whose OWN ld.so maps its libraries. That
 # memory is not the loader's and no recorded extent describes it, so it is the
 # half the sweep exists for — and the half that used to hurt. Measured on an

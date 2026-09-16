@@ -630,9 +630,17 @@ void cng_exec_reap(void) {
  *
  * The victims are collected first and unmapped after, rather than unmapped as
  * the walk finds them: /proc/self/maps is a seq_file over the live VMA tree,
- * and editing that tree mid-iteration is not something to ask of it. */
-#define SWEEP_MAX  48 /* victims per pass */
-#define SWEEP_PASS 8  /* passes before we stop, however much is left */
+ * and editing that tree mid-iteration is not something to ask of it. A walk
+ * that fills the table is followed by another, and another, until one runs to
+ * the end — there is no ceiling on the passes. There was one: eight passes of
+ * forty-eight, and the 385th reclaimable mapping and everything after it
+ * survived the exec. A JIT, a program that dlopens by the hundred, an
+ * allocator that reserves by the arena, all run through that many, and what
+ * they left behind accumulated per generation exactly as before the sweep
+ * existed. The one thing that ends the loop early is a pass that gave nothing
+ * back: an munmap the kernel refuses is refused on the next pass too, and
+ * walking it again would be walking forever. */
+#define SWEEP_MAX 256 /* victims per pass: 4 KiB of the scratch stack */
 
 struct sweep_ctx {
     unsigned long sp;
@@ -688,23 +696,27 @@ static void exec_sweep(void) {
     }
     struct sweep_ctx s;
     s.sp = (unsigned long)&s;
-    int total = 0;
+    int total = 0, passes = 0;
     unsigned long bytes = 0;
-    for (int pass = 0; pass < SWEEP_PASS; pass++) {
+    for (;;) {
         s.n = 0;
         if (cng_maps_walk(sweep_seen, &s) < 0)
             break; /* no maps: nothing is known, so nothing is unmapped */
+        passes++;
+        int gone = 0;
         for (int i = 0; i < s.n; i++) {
-            sys_munmap((void *)s.hit[i].lo, s.hit[i].len);
+            if (sys_munmap((void *)s.hit[i].lo, s.hit[i].len) != 0)
+                continue;
             bytes += s.hit[i].len;
+            gone++;
         }
-        total += s.n;
-        if (s.n < SWEEP_MAX)
-            break; /* the walk ran to the end: there is nothing more */
+        total += gone;
+        if (s.n < SWEEP_MAX || !gone)
+            break; /* the walk ran to the end, or the rest will not go */
     }
     if (cng_g_debug && total)
-        cng_dprintf(2, "[cng] exec: swept %d mapping(s), %lu kB\n", total,
-                    bytes >> 10);
+        cng_dprintf(2, "[cng] exec: swept %d mapping(s), %lu kB, %d pass(es)\n",
+                    total, bytes >> 10, passes);
 }
 
 void cng_exec_generation(const struct cng_loaded *prog,
