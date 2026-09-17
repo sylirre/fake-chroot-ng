@@ -271,8 +271,10 @@ static int proc_magic(char *cur, size_t sz) {
 
     /* "fd[/<n>]": the magic path *is* the host path — the kernel takes it
      * straight to the open file description, including the anonymous and
-     * deleted files no re-rooted target could ever name. Any trailing
-     * components (a directory fd) ride along, as they do for a real dirfd.
+     * deleted files no re-rooted target could ever name. What follows a
+     * directory's link is not the kernel's to walk from there, though: the
+     * walk (cng_resolve_lim) expands the link into the directory's guest name
+     * and goes on itself, as it does for a real dirfd.
      *
      * The directory itself counts, and not only for symmetry: it used to fall
      * through to cng_fs_translate, which answered it out of the /proc zone —
@@ -375,6 +377,7 @@ static int dev_magic(char *cur, size_t sz) {
 }
 
 static int dirfd_host(int dfd, char *hdir, size_t sz);
+static int host_dir_guest(const char *hdir, char *gdir, size_t sz);
 
 /* A guest path the rootfs/bind map cannot express inside CNG_PATH_MAX. Not a
  * path — never dereferenced — so that a caller which forgets to test for it
@@ -387,6 +390,21 @@ static int dirfd_host(int dfd, char *hdir, size_t sz);
  * an unlink deletes the wrong entry and an O_CREAT makes the wrong one. */
 #define XLATE_TOOLONG ((const char *)8)
 #define XLATE_AT_LONG (-2) /* xlate_at's spelling of the same verdict */
+/* A name relative to a directory the guest has no name for (host_dir_guest):
+ * the resolution cannot be performed, and the syscall answers -EACCES — the
+ * guest may not search a directory that is not in its view. Not a path either,
+ * for the same reason as above. */
+#define XLATE_OUTSIDE ((const char *)16)
+#define XLATE_AT_OUTSIDE (-3) /* xlate_at's spelling of the same verdict */
+
+/* The two refusals a translation can come back as, and the errno each earns.
+ * Every caller asks these of what xlate() handed it before using it as a path. */
+static int xlate_bad(const char *p) {
+    return p == XLATE_TOOLONG || p == XLATE_OUTSIDE;
+}
+static long xlate_errno(const char *p) {
+    return p == XLATE_OUTSIDE ? -EACCES : -ENAMETOOLONG;
+}
 
 /* The canonical GUEST directory an open fd names, for the getdents64 overlay
  * splicing below. Returns 0/-1. */
@@ -725,7 +743,7 @@ int cng_resolve_lim(const char *path, int deref_final, char *out, size_t outsz,
          * verdict rather than the path), an fd link when it is one rather than
          * the directory they live in. */
         int magic_link = magic == PROC_MAGIC_GUEST ||
-                         (magic == PROC_MAGIC_HOST && !(last && proc_fd_dir(canon)));
+                         (magic == PROC_MAGIC_HOST && !proc_fd_dir(canon));
         if (magic_link && lim) {
             if (lim->no_magiclinks || lim->no_symlinks) {
                 lim->err = -ELOOP;
@@ -741,8 +759,64 @@ int cng_resolve_lim(const char *path, int deref_final, char *out, size_t outsz,
             }
         }
         if (magic == PROC_MAGIC_HOST) {
-            /* The magic path IS the host path. Any components left ride along,
-             * as they do for a real dirfd. */
+            /* The magic path IS the host path: the kernel takes it straight to
+             * the open file description, anonymous and deleted files included.
+             *
+             * Not so for what may follow it. An fd link that names a directory
+             * is a directory fd in every respect, and the components after it
+             * used to "ride along, as they do for a real dirfd" — which is to
+             * say the kernel walked them from that directory with no rootfs in
+             * the way: "/proc/self/fd/<dirfd>/../../etc/passwd" climbed out of
+             * the rootfs, and a symlink under the directory was followed from
+             * the host root. Both are what the walk exists to prevent, and a
+             * real dirfd has had them contained since xlate_at. So the link is
+             * expanded the way exe/cwd/root are: the directory's own guest
+             * name replaces it and the walk goes on from there. A directory
+             * the guest has no name for (host_dir_guest) is refused whether
+             * anything follows or not — reopening it would hand the guest a
+             * dirfd it may not hold, the reason cng_fd_admit closes such a
+             * descriptor on arrival. A file, or a description with no path at
+             * all (a pipe, a memfd), is handed over as it stands: the I/O is
+             * the descriptor's own, and a name below a file is the kernel's
+             * ENOTDIR either way. */
+            if (proc_fd_dir(canon)) {
+                /* The fd directory itself, which is a directory of the /proc
+                 * zone: an entry below it is the link, and is judged when the
+                 * walk reaches it. (Only at the end of the name is the
+                 * directory the answer, and then as the host path: --no-proc
+                 * has switched the zone off in cng_fs_translate, and /dev/fd
+                 * still has to resolve.) */
+                if (!last)
+                    continue;
+            } else if (!last || deref_final || want_dir) {
+                /* The link is about to be followed. (Not followed — O_NOFOLLOW
+                 * or lstat on the link itself — it is the kernel's symlink to
+                 * describe or refuse, and nothing is reached through it.) */
+                char real[CNG_PATH_MAX], gdir[CNG_PATH_MAX];
+                long rn = sys_readlinkat(CNG_AT_FDCWD, canon, real,
+                                         sizeof real - 1);
+                if (rn > 0 && real[0] == '/') {
+                    real[rn] = '\0';
+                    char st[STAT_BUF_SIZE];
+                    if (CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, (long)canon,
+                                (long)st, 0, 0, 0) == 0 &&
+                        (*(unsigned *)(st + STAT_MODE_OFF) & CNG_S_IFMT) ==
+                            CNG_S_IFDIR) {
+                        if (host_dir_guest(real, gdir, sizeof gdir) != 0)
+                            return -EACCES;
+                        if (!last) {
+                            if (++nlinks > 40)
+                                return -ELOOP;
+                            if (splice_rest(rest, sizeof rest, gdir, p) < 0)
+                                return -ENAMETOOLONG;
+                            p = rest;
+                            want_dir = cng_path_wants_dir(rest);
+                            cng_strlcpy(canon, "/", sizeof canon);
+                            continue;
+                        }
+                    }
+                }
+            }
             size_t n = cng_strlcpy(out, canon, outsz);
             if (n >= outsz || cng_strlcpy(out + n, p, outsz - n) >= outsz - n)
                 return -ENAMETOOLONG;
@@ -875,6 +949,148 @@ static int dirfd_host(int dfd, char *hdir, size_t sz) {
     return 0;
 }
 
+/* Does the open descriptor name a directory? */
+static int fd_is_dir(long fd) {
+    char st[STAT_BUF_SIZE];
+    return sys_fstat((int)fd, st) == 0 &&
+           (*(unsigned *)(st + STAT_MODE_OFF) & CNG_S_IFMT) == CNG_S_IFDIR;
+}
+
+/* The guest name of a host directory the kernel reported for an open
+ * descriptor (a /proc/self/fd readback, a getcwd), or -1 when the guest has
+ * none for it. Three places a directory the guest can hold a descriptor on
+ * may sit:
+ *
+ *  - inside the view — the rootfs or a bind — where the reverse translation
+ *    names it;
+ *  - the /proc zone, which passes through under its own name: the host path
+ *    IS the guest path, and the hidden-process view and the synthesized files
+ *    are then applied by the walk exactly as they are for an absolute name;
+ *  - the /dev zone, where a whitelist entry stands for a host node the guest
+ *    reaches as "/dev/<name>": /dev/pts and its entries, the /dev/shm stand-in
+ *    directory (which on a host with no /dev/shm is under $TMPDIR — nowhere
+ *    near the rootfs), /dev/fd being the /proc case above.
+ *
+ * A zone answer is checked the way it was reached: the guest spelling has to
+ * translate back to exactly this host directory, or a bind shadows the zone
+ * there (`-b DIR:/proc`) and the guest name would mean something else.
+ *
+ * What is left is a directory the guest has no name for. The launcher's own
+ * descriptors are the way one arrives: a dirfd leaked across the exec, an fd
+ * received over a socket, one pulled out of another process. There is nothing
+ * to resolve a name against, and handing the name to the kernel — which was
+ * done, on the grounds that "the dirfd already points inside the guest view"
+ * — resolved it wherever that directory is: `openat(dirfd("/proc"),
+ * "../etc/passwd")` read the host's, and so did a name through a dirfd on
+ * /dev/pts. Every caller answers -EACCES for this — the guest may not search
+ * a directory it has no name for — except where it is closing the descriptor
+ * on arrival (cng_fd_admit). */
+static int host_dir_guest(const char *hdir, char *gdir, size_t sz) {
+    if (cng_fs_untranslate(cng_g_fs, hdir, gdir, sz) == 0)
+        return 0;
+    char back[CNG_PATH_MAX];
+    if (!cng_g_no_proc && !strncmp(hdir, "/proc", 5) &&
+        (!hdir[5] || hdir[5] == '/')) {
+        if (cng_strlcpy(gdir, hdir, sz) < sz &&
+            cng_fs_translate(cng_g_fs, gdir, back, sizeof back) == 0 &&
+            !strcmp(back, hdir))
+            return 0;
+    }
+    if (!cng_g_no_dev) {
+        for (int i = 0; i < cng_dev_nnodes; i++) {
+            const char *h = cng_dev_nodes[i].host;
+            size_t hl = strlen(h);
+            if (!hl || strncmp(hdir, h, hl) != 0 ||
+                (hdir[hl] && hdir[hl] != '/'))
+                continue;
+            size_t n = cng_strlcpy(gdir, "/dev/", sz);
+            if (n >= sz)
+                return -1;
+            n += cng_strlcpy(gdir + n, cng_dev_nodes[i].name, sz - n);
+            if (n >= sz || cng_strlcpy(gdir + n, hdir + hl, sz - n) >= sz - n)
+                return -1;
+            if (cng_fs_translate(cng_g_fs, gdir, back, sizeof back) == 0 &&
+                !strcmp(back, hdir))
+                return 0;
+        }
+    }
+    return -1;
+}
+
+/* May the descriptor stay in the guest's table? One that names a directory the
+ * guest has no name for (host_dir_guest) is closed, and 0 says so; anything
+ * else — a file, a pipe, a socket, a directory the guest can name — is left
+ * alone, and so is a descriptor that cannot be looked at (no /proc), which is
+ * the same degraded host on which nothing here can translate.
+ *
+ * The rule closes the one gap the walk above cannot: a plain name against a
+ * directory fd goes to the kernel without a walk (at_needs_xlate, the hot
+ * path), on the strength of the directory being inside the view. That holds
+ * only if no descriptor on an outside directory is ever in the table — so each
+ * way one can arrive is checked as it does: the launcher's inheritance before
+ * the guest runs (cng_fds_sanitize), SCM_RIGHTS over a socket (recvmsg and
+ * recvmmsg below), pidfd_getfd. Files are let in for the I/O they carry — a
+ * redirected stdin, a pipe, a socket handed over at launch are what an
+ * inherited descriptor is for — and a file is not a place to resolve a name
+ * from. */
+int cng_fd_admit(int fd) {
+    if (!fd_is_dir(fd))
+        return 1;
+    char hdir[CNG_PATH_MAX], gdir[CNG_PATH_MAX];
+    if (dirfd_host(fd, hdir, sizeof hdir) != 0 ||
+        host_dir_guest(hdir, gdir, sizeof gdir) == 0)
+        return 1;
+    if (cng_g_debug)
+        cng_dprintf(2, "[cng] fd %d names %s, outside the guest view: closed\n",
+                    fd, hdir);
+    sys_close(fd);
+    return 0;
+}
+
+/* Run cng_fd_admit over every descriptor the guest is about to inherit. Called
+ * once, from cng_run, with the view published and before the first program is
+ * loaded. Our own descriptors are all close-on-exec — the launcher's
+ * close-on-exec ones did not survive the exec that started us, so at this
+ * point the flag is ours alone — and are skipped, the directory being read
+ * among them. One of the standard three that goes (`chroot-ng ... < /`) is
+ * replaced by /dev/null rather than left closed, the way a setuid program
+ * treats them: a program is entitled to find 0, 1 and 2 open, and the next
+ * file it opens must not land on one of them. */
+void cng_fds_sanitize(void) {
+    long dfd = sys_openat(CNG_AT_FDCWD, "/proc/self/fd",
+                          CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
+    if (dfd < 0)
+        return;
+    char buf[4096];
+    for (;;) {
+        long n = CNG_SYS(__NR_getdents64, (int)dfd, buf, sizeof buf, 0, 0, 0);
+        if (n <= 0)
+            break;
+        for (long o = 0; o + 19 <= n;) {
+            unsigned short reclen;
+            memcpy(&reclen, buf + o + 16, 2);
+            if (reclen == 0 || o + reclen > n)
+                break;
+            const char *nm = buf + o + 19;
+            o += reclen;
+            long fd = parse_int_run(&nm);
+            if (fd < 0 || *nm || fd == dfd)
+                continue;
+            long fl = sys_fcntl((int)fd, CNG_F_GETFD, 0);
+            if (fl < 0 || (fl & 1 /*FD_CLOEXEC*/))
+                continue;
+            if (!cng_fd_admit((int)fd) && fd <= 2) {
+                long nul = sys_openat(CNG_AT_FDCWD, "/dev/null", CNG_O_RDWR, 0);
+                if (nul >= 0 && nul != fd) {
+                    CNG_SYS(__NR_dup3, nul, fd, 0, 0, 0, 0);
+                    sys_close((int)nul);
+                }
+            }
+        }
+    }
+    sys_close((int)dfd);
+}
+
 /* Put a dirfd-relative name through the same containment an absolute path gets:
  * map the dirfd's host directory back to its GUEST path, join the name onto it,
  * and resolve the whole thing through the rootfs/bind map. Concatenating the
@@ -885,16 +1101,18 @@ static int dirfd_host(int dfd, char *hdir, size_t sz) {
  *
  * `out` comes back an absolute host path. Callers reissue with the original
  * dirfd, which the kernel ignores for an absolute path, so no caller changes.
- * Returns -1 when the dirfd names a directory outside the guest view (a /proc
- * dirfd, say) — there is no guest path to express it as, and the /proc zone
- * wants the host namespace anyway, so the caller passes the name through. */
+ * Returns XLATE_AT_OUTSIDE when the dirfd names a directory the guest has no
+ * name for (see host_dir_guest) — a name against it cannot be resolved at all,
+ * and the caller refuses it — and -1 when the descriptor cannot be read back
+ * (no /proc, not open, not a directory), where the kernel's own answer for the
+ * name is the right one: EBADF, ENOTDIR. */
 static int xlate_at_lim(int dfd, const char *path, char *out, size_t sz,
                         int deref, struct cng_res_limit *lim) {
     char hdir[CNG_PATH_MAX], gdir[CNG_PATH_MAX], gp[CNG_PATH_MAX];
     if (dirfd_host(dfd, hdir, sizeof hdir) != 0)
         return -1;
-    if (cng_fs_untranslate(cng_g_fs, hdir, gdir, sizeof gdir) != 0)
-        return -1;
+    if (host_dir_guest(hdir, gdir, sizeof gdir) != 0)
+        return fd_is_dir(dfd) ? XLATE_AT_OUTSIDE : -1;
     size_t k = cng_strlcpy(gp, gdir, sizeof gp);
     if (k >= sizeof gp)
         return XLATE_AT_LONG;
@@ -916,9 +1134,13 @@ static int xlate_at_lim(int dfd, const char *path, char *out, size_t sz,
         return 0;
     /* A name that does not fit must not be passed through: the kernel would
      * resolve it against the dirfd with no rootfs in the way, which is what
-     * the walk above exists to prevent. Every other failure (ELOOP) is one the
-     * kernel reproduces for itself on the guest's own name. */
-    return r == -ENAMETOOLONG ? XLATE_AT_LONG : -1;
+     * the walk above exists to prevent. Neither may one the walk refused for
+     * leading through a directory the guest has no name for (an fd link to
+     * one, on the way). Every other failure (ELOOP) is one the kernel
+     * reproduces for itself on the guest's own name. */
+    if (r == -ENAMETOOLONG)
+        return XLATE_AT_LONG;
+    return r == -EACCES ? XLATE_AT_OUTSIDE : -1;
 }
 
 static int xlate_at(int dfd, const char *path, char *out, size_t sz, int deref) {
@@ -997,10 +1219,14 @@ static int name_may_be_pid(const char *p) {
 }
 
 /* Does a dirfd-relative name need the guest-side walk above, or can the kernel
- * be trusted with it? The dirfd itself already points inside the guest view, so
- * only three things can redirect out of it: a ".." component, a symlink, and a
- * name the kernel cannot resolve at all because it is ours. This is the hot
- * path (every relative openat), so the cheap cases stay cheap.
+ * be trusted with it? The dirfd itself points inside the guest view or one of
+ * its zones — a descriptor on a directory the guest has no name for never
+ * enters its table: the launcher's are closed before the guest runs and every
+ * way one could arrive later is checked as it does (cng_fd_admit), and the
+ * walk refuses to start from one (host_dir_guest) — so only three things can
+ * redirect out of it: a ".." component, a symlink, and a name the kernel
+ * cannot resolve at all because it is ours. This is the hot path (every
+ * relative openat), so the cheap cases stay cheap.
  *
  *  - any '/' => some intermediate component is followed as a symlink => walk;
  *  - a ".." component => walk;
@@ -1023,9 +1249,9 @@ static int at_needs_xlate(int dfd, const char *path, int deref) {
         return 1;
     if (fs_has_ro())
         return 1;
-    /* A pid-shaped name may be a host process seen through a /proc dirfd, which
-     * only the join in xlate() can hide (that dirfd has no guest path, so the
-     * walk itself fails — the point is to reach the branch after it). */
+    /* A pid-shaped name may be a host process seen through a /proc dirfd,
+     * which only the walk can hide: the zone's guest spelling of the join is
+     * what the hidden-process view is keyed on. */
     if (!cng_g_no_proc && name_may_be_pid(path))
         return 1;
     if (!deref)
@@ -1045,30 +1271,22 @@ int cng_resolve_at(long dirfd, const char *path, int deref, char *out,
     if (!path || !path[0])
         return -1;
     if (path[0] == '/' || dfd == CNG_AT_FDCWD) {
-        if (cng_resolve(path, deref, out, sz) == 0)
+        long r = cng_resolve(path, deref, out, sz);
+        if (r == 0)
             return 0;
+        if (r == -EACCES)
+            return -1; /* through a directory the guest has no name for */
         return cng_fs_translate(cng_g_fs, path, out, sz) == 0 ? 0 : -1;
     }
     if (dfd < 0)
         return -1;
-    int r = xlate_at(dfd, path, out, sz, deref);
-    if (r == 0)
-        return 0;
-    if (r == XLATE_AT_LONG)
-        return -1; /* fail closed rather than fall through to the host join */
-    /* Outside the guest view (a /proc dirfd): the host directory joined with
-     * the name is the only answer available, and the right one there. */
-    char hdir[CNG_PATH_MAX];
-    if (dirfd_host(dfd, hdir, sizeof hdir) != 0)
-        return -1;
-    size_t k = cng_strlcpy(out, hdir, sz);
-    if (k >= sz)
-        return -1;
-    if (k && out[k - 1] != '/' && k + 1 < sz) {
-        out[k++] = '/';
-        out[k] = '\0';
-    }
-    return cng_strlcpy(out + k, path, sz - k) >= sz - k ? -1 : 0;
+    /* Every failure is one: a name that does not fit, a directory the guest
+     * has no name for (host_dir_guest), a descriptor that cannot be read back.
+     * This used to join the host directory and the name for the last two, on
+     * the grounds that a /proc dirfd wants the host namespace — which the walk
+     * now reaches through the zone's own guest spelling — and that join was
+     * the host path of a name the guest had never been allowed to spell. */
+    return xlate_at(dfd, path, out, sz, deref) == 0 ? 0 : -1;
 }
 
 /* Is guest path `x` at or below the directory `base`? Both canonical, `base`
@@ -1135,17 +1353,14 @@ int cng_scope_needs_walk(long dirfd, char *gdir, size_t sz) {
         char hdir[CNG_PATH_MAX];
         if (dirfd_host(dfd, hdir, sizeof hdir) != 0)
             return 0;
-        if (cng_fs_untranslate(cng_g_fs, hdir, gdir, sz) != 0) {
-            /* No guest path — except in the /proc zone, which passes through
-             * to the host under the same name, so the guest path is the host
-             * one. That is worth recovering: the synthesized /proc files and
-             * the hidden-process view live under a dirfd like that, and they
-             * are exactly what the kernel's own resolution would miss. */
-            if (cng_g_no_proc || strncmp(hdir, "/proc", 5) != 0 ||
-                (hdir[5] && hdir[5] != '/') ||
-                cng_strlcpy(gdir, hdir, sz) >= sz)
-                return 0; /* the host namespace is the right one here */
-        }
+        /* The zones are named too (the synthesized /proc files and the
+         * hidden-process view live under a dirfd like that, and they are
+         * exactly what the kernel's own resolution would miss). A directory
+         * the guest has no name for is refused, not handed to the kernel to
+         * scope a resolution under: the scoping keeps the answer beneath that
+         * directory, and beneath it is still outside the view. */
+        if (host_dir_guest(hdir, gdir, sz) != 0)
+            return fd_is_dir(dfd) ? -1 : 0;
     }
     return scope_overlay(gdir);
 }
@@ -1353,10 +1568,16 @@ static const char *xlate_lim(long dirfd, const char *gp, char *buf,
     }
     int dfd = (int)dirfd; /* int arg: the x-register's top half may be dirty */
     if (gp[0] == '/' || dfd == CNG_AT_FDCWD) {
-        if (cng_resolve_lim(gp, deref_final, buf, bufsz, lim) == 0)
+        long r = cng_resolve_lim(gp, deref_final, buf, bufsz, lim);
+        if (r == 0)
             return buf;
         if (lim && lim->err)
             return XLATE_TOOLONG; /* the caller reads lim->err, not this */
+        /* The walk's own refusal, which the lexical translation below would
+         * paper over: the name leads through a directory the guest has no
+         * name for (an fd link to one; see cng_resolve_lim). */
+        if (r == -EACCES)
+            return XLATE_OUTSIDE;
         if (cng_fs_translate(cng_g_fs, gp, buf, bufsz) == 0)
             return buf;
         /* Both routes failing means the name does not fit — cng_fs_translate
@@ -1394,30 +1615,13 @@ static const char *xlate_lim(long dirfd, const char *gp, char *buf,
             return XLATE_TOOLONG; /* the caller reads lim->err, not this */
         if (r == XLATE_AT_LONG)
             return XLATE_TOOLONG;
-        /* The dirfd names no guest path — the /proc zone, which passes through
-         * to the host on purpose. That is the right namespace, but the
-         * hidden-process view has to hold inside it, and it is keyed on the
-         * host path, which a relative name only acquires once it is joined onto
-         * the directory's own. Without the join, `openat(dirfd("/proc"),
-         * "1/status")` read the host's init while "/proc/1/status" answered
-         * ENOENT — the whole host process list, one directory fd away. */
-        if (name_may_be_pid(gp)) {
-            char hdir[CNG_PATH_MAX], hp[CNG_PATH_MAX];
-            if (dirfd_host(dfd, hdir, sizeof hdir) == 0) {
-                size_t k = cng_strlcpy(hp, hdir, sizeof hp);
-                if (k && k + 1 < sizeof hp && hp[k - 1] != '/') {
-                    hp[k++] = '/';
-                    hp[k] = '\0';
-                }
-                /* Only inside /proc: anywhere else this is a host path with no
-                 * guest spelling, and re-rooting it would be the wrong answer. */
-                if (k < sizeof hp &&
-                    cng_strlcpy(hp + k, gp, sizeof hp - k) < sizeof hp - k &&
-                    !strncmp(hp, "/proc/", 6) &&
-                    cng_fs_translate(cng_g_fs, hp, buf, bufsz) == 0)
-                    return buf;
-            }
-        }
+        /* A directory the guest has no name for: nothing here can be resolved
+         * against it, and the kernel must not be the one to try. (A /proc or
+         * /dev zone dirfd is not this — host_dir_guest names it, and the walk
+         * above has applied the hidden-process view to `openat(dirfd("/proc"),
+         * "1/status")` the same way it does to "/proc/1/status".) */
+        if (r == XLATE_AT_OUTSIDE)
+            return XLATE_OUTSIDE;
     }
     /* A plain name against a dirfd already inside the guest view: the kernel
      * resolves it there, which is the containment. */
@@ -1534,19 +1738,33 @@ static int rl_may_fdlink(long dirfd, const char *p) {
 }
 
 /* The canonical GUEST path an (dirfd, path) pair names, for the /proc hooks.
- * A real dirfd is resolved through its host path and mapped back; a host /proc
- * path is already the guest spelling (that zone passes through). Returns 0/-1. */
+ * Lexical, as the absolute form is: the name is joined onto the guest spelling
+ * of the directory the dirfd names (host_dir_guest — a /proc dirfd's is its
+ * host path, that zone passing through) and canonicalized. Not walked: the
+ * walk expands a magic link into what it points at, and "exe" against a
+ * dirfd on /proc/self has to come out as "/proc/<pid>/exe" for the fixup to
+ * recognize it, not as the program's own path. Returns 0/-1. */
 static int at_canon(long dirfd, const char *path, char *out, size_t sz) {
     if (!path || !path[0])
         return -1;
     if (path[0] == '/' || (int)dirfd == CNG_AT_FDCWD)
         return cng_fs_abscanon(cng_g_fs, path, out, sz);
-    char host[CNG_PATH_MAX];
-    if (cng_resolve_at(dirfd, path, 0, host, sizeof host) != 0)
+    char hdir[CNG_PATH_MAX], gdir[CNG_PATH_MAX], tmp[CNG_PATH_MAX];
+    if (dirfd_host((int)dirfd, hdir, sizeof hdir) != 0 ||
+        host_dir_guest(hdir, gdir, sizeof gdir) != 0)
         return -1;
-    if (!strncmp(host, "/proc/", 6) || !strcmp(host, "/proc"))
-        return cng_path_canon(host, out, sz);
-    return cng_fs_untranslate(cng_g_fs, host, out, sz);
+    size_t n = cng_strlcpy(tmp, gdir, sizeof tmp);
+    if (n >= sizeof tmp)
+        return -1;
+    if (n && tmp[n - 1] != '/') {
+        if (n + 1 >= sizeof tmp)
+            return -1;
+        tmp[n++] = '/';
+        tmp[n] = '\0';
+    }
+    if (cng_strlcpy(tmp + n, path, sizeof tmp - n) >= sizeof tmp - n)
+        return -1;
+    return cng_path_canon(tmp, out, sz);
 }
 
 /* 1 if the open fd refers to the host's real /proc — the directory whose
@@ -2364,6 +2582,41 @@ static unsigned long mmsg_take(struct cng_mmsghdr *dst,
     return got;
 }
 
+/* The descriptors a just-received message installed, put through
+ * cng_fd_admit. `control`/`len` are the guest's control buffer and the length
+ * the kernel wrote back for it: the SCM_RIGHTS records in there name the new
+ * descriptors, and each is looked at where it lies — a header at a time and
+ * the fd numbers in windows, since the buffer is the guest's and may be as
+ * long as it likes. A record the walk cannot make sense of ends it, as the
+ * kernel's own CMSG_NXTHDR would. A number closed here stays in the record:
+ * the guest sees it and finds it not open, which is the whole of what an
+ * import it may not have looks like. */
+static void scm_rights_admit(void *control, unsigned long len) {
+    unsigned long off = 0;
+    while (control && off + sizeof(struct cng_cmsghdr) <= len) {
+        struct cng_cmsghdr ch;
+        if (cng_user_copyin(&ch, (char *)control + off, sizeof ch) < 0)
+            return;
+        if (ch.len < sizeof ch || ch.len > len - off)
+            return;
+        if (ch.level == CNG_SOL_SOCKET && ch.type == CNG_SCM_RIGHTS) {
+            unsigned long nfd = (ch.len - sizeof ch) / sizeof(int);
+            const char *fds = (char *)control + off + sizeof ch;
+            while (nfd) {
+                int win[64];
+                unsigned long k = nfd > 64 ? 64 : nfd;
+                if (cng_user_copyin(win, fds, k * sizeof(int)) < 0)
+                    return;
+                for (unsigned long i = 0; i < k; i++)
+                    cng_fd_admit(win[i]);
+                fds += k * sizeof(int);
+                nfd -= k;
+            }
+        }
+        off += (ch.len + 7) & ~7UL; /* CMSG_ALIGN */
+    }
+}
+
 /* Run the readback translation over an address the kernel just wrote into our
  * bounce buffer, and hand the result to the guest. `al` is what the kernel
  * reported; it cannot exceed the buffer (the kernel bounds every address by
@@ -2689,7 +2942,10 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * applied by the walk (cng_resolve_lim) and then stripped from the
          * re-issue, exactly as the other resolve bits already are. */
         if (resolve & (CNG_RESOLVE_BENEATH | CNG_RESOLVE_IN_ROOT)) {
-            if (!cng_scope_needs_walk(a0, sdir, sizeof sdir))
+            int walk = cng_scope_needs_walk(a0, sdir, sizeof sdir);
+            if (walk < 0)
+                return -EACCES; /* a directory the guest has no name for */
+            if (!walk)
                 return openat2_scoped(a0, a1, a4, a5, &how);
             /* From here we answer in place of the kernel, so the how has to be
              * judged the way it would have been: build_open_flags() runs before
@@ -2784,8 +3040,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                       (resolve && nr == __NR_openat2) ? &lim : 0);
         if (lim.err)
             return lim.err;
-        if (p == XLATE_TOOLONG)
-            return -ENAMETOOLONG;
+        if (xlate_bad(p))
+            return xlate_errno(p);
         /* :ro bind — mkdirat/mknodat always create; an open only offends with
          * write intent (non-RDONLY, or O_CREAT/O_TRUNC). name_to_handle_at also
          * lands here and never writes, so its a2 (a handle pointer) is never
@@ -2868,8 +3124,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         if (nr == __NR_faccessat2 && ((int)a3 & CNG_AT_SYMLINK_NOFOLLOW))
             deref = 0;
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
-        if (p == XLATE_TOOLONG)
-            return -ENAMETOOLONG;
+        if (xlate_bad(p))
+            return xlate_errno(p);
         /* faccessat(2) takes three arguments and has no flags word at all —
          * only faccessat2 does. a3 is therefore whatever the guest happened to
          * leave in x3, and reading it as flags made the fake-root stat below
@@ -2941,8 +3197,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * denies the mode change (a chmod on a file you own still applies for real). */
     case __NR_fchmodat: {
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, 1);
-        if (p == XLATE_TOOLONG)
-            return -ENAMETOOLONG;
+        if (xlate_bad(p))
+            return xlate_errno(p);
         long ro = ro_refusal_name(a0, (const char *)a1, p, 0);
         if (ro)
             return ro;
@@ -2965,8 +3221,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                                          a5, nr));
         }
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
-        if (p == XLATE_TOOLONG)
-            return -ENAMETOOLONG;
+        if (xlate_bad(p))
+            return xlate_errno(p);
         long ro = ro_refusal_name(a0, (const char *)a1, p,
                                   deref ? 0 : CNG_AT_SYMLINK_NOFOLLOW);
         if (ro)
@@ -2987,8 +3243,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 dec = 1;
         }
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, 0);
-        if (p == XLATE_TOOLONG)
-            return -ENAMETOOLONG;
+        if (xlate_bad(p))
+            return xlate_errno(p);
         if (ro_denied(p))
             return -EROFS;
         long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_unlinkat);
@@ -3024,8 +3280,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         }
         int deref = !((int)a3 & CNG_AT_SYMLINK_NOFOLLOW);
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
-        if (p == XLATE_TOOLONG)
-            return -ENAMETOOLONG;
+        if (xlate_bad(p))
+            return xlate_errno(p);
         long ro = ro_refusal_name(a0, (const char *)a1, p,
                                   deref ? 0 : CNG_AT_SYMLINK_NOFOLLOW);
         if (ro)
@@ -3068,8 +3324,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         }
         int deref = !((int)a3 & CNG_AT_SYMLINK_NOFOLLOW);
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
-        if (p == XLATE_TOOLONG)
-            return -ENAMETOOLONG;
+        if (xlate_bad(p))
+            return xlate_errno(p);
         long r = reissue(a0, (long)p, ob, a3, a4, a5, __NR_newfstatat);
         /* A synthesized /proc fd, asked about by fd or through its own fd link
          * (stat -L /proc/self/fd/N lands on the memfd the same way). */
@@ -3106,8 +3362,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         }
         int deref = !((int)a2 & CNG_AT_SYMLINK_NOFOLLOW);
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
-        if (p == XLATE_TOOLONG)
-            return -ENAMETOOLONG;
+        if (xlate_bad(p))
+            return xlate_errno(p);
         long r = reissue(a0, (long)p, a2, a3, ob, a5, __NR_statx);
         if (r == 0 && !cng_g_no_proc && a4) {
             if (byfd)
@@ -3144,8 +3400,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         }
         int deref = !((int)a4 & CNG_AT_SYMLINK_NOFOLLOW);
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
-        if (p == XLATE_TOOLONG)
-            return -ENAMETOOLONG;
+        if (xlate_bad(p))
+            return xlate_errno(p);
         long ro = ro_refusal_name(a0, (const char *)a1, p,
                                   deref ? 0 : CNG_AT_SYMLINK_NOFOLLOW);
         if (ro)
@@ -3191,8 +3447,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             }
         }
         const char *p = xlate(a0, gp, b1, sizeof b1, /*deref_final=*/0);
-        if (p == XLATE_TOOLONG)
-            return -ENAMETOOLONG;
+        if (xlate_bad(p))
+            return xlate_errno(p);
         /* A link2symlink entry presents as a regular file: readlink must fail
          * with EINVAL rather than leak the backing path — including through a
          * real dirfd, which xlate passes through untranslated. */
@@ -3296,8 +3552,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     /* symlinkat(target, newdirfd, linkpath): translate only the linkpath. */
     case __NR_symlinkat: {
         const char *lp = xlate(a1, (const char *)a2, b2, sizeof b2, 0);
-        if (lp == XLATE_TOOLONG)
-            return -ENAMETOOLONG;
+        if (xlate_bad(lp))
+            return xlate_errno(lp);
         if (ro_denied(lp))
             return -EROFS;
         return reissue(a0, a1, (long)lp, a3, a4, a5, __NR_symlinkat);
@@ -3456,11 +3712,11 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_renameat:
     case __NR_renameat2: {
         const char *op = xlate(a0, (const char *)a1, b1, sizeof b1, 0);
-        if (op == XLATE_TOOLONG)
-            return -ENAMETOOLONG;
+        if (xlate_bad(op))
+            return xlate_errno(op);
         const char *np = xlate(a2, (const char *)a3, b2, sizeof b2, 0);
-        if (np == XLATE_TOOLONG)
-            return -ENAMETOOLONG;
+        if (xlate_bad(np))
+            return xlate_errno(np);
         /* A rename unlinks the old name and creates the new one, so either end
          * under a :ro bind is EROFS. */
         if (ro_denied(op) || ro_denied(np))
@@ -3871,8 +4127,17 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         struct cng_msghdr snap; /* our copy of the guest's header, taken once */
         if (!a1 || cng_user_copyin(&snap, g, sizeof snap) < 0)
             return reissue(a0, a1, a2, a3, a4, a5, nr);
-        if (!snap.name || !snap.namelen)
-            return reissue(a0, a1, a2, a3, a4, a5, nr);
+        if (!snap.name || !snap.namelen) {
+            long r = reissue(a0, a1, a2, a3, a4, a5, nr);
+            /* The descriptors a message carried are in the table by now, and
+             * the kernel has written how much control data describes them
+             * into the guest's own header. */
+            struct cng_msghdr after;
+            if (r >= 0 && snap.control &&
+                cng_user_copyin(&after, g, sizeof after) == 0)
+                scm_rights_admit(snap.control, after.controllen);
+            return r;
+        }
         char ab[CNG_SOCKADDR_MAX];
         struct cng_msghdr mh = snap;
         mh.name = ab;
@@ -3880,6 +4145,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         long r = reissue(a0, (long)&mh, a2, a3, a4, a5, nr);
         if (r < 0)
             return r;
+        scm_rights_admit(snap.control, mh.controllen);
         /* Written back whole rather than field by field: the guest's header is
          * ours to restore in full, and the copy that carries it also validates
          * it, so there is no zeroed remainder to worry about either. */
@@ -4009,6 +4275,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 r = n;
                 break;
             }
+            scm_rights_admit(snap.control, mh.controllen);
             h.hdr = snap;
             h.hdr.controllen = mh.controllen;
             h.hdr.flags = mh.flags;
@@ -4093,8 +4360,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         }
         const char *p =
             xlate(CNG_AT_FDCWD, (const char *)a0, b1, sizeof b1, deref);
-        if (p == XLATE_TOOLONG)
-            return -ENAMETOOLONG;
+        if (xlate_bad(p))
+            return xlate_errno(p);
         if (writes) {
             long ro = ro_refusal_name(CNG_AT_FDCWD, (const char *)a0, p,
                                       deref ? 0 : CNG_AT_SYMLINK_NOFOLLOW);
@@ -4132,8 +4399,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             return reissue(CNG_AT_FDCWD, (long)data, a2, a3, a4, a5, nr);
         }
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
-        if (p == XLATE_TOOLONG)
-            return -ENAMETOOLONG;
+        if (xlate_bad(p))
+            return xlate_errno(p);
         if (writes) {
             long ro = ro_refusal_name(a0, (const char *)a1, p,
                                       deref ? 0 : CNG_AT_SYMLINK_NOFOLLOW);
@@ -4161,8 +4428,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             return reissue(a0, (long)data, a2, a3, a4, a5, nr);
         const char *p =
             xlate(CNG_AT_FDCWD, (const char *)a1, b1, sizeof b1, deref);
-        if (p == XLATE_TOOLONG)
-            return -ENAMETOOLONG;
+        if (xlate_bad(p))
+            return xlate_errno(p);
         return reissue(a0, (long)p, a2, a3, a4, a5, nr);
     }
 
@@ -4170,8 +4437,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_statfs: {
         const char *p =
             xlate(CNG_AT_FDCWD, (const char *)a0, b1, sizeof b1, 1);
-        if (p == XLATE_TOOLONG)
-            return -ENAMETOOLONG;
+        if (xlate_bad(p))
+            return xlate_errno(p);
         if (nr == __NR_truncate) { /* statfs only reads */
             long ro = ro_refusal_name(CNG_AT_FDCWD, (const char *)a0, p, 0);
             if (ro)
@@ -4197,8 +4464,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_chdir: {
         const char *gp = (const char *)a0;
         const char *hp = xlate(CNG_AT_FDCWD, gp, b1, sizeof b1, 1);
-        if (hp == XLATE_TOOLONG)
-            return -ENAMETOOLONG;
+        if (xlate_bad(hp))
+            return xlate_errno(hp);
         long r = reissue((long)hp, 0, 0, 0, 0, 0, __NR_chdir);
         if (r == 0) {
             char gc[CNG_PATH_MAX];
@@ -4218,13 +4485,24 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
 
     /* fchdir: the fd already refers to a translated host dir, so perform it,
      * then resync the virtual cwd from the real cwd (reverse-translated). This
-     * is what apk relies on when running package scripts. */
+     * is what apk relies on when running package scripts.
+     *
+     * "Already refers to" is asked first rather than assumed: a descriptor on
+     * a directory the guest has no name for (host_dir_guest) is not a place
+     * it can stand — the real cwd would leave the view while the virtual one
+     * stayed put, and getcwd would go on answering for a directory the process
+     * is no longer in. EACCES, as for a directory it may not search. The zones
+     * are named on the way back too: fchdir(open("/proc")) used to leave the
+     * virtual cwd where it was, so "self/status" then resolved under it. */
     case __NR_fchdir: {
+        char hc[CNG_PATH_MAX], gc[CNG_PATH_MAX];
+        if (dirfd_host((int)a0, hc, sizeof hc) == 0 &&
+            host_dir_guest(hc, gc, sizeof gc) != 0 && fd_is_dir(a0))
+            return -EACCES;
         long r = cng_syscall6(a0, 0, 0, 0, 0, 0, __NR_fchdir);
         if (r == 0) {
-            char hc[CNG_PATH_MAX], gc[CNG_PATH_MAX];
             if (sys_getcwd(hc, sizeof hc) > 0 &&
-                cng_fs_untranslate(cng_g_fs, hc, gc, sizeof gc) == 0) {
+                host_dir_guest(hc, gc, sizeof gc) == 0) {
                 cng_fs_set_cwd(cng_g_fs, gc);
                 cng_fs_cwd(gc, sizeof gc);
                 cng_procreg_set_cwd(gc);
@@ -4367,6 +4645,19 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                          &out))
             return out;
         return reissue(a0, a1, a2, a3, a4, a5, nr);
+    }
+
+    /* pidfd_getfd imports a descriptor out of another process's table, which
+     * is the third way one can arrive from outside the view (see cng_fd_admit
+     * for the other two). The copy is made and then judged: one that names a
+     * directory the guest has no name for is closed again and the call
+     * answers EPERM, the refusal pidfd_getfd gives for a process the caller
+     * may not reach into. */
+    case __NR_pidfd_getfd: {
+        long r = reissue(a0, a1, a2, a3, a4, a5, nr);
+        if (r >= 0 && !cng_fd_admit((int)r))
+            return -EPERM;
+        return r;
     }
 
     /* exit/exit_group are trapped only on a tracee (the trap-everything

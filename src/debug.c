@@ -144,7 +144,8 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     if (!op || !gpath) {
         cng_dprintf(2, "usage: _dtest -r ROOT [-b SRC:DST[:ro]] "
                        "(open|access|dbgpath|robind|l2sro) GUESTPATH\n"
-                       "       _dtest -r ROOT atrel GUESTDIR RELPATH\n");
+                       "       _dtest -r ROOT atrel GUESTDIR RELPATH\n"
+                       "       _dtest -r ROOT outside HOSTDIR HOSTFILE\n");
         return 2;
     }
 
@@ -648,6 +649,115 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
      * an existing file inside the bind. Without ":ro" on the -b spec the same
      * calls must NOT report EROFS — that is the negative control the test
      * drives, so a blanket refusal cannot pass. */
+    /* _dtest -r ROOT outside HOSTDIR HOSTFILE — descriptors the guest has no
+     * name for. HOSTDIR and HOSTFILE are host paths outside ROOT; the driver
+     * opens both itself (it runs without the startup sanitization that keeps
+     * such a dirfd out of a real guest's table, which is what makes the
+     * refusals observable here) and asks the dispatcher what a guest holding
+     * them may do. The directory: nothing that resolves a name from it — a walk
+     * (a name with a slash or ".."), fchdir, a reopen or a name through its
+     * magic link — is EACCES, and a copy of it that arrives over a socket or
+     * from pidfd_getfd is closed on arrival. The file keeps the kernel's own
+     * answers: ENOTDIR for a name below it, a reopen through its magic link,
+     * and it survives both imports — the I/O it carries is what an inherited
+     * descriptor is for. (A plain single-component name against the directory
+     * is not asked about: that is the walk-free path whose safety rests on the
+     * sanitization this driver skips.) */
+    if (!strcmp(op, "outside")) {
+        const char *hostfile = relpath;
+        if (!hostfile) {
+            cng_dprintf(2, "outside: HOSTFILE missing\n");
+            return 2;
+        }
+        long od = sys_openat(CNG_AT_FDCWD, gpath, CNG_O_RDONLY | CNG_O_DIRECTORY, 0);
+        long of = sys_openat(CNG_AT_FDCWD, hostfile, CNG_O_RDONLY, 0);
+        if (od < 0 || of < 0) {
+            cng_dprintf(2, "outside: cannot open %s / %s\n", gpath, hostfile);
+            return 2;
+        }
+        char link[40], sub[64], st[144];
+        int fails = 0;
+        struct {
+            const char *name;
+            long want; /* -errno, or 0 for "succeeds" */
+            long r;
+        } t[16];
+        int n = 0;
+#define OUT_LEG(nm, w, call)                                                   \
+        do {                                                                   \
+            t[n].name = nm;                                                    \
+            t[n].want = w;                                                     \
+            t[n].r = call;                                                     \
+            n++;                                                               \
+        } while (0)
+        OUT_LEG("dir-walk", -EACCES,
+                cng_dispatch(__NR_openat, od, (long)"a/b", CNG_O_RDONLY, 0, 0, 0, 0));
+        OUT_LEG("dir-dotdot", -EACCES,
+                cng_dispatch(__NR_openat, od, (long)"..", CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0));
+        OUT_LEG("dir-stat-walk", -EACCES,
+                cng_dispatch(__NR_newfstatat, od, (long)"x/y", (long)st, 0, 0, 0, 0));
+        OUT_LEG("dir-fchdir", -EACCES,
+                cng_dispatch(__NR_fchdir, od, 0, 0, 0, 0, 0, 0));
+        cng_snprintf(link, sizeof link, "/proc/self/fd/%d", (int)od);
+        OUT_LEG("dir-magic", -EACCES,
+                cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)link, CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0));
+        cng_snprintf(sub, sizeof sub, "/proc/self/fd/%d/file", (int)od);
+        OUT_LEG("dir-magic-below", -EACCES,
+                cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)sub, CNG_O_RDONLY, 0, 0, 0, 0));
+        OUT_LEG("file-walk", -ENOTDIR,
+                cng_dispatch(__NR_openat, of, (long)"a/b", CNG_O_RDONLY, 0, 0, 0, 0));
+        cng_snprintf(link, sizeof link, "/proc/self/fd/%d", (int)of);
+        OUT_LEG("file-magic", 0,
+                cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)link, CNG_O_RDONLY, 0, 0, 0, 0));
+        /* Over a socket, through the dispatcher's recvmsg. */
+        int sv[2] = {-1, -1};
+        long spr = CNG_SYS(__NR_socketpair, CNG_AF_UNIX, CNG_SOCK_STREAM, 0, sv, 0, 0);
+        for (int k = 0; k < 2; k++) {
+            int send = k == 0 ? (int)od : (int)of;
+            long got = -1;
+            if (spr == 0 && cng_broker_send(sv[0], "x", 1, send) == 0) {
+                char data;
+                struct cng_iovec iov = {&data, 1};
+                struct {
+                    struct cng_cmsghdr h;
+                    int fd;
+                    int pad;
+                } cm;
+                memset(&cm, 0, sizeof cm);
+                struct cng_msghdr msg;
+                memset(&msg, 0, sizeof msg);
+                msg.iov = &iov;
+                msg.iovlen = 1;
+                msg.control = &cm;
+                msg.controllen = sizeof cm;
+                long rr = cng_dispatch(__NR_recvmsg, sv[1], (long)&msg, 0, 0, 0, 0, 0);
+                if (rr >= 0 && cm.h.type == CNG_SCM_RIGHTS)
+                    got = sys_fcntl(cm.fd, CNG_F_GETFD, 0) < 0 ? -EBADF : cm.fd;
+                else
+                    got = rr < 0 ? rr : -EIO;
+            }
+            OUT_LEG(k == 0 ? "dir-scm" : "file-scm", k == 0 ? -EBADF : 0, got);
+        }
+        /* Out of another table: our own, through pidfd_getfd. */
+        long pfd = CNG_SYS(__NR_pidfd_open, sys_getpid(), 0, 0, 0, 0, 0);
+        if (pfd >= 0) {
+            OUT_LEG("dir-pidfd_getfd", -EPERM,
+                    cng_dispatch(__NR_pidfd_getfd, pfd, od, 0, 0, 0, 0, 0));
+            OUT_LEG("file-pidfd_getfd", 0,
+                    cng_dispatch(__NR_pidfd_getfd, pfd, of, 0, 0, 0, 0, 0));
+        } else {
+            cng_dprintf(1, "outside pidfd: unavailable (errno %d)\n", (int)-pfd);
+        }
+#undef OUT_LEG
+        for (int i = 0; i < n; i++) {
+            int ok = t[i].want == 0 ? t[i].r >= 0 : t[i].r == t[i].want;
+            cng_dprintf(1, "outside %s: rc=%d -> %s\n", t[i].name, (int)t[i].r,
+                        ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+        cng_dprintf(1, "outside: %d failures\n", fails);
+        return fails ? 1 : 0;
+    }
     if (!strcmp(op, "robind")) {
         int ro = fs.nbinds > 0 && fs.binds[0].ro;
         char sib[CNG_PATH_MAX];

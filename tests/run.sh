@@ -116,6 +116,7 @@ if [ -f tests/m19_scripts.sh ]; then . tests/m19_scripts.sh; fi
 if [ -f tests/m20_sysvipc.sh ]; then . tests/m20_sysvipc.sh; fi
 if [ -f tests/m23_execmap.sh ]; then . tests/m23_execmap.sh; fi
 if [ -f tests/m24_openat2.sh ]; then . tests/m24_openat2.sh; fi
+if [ -f tests/m25_fdview.sh ]; then . tests/m25_fdview.sh; fi
 
 echo
 echo "== summary: $pass passed, $fail failed, $skipped skipped =="

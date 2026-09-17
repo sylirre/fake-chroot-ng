@@ -111,6 +111,16 @@ record of *our* invocation, so this is a correctness requirement, not polish.
 See `src/monitor/procfs.c` (synthesis) and `src/monitor/procreg.c` (the
 fork-inherited registry that tells a guest pid from a host one).
 
+Directory descriptors are part of the same containment: a name relative to a
+dirfd is resolved by the kernel with no rootfs in the way, so every directory
+the guest can hold a descriptor on must have a guest name — inside the view,
+or one of the two zones — and the walk from it is ours. A descriptor on a
+directory the guest cannot name is never let into its table: the launcher's
+are closed before the first program loads, and one arriving later over a
+socket or from `pidfd_getfd` is closed on arrival (`cng_fd_admit`,
+`src/monitor/dispatch.c`). Files are let in for the I/O they carry; a file is
+not a place to resolve a name from.
+
 ### Shared component 3 — the IPC broker
 
 A detached per-namespace daemon (`src/monitor/broker.c`) that owns shared state

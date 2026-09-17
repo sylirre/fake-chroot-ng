@@ -360,6 +360,12 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
      * than editing it under them (path.c). g_fs itself is not looked at again. */
     cng_g_fs = cng_fs_publish(&g_fs);
 
+    /* What the launcher handed down, judged against that view: a descriptor on
+     * a directory the guest has no name for is closed here rather than left
+     * for the guest to resolve names from — the one way to reach outside the
+     * view that no path translation can see (dispatch.c, cng_fd_admit). */
+    cng_fds_sanitize();
+
     /* The floor: every mapping that exists at this moment is ours or the
      * kernel's, because nothing of the guest has been mapped yet. An emulated
      * execve gives back what is NOT in it (the sweep in execve.c), so where

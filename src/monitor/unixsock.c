@@ -384,8 +384,10 @@ int cng_sun_in(struct cng_sun_xlate *x, int fd, const void *addr, long alen,
         }
 
     char host[CNG_PATH_MAX];
-    if (cng_resolve(guest, follow, host, sizeof host) != 0 &&
-        cng_fs_translate(cng_g_fs, guest, host, sizeof host) != 0)
+    long rr = cng_resolve(guest, follow, host, sizeof host);
+    if (rr == -EACCES)
+        return -EACCES; /* through a directory the guest has no name for */
+    if (rr != 0 && cng_fs_translate(cng_g_fs, guest, host, sizeof host) != 0)
         return -ENAMETOOLONG; /* the contained name cannot be spelled */
 
     size_t hl = strlen(host);

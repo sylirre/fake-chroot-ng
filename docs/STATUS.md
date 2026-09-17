@@ -2544,6 +2544,77 @@ vfork/`posix_spawn` child-stack handling.
   `--shared-proc /` legs (the refusal on an inert host, `nnp=1` on a live
   one). M8 also checks that `-R` on an inert host runs and warns.
 
+- [x] **M43 — a directory descriptor was a place to resolve names from, wherever it pointed**
+  The kernel resolves a name relative to a dirfd with no rootfs in the way,
+  so every directory descriptor the guest holds has to be on a directory
+  inside its view. The dispatcher assumed that instead of establishing it: a
+  plain name against a dirfd went to the kernel on the strength of "the dirfd
+  already points inside the guest view", and a dirfd it could not map back to
+  a guest path had *every* name passed through — on the grounds that such a
+  dirfd is one inside `/proc`, which wants the host namespace anyway. Three
+  things followed. `openat(dirfd("/proc"), "../etc/passwd")` read the host's
+  file, and so did a name through a dirfd on `/dev/pts` (measured both). The
+  components after an fd magic link "rode along, as they do for a real
+  dirfd": the resolver stopped at `/proc/self/fd/<n>` and handed the rest to
+  the kernel, which walked `..` out of the rootfs from the directory the fd
+  named and followed a symlink under it from the host root. And a directory
+  descriptor the launcher leaked across the exec that started chroot-ng was
+  inherited as it was — nothing looked at the table — and was a door out of
+  the view by any relative name at all.
+  - **Every directory the guest can hold a descriptor on is named**
+    (`host_dir_guest`): inside the view by the reverse translation; the
+    `/proc` zone under its own name, so the walk applies the hidden-process
+    view and the synthesized files to `openat(dirfd("/proc"), "1/status")`
+    exactly as to `"/proc/1/status"`; the `/dev` zone through the whitelist
+    entry the host node stands for (`/dev/pts`, the `/dev/shm` stand-in under
+    `$TMPDIR`). A zone answer must translate back to the same host directory,
+    or a bind shadows the zone there. `xlate_at`, `cng_resolve_at`, the
+    scoped `openat2` route, `fchdir`'s cwd resync and the `/proc` hooks'
+    `at_canon` all go through it — the last now lexically, so `exe` against a
+    dirfd on `/proc/self` is still the link the fixup recognizes.
+  - **What follows a directory's fd link is walked, not ridden.** The fd
+    directory itself is walked through like the directory it is; at the link
+    the resolver reads where it points, and a directory of the view replaces
+    it by its guest name the way `exe`/`cwd`/`root` are expanded, so the
+    rest of the name gets the `..` and symlink handling every name gets. A
+    file, or a description with no path (a pipe, a memfd), is handed over as
+    before. Judged only where the link is followed: `O_NOFOLLOW` and `lstat`
+    on the link itself are the kernel's to answer.
+  - **A directory the guest has no name for is not a place to resolve from,
+    and never enters its table.** A name walked against one, a reopen of it
+    or a name through its magic link, a scoped `openat2` under it and an
+    `fchdir` into it are all `EACCES` — the guest may not search a directory
+    it cannot name — and the walk's refusal is carried past the lexical
+    fallbacks that used to paper over a failed resolution (`xlate`,
+    `cng_resolve_at`, the AF_UNIX address translation). What makes the
+    walk-free path sound is that no such descriptor exists to take it:
+    `cng_fd_admit` closes one, and it is run over everything the launcher
+    handed down before the first program loads (`cng_fds_sanitize`; our own
+    descriptors are close-on-exec and skipped), over every `SCM_RIGHTS`
+    record a `recvmsg`/`recvmmsg` delivers, and over what `pidfd_getfd`
+    imports (closed again, `EPERM`). Files are let in: a redirected stdin, a
+    pipe, a socket handed over at launch are what an inherited descriptor is
+    for, and a file is not a place to resolve a name from. One of the
+    standard three that goes (`chroot-ng ... < /`) is replaced by `/dev/null`
+    rather than left closed, as a setuid program treats them. The one descriptor
+    that can still point above the guest's root is one opened before an
+    emulated `chroot(2)` — bounded by the launcher's own view, and exactly
+    what a real chroot leaves a process holding; a walk from it is refused
+    where the kernel would have allowed the climb.
+  - `fchdir(open("/proc"))` used to leave the virtual cwd where it was, so
+    `getcwd` answered `/` while `self/status` resolved under it; the zone's
+    name now carries the cwd along.
+  - Validated by `tests/m25_fdview.sh`: `-t dtest outside` drives the
+    dispatcher without the startup sanitization, so the refusals against an
+    outside directory are observable (walk, `..`, `fchdir`, the magic link,
+    a socket-delivered copy closed, `pidfd_getfd` refused) beside the file
+    that keeps the kernel's answers; `tests/guests/fdescape.c` runs as a
+    guest with a leaked host directory and file in its table and takes every
+    route out — `..` from the zones' dirfds, `..` and an absolute symlink
+    through a dirfd's magic link and its `/dev/fd` spelling — landing on the
+    rootfs's marker each time, with the reopen, the `fchdir` and the
+    in-view socket trip as the controls that still work.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

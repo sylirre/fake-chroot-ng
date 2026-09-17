@@ -95,6 +95,11 @@ static const int path_syscalls[] = {
      * kill, the tracee's whole syscall stream) is trapped by a second filter
      * stacked on demand, only on the tasks that trace or are traced. */
     __NR_ptrace,
+    /* pidfd_getfd: a descriptor copied out of another process's table, which
+     * may name a directory the guest has no name for — the one kind of
+     * descriptor that must never be in its table (cng_fd_admit). Judged after
+     * the import, in the dispatcher. */
+    __NR_pidfd_getfd,
 };
 
 #define NPATH ((int)(sizeof(path_syscalls) / sizeof(path_syscalls[0])))

@@ -339,10 +339,20 @@ int cng_proc_self_fd(const char *host);
  * same branch — so the resolution must be walked here with the scope applied;
  * 0 when the kernel's scoped resolution of the guest's own name is exactly
  * right, which is what it is then handed. `gdir` comes back with the dirfd's
- * guest path (the scope) whenever the answer is 1. Also 0 when the dirfd has no
- * guest path at all (one inside /proc), where the host namespace is the right
- * one anyway. Exposed for `-t o2test`. */
+ * guest path (the scope) whenever the answer is 1. -1 when the dirfd names a
+ * directory the guest has no name for at all — one from outside the view —
+ * which the caller refuses. Exposed for `-t o2test`. */
 int cng_scope_needs_walk(long dirfd, char *gdir, size_t sz);
+
+/* Descriptors and the guest view. A descriptor that names a directory the
+ * guest has no name for — outside the rootfs, the binds and the /proc and /dev
+ * zones — is never let into its table: cng_fd_admit closes such a descriptor
+ * and returns 0 (1 for anything else, which is left alone), and
+ * cng_fds_sanitize runs it over everything the launcher handed down, once,
+ * before the first program is loaded. See the definitions for why a file is
+ * let in and a directory is not. */
+int cng_fd_admit(int fd);
+void cng_fds_sanitize(void);
 
 /* Serve an open the host refused (`err`) on a path naming one of our own fds,
  * from that descriptor: a duplicate when the inode grants the access anyway
