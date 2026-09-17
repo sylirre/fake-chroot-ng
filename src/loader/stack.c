@@ -18,8 +18,18 @@
  * above the common 8 MiB rlimit that recursion-heavy tools (e.g. gcc's cc1) size
  * themselves against. It is virtual — only touched pages commit.
  * (CNG_GUEST_STACK_SIZE in loader.h: the argv/envp bound is derived from it, the
- * way the kernel derives ARG_MAX from RLIMIT_STACK.) */
-#define GUEST_STACK_SIZE CNG_GUEST_STACK_SIZE
+ * way the kernel derives ARG_MAX from RLIMIT_STACK.)
+ *
+ * Below it, a guard. The kernel keeps stack_guard_gap — 256 pages — of nothing
+ * under a real stack, and a stack that grows into it faults; ours was one RW
+ * mapping with whatever the kernel had happened to place beneath it, which is
+ * top-down allocation's most recent mapping: a library the guest loaded, or a
+ * scratch stack of ours. A recursion that ran off the end wrote into that and
+ * went on running. The same 256 pages are reserved with the stack and made
+ * PROT_NONE, so nothing else can be mapped there and the first store past the
+ * bottom is the SIGSEGV a real stack overflow is. Virtual, like the rest. */
+#define GUEST_STACK_SIZE  CNG_GUEST_STACK_SIZE
+#define GUEST_STACK_GUARD (256 * cng_page_size)
 
 unsigned long cng_g_stack_lo, cng_g_stack_len;
 
@@ -41,17 +51,22 @@ unsigned long cng_build_stack(int argc, char **argv, char **envp,
     while (envp && envp[envc])
         envc++;
 
-    void *stk = sys_mmap(0, GUEST_STACK_SIZE, CNG_PROT_READ | CNG_PROT_WRITE,
+    unsigned long region = GUEST_STACK_GUARD + GUEST_STACK_SIZE;
+    void *stk = sys_mmap(0, region, CNG_PROT_READ | CNG_PROT_WRITE,
                          CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
     if (stk == CNG_MAP_FAILED || cng_is_err((long)stk))
         cng_die("guest stack mmap", (long)stk);
+    long gr = sys_mprotect(stk, GUEST_STACK_GUARD, CNG_PROT_NONE);
+    if (gr < 0)
+        cng_die("guest stack guard mprotect", gr);
     /* The region, not the sp inside it: an emulated execve gives the previous
      * program's back (see cng_exec_generation), and it is by far the largest
      * thing it can give back. Published only once everything below has
      * succeeded — the one failure path here unmaps it again. */
     cng_g_stack_lo = 0;
     cng_g_stack_len = 0;
-    unsigned long top = (unsigned long)stk + GUEST_STACK_SIZE;
+    unsigned long bottom = (unsigned long)stk + GUEST_STACK_GUARD;
+    unsigned long top = bottom + GUEST_STACK_SIZE;
 
     /* Where the address of each pushed string is collected until the vector
      * region's base is known. These were VLAs, so they were argc*8 bytes of the
@@ -62,9 +77,11 @@ unsigned long cng_build_stack(int argc, char **argv, char **envp,
      * overflowed the handler's stack on, which inside the handler (every signal
      * but SIGSYS masked) is the death of the guest rather than a fault.
      *
-     * They live at the bottom of the region just mapped instead — 64 MiB below
-     * where the stack is built, and further below than any guest reaches. */
-    unsigned long *argv_addr = (unsigned long *)stk;
+     * They live at the bottom of the stack just mapped instead — 64 MiB below
+     * where the stack is built, and further below than any guest reaches
+     * (just above the guard, which is the one part of the region that cannot
+     * hold them). */
+    unsigned long *argv_addr = (unsigned long *)bottom;
     unsigned long *env_addr = argv_addr + argc;
 
     const char *execfn_str = execfn ? execfn : (argc > 0 ? argv[0] : "");
@@ -82,7 +99,7 @@ unsigned long cng_build_stack(int argc, char **argv, char **envp,
     unsigned long need = 2 * ((unsigned long)argc + (unsigned long)envc) * 8 +
                          strbytes + (3 + 64 * 2) * 8 + 64 /* auxv + alignment */;
     if (need > GUEST_STACK_SIZE) {
-        sys_munmap(stk, GUEST_STACK_SIZE);
+        sys_munmap(stk, region);
         return 0;
     }
 
@@ -214,6 +231,6 @@ unsigned long cng_build_stack(int argc, char **argv, char **envp,
     }
 
     cng_g_stack_lo = (unsigned long)stk;
-    cng_g_stack_len = GUEST_STACK_SIZE;
+    cng_g_stack_len = region;
     return sp;
 }

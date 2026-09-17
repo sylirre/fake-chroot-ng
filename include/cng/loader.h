@@ -58,9 +58,10 @@ struct cng_loaded {
                                * only strategy left */
 
 /* The stack region the last successful cng_build_stack mapped — the whole
- * mapping, not the sp it returned. An emulated execve keeps the address space,
- * so this is what it has to give back for the program it replaces, and at
- * CNG_GUEST_STACK_SIZE it is the largest single thing there is to give. */
+ * mapping, guard page run included, not the sp it returned. An emulated execve
+ * keeps the address space, so this is what it has to give back for the program
+ * it replaces, and at CNG_GUEST_STACK_SIZE plus the guard it is the largest
+ * single thing there is to give. */
 extern unsigned long cng_g_stack_lo, cng_g_stack_len;
 
 /* Force file-backed segment mapping (mmap PROT_EXEC from the file) instead of
@@ -137,9 +138,10 @@ int cng_elf_map(const struct cng_elf_plan *plan, unsigned long base_hint,
 
 void cng_elf_plan_release(struct cng_elf_plan *plan);
 
-/* Size of the fixed anonymous stack each loaded program gets (see stack.c).
- * Exposed because the emulated execve bounds argv/envp against it, exactly as
- * the kernel bounds ARG_MAX against RLIMIT_STACK. */
+/* Size of the fixed anonymous stack each loaded program gets (see stack.c) —
+ * the usable part, above the PROT_NONE guard mapped beneath it. Exposed because
+ * the emulated execve bounds argv/envp against it, exactly as the kernel bounds
+ * ARG_MAX against RLIMIT_STACK. */
 #define CNG_GUEST_STACK_SIZE (64UL << 20)
 
 /* Upper bound on -E/--env entries. The guest environment is assembled from those

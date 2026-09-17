@@ -4031,6 +4031,66 @@ int cng_cmd_argvtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     return ok ? 0 : 1;
 }
 
+/* _stackguardtest — the guest stack has a guard under it.
+ *
+ * A real main stack has stack_guard_gap (256 pages) of nothing beneath it and
+ * faults when it grows into that; the stack cng_build_stack maps was one RW
+ * region with whatever the kernel had placed below, so a recursion that ran off
+ * its end wrote into the next mapping down — a library, a scratch stack of ours
+ * — and kept going. Now the lowest 256 pages of the region are PROT_NONE.
+ *
+ * Checked from a child, since the check is a fault: a store one word below the
+ * usable bottom must die with SIGSEGV, a store at the usable bottom must not
+ * (the argv address scratch lives there while the stack is built, so it has to
+ * be writable), the sp handed back must lie above both, and the extent that
+ * the exec reclaim is told covers the guard as well as the stack. */
+static int stackguard_child(unsigned long addr) {
+    *(volatile unsigned long *)addr = 0x600d;
+    return 0;
+}
+
+static int stackguard_probe(unsigned long addr) {
+    long p = sys_fork();
+    if (p == 0)
+        sys_exit_group(stackguard_child(addr));
+    if (p < 0)
+        return -1;
+    int st = 0;
+    sys_wait4((int)p, &st, 0, 0);
+    if ((st & 0x7f) == 11) /* SIGSEGV */
+        return 1;
+    if ((st & 0x7f) == 0 && ((st >> 8) & 0xff) == 0)
+        return 0;
+    return -1;
+}
+
+int cng_cmd_stackguardtest(int argc, char **argv, char **envp,
+                           unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    static struct cng_loaded prog;
+    char *av[2] = {(char *)"guard", 0};
+    char *ev[1] = {0};
+    unsigned long sp = cng_build_stack(1, av, ev, 0, &prog, 0, "guard");
+    unsigned long guard = 256 * cng_page_size;
+    unsigned long lo = cng_g_stack_lo, len = cng_g_stack_len;
+    int extent = sp && lo && len == CNG_GUEST_STACK_SIZE + guard;
+    int sp_in = extent && sp > lo + guard && sp < lo + len;
+    int below = extent ? stackguard_probe(lo + guard - sizeof(long)) : -1;
+    int bottom = extent ? stackguard_probe(lo + guard) : -1;
+    int deep = extent ? stackguard_probe(lo) : -1; /* the guard's own bottom */
+    int ok = extent && sp_in && below == 1 && bottom == 0 && deep == 1;
+    cng_dprintf(1,
+                "stackguard: extent=%d sp_in=%d below_faults=%d bottom_writes=%d"
+                " guard_base_faults=%d -> %s\n",
+                extent, sp_in, below, bottom == 0, deep, ok ? "OK" : "FAIL");
+    if (lo && len)
+        sys_munmap((void *)lo, len);
+    return ok ? 0 : 1;
+}
+
 /* _elfspan — a PT_LOAD whose file part reaches past its memory part, and the
  * well-formed object it has to be told apart from.
  *

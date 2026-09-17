@@ -2460,6 +2460,29 @@ vfork/`posix_spawn` child-stack handling.
   EMFILE, and the pass is run — the CLOEXEC descriptors below and at the very
   top of the fill have to go, the plain ones have to stay.
 
+- [x] **M40 — the guest stack had no guard under it**
+  A real main stack has `stack_guard_gap` — 256 pages — of nothing beneath
+  it, and a stack that grows into the gap faults. The stack `cng_build_stack`
+  mapped was one 64 MiB RW mapping, writable to its last byte, with whatever
+  the kernel had happened to place beneath it next in line: top-down
+  allocation's most recent mapping, a library the guest loaded or a scratch
+  stack of ours. A recursion that ran off the end wrote into that and went on
+  running, where the kernel gives SIGSEGV.
+  The same 256 pages are now reserved with the stack and made PROT_NONE:
+  nothing else can be mapped there, the first store past the bottom is the
+  fault a real overflow is, and it costs address space only. The usable size
+  is unchanged (`CNG_GUEST_STACK_SIZE` still bounds argv/envp the way the
+  kernel bounds ARG_MAX), the argv address scratch at the bottom of the
+  region sits just above the guard, and the extent the exec reclaim is told
+  covers the guard, so an emulated execve gives the whole region back.
+  `-t stackguardtest` probes the guard and the usable bottom from a child (a
+  store one word below the bottom dies of SIGSEGV, one at the bottom does
+  not, the guard's own base faults, the sp lies above both, the recorded
+  extent is stack plus guard); `tests/guests/recurse.c` is the end-to-end
+  half — 48 MiB of recursion returns, so the guard took nothing from the
+  stack, and an unbounded one dies of SIGSEGV where it used to write into its
+  neighbour.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

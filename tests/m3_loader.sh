@@ -182,3 +182,26 @@ check_contains "...before anything is mapped, and only for the overlap" \
     "exec-over=-8 intact=1 exec-below=0 dyn-hint=0" "$out"
 check_contains "...and so is one over any other mapping of the monitor's" \
     "own=-8 own-intact=1 scratch=-8 late=0/-8 -> OK" "$out"
+
+# The guest stack has a guard under it. A real main stack faults when it grows
+# into stack_guard_gap; the one cng_build_stack mapped was RW to its last byte,
+# with whatever the kernel had placed below it -- a library, a scratch stack of
+# ours -- next in line for a recursion that ran off the end. The self-test
+# probes the guard and the usable bottom from a child; the compiled guest
+# recurses 48 MiB deep and returns (the guard took nothing from the stack), then
+# without limit and dies of SIGSEGV where it used to write into the neighbour.
+out=$(run -t stackguardtest 2>&1); rc=$?
+check "stackguardtest exit 0" 0 $rc
+check_contains "the page run below the guest stack faults, and the stack itself does not" \
+    "stackguard: extent=1 sp_in=1 below_faults=1 bottom_writes=1 guard_base_faults=1 -> OK" \
+    "$out"
+if guest_cc_report "$GDIR/recurse" tests/guests/recurse.c; then
+    out=$(run_t 120 / "$GDIR/recurse" deep 2>&1); rc=$?
+    check "a guest recursing 48 MiB deep returns (the guard costs no stack)" 0 $rc
+    check_contains "...and did the work" "recurse: deep ok" "$out"
+    out=$(run_t 120 / "$GDIR/recurse" overflow 2>&1); rc=$?
+    check "a guest overflowing its stack dies of SIGSEGV (139)" 139 $rc
+    check_absent "...and never ran past the guard" "survived the overflow" "$out"
+else
+    skip "stack guard guest legs: no AArch64 guest toolchain"
+fi
