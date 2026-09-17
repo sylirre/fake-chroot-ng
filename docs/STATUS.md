@@ -2432,10 +2432,16 @@ vfork/`posix_spawn` child-stack handling.
   a refusal is at worst a fatal exec that says why), `shmat(SHM_REMAP)`
   (EINVAL) and the mmap hook's anonymous stand-in (the kernel's own answer).
   The sweep uses the same helper, so the two can no longer drift apart.
-  `-t imgtest` gained three legs against live addresses: an ET_EXEC over a
+  The extent asked about is the whole of what `map_anon` reserves: under `-R`
+  that is the span plus the trampoline pool on top of it, MAP_FIXED alike, so
+  an ET_EXEC whose span ends exactly where a mapping of ours begins would have
+  put its pool over that mapping.
+  `-t imgtest` gained four legs against live addresses: an ET_EXEC over a
   region recorded with `cng_own_map` (refused, and the region's contents
-  intact afterwards), one over this thread's scratch stack, and one planned
-  over a free page that becomes ours between the plan and the map.
+  intact afterwards), one over this thread's scratch stack, one planned over
+  a free page that becomes ours between the plan and the map, and one whose
+  pool would land on a region of ours — refused with `-R` on, loaded with it
+  off.
 
 - [x] **M39 — the close-on-exec pass did nothing without `/proc/self/fd`**
   A real execve closes every FD_CLOEXEC descriptor; ours reads

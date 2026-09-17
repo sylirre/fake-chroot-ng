@@ -420,8 +420,11 @@ static int elf_read_headers(int fd, struct cng_elf_plan *plan,
      * mappings at addresses a file can name just as well — the exec sweep
      * (execve.c) knows to leave every one of them alone, but that sweep runs
      * after the map pass, and the map pass had already put the guest over
-     * them. cng_hits_monitor asks about all of it. */
-    if (eh->e_type == ET_EXEC && cng_hits_monitor(lo, hi - lo))
+     * them. cng_hits_monitor asks about all of it — over the whole of what
+     * map_anon reserves, which under -R is the span plus the trampoline pool
+     * on top of it, MAP_FIXED alike. */
+    if (eh->e_type == ET_EXEC &&
+        cng_hits_monitor(lo, (hi - lo) + (cng_g_rewrite ? CNG_TRAMP_POOL : 0)))
         return CNG_LOAD_ECLOBBER;
 
     plan->lo = lo;
@@ -511,7 +514,8 @@ int cng_elf_map(const struct cng_elf_plan *plan, unsigned long base_hint,
      * again at the last moment before the MAP_FIXED, where a stale yes would
      * replace the monitor and a refusal is at worst a fatal exec — which is
      * still a process that dies saying why. */
-    if (!plan->is_dyn && cng_hits_monitor(lo, span))
+    if (!plan->is_dyn &&
+        cng_hits_monitor(lo, span + (cng_g_rewrite ? CNG_TRAMP_POOL : 0)))
         return CNG_LOAD_ECLOBBER;
     int rc = cng_g_loader_file ? map_file(plan->fd, eh, ph, plan->is_dyn, lo,
                                           span, base_hint, &bias, &maplen)

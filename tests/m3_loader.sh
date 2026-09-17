@@ -175,13 +175,16 @@ check_contains "...each refusal being the errno the kernel gives" \
 # mappings at addresses just as spellable, and the preflight asked about the
 # image alone. The last three fields are an ET_EXEC over a registered region,
 # one over this thread's scratch stack, and one planned over a free page that
-# became ours between the plan and the map -- refused at the map.
+# became ours between the plan and the map -- refused at the map. The last is
+# the trampoline pool: under -R the reservation is the span plus the pool,
+# MAP_FIXED alike, so an ET_EXEC whose span ends exactly where a mapping of
+# ours begins is refused with -R on and loads with it off.
 out=$(run -t imgtest 2>&1); rc=$?
 check "an ET_EXEC whose span covers chroot-ng's own image is refused" 0 $rc
 check_contains "...before anything is mapped, and only for the overlap" \
     "exec-over=-8 intact=1 exec-below=0 dyn-hint=0" "$out"
 check_contains "...and so is one over any other mapping of the monitor's" \
-    "own=-8 own-intact=1 scratch=-8 late=0/-8 -> OK" "$out"
+    "own=-8 own-intact=1 scratch=-8 late=0/-8 pool=0/-8 -> OK" "$out"
 
 # The guest stack has a guard under it. A real main stack faults when it grows
 # into stack_guard_gap; the one cng_build_stack mapped was RW to its last byte,

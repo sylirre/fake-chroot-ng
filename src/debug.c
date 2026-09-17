@@ -5182,15 +5182,48 @@ int cng_cmd_imgtest(int argc, char **argv, char **envp, unsigned long *auxv) {
             sys_close((int)fd);
     }
 
+    /* Under -R the reservation is the span plus the trampoline pool on top
+     * of it, MAP_FIXED alike, so an ET_EXEC whose span ends exactly where a
+     * mapping of ours begins puts its pool over that mapping: refused with -R
+     * on, loaded with it off. Two pages, the first given back as the hole
+     * the image goes into, the second recorded as ours. */
+    int pool_plain = -1, pool_rw = -1;
+    void *pair = sys_mmap(0, 2 * pg, CNG_PROT_READ | CNG_PROT_WRITE,
+                          CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (!cng_is_err((long)pair)) {
+        sys_munmap(pair, pg);
+        cng_own_map((char *)pair + pg, pg);
+        struct synth_seg edge_seg = {(unsigned long)pair, SYNTH_ELF_HDRSZ, pg,
+                                     6 /*PF_R|PF_W*/, 0};
+        int saved = cng_g_rewrite;
+        for (int rw = 0; rw < 2; rw++) {
+            cng_g_rewrite = rw;
+            fd = synth_elf_memfd(2 /*ET_EXEC*/, &edge_seg, 1);
+            int r = fd < 0 ? (int)fd : cng_load_elf_fd((int)fd, 0, &ld);
+            if (fd >= 0)
+                sys_close((int)fd);
+            if (r == CNG_LOAD_OK)
+                sys_munmap(pair, pg);
+            if (rw)
+                pool_rw = r;
+            else
+                pool_plain = r;
+        }
+        cng_g_rewrite = saved;
+        cng_own_drop((char *)pair + pg, pg);
+        sys_munmap((char *)pair + pg, pg);
+    }
+
     int ok = over == CNG_LOAD_ECLOBBER && intact && under == CNG_LOAD_OK &&
              dyn == CNG_LOAD_OK && own == CNG_LOAD_ECLOBBER && own_still &&
              scr == CNG_LOAD_ECLOBBER && race_plan == CNG_LOAD_OK &&
-             race_map == CNG_LOAD_ECLOBBER;
+             race_map == CNG_LOAD_ECLOBBER && pool_plain == CNG_LOAD_OK &&
+             pool_rw == CNG_LOAD_ECLOBBER;
     cng_dprintf(1,
                 "imgtest exec-over=%d intact=%d exec-below=%d dyn-hint=%d"
-                " own=%d own-intact=%d scratch=%d late=%d/%d -> %s\n",
+                " own=%d own-intact=%d scratch=%d late=%d/%d pool=%d/%d -> %s\n",
                 over, intact, under, dyn, own, own_still, scr, race_plan,
-                race_map, ok ? "OK" : "FAIL");
+                race_map, pool_plain, pool_rw, ok ? "OK" : "FAIL");
     return ok ? 0 : 1;
 }
 
