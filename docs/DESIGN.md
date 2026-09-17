@@ -121,6 +121,19 @@ socket or from `pidfd_getfd` is closed on arrival (`cng_fd_admit`,
 `src/monitor/dispatch.c`). Files are let in for the I/O they carry; a file is
 not a place to resolve a name from.
 
+A file descriptor is the whole capability it is under `chroot(2)`, and
+deliberately so. What the launcher hands over by descriptor — a redirected
+stdin, a script or a data file on fd 3, one received over a socket — the
+guest can read, write as the description's mode allows, execute
+(`execveat(fd, "", AT_EMPTY_PATH)`, `fexecve`, `/proc/self/fd/N`) and give
+a name of its own with `linkat(fd, "", …, AT_EMPTY_PATH)` where the kernel
+lets an unprivileged process link by descriptor, exactly as a chrooted
+process can with a descriptor it inherited. None of that resolves a name
+against the host, so none of it is the walk's to refuse — and refusing it
+would break every launcher that passes a program or its input by
+descriptor. A launcher that must not let the guest execute, or keep, a
+host file does not hand it the descriptor.
+
 ### Shared component 3 — the IPC broker
 
 A detached per-namespace daemon (`src/monitor/broker.c`) that owns shared state
