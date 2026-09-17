@@ -10,7 +10,7 @@ against that rather than against a hardcoded devbox.
 
 | host | how binaries run | seccomp/SIGSYS tier | guest toolchain |
 |---|---|---|---|
-| Linux x86_64 | `qemu-aarch64[-static]` | **inert** — qemu-user does not apply a guest filter, so `-R` svc-rewriting carries translation | `aarch64-linux-gnu-gcc*`, static-PIE |
+| Linux x86_64 | `qemu-aarch64[-static]` | **inert** — qemu-user rejects the filter, so `-R` svc-rewriting carries translation; a run that needs a monitor and has no `-R` is refused | `aarch64-linux-gnu-gcc*`, static-PIE |
 | Linux aarch64 | directly | **live** | native `gcc`/`cc`/`clang`, static-PIE |
 | Termux (Android aarch64) | directly | **live** | `clang` (bionic); often dynamic-only |
 

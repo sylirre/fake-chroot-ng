@@ -459,16 +459,46 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
                      cng_g_shared_proc;
     if (want_xlate) {
         int mrc = cng_install_monitor(cng_g_fs);
+        /* A monitor that could not be installed is not a warning to print on
+         * the way into the guest. Without one, nothing intercepts: a rootfs
+         * that is not `/` runs against the host's own paths, -u reports the
+         * real identity, -l makes no hardlink, --no-ptrace refuses nothing and
+         * --shared-proc publishes nothing — every one of them the thing the
+         * invocation asked for, and none of them delivered. That used to go
+         * ahead behind one line on stderr, which a launcher script never
+         * reads, and the guest wrote where the host keeps its files. It stops
+         * here instead, with the errno: EINVAL is qemu-user or a kernel
+         * before 3.5, EACCES a policy that forbids the filter (the probe says
+         * which).
+         *
+         * -R is the exception, and a deliberate one: a rewritten svc site
+         * calls the dispatcher directly and needs no filter, which is what
+         * makes it the interception tier for hosts that have none
+         * (docs/DESIGN.md). What it cannot reach — the svc sites in a library
+         * the guest's own ld.so maps from a mount that grants PROT_EXEC, and
+         * code no object carries — goes to the host untranslated, and the
+         * warning says exactly that, so a run that goes on does so knowing. */
+        if (mrc < 0 && !cng_g_rewrite) {
+            cng_dprintf(2,
+                        "chroot-ng: cannot install the seccomp monitor (errno %d)"
+                        " and nothing else would intercept the guest's syscalls:"
+                        " not entering it\n"
+                        "           (seccomp is inert under qemu-user and needs a"
+                        " kernel >= 3.5 that permits the filter; -R carries"
+                        " translation without it, for the svc sites it can"
+                        " reach)\n",
+                        -mrc);
+            return 1;
+        }
         if (mrc < 0)
             cng_dprintf(2,
-                        "chroot-ng: warning: could not install seccomp monitor "
-                        "(errno %d); %s\n"
-                        "           (seccomp is inert under qemu-user; a real "
-                        "AArch64 kernel is required for the SIGSYS path)\n",
-                        -mrc,
-                        cng_g_rewrite
-                            ? "svc-rewriting (-R) still handles located sites"
-                            : "path translation is INACTIVE");
+                        "chroot-ng: warning: could not install the seccomp"
+                        " monitor (errno %d); only the svc sites -R rewrote are"
+                        " intercepted\n"
+                        "           (code in a library the guest's ld.so maps"
+                        " from an exec-permitted mount, and any code no object"
+                        " carries, reaches the host untranslated)\n",
+                        -mrc);
     }
 
     cng_enter(sp, entry);

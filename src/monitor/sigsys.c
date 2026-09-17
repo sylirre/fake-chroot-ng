@@ -849,8 +849,9 @@ int cng_sigsys_install_only(void) {
 
 int cng_install_monitor(struct cng_fs *fs) {
     cng_g_fs = fs;
-    if (cng_sig_install(CNG_SIGSYS, sigsys_handler) < 0)
-        return -1;
+    int sr = cng_sig_install(CNG_SIGSYS, sigsys_handler);
+    if (sr < 0)
+        return sr; /* -errno: cng_run reports it, so it has to be the real one */
     /* From here a trapping filter is survivable. Anything that stacks one on
      * demand (the ptrace roles) must not do so before this point: a
      * SECCOMP_RET_TRAP with no handler for the signal kills the process. */

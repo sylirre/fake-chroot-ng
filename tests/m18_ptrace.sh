@@ -251,9 +251,12 @@ fi
 # honoured by there being no monitor; one whose whole effect is a trap of ours is
 # not — --no-ptrace has a ptrace to refuse, and --shared-proc has to publish each
 # forked guest process into the shared registry, which hangs off the trapped
-# clone. Asked through PR_SET_NO_NEW_PRIVS, which installing the monitor sets and
-# /proc/self/status reports: on a host whose seccomp tier is inert that is the
-# only thing about an installed monitor a guest can still see.
+# clone. On a live host the monitor shows through PR_SET_NO_NEW_PRIVS, which
+# installing it sets and /proc/self/status reports. On a host whose seccomp tier
+# is inert the filter cannot go in at all, and an option that needs one is then
+# a refusal to enter the guest -- which is the same fact, told the only way an
+# inert host can tell it (it used to run the guest anyway, with the option
+# silently inert, behind a warning).
 if guest_cc_report "$PT_DIR/nnprivs" tests/guests/nnprivs.c; then
     out=$(run_t 60 / "$PT_DIR/nnprivs" 2>/dev/null)
     check_contains "an identity view with nothing to translate installs no monitor" \
@@ -261,12 +264,24 @@ if guest_cc_report "$PT_DIR/nnprivs" tests/guests/nnprivs.c; then
     out=$(run_t 60 --no-proc / "$PT_DIR/nnprivs" 2>/dev/null)
     check_contains "...nor does an option that only turns an emulation off" \
         "nnp=0" "$out"
-    out=$(run_t 60 --no-ptrace / "$PT_DIR/nnprivs" 2>/dev/null)
-    check_contains "--no-ptrace installs one: it has a ptrace to refuse" \
-        "nnp=1" "$out"
-    out=$(run_t 60 --shared-proc / "$PT_DIR/nnprivs" 2>/dev/null)
-    check_contains "--shared-proc installs one: forks must reach the registry" \
-        "nnp=1" "$out"
+    if [ "$CNG_SECCOMP_LIVE" = 1 ]; then
+        out=$(run_t 60 --no-ptrace / "$PT_DIR/nnprivs" 2>/dev/null)
+        check_contains "--no-ptrace installs one: it has a ptrace to refuse" \
+            "nnp=1" "$out"
+        out=$(run_t 60 --shared-proc / "$PT_DIR/nnprivs" 2>/dev/null)
+        check_contains "--shared-proc installs one: forks must reach the registry" \
+            "nnp=1" "$out"
+    else
+        out=$(run_t 60 --no-ptrace / "$PT_DIR/nnprivs" 2>&1); rc=$?
+        check "--no-ptrace wants one: with none to be had, the guest is not entered" 1 $rc
+        check_contains "...and the refusal says so" \
+            "cannot install the seccomp monitor" "$out"
+        check_absent "...before the guest could run with ptrace unrefused" \
+            "nnp=" "$out"
+        out=$(run_t 60 --shared-proc / "$PT_DIR/nnprivs" 2>&1); rc=$?
+        check "--shared-proc wants one: with none to be had, the guest is not entered" 1 $rc
+        check_absent "...before the guest could fork unpublished" "nnp=" "$out"
+    fi
 fi
 
 rm -rf "$PT_DIR"

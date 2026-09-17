@@ -486,8 +486,10 @@ int cng_build_seccomp(struct sock_filter *f, int cap);
 int cng_denied_syscall(long nr);
 
 /* Point the dispatcher at fs, install the SIGSYS handler, then the filter.
- * Returns 0 on success or a negative errno (e.g. under qemu, where guest
- * seccomp filters are inert). */
+ * Returns 0 on success or a negative errno (EINVAL under qemu-user, which
+ * rejects the filter, and on a kernel before 3.5; EACCES where policy forbids
+ * it). Without -R, cng_run does not enter the guest on a failure: nothing else
+ * would intercept its syscalls. */
 int cng_install_monitor(struct cng_fs *fs);
 
 #endif /* CNG_MONITOR_H */

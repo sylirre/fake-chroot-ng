@@ -94,17 +94,33 @@ elif guest_cc_report "$ROOT/bin/readfile" tests/guests/readfile.c; then
     # The same guest with no -R. Which answer is correct depends on the host: on a
     # real AArch64 kernel the seccomp monitor installs and translates it anyway
     # (the tier that matters on a device, and the only place it can be observed);
-    # under qemu-user nothing traps, so the guest's open reaches the untranslated
-    # host path and fails. Either way this is the control that proves the rewrite
-    # leg above was not passing for some unrelated reason.
+    # under qemu-user the filter cannot be installed, and with no -R nothing else
+    # would intercept -- so chroot-ng refuses to enter the guest at all, rather
+    # than run it against the host's own paths behind a warning (which is what
+    # it used to do: the guest's open reached the untranslated host path and
+    # failed with rc 3, and a guest that wrote would have written there). Either
+    # way this is the control that proves the rewrite leg above was not passing
+    # for some unrelated reason.
     if [ "$CNG_SECCOMP_LIVE" = 1 ]; then
         out=$(m8run "$ROOT" /bin/readfile 2>/dev/null); rc=$?
         check "without -R the seccomp tier translates instead" 0 $rc
         check_contains "seccomp-translated openat reached the rootfs" \
             "GREETING-VIA-REWRITE" "$out"
     else
-        m8run "$ROOT" /bin/readfile >/dev/null 2>&1
-        check "without -R and with the filter inert: not translated (rc 3)" 3 $?
+        out=$(m8run "$ROOT" /bin/readfile 2>&1); rc=$?
+        check "without -R and with the filter inert: the guest is not entered (rc 1)" 1 $rc
+        check_contains "...and the refusal says why" \
+            "cannot install the seccomp monitor" "$out"
+        check_absent "...before the guest ran a single instruction" \
+            "GREETING-VIA-REWRITE" "$out"
+    fi
+    # ...and with -R the filter's absence is a warning, since the rewritten
+    # sites carry the translation; the warning names what they cannot reach.
+    if [ "$CNG_SECCOMP_LIVE" != 1 ]; then
+        out=$(m8run -R "$ROOT" /bin/readfile 2>&1); rc=$?
+        check "with -R and the filter inert: the guest runs" 0 $rc
+        check_contains "...behind a warning that says what stays untranslated" \
+            "only the svc sites -R rewrote are intercepted" "$out"
     fi
 fi
 

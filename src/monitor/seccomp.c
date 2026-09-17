@@ -692,17 +692,21 @@ int cng_install_seccomp_tracer(void) {
     return n < 0 ? -1 : install_filter(f, n);
 }
 
+/* 0, or -errno: cng_run prints the number when the install is what ends the
+ * run, so a failure here has to carry the kernel's own answer rather than -1
+ * (which would read as EPERM). */
 int cng_install_seccomp(void) {
     struct sock_filter f[CNG_SECCOMP_MAX_INSNS];
     int n = cng_build_seccomp(f, (int)(sizeof f / sizeof f[0]));
     if (n < 0)
-        return -1;
+        return -EINVAL; /* the buffer cannot hold the filter: ours, not the host's */
     struct sock_fprog prog = {.len = (uint16_t)n, .filter = f};
 
-    if (sys_prctl(CNG_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
-        return -1;
+    long r = sys_prctl(CNG_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    if (r < 0)
+        return (int)r;
     /* prctl path is 3.5+ (the seccomp() syscall is only 3.17+). */
-    long r = sys_prctl(CNG_PR_SET_SECCOMP, CNG_SECCOMP_MODE_FILTER,
-                       (unsigned long)&prog, 0, 0);
+    r = sys_prctl(CNG_PR_SET_SECCOMP, CNG_SECCOMP_MODE_FILTER,
+                  (unsigned long)&prog, 0, 0);
     return (int)r;
 }

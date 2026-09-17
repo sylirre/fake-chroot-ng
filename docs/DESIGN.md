@@ -174,6 +174,13 @@ locatable `svc` sites in objects we load (not JIT/self-modifying code, and not
 `.so`s until the mmap hook lands), whereas the SIGSYS floor catches every raw
 syscall. The two compose: rewrite what we can find, trap the rest.
 
+That composition is also the whole of what a run may fall back to. When the
+filter cannot be installed and `-R` is on, chroot-ng enters the guest behind a
+warning that names what stays untranslated; when `-R` is off there is nothing
+left that intercepts, and the invocation — a rootfs, binds, `-u`, `-l`,
+`--no-ptrace`, `--shared-proc` — cannot be delivered at all, so `cng_run`
+refuses to enter the guest rather than run it against the host's own paths.
+
 ### Coexisting with Android's own seccomp filter
 
 On Android our process already carries the zygote's app seccomp filter, whose

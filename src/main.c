@@ -409,7 +409,10 @@ static void help(char **envp) {
                       "site that pass could not reach. Faster than trapping "
                       "every syscall, and also provides path translation where "
                       "the seccomp monitor is unavailable (e.g. under "
-                      "qemu-user)."},
+                      "qemu-user): without -R, a monitor that cannot be "
+                      "installed is a refusal to run, since nothing else would "
+                      "intercept; with it the run goes ahead, and only the svc "
+                      "sites the rewriter reached are intercepted."},
         {"-F, --file-backed", "Force file-backed segment mapping. Auto-selected "
                       "when anonymous executable memory is denied (Android "
                       "no-new-privs / execmem); this forces it unconditionally."},

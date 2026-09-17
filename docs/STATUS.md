@@ -2510,6 +2510,34 @@ vfork/`posix_spawn` child-stack handling.
   kernel's answer for the pages past EOF is checked to be SIGBUS, so an
   agreement is not two mappings that both merely died.
 
+- [x] **M42 — a monitor that could not be installed was a warning, not a refusal**
+  `cng_run` installs the monitor last, when the invocation asked for
+  something only a monitor delivers: a rootfs that is not `/`, a bind, `-u`,
+  `-l`, `--no-ptrace`, `--shared-proc`. When `cng_install_monitor` failed it
+  printed one line on stderr and entered the guest anyway — and without a
+  filter nothing intercepts, so the rootfs ran against the host's own paths,
+  `-u` reported the real identity, `-l` made no hardlink, `--no-ptrace`
+  refused nothing and `--shared-proc` published nothing. Every one of those
+  is the thing the invocation asked for, and none of them was delivered; a
+  launcher script never reads the line, and a guest that wrote, wrote where
+  the host keeps its files. Under qemu-user that was every run, since
+  qemu rejects `PR_SET_SECCOMP` (EINVAL); on a device it is a policy that
+  forbids the filter (EACCES — what `--probe` calls a hard blocker).
+  Now the failure is the end of the run: chroot-ng says it cannot install
+  the monitor, with the errno, and that nothing else would intercept, and
+  exits 1 before the guest has run an instruction. `-R` is the one exception,
+  and a deliberate one — a rewritten `svc` site calls the dispatcher directly
+  and needs no filter, which is what makes it the interception tier for hosts
+  that have none (`docs/DESIGN.md`). With `-R` the run goes ahead, and the
+  warning now names exactly what it cannot reach: the `svc` sites in a
+  library the guest's own ld.so maps from a mount that grants PROT_EXEC, and
+  code no object carries.
+  Three suite legs observed the old behaviour and now assert the new one:
+  M8's no-`-R` control (rc 1 and the message on an inert host, the
+  seccomp-translated open on a live one) and M18's `--no-ptrace /` and
+  `--shared-proc /` legs (the refusal on an inert host, `nnp=1` on a live
+  one). M8 also checks that `-R` on an inert host runs and warns.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes
@@ -2531,5 +2559,6 @@ vfork/`posix_spawn` child-stack handling.
   needs simulated-SIGSYS unit tests + real-hardware validation. Loader (M3/M4)
   and path logic are fully qemu-testable. On an AArch64 host the harness detects
   the live filter (`CNG_SECCOMP_LIVE`) and flips the legs that depend on it —
-  M8's no-`-R` control, for instance, expects an untranslated open under qemu and
-  a seccomp-translated one on a real kernel.
+  M8's no-`-R` control, for instance, expects chroot-ng to refuse to enter the
+  guest under qemu (no filter and no `-R` means nothing intercepts; see M42)
+  and a seccomp-translated open on a real kernel.
