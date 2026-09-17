@@ -6181,6 +6181,42 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
             cng_dprintf(1, "proctest pread keeps the offset: %ld then %ld -> %s\n",
                         before, after, kept ? "OK" : "FAIL");
             fails += !kept;
+            /* The refresh is keyed on the number, and close(2) is not
+             * trapped: a guest file moved onto it must be left exactly as
+             * it is. The identity that decides is the (device, inode) pair —
+             * an inode number is per filesystem, so the memfd's number on
+             * another device is not the memfd — asked of the helper
+             * directly, since no guest can be made to produce that
+             * collision to order; then the reuse itself, through the
+             * dispatcher, on a file whose inode differs as any real one
+             * would. */
+            struct cng_fdid id, alias;
+            int ident = cng_fdid_of((int)fd, &id) == 0 && cng_fd_is((int)fd, &id);
+            alias = id;
+            alias.dev ^= 1;
+            ident &= !cng_fd_is((int)fd, &alias);
+            alias = id;
+            alias.ino ^= 1;
+            ident &= !cng_fd_is((int)fd, &alias);
+            char keep[CNG_PATH_MAX];
+            cng_snprintf(keep, sizeof keep, "%s/keep", rootfs);
+            long kf = sys_openat(CNG_AT_FDCWD, keep,
+                                 CNG_O_RDWR | CNG_O_CREAT | CNG_O_TRUNC, 0644);
+            int reuse = kf >= 0 && sys_write((int)kf, "kept\n", 5) == 5 &&
+                        CNG_SYS(__NR_dup3, kf, fd, 0, 0, 0, 0) == fd;
+            if (reuse) {
+                sys_lseek((int)fd, 0, CNG_SEEK_SET);
+                m = cng_dispatch(__NR_read, fd, (long)again, sizeof again - 1,
+                                 0, 0, 0, 0);
+                reuse = m == 5 && !strncmp(again, "kept\n", 5);
+            }
+            if (kf >= 0)
+                sys_close((int)kf);
+            cng_dprintf(1,
+                        "proctest synth fd identity: dev+ino=%d reused number "
+                        "left alone=%d -> %s\n",
+                        ident, reuse, ident && reuse ? "OK" : "FAIL");
+            fails += !(ident && reuse);
             sys_close((int)fd);
         }
 

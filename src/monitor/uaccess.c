@@ -25,8 +25,9 @@
  *     writable  pread64 (fd, p, n, ZERO)     — copy_to_user of exactly [p,p+n)
  *   This one holds a descriptor, and we do not trap close(2), so the guest can
  *   close ours and have the number handed straight back for a file of its own —
- *   after which a probe would write into a guest file. Hence the inode check on
- *   every use, which is the second syscall the pair above does not need.
+ *   after which a probe would write into a guest file. Hence the identity
+ *   check on every use, which is the second syscall the pair above does not
+ *   need.
  *
  * Both report -EFAULT (or a short count, where the fault is partway in) for an
  * inaccessible range and touch nothing else. The write probe's source region is
@@ -65,19 +66,10 @@
 #define UA_SLOTS       64
 #define UA_FD_SIZE     (UA_SLOT_OFF + (long)UA_SLOTS * UA_CHUNK)
 
-#define STAT_INO_OFF 8
-
 /* -1 = not created yet, -2 = another thread is creating it, -3 = unavailable. */
 static int g_fd = -1;
-static unsigned long g_ino;
+static struct cng_fdid g_id;
 static long g_pid;
-
-static unsigned long fd_ino(int fd) {
-    char st[128]; /* AArch64 struct stat */
-    if (sys_fstat(fd, st) != 0)
-        return 0;
-    return *(unsigned long *)(st + STAT_INO_OFF);
-}
 
 /* A staging slot of the descriptor, held for the length of one copy.
  *
@@ -119,10 +111,11 @@ static void slot_release(int s) {
  *
  * We do not trap close(2), so the guest can close ours and the kernel will hand
  * the number straight back out for a file of its own — after which a probe would
- * write into a guest file. The inode is recorded at creation and checked on every
- * use, which is the same staleness discipline procfs.c applies to its
- * synthesized fds. A stale number is abandoned, never closed: by then it belongs
- * to the guest.
+ * write into a guest file. The file's identity (cng_fdid: device and inode,
+ * since an inode number alone is per filesystem) is recorded at creation and
+ * checked on every use, which is the same staleness discipline procfs.c applies
+ * to its synthesized fds. A stale number is abandoned, never closed: by then it
+ * belongs to the guest.
  *
  * The pid is recorded and checked for a different reason: fork. A descriptor
  * comes across with the address space, and so does the file behind it, so
@@ -140,7 +133,7 @@ static int scratch_fd(void) {
     if (fd == -3 || fd == -2)
         return -1; /* unavailable, or another thread is mid-creation */
     long pid = sys_getpid();
-    int ours = fd >= 0 && fd_ino(fd) == g_ino;
+    int ours = fd >= 0 && cng_fd_is(fd, &g_id);
     if (ours && g_pid == pid)
         return fd;
 
@@ -159,14 +152,11 @@ static int scratch_fd(void) {
     }
 
     long nfd = sys_memfd_create("cng-uaccess", CNG_MFD_CLOEXEC);
-    if (nfd >= 0 && sys_ftruncate((int)nfd, UA_FD_SIZE) == 0) {
-        unsigned long ino = fd_ino((int)nfd);
-        if (ino) {
-            g_ino = ino;
-            g_pid = pid;
-            __atomic_store_n(&g_fd, (int)nfd, __ATOMIC_RELEASE);
-            return (int)nfd;
-        }
+    if (nfd >= 0 && sys_ftruncate((int)nfd, UA_FD_SIZE) == 0 &&
+        cng_fdid_of((int)nfd, &g_id) == 0) {
+        g_pid = pid;
+        __atomic_store_n(&g_fd, (int)nfd, __ATOMIC_RELEASE);
+        return (int)nfd;
     }
     if (nfd >= 0)
         sys_close((int)nfd);
@@ -179,7 +169,7 @@ static int scratch_fd(void) {
  * so a test can assert the one property that identity carries — that a forked
  * child does not go on staging through its parent's descriptor. */
 unsigned long cng_uaccess_scratch_ino(void) {
-    return scratch_fd() >= 0 ? g_ino : 0;
+    return scratch_fd() >= 0 ? g_id.ino : 0;
 }
 
 /* Did a probe of `n` bytes come back saying the range is inaccessible? A fault

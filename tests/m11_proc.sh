@@ -93,6 +93,8 @@ check_contains "the readv path takes the same refresh hook" \
 # The p-variants take it too, and there the offset is the caller's argument, not
 # the description's — which pread(2) is defined never to move. Measured: the
 # kernel leaves a held /proc/uptime fd at 8 across a pread of the whole file.
+check_contains "the refresh is keyed on device and inode, and a reused number is left alone" \
+    "proctest synth fd identity: dev+ino=1 reused number left alone=1 -> OK" "$out"
 check_contains "a pread that triggers the refresh leaves the offset alone" \
     "proctest pread keeps the offset: 8 then 8 -> OK" "$out"
 check_contains "uptime is synthesized" "proctest uptime:" "$out"

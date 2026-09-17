@@ -677,42 +677,40 @@ static int put_maps(int fd, const char *host) {
 
 /* ---- synthesized fd bookkeeping ----------------------------------------- */
 
-/* Time-varying files are regenerated when a read starts at offset 0. The memfd
- * inode is recorded so a stale entry (an fd number reused after a close we
- * never saw — we do not trap close) is detected and dropped rather than
- * clobbering an innocent file. */
+/* Time-varying files are regenerated when a read starts at offset 0. The
+ * memfd's identity is recorded so a stale entry (an fd number reused after a
+ * close we never saw — we do not trap close) is detected and dropped rather
+ * than clobbering an innocent file. The identity is the (device, inode) pair
+ * (cng_fdid): the inode number alone was what this kept, and an inode number
+ * is per filesystem — a guest file with the memfd's number, moved onto the
+ * memfd's old descriptor number, passed as the memfd and was truncated and
+ * rewritten with /proc/stat, through a description of our own opened for
+ * writing on a file the guest may only have been able to read. */
 static struct {
     int fd1; /* fd + 1, so a zeroed table means "all free"; claimed by CAS */
     int kind;
-    unsigned long ino;
+    struct cng_fdid id;
 } g_pf[CNG_SYNTH_FD_SLOTS];
 
-static unsigned long fd_ino(int fd) {
-    char st[128];
-    if (sys_fstat(fd, st) != 0)
-        return 0;
-    return *(unsigned long *)(st + STAT_INO_OFF);
-}
-
 static void pf_track(int fd, int kind) {
-    unsigned long ino = fd_ino(fd);
-    if (!ino)
+    struct cng_fdid id;
+    if (cng_fdid_of(fd, &id) != 0)
         return;
     for (int i = 0; i < CNG_SYNTH_FD_SLOTS; i++) {
         int expect = 0; /* free */
         if (__atomic_compare_exchange_n(&g_pf[i].fd1, &expect, fd + 1, 0,
                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
             g_pf[i].kind = kind;
-            g_pf[i].ino = ino;
+            g_pf[i].id = id;
             return;
         }
         /* Reclaim a slot whose fd is gone or now names a different file (we do
          * not trap close, so entries are only ever retired lazily). */
-        if (expect > 0 && fd_ino(expect - 1) != g_pf[i].ino &&
+        if (expect > 0 && !cng_fd_is(expect - 1, &g_pf[i].id) &&
             __atomic_compare_exchange_n(&g_pf[i].fd1, &expect, fd + 1, 0,
                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
             g_pf[i].kind = kind;
-            g_pf[i].ino = ino;
+            g_pf[i].id = id;
             return;
         }
     }
@@ -731,14 +729,24 @@ static long synth_reopen(int fd, long oflags) {
     return sys_openat(CNG_AT_FDCWD, link, oflags | CNG_O_CLOEXEC, 0);
 }
 
-static void regen(int fd, int kind) {
+static void regen(int fd, int kind, const struct cng_fdid *id) {
     /* The guest holds a read-only description, so the rewrite goes through a
      * writable one taken for the call. Where that cannot be had, the fd itself
      * is tried: it is writable exactly when the seal below could not be
-     * applied, and the rewrite moves its offset, which the caller puts back. */
+     * applied, and the rewrite moves its offset, which the caller puts back.
+     *
+     * The reopen goes through the fd's magic link, which names whatever the
+     * number is at that moment — the caller checked it a syscall ago, and the
+     * number is in the guest's table. So what came back is checked against
+     * the memfd's identity before a byte of it is truncated: a description
+     * of something else is closed and left as it was. */
     long w = synth_reopen(fd, CNG_O_RDWR);
+    if (w >= 0 && !cng_fd_is((int)w, id)) {
+        sys_close((int)w);
+        return;
+    }
     int wfd = w >= 0 ? (int)w : fd;
-    if (sys_ftruncate(wfd, 0) == 0) {
+    if ((w >= 0 || cng_fd_is(fd, id)) && sys_ftruncate(wfd, 0) == 0) {
         sys_lseek(wfd, 0, CNG_SEEK_SET);
         switch (kind) {
         case PF_LOADAVG:
@@ -764,7 +772,7 @@ void cng_procfs_pre_read(int fd, long off) {
     for (int i = 0; i < CNG_SYNTH_FD_SLOTS; i++) {
         if (__atomic_load_n(&g_pf[i].fd1, __ATOMIC_ACQUIRE) != fd + 1)
             continue;
-        if (fd_ino(fd) != g_pf[i].ino) { /* stale: the fd was reused */
+        if (!cng_fd_is(fd, &g_pf[i].id)) { /* stale: the fd was reused */
             __atomic_store_n(&g_pf[i].fd1, 0, __ATOMIC_RELEASE);
             return;
         }
@@ -773,7 +781,7 @@ void cng_procfs_pre_read(int fd, long off) {
             off = cur;
         if (off != 0)
             return; /* mid-file: keep the current snapshot */
-        regen(fd, g_pf[i].kind);
+        regen(fd, g_pf[i].kind, &g_pf[i].id);
         /* pread(2) is defined never to move the file offset. The rewrite goes
          * through a description of its own and leaves the guest's where it
          * was — unless it had to write through the guest's own, which it then

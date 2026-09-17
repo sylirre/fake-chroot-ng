@@ -2746,6 +2746,27 @@ vfork/`posix_spawn` child-stack handling.
     an exec still dumps — relayed, on a relay socket of ours, counted in the
     debug trace where the host relays at all.
 
+- [x] **M48 — a synthesized `/proc` file was known by its inode number alone**
+  The refreshable synthesized files (`loadavg`, `uptime`, `stat`) are memfds
+  kept by descriptor number, and since `close(2)` is not trapped the entry
+  is checked against the file behind the number before every refresh — by
+  `st_ino` only. An inode number is per filesystem: a guest file carrying
+  the memfd's number, moved onto the memfd's descriptor number, passed as
+  the memfd, and the refresh reopened it for writing through the fd's magic
+  link, truncated it and wrote `/proc/stat` into it — a write the monitor
+  made on a file the guest may only have been able to read. The scratch
+  memfd `uaccess.c` stages guest copies through carried the same
+  inode-only check.
+  - Both keep the `(st_dev, st_ino)` pair now (`cng_fdid`, M47's helper),
+    and the refresh checks what its reopen actually returned against the
+    recorded identity before it truncates a byte: the number is in the
+    guest's table, and what the magic link names is decided the moment it
+    is opened, not the syscall before.
+  - `-t proctest` asks the helper the question no guest can be made to
+    pose (the memfd's inode number on another device is not the memfd),
+    then moves a file of its own onto the synthesized number and reads it
+    back intact through the dispatcher.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes
