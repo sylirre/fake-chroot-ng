@@ -6923,6 +6923,27 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
                     "fchmod_on=%d -> %s\n",
                     off_ok, proc_ok, on_ok, ch_ok, ok2 ? "OK" : "FAIL");
         fails += !ok2;
+
+        /* The largest filter there is: every optional set on at once. The
+         * builder writes into a CNG_SECCOMP_MAX_INSNS buffer with no bounds
+         * check of its own, and the tail's per-syscall jump offset is a u8, so
+         * both limits have to hold with room for the next syscall somebody
+         * adds — this is where that is found out, rather than in the
+         * installer's stack frame. */
+        int was_l2s = cng_g_l2s, was_nd = cng_g_no_dev;
+        cng_g_fake_id = 1;
+        cng_g_no_proc = 0;
+        cng_g_l2s = 1;
+        cng_g_no_dev = 0;
+        int nmax = cng_build_seccomp(f, CNG_SECCOMP_MAX_INSNS);
+        cng_g_fake_id = was;
+        cng_g_no_proc = was_np;
+        cng_g_l2s = was_l2s;
+        cng_g_no_dev = was_nd;
+        int fits = nmax > 0 && nmax <= CNG_SECCOMP_MAX_INSNS - 8;
+        cng_dprintf(1, "bpftest largest filter: %d of %d insns -> %s\n", nmax,
+                    CNG_SECCOMP_MAX_INSNS, fits ? "OK" : "FAIL");
+        fails += !fits;
     }
 
     /* The two filters a ptrace role stacks on a task. Neither can be observed

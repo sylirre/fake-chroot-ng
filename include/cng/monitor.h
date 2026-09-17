@@ -464,11 +464,14 @@ struct sock_filter;
 int cng_build_seccomp_traceall(struct sock_filter *f, int cap);
 int cng_build_seccomp_tracer(struct sock_filter *f, int cap);
 
-/* Upper bound on the filter's instruction count: prologue + clone block +
- * synthesized-fd block + one check per trapped syscall + the two tail RETs. */
-/* Raised from 128 for the AF_UNIX and credential additions. The kernel's own
- * limit is 4096 instructions, so there is ample headroom; the tail's per-syscall
- * jump offset is a u8, which stays valid while the trapped set is under 255. */
+/* Upper bound on the filter's instruction count: prologue + the designed-ENOSYS
+ * block + gate + the clone/prctl/ioctl/mmap/wait/read blocks + one check per
+ * trapped syscall + the two tail RETs. Raised from 128 for the AF_UNIX and
+ * credential additions; the largest configuration (every optional set on) is
+ * 224 after M37, and `-t bpftest` refuses a build that leaves fewer than eight
+ * spare, since the builder has no bounds check of its own. The kernel's own
+ * limit is 4096 instructions; the tail's per-syscall jump offset is a u8, which
+ * stays valid while the trapped set is under 255. */
 #define CNG_SECCOMP_MAX_INSNS 256
 
 /* Emit the filter into `f` (which must hold CNG_SECCOMP_MAX_INSNS entries) and

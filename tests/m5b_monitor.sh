@@ -648,6 +648,11 @@ for _leg in open_tree_attr open_tree statmount; do
     check_contains "$_leg is refused whatever headers built this binary" \
         "bpftest $_leg is refused ENOSYS: ERRNO -> OK" "$out"
 done
+# ...and the filter with every optional set on still fits its buffer, with room
+# for the next entry: the builder has no bounds check of its own. (The count is
+# printed and not pinned; a FAIL there fails the "exit 0" check above.)
+check_contains "the largest filter is measured against CNG_SECCOMP_MAX_INSNS" \
+    "bpftest largest filter: " "$out"
 check_contains "plain clone still traps for the vfork conversion" \
     "bpftest plain clone still traps for the conversion: TRAP -> OK" "$out"
 
