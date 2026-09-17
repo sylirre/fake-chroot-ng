@@ -259,6 +259,62 @@ int cng_denied_syscall(long nr) {
     return 0;
 }
 
+/* The descriptor-keyed side of a :ro bind (dispatch.c, fd_ro). A read-only
+ * mount refuses these as it refuses the path forms — mnt_want_write_file() is
+ * the same test — and a descriptor on a file under a :ro bind is what its
+ * read-only open hands out. Trapped only with a :ro bind in the view, since
+ * that is the only thing the trap is for; the fd xattr setters were left
+ * native on the grounds that they "need no translation", which is true and
+ * was not the question. fchmod and fchown are also in the credential set,
+ * and are listed once whichever applies. */
+static const int ro_fd_syscalls[] = {
+    __NR_fchmod, __NR_fchown, __NR_fsetxattr, __NR_fremovexattr,
+};
+#define NROFD ((int)(sizeof(ro_fd_syscalls) / sizeof(ro_fd_syscalls[0])))
+
+/* ...and the ioctl requests that take write access on the mount without the
+ * descriptor being open for writing: the generic flag, fsxattr, version,
+ * encryption-policy and verity setters, and the ext4, btrfs and f2fs private
+ * requests an owner may issue on a read-only descriptor (a snapshot into a
+ * directory, a subvolume's flags, a pin, a migration). Each is one JEQ in
+ * the ioctl block below; the SIOCxIF band test stays in front of them.
+ * FIDEDUPERANGE is trapped with them and answered per destination. The
+ * codes are in uapi.h, and the dispatcher's own list is this one. */
+const unsigned cng_ioctl_mnt_write[] = {
+    CNG_FS_IOC_SETFLAGS,
+    CNG_FS_IOC_FSSETXATTR,
+    CNG_FS_IOC_SETVERSION,
+    CNG_FS_IOC_SET_ENCRYPTION_POLICY,
+    CNG_FS_IOC_ENABLE_VERITY,
+    CNG_EXT4_IOC_MIGRATE,
+    CNG_EXT4_IOC_ALLOC_DA_BLKS,
+    CNG_BTRFS_IOC_SNAP_CREATE,
+    CNG_BTRFS_IOC_SNAP_CREATE_V2,
+    CNG_BTRFS_IOC_SUBVOL_CREATE,
+    CNG_BTRFS_IOC_SUBVOL_CREATE_V2,
+    CNG_BTRFS_IOC_SNAP_DESTROY,
+    CNG_BTRFS_IOC_SNAP_DESTROY_V2,
+    CNG_BTRFS_IOC_DEFRAG,
+    CNG_BTRFS_IOC_DEFRAG_RANGE,
+    CNG_BTRFS_IOC_SUBVOL_SETFLAGS,
+    CNG_BTRFS_IOC_SET_RECEIVED_SUBVOL,
+    CNG_F2FS_IOC_SET_PIN_FILE,
+    CNG_FIDEDUPERANGE,
+};
+const int cng_ioctl_mnt_write_n =
+    (int)(sizeof cng_ioctl_mnt_write / sizeof cng_ioctl_mnt_write[0]);
+
+/* Is any bind in the view read-only? Decided at build time, which is final:
+ * binds are fixed at startup, and an emulated chroot only drops them. */
+static int view_has_ro(void) {
+    if (!cng_g_fs)
+        return 0;
+    for (int i = 0; i < cng_g_fs->nbinds; i++)
+        if (cng_g_fs->binds[i].ro)
+            return 1;
+    return 0;
+}
+
 int cng_build_seccomp(struct sock_filter *f, int cap) {
     unsigned long gs = (unsigned long)__cng_gate_start;
     unsigned long ge = (unsigned long)__cng_gate_end;
@@ -267,8 +323,8 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
     uint32_t gate_end_lo = (uint32_t)ge;
 
     /* Build the trapped syscall list (path set + SysV IPC set, plus the id set
-     * when faking, plus the three conditional entries below). */
-    int nr[NPATH + NIPC + NID + 3];
+     * when faking, plus the conditional entries below). */
+    int nr[NPATH + NIPC + NID + NROFD + 3];
     int nsys = 0;
     for (int i = 0; i < NPATH; i++)
         nr[nsys++] = path_syscalls[i];
@@ -277,6 +333,15 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
     if (cng_g_fake_id)
         for (int i = 0; i < NID; i++)
             nr[nsys++] = id_syscalls[i];
+    int has_ro = view_has_ro();
+    if (has_ro)
+        for (int i = 0; i < NROFD; i++) {
+            int dup = 0;
+            for (int j = 0; j < nsys && !dup; j++)
+                dup = nr[j] == ro_fd_syscalls[i];
+            if (!dup)
+                nr[nsys++] = ro_fd_syscalls[i];
+        }
     /* fstat: under -l it must report the emulated st_nlink; under --fake-id it
      * needs the same ownership remap stat() gets, or stat("f") and
      * fstat(open("f")) disagree about who owns the very same file — which is
@@ -420,29 +485,53 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
     f[n++] = (struct sock_filter)CNG_BPF_STMT(
         CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* reload A=nr */
 
-    /* ioctl, for the interface-query band only. SIOCGIF* answers the same
-     * questions the netlink dumps do and has to agree with them, but the
-     * requests arrive on an ordinary AF_INET socket — there is no fd range to
-     * key on, the way the synthesized /proc files have. Trapping ioctl wholesale
-     * would put every terminal TCGETS and every driver call through the handler,
-     * so the request itself is tested instead: 0x8910..0x8970 is the SIOCxIF
-     * band, which is small enough to trap whole (the setters land in the
-     * dispatcher and are passed straight through). */
-    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
-        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, (uint32_t)__NR_ioctl, 0,
-        5); /* not ioctl -> reload nr */
-    f[n++] = (struct sock_filter)CNG_BPF_STMT(
-        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_ARGS + 8); /* A = request */
-    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
-        CNG_BPF_JMP | CNG_BPF_JGE | CNG_BPF_K, 0x8910, 0, 2); /* below -> allow */
-    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
-        CNG_BPF_JMP | CNG_BPF_JGT | CNG_BPF_K, 0x8970, 1, 0); /* above -> allow */
-    f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
-                                              CNG_SECCOMP_RET_TRAP);
-    f[n++] = (struct sock_filter)CNG_BPF_STMT(
-        CNG_BPF_RET | CNG_BPF_K, CNG_SECCOMP_RET_ALLOW); /* not the band */
-    f[n++] = (struct sock_filter)CNG_BPF_STMT(
-        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* reload A=nr */
+    /* ioctl, for the interface-query band — and, with a :ro bind in the view,
+     * the requests that write the mount (cng_ioctl_mnt_write). SIOCGIF*
+     * answers the same questions the netlink dumps do and has to agree with
+     * them, but the requests arrive on an ordinary AF_INET socket — there is
+     * no fd range to key on, the way the synthesized /proc files have.
+     * Trapping ioctl wholesale would put every terminal TCGETS and every
+     * driver call through the handler, so the request itself is tested
+     * instead: 0x8910..0x8970 is the SIOCxIF band, which is small enough to
+     * trap whole (the setters land in the dispatcher and are passed straight
+     * through), and each mutating request is one JEQ after it. Layout, with
+     * M the number of those (0 without a :ro bind):
+     *
+     *   JEQ ioctl        no -> reload nr
+     *   LD  request
+     *   JGE 0x8910       no -> the M checks (or allow)
+     *   JGT 0x8970       yes -> the M checks (or allow), no -> trap
+     *   RET TRAP
+     *   JEQ m[k]         yes -> trap, no -> next; the last: no -> allow
+     *   RET TRAP         (only with M > 0)
+     *   RET ALLOW
+     *   LD  nr */
+    {
+        int m = has_ro ? cng_ioctl_mnt_write_n : 0;
+        int blk = 4 + m + (m > 0) + 1; /* LD .. RET ALLOW, after the JEQ */
+        f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+            CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, (uint32_t)__NR_ioctl, 0,
+            (uint8_t)blk); /* not ioctl -> reload nr */
+        f[n++] = (struct sock_filter)CNG_BPF_STMT(
+            CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_ARGS + 8); /* request */
+        f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+            CNG_BPF_JMP | CNG_BPF_JGE | CNG_BPF_K, 0x8910, 0, 2); /* below */
+        f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+            CNG_BPF_JMP | CNG_BPF_JGT | CNG_BPF_K, 0x8970, 1, 0); /* above */
+        f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
+                                                  CNG_SECCOMP_RET_TRAP);
+        for (int k = 0; k < m; k++)
+            f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+                CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, cng_ioctl_mnt_write[k],
+                (uint8_t)(m - 1 - k), (uint8_t)(k == m - 1 ? 1 : 0));
+        if (m > 0)
+            f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
+                                                      CNG_SECCOMP_RET_TRAP);
+        f[n++] = (struct sock_filter)CNG_BPF_STMT(
+            CNG_BPF_RET | CNG_BPF_K, CNG_SECCOMP_RET_ALLOW); /* neither */
+        f[n++] = (struct sock_filter)CNG_BPF_STMT(
+            CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* reload A=nr */
+    }
 
     /* mmap, for the executable file-mapping band only. A .so on a true noexec
      * mount cannot be mapped PROT_EXEC from its file at all, and it is the

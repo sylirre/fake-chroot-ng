@@ -157,6 +157,39 @@ struct cng_open_how {
 #define CNG_STATX_NLINK 0x00000004U
 #define CNG_STATX_BASIC_STATS 0x000007ffU
 
+/* ioctl requests that take write access on the mount the descriptor's file is
+ * on (mnt_want_write_file) without the descriptor itself being open for
+ * writing — what a :ro bind has to refuse by descriptor (dispatch.c, fd_ro).
+ * The encodings are the kernel's, identical on every arch that uses the
+ * asm-generic ioctl layout (arm64 and the x86_64 dev host both); FIDEDUPERANGE
+ * is apart because its targets are the dest_fd fields of its argument. */
+#define CNG_FS_IOC_SETFLAGS              0x40086602u /* _IOW('f', 2, long) */
+#define CNG_FS_IOC_FSSETXATTR            0x401c5820u /* _IOW('X', 32, fsxattr) */
+#define CNG_FS_IOC_SETVERSION            0x40087602u /* _IOW('v', 2, long) */
+#define CNG_FS_IOC_SET_ENCRYPTION_POLICY 0x800c6613u /* _IOR('f', 19, policy) */
+#define CNG_FS_IOC_ENABLE_VERITY         0x40806685u /* _IOW('f', 133, arg) */
+#define CNG_EXT4_IOC_MIGRATE             0x00006609u /* _IO('f', 9) */
+#define CNG_EXT4_IOC_ALLOC_DA_BLKS       0x0000660cu /* _IO('f', 12) */
+#define CNG_BTRFS_IOC_SNAP_CREATE        0x50009401u
+#define CNG_BTRFS_IOC_SNAP_CREATE_V2     0x50009417u
+#define CNG_BTRFS_IOC_SUBVOL_CREATE      0x5000940eu
+#define CNG_BTRFS_IOC_SUBVOL_CREATE_V2   0x50009418u
+#define CNG_BTRFS_IOC_SNAP_DESTROY       0x5000940fu
+#define CNG_BTRFS_IOC_SNAP_DESTROY_V2    0x5000943fu
+#define CNG_BTRFS_IOC_DEFRAG             0x50009402u
+#define CNG_BTRFS_IOC_DEFRAG_RANGE       0x40309410u
+#define CNG_BTRFS_IOC_SUBVOL_SETFLAGS    0x4008941au
+#define CNG_BTRFS_IOC_SET_RECEIVED_SUBVOL 0xc0c89425u
+#define CNG_F2FS_IOC_SET_PIN_FILE        0x4004f50du
+#define CNG_FIDEDUPERANGE                0xc0189436u /* _IOWR(0x94, 54, range) */
+/* struct file_dedupe_range: src_offset u64, src_length u64, dest_count u16,
+ * two reserved words; then dest_count of struct file_dedupe_range_info:
+ * dest_fd s64, dest_offset u64, bytes_deduped u64, status s32, reserved u32. */
+#define CNG_DEDUPE_HDR        24
+#define CNG_DEDUPE_COUNT_OFF  16
+#define CNG_DEDUPE_INFO       32
+#define CNG_DEDUPE_STATUS_OFF 24
+
 /* AF_UNIX sockets + ppoll — the --shared-proc registry broker (procreg.c). */
 #define CNG_AF_UNIX      1
 #define CNG_SOCK_STREAM  1

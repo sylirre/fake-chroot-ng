@@ -390,6 +390,24 @@ for _leg in fdlink-open-w fdlink-open-trunc devfd-open-w pathfd-open-w \
     check_contains ":ro bind refuses $_leg through an fd link" \
         "robind ro $_leg: rc=-30 -> OK" "$out"
 done
+# ...and by descriptor alone: the calls that carry no path for the refusal to
+# key on. The bind hands out read-only descriptors, and fchmod, fchown,
+# futimens, the fd xattr setters, the AT_EMPTY_PATH spellings of the path
+# forms and the mount-writing ioctls on one all used to go to the kernel with
+# nothing in the way — where a real read-only mount refuses every one of them
+# (mnt_want_write_file). FIDEDUPERANGE names its target in its argument and
+# is judged per destination; a kernel with no dedupe at all (tmpfs, qemu-user)
+# fails the call whole, which the driver reports and does not judge.
+for _leg in fchmod fchown fchmod-dir futimens fsetxattr fremovexattr \
+    fchownat-empty fchmodat2-empty setxattrat-empty file_setattr-empty \
+    ioctl-setflags ioctl-fssetxattr cwd-empty; do
+    check_contains ":ro bind refuses $_leg by descriptor" \
+        "robind ro $_leg: rc=-30 -> OK" "$out"
+done
+check_contains ":ro bind's dedupe destination is judged, or dedupe is absent here" \
+    "robind ro dedupe: rc=" "$out"
+check_absent ":ro bind's dedupe destination did not fail the judgement" \
+    "robind ro dedupe: rc=0 status=0" "$out"
 # A read-only mount refuses where the kernel reaches it, and for the calls that
 # must operate on an existing name that is *after* the path has resolved -- so a
 # name that is not there is ENOENT, the same answer a writable mount gives. The
@@ -667,6 +685,27 @@ done
 # printed and not pinned; a FAIL there fails the "exit 0" check above.)
 check_contains "the largest filter is measured against CNG_SECCOMP_MAX_INSNS" \
     "bpftest largest filter: " "$out"
+# The descriptor side of a :ro bind. With one in the view, the fd-form
+# metadata setters and the mount-writing ioctl requests trap so the dispatcher
+# can refuse them for a descriptor under the bind; the SIOCxIF band still
+# traps beside them, and a terminal TCGETS, the flag getter and FICLONE (which
+# needs a write descriptor the bind never hands out) stay native. Without a
+# :ro bind none of it is in the filter and the calls run native as before.
+for _leg in fchmod fchown fsetxattr fremovexattr FS_IOC_SETFLAGS \
+    FS_IOC_FSSETXATTR FIDEDUPERANGE F2FS_IOC_SET_PIN_FILE; do
+    check_contains "with a :ro bind, $_leg traps" \
+        "bpftest ro-fd $_leg traps: TRAP -> OK" "$out"
+done
+check_contains "with a :ro bind, SIOCGIFCONF still traps" \
+    "bpftest ro-fd SIOCGIFCONF still traps: TRAP -> OK" "$out"
+check_contains "with a :ro bind, TCGETS still runs native" \
+    "bpftest ro-fd TCGETS still runs native: ALLOW -> OK" "$out"
+check_contains "with a :ro bind, FS_IOC_GETFLAGS runs native" \
+    "bpftest ro-fd FS_IOC_GETFLAGS runs native: ALLOW -> OK" "$out"
+for _leg in fchmod fsetxattr FS_IOC_SETFLAGS FIDEDUPERANGE; do
+    check_contains "without a :ro bind, $_leg runs native" \
+        "bpftest rw-fd $_leg runs native: ALLOW -> OK" "$out"
+done
 check_contains "plain clone still traps for the vfork conversion" \
     "bpftest plain clone still traps for the conversion: TRAP -> OK" "$out"
 

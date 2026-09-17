@@ -2648,6 +2648,48 @@ vfork/`posix_spawn` child-stack handling.
     read-only reopen still works; the same through an l2s name; the rw
     control run reopens every one of them.
 
+- [x] **M45 — a `:ro` bind refused mutation by name and not by descriptor**
+  A read-only mount refuses the calls that reach a file by its descriptor as
+  surely as the ones that reach it by name — `mnt_want_write_file()` is the
+  same test either way — and a descriptor on a file under a `:ro` bind is
+  what the bind's read-only open hands out. `fchmod`, `fchown`, `futimens`
+  (`utimensat` with a NULL path), `fsetxattr`, `fremovexattr`, the
+  `AT_EMPTY_PATH` spellings of `fchownat`, `fchmodat2`, `setxattrat`,
+  `removexattrat` and `file_setattr`, and the ioctl requests that write the
+  mount (`chattr`'s `FS_IOC_SETFLAGS` on a read-only descriptor, for one)
+  all went to the kernel with nothing in the way: they carry no path for the
+  refusal to key on. Measured: a guest changed the mode, owner, times,
+  xattrs and inode flags of a file it could only open read-only.
+  - What they carry is the descriptor, whose own path the kernel reports:
+    `fd_ro` puts the question to its fd link, which `ro_denied` resolves
+    (M44) exactly as for a guest that spells `/proc/self/fd/<n>` out. The
+    fd forms are trapped only with a `:ro` bind in the view — the trap is for
+    the refusal alone — and `fchmodat2` learns `AT_EMPTY_PATH`, which the
+    kernel has accepted since the syscall appeared and the dispatcher had
+    been answering `ENOENT` for. `AT_EMPTY_PATH` with `AT_FDCWD` names the
+    working directory, which the translation has already spelled out.
+  - The ioctl requests are an explicit table (`cng_ioctl_mnt_write`, one
+    table for the filter and the dispatcher): the generic flag, fsxattr,
+    version, encryption-policy and verity setters, and the ext4, btrfs and
+    f2fs private requests an owner may issue on a read-only descriptor (a
+    snapshot into a directory, a subvolume's flags, a pin, a migration).
+    Each is one `JEQ` in the ioctl block, behind the `SIOCxIF` band test,
+    present only with a `:ro` bind; a terminal `TCGETS` and every getter stay
+    native. `FIDEDUPERANGE` names its targets in the argument and is answered
+    per destination as the kernel does: the argument is copied, a destination
+    under the bind is replaced by a descriptor that is not open, and its
+    status comes back `EROFS` with the guest's own `dest_fd` restored. The
+    kernel orders a few of the private requests the other way (an owner
+    check, a copy of the argument) and would answer `EPERM` or `EFAULT`
+    ahead of `EROFS` for a call refused either way; that precedence is not
+    reproduced.
+  - `CNG_SECCOMP_MAX_INSNS` goes to 320: the largest configuration measures
+    247 with the table in.
+  - Validated by new `-t dtest robind` legs in `tests/m5b_monitor.sh` (each
+    fd form `EROFS` under the bind and not under the rw control; the dedupe
+    destination judged where the kernel has dedupe at all) and `-t bpftest`
+    legs that simulate the filter with and without a `:ro` bind.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

@@ -1533,12 +1533,40 @@ static int l2s_nofollow_data(long dirfd, const char *gp, char *hnf_out,
     return 1;
 }
 
+/* --- :ro binds, by descriptor -----------------------------------------------
+ *
+ * A read-only mount refuses the calls that reach a file by its descriptor as
+ * surely as the ones that reach it by name — mnt_want_write_file() is the
+ * same test either way — and a descriptor on a file under a :ro bind is easy
+ * to come by: the read-only open the bind allows. fchmod, fchown, futimens,
+ * fsetxattr and fremovexattr on it, and the AT_EMPTY_PATH spellings of the
+ * path forms, went to the kernel with nothing in the way: they carry no path
+ * for the refusal to key on. What they carry is the descriptor, whose own
+ * path the kernel reports, so the question is put to the fd link of it —
+ * which ro_denied resolves (fd_link_ro) exactly as it does for a guest that
+ * spells "/proc/self/fd/<n>" out. Only asked with a :ro bind in the view;
+ * the calls are only trapped then. */
+static int fd_ro(long fd) {
+    if (!cng_g_fs || !fs_has_ro())
+        return 0;
+    char link[40];
+    proc_fd_path(fd, link);
+    return ro_denied(link);
+}
+
 /* ro_refusal() for a call whose resolution followed the final component. The
  * l2s case is answered first and always with EROFS: the name resolved to a
  * link of ours, so it is there, and "there" is the whole of what the ENOENT
- * half of ro_refusal exists to establish. */
+ * half of ro_refusal exists to establish. An empty name is AT_EMPTY_PATH (the
+ * dispatcher has already refused one the call does not allow): the dirfd is
+ * the file, and it is there — or, with AT_FDCWD, the working directory is,
+ * which the translation has already named in `host`. */
 static long ro_refusal_name(long dirfd, const char *gp, const char *host,
                             int atflags) {
+    if (gp && !gp[0])
+        return ((int)dirfd == CNG_AT_FDCWD ? ro_denied(host) : fd_ro(dirfd))
+                   ? -EROFS
+                   : 0;
     if (ro_denied_l2s(dirfd, gp))
         return -EROFS;
     return ro_refusal(host, atflags);
@@ -2384,6 +2412,8 @@ static int empty_path_ok(long nr, long a0, long a2, long a3, long a4) {
     case __NR_fchownat:
     case __NR_linkat:
         return ((int)a4 & CNG_AT_EMPTY_PATH) != 0;
+    case __NR_fchmodat2:
+        return ((int)a3 & CNG_AT_EMPTY_PATH) != 0;
     case __NR_faccessat2:
         return ((int)a3 & CNG_AT_EMPTY_PATH) != 0;
     case __NR_name_to_handle_at:
@@ -2591,6 +2621,60 @@ void cng_nnp_fork_child(int val) {
     for (unsigned i = 0; i < NNP_N; i++)
         __atomic_store_n(&g_nnp[i], 0L, __ATOMIC_RELAXED);
     __atomic_store_n(&g_nnp_floor, val, __ATOMIC_RELEASE);
+}
+
+/* FIDEDUPERANGE: the descriptor is the source, and the destinations are the
+ * dest_fd fields of the argument — each of which the kernel takes write
+ * access on the mount for (vfs_dedupe_file_range_one), answering per
+ * destination in that entry's status rather than for the call as a whole.
+ * So the argument is taken as a copy, every destination under a :ro bind is
+ * replaced by a descriptor that is not open — the kernel then skips it with
+ * EBADF and goes on to the rest — and on the way back that status becomes
+ * the EROFS the mount would have given, with the guest's own dest_fd put
+ * back. The size rules are the kernel's: the count is read first, and a
+ * struct that would exceed a page is ENOMEM before anything else is looked
+ * at. The copy lives on the handler's stack, bounded at a page of the
+ * largest page size this runs with; the same ENOMEM answers above it. */
+static long ioctl_dedupe(long fd, long req, long argp, long a3, long a4,
+                         long a5) {
+    unsigned short count;
+    if (!argp ||
+        cng_user_copyin(&count, (char *)argp + CNG_DEDUPE_COUNT_OFF,
+                        sizeof count) < 0)
+        return -EFAULT;
+    unsigned long size = CNG_DEDUPE_HDR + (unsigned long)count * CNG_DEDUPE_INFO;
+    char buf[16384];
+    if (size > cng_page_size || size > sizeof buf)
+        return -ENOMEM;
+    if (cng_user_copyin(buf, (void *)argp, size) < 0)
+        return -EFAULT;
+    /* Which destinations were taken out, to put back afterwards. A bit per
+     * entry: at most 511 entries fit the page. */
+    unsigned long ro[8] = {0};
+    long dest[512];
+    for (unsigned i = 0; i < count; i++) {
+        char *info = buf + CNG_DEDUPE_HDR + (unsigned long)i * CNG_DEDUPE_INFO;
+        memcpy(&dest[i], info, sizeof dest[i]);
+        if (fd_ro(dest[i])) {
+            ro[i / 64] |= 1UL << (i % 64);
+            long none = -1;
+            memcpy(info, &none, sizeof none);
+        }
+    }
+    long r = reissue(fd, req, (long)buf, a3, a4, a5, __NR_ioctl);
+    if (r < 0)
+        return r;
+    for (unsigned i = 0; i < count; i++) {
+        char *info = buf + CNG_DEDUPE_HDR + (unsigned long)i * CNG_DEDUPE_INFO;
+        if (!(ro[i / 64] & (1UL << (i % 64))))
+            continue;
+        memcpy(info, &dest[i], sizeof dest[i]);
+        int st = -EROFS;
+        memcpy(info + CNG_DEDUPE_STATUS_OFF, &st, sizeof st);
+    }
+    if (cng_user_copyout((void *)argp, buf, size) < 0)
+        return -EFAULT;
+    return r;
 }
 
 /* Deliver a translated sockaddr to the guest exactly as move_addr_to_user()
@@ -3323,6 +3407,11 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * — must land on the backing, not the link). Setting an explicit time needs
      * ownership; under fake-root fake success on EPERM. */
     case __NR_utimensat: {
+        /* A NULL path names the dirfd (futimens). The flags have to be zero
+         * for that, and the kernel says so before it looks at the descriptor,
+         * so only a call it would perform is asked the :ro question. */
+        if (!a1 && !(int)a3 && fd_ro(a0))
+            return -EROFS;
         char data[CNG_PATH_MAX];
         unsigned long cnt;
         if (cng_g_l2s) {
@@ -3633,7 +3722,17 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * succeeded. */
     case __NR_fchown:
     case __NR_fchmod:
+        if (fd_ro(a0))
+            return -EROFS;
         return chattr_result(reissue(a0, a1, a2, a3, a4, a5, nr));
+
+    /* The fd forms of the xattr setters: trapped only with a :ro bind in the
+     * view, for the refusal alone. */
+    case __NR_fsetxattr:
+    case __NR_fremovexattr:
+        if (fd_ro(a0))
+            return -EROFS;
+        return reissue(a0, a1, a2, a3, a4, a5, nr);
 
     /* fstat(fd): no path, but the fd may name an l2s backing file whose
      * st_nlink must reflect the live group count (tar/rsync/ls stat open
@@ -4758,17 +4857,37 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         return cng_syscall6(a0, a1, a2, a3, a4, a5, __NR_rt_sigprocmask);
     }
 
-    /* ioctl, trapped only for the SIOCxIF request band (seccomp.c tests the
+    /* ioctl, trapped for the SIOCxIF request band and — with a :ro bind in
+     * the view — for the requests that write the mount (seccomp.c tests the
      * request in BPF, so every other ioctl runs native). The interface getters
      * are answered from the same enumeration the netlink dumps are built on —
      * a guest told by `ip addr` that it has only loopback must not be shown the
      * host's whole interface list by `ifconfig`. The setters and anything else
      * in the band fall through to the host, which refuses them to an
-     * unprivileged process exactly as it should. */
+     * unprivileged process exactly as it should.
+     *
+     * The mount writers are the descriptor's own :ro question (fd_ro):
+     * FS_IOC_SETFLAGS on a read-only descriptor is chattr(1), and ext4 takes
+     * mnt_want_write_file before it looks at the flags, so a real read-only
+     * mount answers EROFS. So does this, for every request in the table. The
+     * kernel orders a few of the private ones the other way (an owner check,
+     * a copy of the argument) and would answer EPERM or EFAULT ahead of
+     * EROFS for a call that is refused either way; that precedence is not
+     * reproduced. FIDEDUPERANGE names its targets in the argument, and is
+     * answered per destination (ioctl_dedupe). */
     case __NR_ioctl: {
         long r = 0;
         if (cng_nl_ioctl((int)a0, (unsigned long)a1, (void *)a2, &r))
             return r;
+        unsigned req = (unsigned)a1;
+        if (req == CNG_FIDEDUPERANGE && fs_has_ro())
+            return ioctl_dedupe(a0, a1, a2, a3, a4, a5);
+        for (int i = 0; i < cng_ioctl_mnt_write_n; i++)
+            if (req == cng_ioctl_mnt_write[i]) {
+                if (fd_ro(a0))
+                    return -EROFS;
+                break;
+            }
         return reissue(a0, a1, a2, a3, a4, a5, nr);
     }
 

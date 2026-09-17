@@ -916,6 +916,110 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
                         fdl[i].name, (int)fdl[i].r, ok ? "OK" : "FAIL");
             fails += !ok;
         }
+        /* And by descriptor alone: the calls that carry no path for the
+         * refusal to key on. A read-only descriptor under the bind is what
+         * the bind hands out, and fchmod, fchown, futimens, the fd xattr
+         * setters, the AT_EMPTY_PATH spellings of the path forms and the
+         * mount-writing ioctls all went to the kernel with nothing in the
+         * way — mnt_want_write_file() refuses every one of them on a real
+         * read-only mount. FIDEDUPERANGE names its target in the argument:
+         * the descriptor is the source (a rw name of the same file, so the
+         * source is never the refusal), and the destination under the bind
+         * has to come back with EROFS in its own status. Where the kernel
+         * has no dedupe at all (tmpfs, qemu-user) the call fails whole and
+         * says nothing about the mount; that is reported and not judged. */
+        long mfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
+                                CNG_O_RDONLY, 0, 0, 0, 0);
+        long dfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
+                                CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+        if (dfd < 0) /* gpath is a file: its directory is the bind itself */
+            dfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD,
+                               (long)(fs.nbinds > 0 ? fs.binds[0].guest : "/"),
+                               CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+        long ioflags = 0;
+        unsigned char fsx[28] = {0};
+        struct {
+            const char *name;
+            long r;
+        } fdm[] = {
+            {"fchmod", cng_dispatch(__NR_fchmod, mfd, 0644, 0, 0, 0, 0, 0)},
+            {"fchown", cng_dispatch(__NR_fchown, mfd, -1, -1, 0, 0, 0, 0)},
+            {"fchmod-dir", cng_dispatch(__NR_fchmod, dfd, 0755, 0, 0, 0, 0, 0)},
+            {"futimens",
+             cng_dispatch(__NR_utimensat, mfd, 0, 0, 0, 0, 0, 0)},
+            {"fsetxattr",
+             cng_dispatch(__NR_fsetxattr, mfd, (long)"user.cng", (long)"1", 1,
+                          0, 0, 0)},
+            {"fremovexattr",
+             cng_dispatch(__NR_fremovexattr, mfd, (long)"user.cng", 0, 0, 0, 0,
+                          0)},
+            {"fchownat-empty",
+             cng_dispatch(__NR_fchownat, mfd, (long)"", -1, -1,
+                          CNG_AT_EMPTY_PATH, 0, 0)},
+            {"fchmodat2-empty",
+             cng_dispatch(__NR_fchmodat2, mfd, (long)"", 0644,
+                          CNG_AT_EMPTY_PATH, 0, 0, 0)},
+            {"setxattrat-empty",
+             cng_dispatch(__NR_setxattrat, mfd, (long)"", CNG_AT_EMPTY_PATH,
+                          (long)"user.cng", 0, 0, 0)},
+            {"file_setattr-empty",
+             cng_dispatch(__NR_file_setattr, mfd, (long)"", (long)fsx, 24,
+                          CNG_AT_EMPTY_PATH, 0, 0)},
+            {"ioctl-setflags",
+             cng_dispatch(__NR_ioctl, mfd, CNG_FS_IOC_SETFLAGS, (long)&ioflags,
+                          0, 0, 0, 0)},
+            {"ioctl-fssetxattr",
+             cng_dispatch(__NR_ioctl, mfd, CNG_FS_IOC_FSSETXATTR, (long)fsx, 0,
+                          0, 0, 0)},
+        };
+        for (unsigned i = 0; i < sizeof fdm / sizeof *fdm; i++) {
+            int ok = ro ? fdm[i].r == -EROFS : fdm[i].r != -EROFS;
+            cng_dprintf(1, "robind %s %s: rc=%d -> %s\n", ro ? "ro" : "rw",
+                        fdm[i].name, (int)fdm[i].r, ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+        /* AT_EMPTY_PATH with AT_FDCWD names the working directory, which the
+         * translation spells out and the descriptor question cannot ask. */
+        {
+            cng_fs_set_cwd(&fs, fs.nbinds > 0 ? fs.binds[0].guest : "/");
+            long r = cng_dispatch(__NR_fchownat, CNG_AT_FDCWD, (long)"", -1,
+                                  -1, CNG_AT_EMPTY_PATH, 0, 0);
+            cng_fs_set_cwd(&fs, "/");
+            int ok = ro ? r == -EROFS : r != -EROFS;
+            cng_dprintf(1, "robind %s cwd-empty: rc=%d -> %s\n",
+                        ro ? "ro" : "rw", (int)r, ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+        {
+            /* The source is the file by its host path, so it is never under
+             * the bind; the destination is the guest's read-only descriptor. */
+            char hostp[CNG_PATH_MAX];
+            long sfd = cng_fs_translate(&fs, gpath, hostp, sizeof hostp) == 0
+                           ? sys_openat(CNG_AT_FDCWD, hostp, CNG_O_RDONLY, 0)
+                           : -1;
+            unsigned char dd[CNG_DEDUPE_HDR + CNG_DEDUPE_INFO];
+            memset(dd, 0, sizeof dd);
+            unsigned short one = 1;
+            memcpy(dd + CNG_DEDUPE_COUNT_OFF, &one, sizeof one);
+            long dest = mfd;
+            memcpy(dd + CNG_DEDUPE_HDR, &dest, sizeof dest);
+            long r = cng_dispatch(__NR_ioctl, sfd, CNG_FIDEDUPERANGE, (long)dd,
+                                  0, 0, 0, 0);
+            int st = 0;
+            memcpy(&st, dd + CNG_DEDUPE_HDR + CNG_DEDUPE_STATUS_OFF, sizeof st);
+            int judged = r >= 0;
+            int ok = !judged || (ro ? st == -EROFS : st != -EROFS);
+            cng_dprintf(1, "robind %s dedupe: rc=%d status=%d -> %s\n",
+                        ro ? "ro" : "rw", (int)r, st,
+                        !judged ? "UNSUPPORTED" : ok ? "OK" : "FAIL");
+            fails += !ok;
+            if (sfd >= 0)
+                sys_close((int)sfd);
+        }
+        if (mfd >= 0)
+            sys_close((int)mfd);
+        if (dfd >= 0)
+            sys_close((int)dfd);
         if (rfd >= 0)
             sys_close((int)rfd);
         if (pfd >= 0)
@@ -7106,13 +7210,103 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
                     off_ok, proc_ok, on_ok, ch_ok, ok2 ? "OK" : "FAIL");
         fails += !ok2;
 
-        /* The largest filter there is: every optional set on at once. The
-         * builder writes into a CNG_SECCOMP_MAX_INSNS buffer with no bounds
-         * check of its own, and the tail's per-syscall jump offset is a u8, so
-         * both limits have to hold with room for the next syscall somebody
-         * adds — this is where that is found out, rather than in the
-         * installer's stack frame. */
+        /* The descriptor side of a :ro bind (M45): with one in the view,
+         * fchmod, fchown and the fd xattr setters trap, and so does every
+         * ioctl request that writes the mount — one JEQ each in the ioctl
+         * block, behind the SIOCxIF band test, which must keep working. A
+         * terminal TCGETS and the flag *getter* stay native, since the block
+         * runs for every ioctl a guest makes. Without a :ro bind none of it
+         * is in the filter at all: the calls run native, as before. */
+        {
+            static struct cng_fs rofs;
+            struct cng_fs *was_fs = cng_g_fs;
+            cng_fs_init(&rofs, "/tmp/cng-bpftest-root");
+            cng_fs_add_bind(&rofs, "/ro", "/tmp/cng-bpftest-ro", 1);
+            cng_g_fs = &rofs;
+            int nro = cng_build_seccomp(f, CNG_SECCOMP_MAX_INSNS);
+            static const struct {
+                const char *what;
+                int nr;
+                unsigned long arg;
+                u32 want;
+            } rc[] = {
+                {"fchmod traps", __NR_fchmod, 0, CNG_SECCOMP_RET_TRAP},
+                {"fchown traps", __NR_fchown, 0, CNG_SECCOMP_RET_TRAP},
+                {"fsetxattr traps", __NR_fsetxattr, 0, CNG_SECCOMP_RET_TRAP},
+                {"fremovexattr traps", __NR_fremovexattr, 0,
+                 CNG_SECCOMP_RET_TRAP},
+                {"FS_IOC_SETFLAGS traps", __NR_ioctl, CNG_FS_IOC_SETFLAGS,
+                 CNG_SECCOMP_RET_TRAP},
+                {"FS_IOC_FSSETXATTR traps", __NR_ioctl, CNG_FS_IOC_FSSETXATTR,
+                 CNG_SECCOMP_RET_TRAP},
+                {"FIDEDUPERANGE traps", __NR_ioctl, CNG_FIDEDUPERANGE,
+                 CNG_SECCOMP_RET_TRAP},
+                {"F2FS_IOC_SET_PIN_FILE traps", __NR_ioctl,
+                 CNG_F2FS_IOC_SET_PIN_FILE, CNG_SECCOMP_RET_TRAP},
+                {"SIOCGIFCONF still traps", __NR_ioctl, 0x8912,
+                 CNG_SECCOMP_RET_TRAP},
+                {"TCGETS still runs native", __NR_ioctl, 0x5401,
+                 CNG_SECCOMP_RET_ALLOW},
+                {"FS_IOC_GETFLAGS runs native", __NR_ioctl, 0x80086601,
+                 CNG_SECCOMP_RET_ALLOW},
+                {"FICLONE runs native (a write descriptor)", __NR_ioctl,
+                 0x40049409, CNG_SECCOMP_RET_ALLOW},
+            };
+            int ro_ok = nro > 0;
+            for (unsigned k = 0; k < sizeof rc / sizeof rc[0]; k++) {
+                u32 d[16];
+                int b2 = 0;
+                bpf_data(d, rc[k].nr, 0x1000, rc[k].arg);
+                u32 got = nro > 0 ? bpf_run(f, nro, d, &b2) : 0;
+                int ok = nro > 0 && !b2 && got == rc[k].want;
+                cng_dprintf(1, "bpftest ro-fd %s: %s -> %s\n", rc[k].what,
+                            b2                              ? "malformed"
+                            : got == CNG_SECCOMP_RET_TRAP  ? "TRAP"
+                            : got == CNG_SECCOMP_RET_ALLOW ? "ALLOW"
+                                                           : "other",
+                            ok ? "OK" : "FAIL");
+                ro_ok &= ok;
+            }
+            /* ...and the same calls with no :ro bind: native. */
+            rofs.binds[0].ro = 0;
+            int nrw = cng_build_seccomp(f, CNG_SECCOMP_MAX_INSNS);
+            static const struct {
+                const char *what;
+                int nr;
+                unsigned long arg;
+            } rw[] = {
+                {"fchmod", __NR_fchmod, 0},
+                {"fsetxattr", __NR_fsetxattr, 0},
+                {"FS_IOC_SETFLAGS", __NR_ioctl, CNG_FS_IOC_SETFLAGS},
+                {"FIDEDUPERANGE", __NR_ioctl, CNG_FIDEDUPERANGE},
+            };
+            for (unsigned k = 0; k < sizeof rw / sizeof rw[0]; k++) {
+                u32 d[16];
+                int b2 = 0;
+                bpf_data(d, rw[k].nr, 0x1000, rw[k].arg);
+                u32 got = nrw > 0 ? bpf_run(f, nrw, d, &b2) : 0;
+                int ok = nrw > 0 && !b2 && got == CNG_SECCOMP_RET_ALLOW;
+                cng_dprintf(1, "bpftest rw-fd %s runs native: %s -> %s\n",
+                            rw[k].what, ok ? "ALLOW" : "other",
+                            ok ? "OK" : "FAIL");
+                ro_ok &= ok;
+            }
+            cng_g_fs = was_fs;
+            fails += !ro_ok;
+        }
+
+        /* The largest filter there is: every optional set on at once, with
+         * a :ro bind in the view. The builder writes into a
+         * CNG_SECCOMP_MAX_INSNS buffer with no bounds check of its own, and
+         * the tail's per-syscall jump offset is a u8, so both limits have to
+         * hold with room for the next syscall somebody adds — this is where
+         * that is found out, rather than in the installer's stack frame. */
         int was_l2s = cng_g_l2s, was_nd = cng_g_no_dev;
+        static struct cng_fs maxfs;
+        struct cng_fs *was_fs = cng_g_fs;
+        cng_fs_init(&maxfs, "/tmp/cng-bpftest-root");
+        cng_fs_add_bind(&maxfs, "/ro", "/tmp/cng-bpftest-ro", 1);
+        cng_g_fs = &maxfs;
         cng_g_fake_id = 1;
         cng_g_no_proc = 0;
         cng_g_l2s = 1;
@@ -7122,6 +7316,7 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
         cng_g_no_proc = was_np;
         cng_g_l2s = was_l2s;
         cng_g_no_dev = was_nd;
+        cng_g_fs = was_fs;
         int fits = nmax > 0 && nmax <= CNG_SECCOMP_MAX_INSNS - 8;
         cng_dprintf(1, "bpftest largest filter: %d of %d insns -> %s\n", nmax,
                     CNG_SECCOMP_MAX_INSNS, fits ? "OK" : "FAIL");
