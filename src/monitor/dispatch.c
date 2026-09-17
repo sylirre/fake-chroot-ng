@@ -13,6 +13,7 @@
 #include "cng/loader.h"
 #include "cng/monitor.h"
 #include "cng/path.h"
+#include "cng/pin.h"
 #include "cng/procfs.h"
 #include "cng/procreg.h"
 #include "cng/ptrace.h"
@@ -179,8 +180,7 @@ static long ro_refusal(const char *host, int atflags) {
     if (!ro_denied(host))
         return 0;
     char st[144];
-    long r = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, (long)host, (long)st,
-                     atflags, 0, 0);
+    long r = cng_pin_fstatat(host, st, atflags);
     return r < 0 ? r : -EROFS;
 }
 
@@ -221,6 +221,362 @@ static const char *dbg_path(long a0, long a1, char *buf, unsigned long sz) {
     return "";
 }
 
+/* The newer forms a pinned re-issue reaches for (see pin_args): faccessat2
+ * and fchmodat2 where the old call has no NOFOLLOW to give, and openat2 for
+ * every open. A kernel without one answers ENOSYS, which is remembered so
+ * the other form is taken directly from then on; a filter that blocks them
+ * is already in cng_blocked. */
+static int g_no_faccessat2, g_no_fchmodat2, g_no_openat2;
+
+/* An open is not made with O_NOFOLLOW added: the kernel keeps that flag on
+ * the description, F_GETFL and fdinfo report it, and a program that reopens
+ * a name with the flags it read back would then be refused a symlink it
+ * never asked to avoid. RESOLVE_NO_SYMLINKS refuses the same link without a
+ * trace on the description, so the open is made as an openat2 with the how
+ * the kernel itself builds for an openat (build_open_how: the flags outside
+ * its own set dropped, O_PATH keeping only its companions, the mode kept only
+ * for a creating open) — openat2 refuses what openat silently strips, and
+ * the two calls must answer alike. A flag this table does not know is left
+ * alone and takes the O_NOFOLLOW form instead, so a newer kernel's flag is
+ * never stripped here; so does a host without openat2 (Android's filter
+ * blocks it), where the bit on the description is the residue. */
+#define OPEN_FLAGS_KNOWN                                                      \
+    (CNG_O_ACCMODE | CNG_O_CREAT | CNG_O_EXCL | CNG_O_NOCTTY | CNG_O_TRUNC |  \
+     CNG_O_APPEND | CNG_O_NONBLOCK | CNG_O_DSYNC | 020000 /*FASYNC*/ |        \
+     CNG_O_DIRECT | CNG_O_LARGEFILE | CNG_O_DIRECTORY | CNG_O_NOFOLLOW |      \
+     CNG_O_NOATIME | CNG_O_CLOEXEC | 04000000 /*__O_SYNC*/ | CNG_O_PATH |     \
+     CNG___O_TMPFILE)
+#define OPEN_FLAGS_PATH (CNG_O_DIRECTORY | CNG_O_NOFOLLOW | CNG_O_PATH | CNG_O_CLOEXEC)
+
+static int open_as_openat2(long flags, long mode, struct cng_open_how *how) {
+    if (g_no_openat2 || cng_blocked[__NR_openat2] ||
+        (flags & ~(long)OPEN_FLAGS_KNOWN))
+        return 0;
+    how->flags = (unsigned long)flags;
+    if (how->flags & CNG_O_PATH)
+        how->flags &= OPEN_FLAGS_PATH;
+    how->mode = (how->flags & (CNG_O_CREAT | CNG___O_TMPFILE))
+                    ? (unsigned long)mode & 07777
+                    : 0;
+    how->resolve = CNG_RESOLVE_NO_SYMLINKS;
+    return 1;
+}
+
+/* Which argument slots of a path-bearing re-issue carry a (dirfd, path) pair,
+ * for pin_args and the errno probe below: the first pair's dirfd and path
+ * indices, the second's, -1 where there is none. A path-only syscall has a
+ * path slot and no dirfd. */
+static int reissue_pairs(long nr, int *d1, int *p1, int *d2, int *p2) {
+    *d1 = *p1 = *d2 = *p2 = -1;
+    switch (nr) {
+    case __NR_openat:
+    case __NR_openat2:
+    case __NR_mkdirat:
+    case __NR_mknodat:
+    case __NR_name_to_handle_at:
+    case __NR_faccessat:
+    case __NR_faccessat2:
+    case __NR_fchmodat:
+    case __NR_fchmodat2:
+    case __NR_unlinkat:
+    case __NR_utimensat:
+    case __NR_newfstatat:
+    case __NR_statx:
+    case __NR_fchownat:
+    case __NR_readlinkat:
+    case __NR_setxattrat:
+    case __NR_getxattrat:
+    case __NR_listxattrat:
+    case __NR_removexattrat:
+    case __NR_file_getattr:
+    case __NR_file_setattr:
+        *d1 = 0;
+        *p1 = 1;
+        return 1;
+    case __NR_symlinkat:
+        *d1 = 1;
+        *p1 = 2;
+        return 1;
+    case __NR_renameat:
+    case __NR_renameat2:
+    case __NR_linkat:
+        *d1 = 0;
+        *p1 = 1;
+        *d2 = 2;
+        *p2 = 3;
+        return 2;
+    case __NR_inotify_add_watch:
+        *p1 = 1;
+        return 1;
+    case __NR_truncate:
+    case __NR_statfs:
+    case __NR_chdir:
+    case __NR_setxattr:
+    case __NR_lsetxattr:
+    case __NR_getxattr:
+    case __NR_lgetxattr:
+    case __NR_listxattr:
+    case __NR_llistxattr:
+    case __NR_removexattr:
+    case __NR_lremovexattr:
+        *p1 = 0;
+        return 1;
+    }
+    return 0;
+}
+
+/* The errno a pin could not produce. The kernel checks a call's flags, its
+ * mode, its lengths before it resolves anything, and answers those first:
+ * `fstatat("/missing/x", badflags)` is EINVAL, not ENOENT. A pin that failed
+ * on the directory has skipped that order, so the call is made once more with
+ * the pinned pair replaced by a descriptor that is no descriptor and a name
+ * that needs one — resolution then fails at EBADF, after every check that
+ * comes before it. EBADF means the checks passed and the pin's own answer
+ * stands; anything else is the kernel's answer, given in its order. The
+ * path-only calls that check first use an empty name for the same sentinel,
+ * ENOENT. */
+static long pin_errno(long nr, const long *a, long err) {
+    int d1, p1, d2, p2;
+    if (!reissue_pairs(nr, &d1, &p1, &d2, &p2))
+        return err;
+    long b[6];
+    memcpy(b, a, sizeof b);
+    long want;
+    if (d1 >= 0) {
+        b[d1] = -1;
+        b[p1] = (long)".";
+        if (d2 >= 0) {
+            b[d2] = -1;
+            b[p2] = (long)".";
+        }
+        want = -EBADF;
+    } else if (nr == __NR_truncate || nr == __NR_inotify_add_watch) {
+        b[p1] = (long)"";
+        want = -ENOENT;
+    } else
+        return err; /* the path is what the kernel looks at first */
+    long r = cng_syscall6(b[0], b[1], b[2], b[3], b[4], b[5], nr);
+    if (r >= 0) { /* cannot happen for these; never leak what it made */
+        if (nr == __NR_openat || nr == __NR_openat2 ||
+            nr == __NR_name_to_handle_at)
+            sys_close((int)r);
+        return err;
+    }
+    return r == want ? err : r;
+}
+
+/* Rewrite a re-issue's arguments so that no host path reaches the kernel as
+ * a string (cng/pin.h): each (dirfd, path) pair becomes the pinned directory
+ * and the last component with the family's NOFOLLOW set, and the forms with
+ * no NOFOLLOW to set — or where the kernel follows regardless, after a
+ * trailing slash — are made through the leaf's own fd link. `spell` and
+ * `how` are storage the rewritten arguments may point into for the call.
+ * Returns 0, or the errno of a directory that could not be pinned (already
+ * put through pin_errno). The caller unpins both, whatever the answer. */
+static long pin_args(long *nr, long *a, struct cng_pin *x, struct cng_pin *y,
+                     char *spell, struct cng_open_how *how) {
+    int d1, p1, d2, p2;
+    x->pinned = y->pinned = 0;
+    x->own = y->own = 0;
+    x->leaf = y->leaf = -1;
+    x->dfd = y->dfd = -1;
+    if (!reissue_pairs(*nr, &d1, &p1, &d2, &p2))
+        return 0;
+    long e = cng_pin_at(d1 >= 0 ? (int)a[d1] : CNG_AT_FDCWD,
+                        (const char *)a[p1], x);
+    if (e)
+        return pin_errno(*nr, a, e);
+    if (d2 >= 0) {
+        e = cng_pin_at((int)a[d2], (const char *)a[p2], y);
+        if (e)
+            return pin_errno(*nr, a, e);
+        if (y->pinned) {
+            a[d2] = y->dfd;
+            a[p2] = (long)y->name;
+        }
+    }
+    if (!x->pinned)
+        return 0;
+    if (d1 >= 0)
+        a[d1] = x->dfd;
+    a[p1] = (long)x->name;
+
+    /* The forms below that take the leaf: `leaf` pins it (a directory where
+     * the name asked for one) and re-aims the pair at its link. */
+#define LEAF(need_dir)                                                        \
+    do {                                                                      \
+        long le = cng_pin_leaf(x, (need_dir));                                \
+        if (le)                                                               \
+            return le;                                                        \
+        if (d1 >= 0)                                                          \
+            a[d1] = CNG_AT_FDCWD;                                             \
+        a[p1] = (long)x->link;                                                \
+    } while (0)
+
+    switch (*nr) {
+    case __NR_openat:
+        if (x->want_dir && !(a[2] & CNG_O_CREAT)) {
+            LEAF(1);
+            a[2] &= ~(long)CNG_O_NOFOLLOW;
+        } else if (a[2] & CNG_O_NOFOLLOW) {
+            ; /* the guest's own, and all the refusal needed */
+        } else if (open_as_openat2(a[2], a[3], how)) {
+            *nr = __NR_openat2;
+            a[2] = (long)how;
+            a[3] = (long)sizeof *how;
+        } else
+            a[2] |= CNG_O_NOFOLLOW;
+        break;
+    case __NR_openat2:
+        /* The caller's copy of the how is not edited: this one is. */
+        *how = *(const struct cng_open_how *)a[2];
+        a[2] = (long)how;
+        a[3] = (long)sizeof *how;
+        if (x->want_dir && !(how->flags & CNG_O_CREAT)) {
+            LEAF(1);
+            how->flags &= ~(unsigned long)CNG_O_NOFOLLOW;
+        } else if (!(how->flags & CNG_O_NOFOLLOW))
+            how->resolve |= CNG_RESOLVE_NO_SYMLINKS;
+        break;
+    case __NR_mkdirat:
+    case __NR_mknodat:
+    case __NR_unlinkat:
+    case __NR_readlinkat:
+    case __NR_symlinkat:
+    case __NR_renameat:
+    case __NR_renameat2:
+        break; /* the last component is never followed */
+    case __NR_linkat:
+        /* The walk followed the source where AT_SYMLINK_FOLLOW asked it to;
+         * the pinned name is what it reached, and is not followed again. */
+        a[4] &= ~(long)CNG_AT_SYMLINK_FOLLOW;
+        break;
+    case __NR_name_to_handle_at:
+        a[4] &= ~(long)CNG_AT_SYMLINK_FOLLOW;
+        if (x->want_dir) {
+            long le = cng_pin_leaf(x, 1);
+            if (le)
+                return le;
+            a[0] = x->leaf;
+            a[1] = (long)"";
+            a[4] |= CNG_AT_EMPTY_PATH;
+        }
+        break;
+    case __NR_faccessat:
+        /* No flags word at all: the NOFOLLOW is faccessat2's, where the host
+         * has it, and the leaf's link otherwise. */
+        if (x->want_dir || g_no_faccessat2 || cng_blocked[__NR_faccessat2]) {
+            LEAF(0);
+            a[3] = 0;
+        } else {
+            *nr = __NR_faccessat2;
+            a[3] = CNG_AT_SYMLINK_NOFOLLOW;
+        }
+        break;
+    case __NR_faccessat2:
+        if (x->want_dir) {
+            LEAF(1);
+            a[3] &= ~(long)CNG_AT_SYMLINK_NOFOLLOW;
+        } else
+            a[3] |= CNG_AT_SYMLINK_NOFOLLOW;
+        break;
+    case __NR_fchmodat:
+        if (x->want_dir || g_no_fchmodat2 || cng_blocked[__NR_fchmodat2]) {
+            LEAF(0);
+            a[3] = 0;
+        } else {
+            *nr = __NR_fchmodat2;
+            a[3] = CNG_AT_SYMLINK_NOFOLLOW;
+        }
+        break;
+    case __NR_fchmodat2:
+    case __NR_utimensat:
+    case __NR_newfstatat:
+        if (x->want_dir) {
+            LEAF(1);
+            a[3] &= ~(long)CNG_AT_SYMLINK_NOFOLLOW;
+        } else
+            a[3] |= CNG_AT_SYMLINK_NOFOLLOW;
+        break;
+    case __NR_statx:
+    case __NR_setxattrat:
+    case __NR_getxattrat:
+    case __NR_listxattrat:
+    case __NR_removexattrat:
+        if (x->want_dir) {
+            LEAF(1);
+            a[2] &= ~(long)CNG_AT_SYMLINK_NOFOLLOW;
+        } else
+            a[2] |= CNG_AT_SYMLINK_NOFOLLOW;
+        break;
+    case __NR_fchownat:
+    case __NR_file_getattr:
+    case __NR_file_setattr:
+        if (x->want_dir) {
+            LEAF(1);
+            a[4] &= ~(long)CNG_AT_SYMLINK_NOFOLLOW;
+        } else
+            a[4] |= CNG_AT_SYMLINK_NOFOLLOW;
+        break;
+    case __NR_truncate:
+    case __NR_statfs:
+        LEAF(0);
+        break;
+    case __NR_chdir:
+        LEAF(1);
+        *nr = __NR_fchdir;
+        a[0] = x->leaf;
+        break;
+    case __NR_setxattr:
+    case __NR_getxattr:
+    case __NR_listxattr:
+    case __NR_removexattr:
+    case __NR_lsetxattr:
+    case __NR_lgetxattr:
+    case __NR_llistxattr:
+    case __NR_lremovexattr: {
+        /* The l-forms never follow their last component, so the pinned pair
+         * spelled through the directory's fd link is the race-free form of
+         * both families: what the following forms would have followed, the
+         * walk already did. After a trailing slash the leaf is a directory
+         * and its link is followed to it. */
+        int follow = *nr == __NR_setxattr || *nr == __NR_getxattr ||
+                     *nr == __NR_listxattr || *nr == __NR_removexattr;
+        if (x->want_dir) {
+            LEAF(1);
+            if (!follow)
+                *nr = *nr == __NR_lsetxattr    ? __NR_setxattr
+                      : *nr == __NR_lgetxattr  ? __NR_getxattr
+                      : *nr == __NR_llistxattr ? __NR_listxattr
+                                               : __NR_removexattr;
+        } else {
+            if (cng_pin_spell(x, spell, CNG_PATH_MAX) != 0)
+                return -ENAMETOOLONG;
+            a[0] = (long)spell;
+            if (follow)
+                *nr = *nr == __NR_setxattr    ? __NR_lsetxattr
+                      : *nr == __NR_getxattr  ? __NR_lgetxattr
+                      : *nr == __NR_listxattr ? __NR_llistxattr
+                                              : __NR_lremovexattr;
+        }
+        break;
+    }
+    case __NR_inotify_add_watch:
+        if (x->want_dir) {
+            LEAF(1);
+            a[2] &= ~(long)CNG_IN_DONT_FOLLOW;
+        } else {
+            if (cng_pin_spell(x, spell, CNG_PATH_MAX) != 0)
+                return -ENAMETOOLONG;
+            a[1] = (long)spell;
+            a[2] |= CNG_IN_DONT_FOLLOW;
+        }
+        break;
+    }
+#undef LEAF
+    return 0;
+}
+
 static long reissue(long a0, long a1, long a2, long a3, long a4, long a5,
                     long nr) {
     char pb[CNG_PATH_MAX];
@@ -231,7 +587,31 @@ static long reissue(long a0, long a1, long a2, long a3, long a4, long a5,
                         dbg_path(a0, a1, pb, sizeof pb));
         return -ENOSYS;
     }
-    long r = cng_syscall6(a0, a1, a2, a3, a4, a5, nr);
+    long a[6] = {a0, a1, a2, a3, a4, a5}, callnr = nr;
+    struct cng_pin x, y;
+    char spell[CNG_PATH_MAX];
+    struct cng_open_how how;
+    long r = pin_args(&callnr, a, &x, &y, spell, &how);
+    if (r == 0) {
+        r = cng_syscall6(a[0], a[1], a[2], a[3], a[4], a[5], callnr);
+        /* A kernel without the newer form: remembered, and the other form
+         * taken this time and every time after. */
+        if (r == -ENOSYS && callnr != nr &&
+            (callnr == __NR_faccessat2 || callnr == __NR_fchmodat2 ||
+             callnr == __NR_openat2)) {
+            if (callnr == __NR_faccessat2)
+                g_no_faccessat2 = 1;
+            else if (callnr == __NR_fchmodat2)
+                g_no_fchmodat2 = 1;
+            else
+                g_no_openat2 = 1;
+            cng_unpin(&x);
+            cng_unpin(&y);
+            return reissue(a0, a1, a2, a3, a4, a5, nr);
+        }
+    }
+    cng_unpin(&x);
+    cng_unpin(&y);
     if (cng_g_debug && r < 0 && r != -ENOENT)
         cng_dprintf(2, "[cng] nr=%ld %s -> errno=%ld\n", nr,
                     dbg_path(a0, a1, pb, sizeof pb), -r);
@@ -769,8 +1149,7 @@ int cng_resolve_lim(const char *path, int deref_final, char *out, size_t outsz,
                 char dh[CNG_PATH_MAX], dst[144];
                 long e = 0; /* a name with no host path is not this to answer */
                 if (cng_fs_translate(cng_g_fs, canon, dh, sizeof dh) == 0) {
-                    e = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, (long)dh,
-                                (long)dst, 0, 0, 0);
+                    e = cng_pin_fstatat(dh, dst, 0);
                     if (e >= 0)
                         e = (*(unsigned *)(dst + STAT_MODE_OFF) & CNG_S_IFMT) ==
                                     CNG_S_IFDIR
@@ -1097,6 +1476,10 @@ static int host_dir_guest(const char *hdir, char *gdir, size_t sz) {
         }
     }
     return -1;
+}
+
+int cng_host_dir_guest(const char *hdir, char *gdir, size_t sz) {
+    return host_dir_guest(hdir, gdir, sz);
 }
 
 /* May the descriptor stay in the guest's table? One that names a directory the
@@ -1652,8 +2035,7 @@ long cng_fd_reopen(const char *host, long flags, long mode, long err) {
         return err;
     if (CNG_SYS(__NR_fchmod, fd, (m & 07777) | need, 0, 0, 0, 0) != 0)
         return err;
-    long r = cng_syscall6(CNG_AT_FDCWD, (long)host, flags, mode, 0, 0,
-                          __NR_openat);
+    long r = cng_pin_open(host, flags, mode);
     CNG_SYS(__NR_fchmod, fd, m & 07777, 0, 0, 0, 0);
     if (cng_g_debug)
         cng_dprintf(2, "[cng] fake-root reopen %s (mode %o) -> %ld\n", host,
@@ -3449,8 +3831,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                  * the check below never sees the guest's name again. */
                 if (ro_denied(hnf))
                     return -EROFS;
-                long r = cng_syscall6(CNG_AT_FDCWD, (long)data, a2, 0, 0, 0,
-                                      __NR_utimensat);
+                long r = reissue(CNG_AT_FDCWD, (long)data, a2, 0, 0, 0,
+                                 __NR_utimensat);
                 if (cng_fake_root() && (r == -EPERM || r == -EACCES))
                     return 0;
                 return r;
@@ -3678,7 +4060,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                          * the guest spelling of the whole value is what gets
                          * cut to size below, exactly as the kernel cuts its
                          * own. */
-                        tl = sys_readlinkat((int)a0, p, tgt, sizeof tgt - 1);
+                        tl = reissue(a0, (long)p, (long)tgt, sizeof tgt - 1, 0,
+                                     0, __NR_readlinkat);
                     }
                     if (tl > 0 && (size_t)tl < sizeof tgt && tgt[0] == '/') {
                         tgt[tl] = '\0';
@@ -4004,8 +4387,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * from the fallback's own symlink step.) */
         if (cng_g_l2s && r == -ENOENT) {
             char stt[144];
-            if (CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, srch, stt,
-                        CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0)
+            if (cng_pin_fstatat(srch, stt, CNG_AT_SYMLINK_NOFOLLOW) == 0)
                 r = -EPERM;
         }
         if (cng_g_l2s &&
@@ -4017,13 +4399,11 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                  * or deleted files keep the /proc path: the fallback's
                  * materialize copies the contents. */
                 char tgt[CNG_PATH_MAX], stt[144];
-                long tn = sys_readlinkat(CNG_AT_FDCWD, srch, tgt,
-                                         sizeof tgt - 1);
+                long tn = cng_pin_readlink(srch, tgt, sizeof tgt - 1);
                 if (tn > 0) {
                     tgt[tn] = '\0';
                     if (tgt[0] == '/' &&
-                        CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, tgt, stt,
-                                CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0)
+                        cng_pin_fstatat(tgt, stt, CNG_AT_SYMLINK_NOFOLLOW) == 0)
                         cng_strlcpy(srch, tgt, sizeof srch);
                 }
             }
@@ -4093,7 +4473,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         } else {
             r = reissue(a0, a1, a2, a3, a4, a5, nr);
         }
-        cng_sun_done(&x); /* after the syscall: the kernel walked the dirfd */
+        cng_sun_done(&x, r); /* after the syscall: the kernel walked the dirfd */
         return r;
     }
 
@@ -4123,6 +4503,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         long r;
         x.dirfd = -1; /* a NULL msghdr never reaches cng_sun_in, and cng_sun_done
                        * must not then close whatever the stack held */
+        x.bind_fd = -1;
         int sx = a1 ? cng_sun_in(&x, -1, mh.name, (long)mh.namelen, 1) : 0;
         if (sx > 0) {
             mh.name = x.buf;
@@ -4133,7 +4514,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         } else {
             r = reissue(a0, a1, a2, a3, a4, a5, nr);
         }
-        cng_sun_done(&x);
+        cng_sun_done(&x, r);
         return r;
     }
 
@@ -4207,7 +4588,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                     r = sx;
                 else
                     r = reissue(a0, (long)&mh, a3, 0, 0, 0, __NR_sendmsg);
-                cng_sun_done(&x);
+                cng_sun_done(&x, r);
                 if (r < 0)
                     break;
                 /* The kernel does not count a message whose length writeback
@@ -4745,8 +5126,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         if (cng_fs_untranslate(cng_g_fs, hp, resolved, sizeof resolved) == 0)
             cng_strlcpy(gc, resolved, sizeof gc);
         char sb[128]; /* AArch64 struct stat is 128 bytes */
-        long r = cng_syscall6(CNG_AT_FDCWD, (long)hp, (long)sb, 0, 0, 0,
-                              __NR_newfstatat);
+        long r = cng_pin_fstatat(hp, sb, 0);
         if (r < 0)
             return r;
         if ((*(unsigned *)(sb + STAT_MODE_OFF) & 0170000) != 0040000)

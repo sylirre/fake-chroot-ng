@@ -34,6 +34,7 @@
 #include "cng/netlink.h"
 #include "cng/ownmap.h"
 #include "cng/path.h"
+#include "cng/pin.h"
 #include "cng/procfs.h"
 #include "cng/procreg.h" /* cng_g_shared_proc */
 #include "cng/ptrace.h"
@@ -150,8 +151,7 @@ static int set_workdir(struct cng_fs *fs, const char *wd) {
         return -1;
     }
     char st[128];   /* struct stat, aarch64 */
-    long r = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, (long)host, (long)st, 0, 0,
-                     0);
+    long r = cng_pin_fstatat(host, st, 0);
     if (r == -ENOENT) {
         cng_dprintf(2, "chroot-ng: --work-dir '%s': not found\n", wd);
         return -1;

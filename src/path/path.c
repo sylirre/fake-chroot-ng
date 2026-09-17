@@ -37,15 +37,21 @@ int cng_g_no_dev = 0;
  * readlink'ing them as ordinary symlinks; this table is what a direct
  * cng_fs_translate call falls back on, and the two agree. */
 /* Where the guest's /dev/shm lives. Mutable, and the table below points at it:
- * see cng_dev_shm_init for what may end up here and why. */
+ * see cng_dev_shm_init for what may end up here and why. The two directory
+ * nodes, this and pts, are stored the way the kernel spells them (as the
+ * rootfs and the binds are: canon_host_root), because a name below one is
+ * pinned for its syscall against the kernel's own name for the directory
+ * (cng/pin.h) — a /dev/shm that is the host's symlink to /run/shm would
+ * otherwise never agree with itself. */
 static char g_shm_host[CNG_PATH_MAX] = "/dev/shm";
+static char g_pts_host[CNG_PATH_MAX] = "/dev/pts";
 
 const struct cng_dev_node cng_dev_nodes[] = {
     {"null", "/dev/null"},         {"zero", "/dev/zero"},
     {"full", "/dev/full"},         {"random", "/dev/random"},
     {"urandom", "/dev/urandom"},   {"tty", "/dev/tty"},
     {"ptmx", "/dev/ptmx"},         {"console", "/dev/tty"},
-    {"pts", "/dev/pts"},           {"shm", g_shm_host},
+    {"pts", g_pts_host},           {"shm", g_shm_host},
     {"fd", "/proc/self/fd"},       {"stdin", "/proc/self/fd/0"},
     {"stdout", "/proc/self/fd/1"}, {"stderr", "/proc/self/fd/2"},
 };
@@ -89,13 +95,27 @@ int cng_dev_shm_ok(void) { return !cng_g_no_dev && is_dir(g_shm_host); }
  * the old behaviour, which is that /dev/shm resolves to a name that is not
  * there, is left out of the listing, and — now — is left out of the mount
  * tables too. */
+static int canon_host_root(char *dst, size_t dstsz, const char *src);
+
+/* The directory node's host path, as the kernel spells it (see g_shm_host):
+ * a symlink-free spelling that the readback of a descriptor on it, or below
+ * it, agrees with. A path that does not resolve keeps its spelling. */
+static void canon_dev_dir(char *node, size_t sz) {
+    char tmp[CNG_PATH_MAX];
+    if (canon_host_root(tmp, sizeof tmp, node) == 0 && tmp[0])
+        cng_strlcpy(node, tmp, sz);
+}
+
 void cng_dev_shm_init(void) {
     if (cng_g_no_dev)
         return;
+    canon_dev_dir(g_pts_host, sizeof g_pts_host);
     /* CNG_DEVSHM_FORCE_TMP=1 takes the stand-in even where /dev/shm exists,
      * which is the only way a host that has one can exercise this at all. */
-    if (!cng_broker_env("CNG_DEVSHM_FORCE_TMP") && is_dir("/dev/shm"))
+    if (!cng_broker_env("CNG_DEVSHM_FORCE_TMP") && is_dir("/dev/shm")) {
+        canon_dev_dir(g_shm_host, sizeof g_shm_host);
         return;
+    }
     /* Not cng_broker_shared_dir(): that list starts at /dev/shm, which is the
      * one place this cannot use — we are here because it is unusable, and under
      * the force knob because we are pretending it is. */
@@ -116,6 +136,7 @@ void cng_dev_shm_init(void) {
         if (!is_dir(path))
             continue; /* something else is sitting on the name */
         cng_strlcpy(g_shm_host, path, sizeof g_shm_host);
+        canon_dev_dir(g_shm_host, sizeof g_shm_host);
         return;
     }
 }

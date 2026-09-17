@@ -354,6 +354,11 @@ int cng_scope_needs_walk(long dirfd, char *gdir, size_t sz);
 int cng_fd_admit(int fd);
 void cng_fds_sanitize(void);
 
+/* The guest name of a host directory the kernel reported (a /proc/self/fd
+ * readback, a getcwd): inside the view, or one of the two zones. 0/-1 — and
+ * -1 is a directory the guest has no name for, which every caller refuses. */
+int cng_host_dir_guest(const char *hdir, char *gdir, size_t sz);
+
 /* The identity of the file behind a descriptor of ours, for the descriptors
  * kept across guest syscalls: close(2) is not trapped, so the guest can close
  * one and be handed the number back for a file of its own, and every later use

@@ -54,8 +54,9 @@ struct cng_dev_node {
 extern const struct cng_dev_node cng_dev_nodes[];
 extern const int cng_dev_nnodes;
 
-/* Settle what the guest's /dev/shm is. Called once from cng_run, before the
- * guest runs and after the host environment is on record. */
+/* Settle what the guest's /dev/shm is, and store the /dev directory nodes
+ * the way the kernel spells them. Called once from cng_run, before the guest
+ * runs and after the host environment is on record. */
 void cng_dev_shm_init(void);
 
 /* Is there a /dev/shm for the guest at all? Asked by the /proc mount tables,

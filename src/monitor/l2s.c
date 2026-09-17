@@ -6,6 +6,7 @@
 #include "cng/l2s.h"
 #include "cng/monitor.h"
 #include "cng/path.h"
+#include "cng/pin.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
 #include "cng/uapi.h"
@@ -41,30 +42,29 @@ int cng_g_l2s_force = 0;
 #define S_IFREG_ 0100000
 #define S_IFDIR_ 0040000
 
-/* ---- raw-syscall wrappers (host paths) ---------------------------------- */
+/* ---- syscall wrappers (host paths) -------------------------------------- */
 
+/* Every path here is a host path derived from a guest name, so each is
+ * handed to the kernel pinned (cng/pin.h): against the directory the walk
+ * reached, never as a string for the kernel to resolve again. */
 static long l2s_lstat(const char *p, void *st) {
-    return CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, p, st, CNG_AT_SYMLINK_NOFOLLOW,
-                   0, 0);
+    return cng_pin_fstatat(p, st, CNG_AT_SYMLINK_NOFOLLOW);
 }
 static long l2s_statf(const char *p, void *st) { /* follow */
-    return CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, p, st, 0, 0, 0);
+    return cng_pin_fstatat(p, st, 0);
 }
 static long l2s_readlink(const char *p, char *b, size_t n) {
-    return sys_readlinkat(CNG_AT_FDCWD, p, b, n);
+    return cng_pin_readlink(p, b, n);
 }
 static long l2s_symlink(const char *target, const char *linkpath) {
-    return CNG_SYS(__NR_symlinkat, target, CNG_AT_FDCWD, linkpath, 0, 0, 0);
+    return cng_pin_symlink(target, linkpath);
 }
 static long l2s_rename(const char *o, const char *n) {
-    return CNG_SYS(__NR_renameat, CNG_AT_FDCWD, o, CNG_AT_FDCWD, n, 0, 0);
+    return cng_pin_rename(o, n);
 }
-static long l2s_unlink(const char *p) {
-    return CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, p, 0, 0, 0, 0);
-}
+static long l2s_unlink(const char *p) { return cng_pin_unlink(p, 0); }
 static void l2s_touch(const char *p) {
-    long fd = sys_openat(CNG_AT_FDCWD, p,
-                         CNG_O_WRONLY | CNG_O_CREAT | CNG_O_CLOEXEC, 0600);
+    long fd = cng_pin_open(p, CNG_O_WRONLY | CNG_O_CREAT | CNG_O_CLOEXEC, 0600);
     if (fd >= 0)
         sys_close((int)fd);
 }
@@ -204,8 +204,8 @@ static int build_name(char *out, size_t sz, const char *dir,
 /* linux_dirent64: d_ino(8) d_off(8) d_reclen(2 @16) d_type(1 @18) name(@19). */
 static int find_marker(const char *dir, unsigned long long ino,
                        unsigned long *count) {
-    long fd = sys_openat(CNG_AT_FDCWD, dir,
-                         CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
+    long fd = cng_pin_open(dir, CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC,
+                           0);
     if (fd < 0)
         return -1;
     char buf[4096];
@@ -264,18 +264,18 @@ static long l2s_lock(const char *data) {
         size_t n = strlen(lk);
         if (n + 7 < sizeof lk) {
             memcpy(lk + n, "/.lock", 7);
-            fd = sys_openat(CNG_AT_FDCWD, lk,
-                            CNG_O_RDWR | CNG_O_CREAT | CNG_O_CLOEXEC, 0600);
+            fd = cng_pin_open(lk, CNG_O_RDWR | CNG_O_CREAT | CNG_O_CLOEXEC,
+                              0600);
         }
     }
     if (fd < 0)
-        fd = sys_openat(CNG_AT_FDCWD, data, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+        fd = cng_pin_open(data, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
     if (fd < 0)
-        fd = sys_openat(CNG_AT_FDCWD, data, CNG_O_WRONLY | CNG_O_CLOEXEC, 0);
+        fd = cng_pin_open(data, CNG_O_WRONLY | CNG_O_CLOEXEC, 0);
     if (fd < 0) {
         l2s_dirname(data, lk, sizeof lk);
-        fd = sys_openat(CNG_AT_FDCWD, lk,
-                        CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
+        fd = cng_pin_open(lk, CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC,
+                          0);
     }
     if (fd < 0) {
         L2S_LOG("[cng] l2s: no lock to be had for %s (%ld): unlocked update\n",
@@ -313,7 +313,7 @@ static int l2s_store_dir(char *out, size_t sz) {
     if (n + 6 >= sz)
         return -ENAMETOOLONG;
     cng_strlcpy(out + n, "/.l2s", sz - n);
-    long r = CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, out, 0700, 0, 0, 0);
+    long r = cng_pin_mkdir(out, 0700);
     if (r < 0 && r != -EEXIST)
         return (int)r;
     char st[ST_SIZE];
@@ -440,7 +440,7 @@ static int l2s_target(const char *host, char *data, size_t dsz,
  * regular file `dst`. Used when src has no named regular inode to symlink to
  * (e.g. /proc/self/fd/N naming an O_TMPFILE), or the link spans directories. */
 static int l2s_materialize(const char *src, const char *dst) {
-    long in = sys_openat(CNG_AT_FDCWD, src, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    long in = cng_pin_open(src, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
     if (in < 0)
         return (int)in;
     /* A real hardlink shares the source's mode; the copy must too (apk
@@ -454,10 +454,10 @@ static int l2s_materialize(const char *src, const char *dst) {
         }
         mode = st_mode(st) & 07777;
     }
-    long out = sys_openat(CNG_AT_FDCWD, dst,
-                          CNG_O_WRONLY | CNG_O_CREAT | CNG_O_EXCL |
-                              CNG_O_CLOEXEC,
-                          (int)mode);
+    long out = cng_pin_open(dst,
+                            CNG_O_WRONLY | CNG_O_CREAT | CNG_O_EXCL |
+                                CNG_O_CLOEXEC,
+                            (int)mode);
     if (out < 0) {
         sys_close((int)in);
         return (int)out;
@@ -712,7 +712,7 @@ int cng_l2s_statx(const char *host, void *statxbuf, unsigned mask,
     /* The data path is never a symlink: force a follow so the guest's
      * NOFOLLOW cannot expose the emulation. Sync flags pass through. */
     flags &= ~(unsigned)(CNG_AT_SYMLINK_NOFOLLOW | CNG_AT_EMPTY_PATH);
-    long s = CNG_SYS(__NR_statx, CNG_AT_FDCWD, data, flags, mask, statxbuf, 0);
+    long s = cng_pin_statx(data, (int)flags, mask, statxbuf);
     if (s < 0)
         return (int)s;
     *(unsigned *)((char *)statxbuf + STX_NLINK_OFF) = count ? count : 1;
@@ -776,9 +776,15 @@ int cng_l2s_dirent(long dirfd, const char *name, unsigned long long *ino,
     if (!parse_data(l2s_basename(tgt), 0))
         return 0;
     /* What stat(2) of the name answers is the data file — a follow lands on
-     * it — so the record carries that inode and type. */
+     * it — so the record carries that inode and type. The target is asked
+     * about directly rather than followed by the kernel: a data file is never
+     * a symlink, and the link is the guest's to have pointed anywhere. */
     char st[ST_SIZE];
-    if (CNG_SYS(__NR_newfstatat, (int)dirfd, name, st, 0, 0, 0) < 0) {
+    long sr = tgt[0] == '/'
+                  ? cng_pin_fstatat(tgt, st, CNG_AT_SYMLINK_NOFOLLOW)
+                  : CNG_SYS(__NR_newfstatat, (int)dirfd, tgt, st,
+                            CNG_AT_SYMLINK_NOFOLLOW, 0, 0);
+    if (sr < 0) {
         /* Dangling: the rootfs tree was moved and the absolute target went
          * stale. cng_l2s_stat self-heals that onto the current store, and a
          * listing must say what the stat after it will. */

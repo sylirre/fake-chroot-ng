@@ -101,11 +101,13 @@ off.
 **AF_UNIX sockets** are contained like any other path. A pathname socket carries
 a filesystem path in `sun_path`, so `bind`/`connect`/`sendto`/`sendmsg` translate
 it into the rootfs and `getsockname`/`getpeername`/`accept`/`recvfrom`/`recvmsg`
-strip the prefix back off, so the guest never sees where its rootfs lives and a
-program comparing the readback against what it bound still agrees. Where the
-rootfs prefix pushes the name past `sun_path`'s 108 bytes, the socket is bound
-relative to a `/proc/self/fd` directory handle instead, so only the basename has
-to fit. Abstract names have no filesystem node to contain, so they are isolated
+map the answer back to the guest's name, so the guest never sees where its
+rootfs lives and a program comparing the readback against what it bound still
+agrees — in any process, not only the one that bound it: a pathname is bound
+against a directory handle the binder keeps open for as long as the socket is,
+and the spelling the kernel stores names that handle, which any process of the
+same user can read back. (Only the basename has to fit `sun_path`'s 108 bytes,
+whatever the rootfs prefix.) Abstract names have no filesystem node to contain, so they are isolated
 per rootfs by a short spliced tag (invisible to the guest, stripped on readback);
 a name with no room left under 108 bytes to carry the tag as well is stood in for
 by a digest of itself, which keeps the isolation and still lets two guests of one

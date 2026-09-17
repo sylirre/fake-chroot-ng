@@ -16,14 +16,20 @@
 extern int cng_g_share_abstract;
 
 /* A translated sockaddr, held across the re-issue. `buf` is a sockaddr_un with
- * room for the tag growth; `dirfd` is the parent directory opened for the
- * over-long-path fallback and must be closed with cng_sun_done() *after* the
- * syscall has run, since the kernel resolves /proc/self/fd/<n> through it. */
+ * room for the tag growth; `dirfd` is the descriptor a pathname is spelled
+ * through — the pinned directory a bind creates the name in, the socket file
+ * itself for a connect — and lives until cng_sun_done() runs *after* the
+ * syscall, since the kernel resolves the /proc/.../fd/<n> link through it.
+ * For a bind that succeeded the record keeps it (see unixsock.c): `bind_fd`
+ * is the socket being bound, `guest` the name the guest asked for. */
 struct cng_sun_xlate {
     char buf[2 + 108 + 16];
     long len;
     int dirfd;
     int applied; /* 0: pass the guest's own address through unchanged */
+    int bind_fd; /* the socket a bind is for; -1 for the other calls */
+    unsigned glen;
+    char guest[108];
 };
 
 /* Translate an outbound guest sockaddr (bind/connect/sendto/sendmsg, and each
@@ -47,8 +53,10 @@ int cng_sun_in(struct cng_sun_xlate *x, int fd, const void *addr, long alen,
  * really does carry an AF_UNIX address. Reads the family bytes only. */
 int cng_sun_needed(const void *addr, long alen);
 
-/* Release anything cng_sun_in() held (the fallback dirfd). */
-void cng_sun_done(struct cng_sun_xlate *x);
+/* Release anything cng_sun_in() held, once the syscall has run and answered
+ * `r`: a bind that succeeded hands its directory to the readback record,
+ * everything else is closed. */
+void cng_sun_done(struct cng_sun_xlate *x, long r);
 
 /* Map a sockaddr the kernel just wrote back into guest terms, in place
  * (getsockname/getpeername/accept/accept4/recvfrom/recvmsg): strip the rootfs

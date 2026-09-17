@@ -14,6 +14,7 @@
 #include "cng/monitor.h"
 #include "cng/netlink.h"
 #include "cng/path.h"
+#include "cng/pin.h"
 #include "cng/procfs.h"
 #include "cng/procreg.h"
 #include "cng/ptrace.h"
@@ -8932,4 +8933,156 @@ int cng_cmd_lazytest(int argc, char **argv, char **envp, unsigned long *auxv) {
                    "trampolines -> %s\n",
                 N, patched, ran, ok ? "OK" : "FAIL");
     return ok ? 0 : 1;
+}
+
+/* _pintest -r ROOT — the pin (cng/pin.h) asked directly, on a tree made
+ * under ROOT: the forms a guest cannot be made to produce to order, and the
+ * one it can (the race) at the unit level. ROOT is the rootfs of the view,
+ * so its prefix is the kernel's own spelling and the readback comparison is
+ * exact; a doubled slash is the spelling that is not, and reaches the
+ * descriptor walk that decides by inodes. */
+static int pt_pin_names(const struct cng_pin *p, const char *dir) {
+    if (!p->pinned || !p->own || p->dfd < 0)
+        return 0;
+    char lk[40], real[CNG_PATH_MAX];
+    cng_snprintf(lk, sizeof lk, "/proc/self/fd/%d", p->dfd);
+    long n = sys_readlinkat(CNG_AT_FDCWD, lk, real, sizeof real - 1);
+    if (n <= 0)
+        return 0;
+    real[n] = '\0';
+    return strcmp(real, dir) == 0;
+}
+
+int cng_cmd_pintest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)envp;
+    (void)auxv;
+    const char *root = 0;
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "-r") && i + 1 < argc)
+            root = argv[++i];
+    if (!root) {
+        cng_dprintf(2, "usage: _pintest -r ROOT\n");
+        return 2;
+    }
+    static struct cng_fs fs;
+    cng_fs_init(&fs, root);
+    cng_g_fs = &fs;
+    cng_probe_blocked();
+    char a[CNG_PATH_MAX], b[CNG_PATH_MAX], x[CNG_PATH_MAX], p[CNG_PATH_MAX];
+    cng_snprintf(a, sizeof a, "%s/a", fs.rootfs);
+    cng_snprintf(b, sizeof b, "%s/a/b", fs.rootfs);
+    cng_snprintf(x, sizeof x, "%s/a/b/x", fs.rootfs);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, (long)a, 0755, 0, 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, (long)b, 0755, 0, 0, 0);
+    long fd = sys_openat(CNG_AT_FDCWD, x, CNG_O_WRONLY | CNG_O_CREAT, 0644);
+    if (fd >= 0)
+        sys_close((int)fd);
+    int fails = 0;
+    struct cng_pin pin;
+
+    /* 1) the plain case: the directory by its fd link, the name alone */
+    long r = cng_pin_at(CNG_AT_FDCWD, x, &pin);
+    int ok = r == 0 && pt_pin_names(&pin, b) && !strcmp(pin.name, "x") &&
+             !pin.want_dir;
+    cng_unpin(&pin);
+    cng_dprintf(1, "pintest plain: rc=%ld names_dir=%d -> %s\n", r, ok, ok ? "OK" : "FAIL");
+    fails += !ok;
+
+    /* 2) a spelling the readback does not agree with: the walk decides */
+    cng_snprintf(p, sizeof p, "%s/a//b/x", fs.rootfs);
+    r = cng_pin_at(CNG_AT_FDCWD, p, &pin);
+    ok = r == 0 && pt_pin_names(&pin, b) && !strcmp(pin.name, "x");
+    cng_unpin(&pin);
+    cng_dprintf(1, "pintest respelled: rc=%ld names_dir=%d -> %s\n", r, ok, ok ? "OK" : "FAIL");
+    fails += !ok;
+
+    /* 3) a trailing slash: the leaf, which must be a directory */
+    cng_snprintf(p, sizeof p, "%s/a/b/", fs.rootfs);
+    r = cng_pin_at(CNG_AT_FDCWD, p, &pin);
+    long l = r == 0 ? cng_pin_leaf(&pin, 0) : -1;
+    ok = r == 0 && pin.want_dir && !strcmp(pin.name, "b/") && l == 0 &&
+         pin.leaf >= 0 && !strncmp(pin.link, "/proc/self/fd/", 14);
+    cng_unpin(&pin);
+    cng_snprintf(p, sizeof p, "%s/a/b/x/", fs.rootfs);
+    r = cng_pin_at(CNG_AT_FDCWD, p, &pin);
+    long lf = r == 0 ? cng_pin_leaf(&pin, 0) : -1;
+    cng_unpin(&pin);
+    ok &= lf == -ENOTDIR;
+    cng_dprintf(1, "pintest trailing slash: dir leaf=%ld file leaf=%ld -> %s\n",
+                l, lf, ok ? "OK" : "FAIL");
+    fails += !ok;
+
+    /* 4) the race, held still: the directory replaced by an absolute link
+     *    after the walk would have seen it. Both routes refuse — the readback
+     *    names the target, and the walk meets the link. */
+    char b2[CNG_PATH_MAX];
+    cng_snprintf(b2, sizeof b2, "%s/a/b2", fs.rootfs);
+    CNG_SYS(__NR_renameat, CNG_AT_FDCWD, (long)b, CNG_AT_FDCWD, (long)b2, 0, 0);
+    CNG_SYS(__NR_symlinkat, (long)b2, CNG_AT_FDCWD, (long)b, 0, 0, 0);
+    r = cng_pin_at(CNG_AT_FDCWD, x, &pin);
+    cng_unpin(&pin);
+    ok = r == -ELOOP;
+    /* ...and a leaf that became a link */
+    char y[CNG_PATH_MAX];
+    cng_snprintf(y, sizeof y, "%s/a/b2/y", fs.rootfs);
+    CNG_SYS(__NR_symlinkat, (long)"x", CNG_AT_FDCWD, (long)y, 0, 0, 0);
+    long r2 = cng_pin_at(CNG_AT_FDCWD, y, &pin);
+    long l2 = r2 == 0 ? cng_pin_leaf(&pin, 0) : -1;
+    cng_unpin(&pin);
+    ok &= r2 == 0 && l2 == -ELOOP;
+    CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, (long)y, 0, 0, 0, 0);
+    CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, (long)b, 0, 0, 0, 0);
+    CNG_SYS(__NR_renameat, CNG_AT_FDCWD, (long)b2, CNG_AT_FDCWD, (long)b, 0, 0);
+    cng_dprintf(1, "pintest link in the way: dir=%ld leaf=%ld -> %s\n", r, l2,
+                ok ? "OK" : "FAIL");
+    fails += !ok;
+
+    /* 5) what is not pinned: /proc, a relative name (against the caller's
+     *    own descriptor), an empty name; and a directory that is not there */
+    r = cng_pin_at(CNG_AT_FDCWD, "/proc/self/status", &pin);
+    ok = r == 0 && !pin.pinned;
+    cng_unpin(&pin);
+    long dfd = sys_openat(CNG_AT_FDCWD, b, CNG_O_PATH | CNG_O_DIRECTORY, 0);
+    r = cng_pin_at((int)dfd, "x", &pin);
+    ok &= r == 0 && pin.pinned && !pin.own && pin.dfd == (int)dfd;
+    cng_unpin(&pin);
+    r = cng_pin_at((int)dfd, "", &pin);
+    ok &= r == 0 && !pin.pinned;
+    cng_unpin(&pin);
+    sys_close((int)dfd);
+    cng_snprintf(p, sizeof p, "%s/a/none/x", fs.rootfs);
+    r = cng_pin_at(CNG_AT_FDCWD, p, &pin);
+    cng_unpin(&pin);
+    ok &= r == -ENOENT;
+    cng_snprintf(p, sizeof p, "%s/a/b/x/y", fs.rootfs);
+    r2 = cng_pin_at(CNG_AT_FDCWD, p, &pin);
+    cng_unpin(&pin);
+    ok &= r2 == -ENOTDIR;
+    cng_dprintf(1, "pintest unpinned and missing: missing=%ld notdir=%ld -> %s\n",
+                r, r2, ok ? "OK" : "FAIL");
+    fails += !ok;
+
+    /* 6) through the dispatcher: the kernel's own order of refusals is kept
+     *    when the directory cannot be pinned — the flags are judged before
+     *    anything is resolved, so a bad flag on a missing name is EINVAL. */
+    char st[128];
+    long e1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/a/none/x",
+                           (long)st, 0x8000, 0, 0, 0);
+    long e2 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/a/none/x",
+                           (long)st, 0, 0, 0, 0);
+    long e3 = cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/a/none/x", 0x1,
+                           0, 0, 0, 0);
+    long e4 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/a/b/x",
+                           (long)st, 0, 0, 0, 0);
+    ok = e1 == -EINVAL && e2 == -ENOENT && e3 == -EINVAL && e4 == 0;
+    cng_dprintf(1, "pintest errno order: badflags=%ld missing=%ld unlink_badflags=%ld "
+                   "present=%ld -> %s\n",
+                e1, e2, e3, e4, ok ? "OK" : "FAIL");
+    fails += !ok;
+
+    CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, (long)x, 0, 0, 0, 0);
+    CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, (long)b, CNG_AT_REMOVEDIR, 0, 0, 0);
+    CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, (long)a, CNG_AT_REMOVEDIR, 0, 0, 0);
+    cng_dprintf(1, "pintest: %d failure(s)\n", fails);
+    return fails ? 1 : 0;
 }

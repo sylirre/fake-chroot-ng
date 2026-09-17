@@ -11,6 +11,7 @@
 #include "cng/loader.h"
 #include "cng/monitor.h"
 #include "cng/ownmap.h"
+#include "cng/pin.h"
 #include "cng/rewrite.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
@@ -471,7 +472,10 @@ int cng_elf_plan(const char *path, struct cng_elf_plan *plan,
     plan->own_fd = 0;
     plan->err = 0;
     plan->file_ok = 0;
-    long fd = sys_openat(CNG_AT_FDCWD, path, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    /* The path is a host path the walk produced, opened pinned (cng/pin.h):
+     * against the directory the walk reached, so a link swapped in behind it
+     * cannot take the open elsewhere. */
+    long fd = cng_pin_open(path, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
     if (fd < 0) {
         plan->err = (int)fd; /* ENOENT, EACCES, ENOTDIR, ELOOP: the caller's */
         return CNG_LOAD_EOPEN;

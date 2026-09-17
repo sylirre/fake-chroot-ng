@@ -111,6 +111,33 @@ record of *our* invocation, so this is a correctness requirement, not polish.
 See `src/monitor/procfs.c` (synthesis) and `src/monitor/procreg.c` (the
 fork-inherited registry that tells a guest pid from a host one).
 
+The walk produces a host path; the syscall is not made on it. A string handed
+to the kernel is resolved again from scratch, following whatever is there by
+then, and between the walk and the call the tree is the guest's to change: a
+directory on the way swapped for an absolute symlink is followed from the host
+root, and the call lands outside the rootfs — the time-of-check-to-time-of-use
+of every string-based translator, `proot` included. So every host path is
+*pinned* for its syscall (`src/monitor/pin.c`): the directory the walk reached
+is opened `O_PATH` and verified to be that directory (the kernel's own name for
+it, read back through its fd link, against the walk's symlink-free spelling;
+where the two differ in spelling alone, as on a case-insensitive filesystem,
+a descriptor-by-descriptor walk of the components from the rootfs or bind
+prefix decides), and the call is made against that descriptor with the last
+component as a plain name and the family's NOFOLLOW — an open as an `openat2`
+with `RESOLVE_NO_SYMLINKS`, which leaves no flag on the description, where the
+host has it. The walk followed everything that was to be followed, so NOFOLLOW
+changes nothing for a tree at rest and refuses exactly the link that appeared
+in the race. Families with no NOFOLLOW to give, and names with a trailing
+slash (which the kernel follows regardless), go through the last component's
+own `O_PATH` descriptor, checked not to be a symlink, by its fd link. A
+pathname `bind` carries the pinned directory's link in `sun_path`, and the
+binder keeps that descriptor open for as long as the socket is, so the stored
+spelling reads back to the guest's name from any process (`unixsock.c`). The
+loader's opens and `-l`'s own bookkeeping take the same route. What is not
+pinned: a relative name against the guest's own dirfd (already a descriptor;
+the NOFOLLOW is all it needs), the host's `/proc`, and a `/dev` whitelist
+node named as itself.
+
 Directory descriptors are part of the same containment: a name relative to a
 dirfd is resolved by the kernel with no rootfs in the way, so every directory
 the guest can hold a descriptor on must have a guest name — inside the view,

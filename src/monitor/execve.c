@@ -35,6 +35,7 @@
 #include "cng/monitor.h"
 #include "cng/ownmap.h"
 #include "cng/path.h"
+#include "cng/pin.h"
 #include "cng/procfs.h"
 #include "cng/ptrace.h"
 #include "cng/rewrite.h"
@@ -1291,7 +1292,7 @@ static int l2s_exe_name(int dirfd, const char *path, char *out, size_t sz) {
             cng_strlcpy(out, nm, sz);
             return 1;
         }
-        long n = sys_readlinkat(CNG_AT_FDCWD, nm, tgt, sizeof tgt - 1);
+        long n = cng_pin_readlink(nm, tgt, sizeof tgt - 1);
         if (n <= 0)
             return 0; /* not a symlink: the resolution above stands */
         tgt[n] = '\0';
@@ -1362,8 +1363,7 @@ static long execve_plan(struct exec_job *j, int dirfd, const char *path,
              * asked to run: that one takes the hop to its backing file. */
             if (nofollow) {
                 char st[144];
-                if (CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, host, st,
-                            CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0 &&
+                if (cng_pin_fstatat(host, st, CNG_AT_SYMLINK_NOFOLLOW) == 0 &&
                     (*(unsigned *)(st + 16) & 0170000) == 0120000) {
                     char data[CNG_PATH_MAX];
                     if (!(cng_g_l2s &&
@@ -1443,7 +1443,9 @@ static long execve_plan(struct exec_job *j, int dirfd, const char *path,
         char hdr[257];
         long fd = gfd;
         if (gfd < 0) {
-            fd = sys_openat(CNG_AT_FDCWD, host, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+            /* Pinned (cng/pin.h): the name the walk reached, and not what a
+             * second resolution of the string finds there. */
+            fd = cng_pin_open(host, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
             if (fd < 0) {
                 if (cng_g_debug)
                     cng_dprintf(2, "[cng] execve open %s -> errno=%d\n", host,

@@ -5,6 +5,7 @@
  * inside the SIGSYS handler, so nothing here may block on a lock. */
 #include "cng/monitor.h"
 #include "cng/path.h"
+#include "cng/pin.h"
 #include "cng/procfs.h"
 #include "cng/procreg.h"
 #include "cng/rt.h"
@@ -119,7 +120,10 @@ static int host_of(const char *canon, char *out, size_t sz) {
 }
 
 static long open_host_ro(const char *host) {
-    return sys_openat(CNG_AT_FDCWD, host, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    /* Pinned (cng/pin.h): under the passthrough this is the host's /proc and
+     * nothing is pinned, but a `-b DIR:/proc` puts a directory of the
+     * guest's own here, where a name is only ever what the walk reached. */
+    return cng_pin_open(host, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
 }
 
 /* ---- mounts / mountinfo / mountstats ------------------------------------ */
@@ -879,7 +883,7 @@ static int noatime_allowed(const char *host) {
     if (euid == 0)
         return 1;
     char st[128];
-    if (CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, host, st, 0, 0, 0) != 0)
+    if (cng_pin_fstatat(host, st, 0) != 0)
         return 1; /* cannot tell: let the open stand rather than invent EPERM */
     return *(unsigned *)(st + 24) == euid; /* st_uid */
 }

@@ -58,11 +58,12 @@ else
         pass=$((pass + 1)); echo "  ok   m15 the host filesystem is untouched"
     fi
 
-    # An over-long translated name cannot fit sun_path's 108 bytes, so the
-    # fallback binds relative to a /proc/self/fd directory handle instead.
-    # Deep enough that the translated host path cannot fit sun_path on ANY host:
-    # $TMPDIR is 4 characters on a devbox and ~40 under Termux, so count the
-    # bytes rather than a fixed number of components.
+    # A translated name that cannot fit sun_path's 108 bytes: every pathname
+    # is bound against the pinned directory's link (M49), so only the basename
+    # has to fit, whatever the rootfs prefix. Deep enough that the translated
+    # host path cannot fit sun_path on ANY host: $TMPDIR is 4 characters on a
+    # devbox and ~40 under Termux, so count the bytes rather than a fixed
+    # number of components.
     DEEP=$M15D
     while [ ${#DEEP} -lt 110 ]; do DEEP="$DEEP/d"; done
     mkdir -p "$DEEP/run" "$DEEP/bin" && cp "$M15D/uxsock" "$DEEP/bin/uxsock"
@@ -72,20 +73,19 @@ else
     # ...and reads back as the name the guest bound. The kernel stores sun_path
     # exactly as it was handed in -- measured: bind through
     # "/proc/self/fd/3/s.sock" and getsockname returns that same string, before
-    # and after fd 3 is closed -- so the fallback's own spelling came straight
-    # back to the guest. It names nothing by then (the dirfd is closed once the
-    # syscall has run) and it is the one address here that cng_fs_untranslate
-    # cannot map, matching neither a bind's host prefix nor the rootfs.
+    # and after fd 3 is closed -- so what comes back is the monitor's own
+    # spelling, the one address here that cng_fs_untranslate cannot map,
+    # matching neither a bind's host prefix nor the rootfs. The binder maps it
+    # by the record it made, keyed by the socket's own identity.
     check_contains "m15 ...and reads back as the name the guest bound" \
         "getsockname: /run/s.sock" "$out"
-    check_absent "m15 ...with none of our own /proc/self/fd spelling in it" \
-        "/proc/self/fd/" "$out"
-    # ...to a process that never bound it, too. A name under the rootfs is
-    # respelled so that the spelling carries the guest path itself — the rootfs
-    # directory as a /proc/self/fd handle and the guest's own path beneath it —
-    # so a peer's getpeername takes the name straight off the string, with no
-    # record of the binder's to consult. It used to answer the internal
-    # spelling, "/proc/self/fd/5/s.sock", for exactly this reader.
+    check_absent "m15 ...with none of our own /proc spelling in it" \
+        "/proc/" "$out"
+    # ...to a process that never bound it, too, and has no record: the
+    # spelling names the binder's pid and the directory descriptor it keeps
+    # open for the binding, so a peer's getpeername reads the link back to
+    # the host directory and that to the guest's name. It used to answer the
+    # internal spelling, "/proc/self/fd/5/s.sock", for exactly this reader.
     m15run -R "$DEEP" /bin/uxsock /run/s.sock x 4 >/dev/null 2>&1 &
     m15bg=$!
     sleep 2
@@ -94,11 +94,11 @@ else
     check_contains "m15 a peer process reads the name back as the guest bound it" \
         "getpeername: /run/s.sock" "$out"
 
-    # A name under a BIND, where the spelling cannot carry the guest name (the
-    # readback would need to know which bind), is remembered by the binding
-    # process instead, keyed by the socket's own identity. The record used to
-    # be eight entries in a ring: the ninth fallback bind overwrote the first's,
-    # and its getsockname handed the guest the internal spelling.
+    # Twelve bindings held open at once, under a bind: each is remembered by
+    # the binding process, keyed by the socket's own identity, and its pinned
+    # directory held with it. The record used to be eight entries in a ring:
+    # the ninth bind overwrote the first's, and its getsockname handed the
+    # guest the internal spelling.
     if guest_cc "$M15D/uxmany" tests/guests/uxmany.c; then
         cp "$M15D/uxmany" "$R1/bin/uxmany"; mkdir -p "$R1/mnt"
         out=$(m15run -R -b "$DEEP/run:/mnt" "$R1" /bin/uxmany /mnt 12 2>&1)

@@ -2767,6 +2767,77 @@ vfork/`posix_spawn` child-stack handling.
     then moves a file of its own onto the synthesized number and reads it
     back intact through the dispatcher.
 
+- [x] **M49 — the resolved path was re-resolved by the kernel, from scratch**
+  The walk turned a guest name into a host path and the syscall was made on
+  that string, which the kernel resolves again, following whatever it finds:
+  a directory on the way swapped for an absolute symlink between the walk
+  and the call was followed from the HOST root, and the call landed outside
+  the rootfs. Every path-bearing family had the window — open, stat,
+  readlink, access, unlink, rmdir, mkdir, truncate, chdir all measured
+  through it, thousands of times a second under a flipping thread — and so
+  did every host path the monitor handled on its own account: the loader's
+  open of the program, `-l`'s data files and markers, the `/proc` files a
+  `-b DIR:/proc` serves, an AF_UNIX `sun_path`. It is the time-of-check to
+  time-of-use of a string-based translator, and `proot` has it too.
+  - No host path reaches the kernel as a string any more (`src/monitor/pin.c`,
+    `cng/pin.h`). The directory the walk reached is opened `O_PATH` and held
+    for the call, verified to be that directory — the kernel's own name for
+    it (its fd link read back) against the walk's symlink-free spelling, the
+    rootfs, bind and `/dev` directory prefixes being stored as the kernel
+    spells them; a spelling that differs (a case-insensitive filesystem
+    answers the stored case, and a `-b /sdcard` is one) is settled by a
+    descriptor-by-descriptor walk from the prefix, each component
+    `O_NOFOLLOW`, a symlink met there being the race and `ELOOP`. The call
+    is then made against that descriptor with the last component as a plain
+    name and the family's NOFOLLOW set, which the walk's own following
+    makes a no-op for a tree at rest. `reissue()` does this for every
+    dispatcher re-issue by table (`pin_args`); the loader, l2s, procfs and
+    the fallback reopen take the whole-path forms.
+  - An open is not given `O_NOFOLLOW`: the kernel keeps that on the
+    description, `F_GETFL` and `fdinfo` report it, and the "reopen with the
+    flags read back" idiom would then refuse a symlink the program never
+    meant to avoid. It is made as an `openat2` with `RESOLVE_NO_SYMLINKS`
+    — the how built as the kernel builds it for an `openat`, so the stricter
+    call answers alike — where the host has `openat2`; a flag outside the
+    known set, or a host that blocks the call (Android's filter), takes
+    `O_NOFOLLOW`, and the bit on the description is the residue there.
+  - `access` and `chmod` have no NOFOLLOW to set and take `faccessat2` and
+    `fchmodat2` (remembered as absent on `ENOSYS`); `truncate`, `statfs`,
+    `chdir` (an `fchdir`), the non-at xattr calls and `inotify_add_watch`,
+    and any name with a trailing slash — which the kernel follows whatever
+    the flag says — go through the last component's own `O_PATH`
+    descriptor, checked not to be a symlink, by its fd link. The pinned
+    pair spelled through the directory's fd link serves the l-form xattr
+    calls and `bind`.
+  - A pin that fails on the directory (`ENOENT`, `ENOTDIR`, `EACCES`) has
+    skipped the checks the kernel makes before it resolves anything, so the
+    call is made once more against a descriptor that is none and a name that
+    needs one: `EBADF` means those checks passed and the pin's answer stands,
+    anything else is the kernel's, in its order (`pin_errno`). Measured:
+    `fstatat("/missing/x", badflags)` is `EINVAL`, as it was.
+  - A pathname `bind` now carries "/proc/<pid>/fd/<n>/<name>" in `sun_path`
+    — the binder's own pid, and the pinned directory kept open in it for as
+    long as the socket is (given back on a later bind once the socket is no
+    longer open here, the number's identity checked first: it is in the
+    guest's table). That is what any process can read back: the binder by
+    the record it made (the socket's own inode first), everything forked from
+    it by the stored spelling, and a process with no record — a datagram
+    service answering at the source address its `recvfrom` reported — by
+    resolving the link to the host directory and that to its guest name. The
+    self-describing "/proc/self/fd/<root>/./<guest path>" form is gone: the
+    kernel resolved the guest path's components itself. A `connect`,
+    `sendto` or `sendmsg` names the socket file by its own `O_PATH` link.
+  - Cost, measured under qemu-user where a syscall is ~5 µs: an absolute
+    `stat` 18 → 35 µs (open, readlink, close), an absolute `open` 28 → 39,
+    a name against a dirfd 12.7 → 15.6 (the hot path pins nothing: the
+    NOFOLLOW is all it gains).
+  - `tests/m26_pinned.sh`: `tests/guests/pathrace.c` flips a directory
+    against an absolute symlink to a host directory under nine families for
+    four seconds (12,000–17,000 host answers before, the host's files
+    unlinked, made and truncated; none now, all intact), and
+    `tests/guests/uxreply.c` has two unrelated invocations exchange
+    datagrams on their own bound names and read each other's back.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

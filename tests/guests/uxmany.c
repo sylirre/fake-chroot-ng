@@ -1,12 +1,12 @@
-/* Many pathname sockets bound through the readback fallback (M15).
+/* Many pathname sockets held open at once (M15).
  *
- * A translated name too long for sun_path is bound through a spelling of the
- * emulator's own, and what getsockname then reports has to be mapped back to
- * the name the guest bound. For a name under a bind that mapping is a record
- * the binding process keeps, and the record used to be eight entries in a
- * ring: the ninth such bind overwrote the first's, whose getsockname then
- * handed the guest the internal spelling. Bind N sockets under DIR, all held
- * open, and read each one back.
+ * A pathname is bound through a spelling of the emulator's own, and what
+ * getsockname then reports has to be mapped back to the name the guest
+ * bound: a record the binding process keeps, keyed by the socket's identity.
+ * The record used to be eight entries in a ring: the ninth bind overwrote
+ * the first's, whose getsockname then handed the guest the internal
+ * spelling. Bind N sockets under DIR, all held open, and read each one
+ * back.
  *
  *   uxmany DIR N
  */
