@@ -354,6 +354,20 @@ int cng_scope_needs_walk(long dirfd, char *gdir, size_t sz);
 int cng_fd_admit(int fd);
 void cng_fds_sanitize(void);
 
+/* The identity of the file behind a descriptor of ours, for the descriptors
+ * kept across guest syscalls: close(2) is not trapped, so the guest can close
+ * one and be handed the number back for a file of its own, and every later use
+ * of the number has to check that it still names our file. The inode number
+ * alone is not that check — it is per filesystem, and a guest file on another
+ * one carries the same number as freely as a memfd or a socket does — so the
+ * device goes with it. cng_fdid_of records the pair (0/-1); cng_fd_is answers
+ * whether `fd` still names it, and 0 for a number that is closed. */
+struct cng_fdid {
+    unsigned long dev, ino;
+};
+int cng_fdid_of(int fd, struct cng_fdid *id);
+int cng_fd_is(int fd, const struct cng_fdid *id);
+
 /* Serve an open the host refused (`err`) on a path naming one of our own fds,
  * from that descriptor: a duplicate when the inode grants the access anyway
  * (a non-DAC refusal, e.g. SELinux on a memfd), or a mode-borrowing reopen

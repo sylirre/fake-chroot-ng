@@ -36,6 +36,8 @@ const char *cng_g_exe_guest = "/";
 #define STAT_BUF_SIZE  128
 #define STATX_BUF_SIZE 256
 #define STATFS_BUF_SIZE 120
+#define STAT_DEV_OFF   0
+#define STAT_INO_OFF   8
 #define STAT_MODE_OFF  16
 #define STAT_UID_OFF   24
 #define STAT_GID_OFF   28
@@ -1018,6 +1020,22 @@ static int fd_is_dir(long fd) {
     char st[STAT_BUF_SIZE];
     return sys_fstat((int)fd, st) == 0 &&
            (*(unsigned *)(st + STAT_MODE_OFF) & CNG_S_IFMT) == CNG_S_IFDIR;
+}
+
+/* The (st_dev, st_ino) pair behind a descriptor: see the header. */
+int cng_fdid_of(int fd, struct cng_fdid *id) {
+    char st[STAT_BUF_SIZE];
+    if (fd < 0 || sys_fstat(fd, st) != 0)
+        return -1;
+    id->dev = *(unsigned long *)(st + STAT_DEV_OFF);
+    id->ino = *(unsigned long *)(st + STAT_INO_OFF);
+    return 0;
+}
+
+int cng_fd_is(int fd, const struct cng_fdid *id) {
+    struct cng_fdid cur;
+    return cng_fdid_of(fd, &cur) == 0 && cur.dev == id->dev &&
+           cur.ino == id->ino;
 }
 
 /* The guest name of a host directory the kernel reported for an open

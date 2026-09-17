@@ -352,6 +352,33 @@ else
         skip "many-socket leg: could not build tests/guests/nlmany.c with -pthread"
     fi
 
+    # --- 5. the hidden descriptors and the guest's own -----------------------
+    # An emulated socket is three descriptors, and the guest knows one. A
+    # close-all loop closes the other two too and the next opens get the
+    # numbers back; the slot's reclaim used to close them again, on the
+    # evidence of the guest's fd alone — two files of the program's. And the
+    # relay socket is close-on-exec while a netlink socket without SOCK_CLOEXEC
+    # is not: after an exec the inherited socket's dump went through, and read
+    # from, whatever the new program had opened on the relay's number.
+    if guest_cc "$M16D/nlstale" tests/guests/nlstale.c; then
+        cp "$M16D/nlstale" "$R/bin/nlstale"
+        st=$(CNG_DEBUG=1 CNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nlstale \
+            2>"$M16D/nlstale.err")
+        check_contains "m16 a close-all loop costs the guest none of its own files" \
+            "closeall: dump=1 files=16 reclaim=-1/88 kept=16 redump=1" "$st"
+        check_contains "m16 a netlink socket without SOCK_CLOEXEC works after an exec" \
+            "exec: inherited_open=1 dump=1 files=16 kept=16" "$st"
+        if [ "$m16_raw" = 1 ]; then
+            # The relay the sweep closed is opened again: the dump after the
+            # exec is relayed like the two before it, not synthesized through
+            # the guest's file on the old number.
+            check "m16 ...and its dump is still relayed, on a relay socket of ours" \
+                3 "$(grep -c -- '-> relayed' "$M16D/nlstale.err")"
+        fi
+    else
+        skip "hidden-descriptor leg: could not build tests/guests/nlstale.c"
+    fi
+
     rm -rf "$R"
 fi
 rm -rf "$M16D"

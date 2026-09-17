@@ -1047,10 +1047,9 @@ vfork/`posix_spawn` child-stack handling.
     byte for byte, `IFLA_EXT_MASK` and all. It previously sent the bare form —
     the one form that already worked — which is precisely why the suite passed
     while the device failed.
-  - Known, unchanged: the relay socket occupies a guest-visible fd (host fd ==
-    guest fd here). Nothing a guest does normally disturbs it, but a
-    `close_range()` sweep would; that hazard is general to this design and
-    tracked with the rest.
+  - The relay socket occupies a guest-visible fd (host fd == guest fd here),
+    and so does the pair peer; what a `close_range()` sweep does to them is
+    M47's.
 
 - [x] **Fix: the startup probe ran its candidates against live fd 0.** The
   blocked-syscall probe (blocklist.c) invoked every candidate with all-zero
@@ -2717,6 +2716,35 @@ vfork/`posix_spawn` child-stack handling.
     by both — the latter sits out where the host has no `process_vm_readv`
     for the guest at all, as qemu-user has not) and a `-t bpftest` leg that
     simulates the filter with and without the view.
+
+- [x] **M47 — the emulated netlink socket's hidden descriptors were the guest's to lose**
+  An emulated `NETLINK_ROUTE` socket is three descriptors in the one table
+  the guest and the monitor share — the guest's end of a socketpair, our
+  end, and an unbound relay socket — and the slot checked the identity of
+  the first alone. `close(2)` is not trapped: a close-all loop before an exec
+  (`daemon(3)`, `closefrom(3)`, every service manager's child setup) closed
+  the two the program never knew about, its next opens were handed the
+  numbers back, and the slot's reclaim — a trapped socket call on the old
+  number, whose inode had changed — then *closed the two hidden numbers
+  again*: two files of the program's. The relay socket was also the one of
+  the three opened close-on-exec, so an emulated execve carrying a netlink
+  socket without `SOCK_CLOEXEC` (the pair peer carries the guest's flags and
+  survived with it) left the slot relaying through, and reading from,
+  whatever the next program opened on that number: a guest socket there
+  would have had its datagrams read by the monitor, blocking inside the
+  handler with no timeout of its own.
+  - Every descriptor of the slot now carries the identity of the file it was
+    opened as, and the number is neither used nor closed without it checked
+    (`cng_fdid`: device and inode both — the inode alone is per filesystem,
+    and a guest file elsewhere carries the same number as freely as a memfd
+    or a socket does). A stale pair peer is abandoned, never
+    closed: the pair is broken, which is what the guest did to it. A stale
+    or closed relay socket is opened again on the next relay, since the
+    ordinary way to lose it is the exec sweep and not the guest.
+  - `tests/guests/nlstale.c` in `tests/m16_netlink.sh`: sixteen files opened
+    onto the freed numbers survive the reclaim, and a socket inherited across
+    an exec still dumps — relayed, on a relay socket of ours, counted in the
+    debug trace where the host relays at all.
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
