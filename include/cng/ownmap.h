@@ -33,8 +33,19 @@ void *cng_own_map(void *p, unsigned long len);
  * one that was recorded; a partial match is not dropped. */
 void cng_own_drop(void *p, unsigned long len);
 
-/* Does [lo, hi) touch anything of ours? */
+/* Does [lo, hi) touch anything recorded above? */
 int cng_own_hit(unsigned long lo, unsigned long hi);
+
+/* Does [addr, addr+len) touch anything of the monitor's at all: its image
+ * (cng_hits_image), a region recorded above, a scratch stack, or the signal
+ * frame a dispatch is returning through (cng_scr_hit)? This is the question
+ * every guest-chosen address has to answer before a MAP_FIXED of ours goes
+ * down on it — an ET_EXEC's link-time vaddr, shmat(SHM_REMAP), the mmap hook's
+ * anonymous stand-in — because a monitor mapped over by its own hand has
+ * nothing left to report the failure with (docs/DESIGN.md, the threat-model
+ * note); and it is the exec sweep's "never the outgoing program's" test. A
+ * `len` that wraps the address space reaches its top, as in cng_hits_image. */
+int cng_hits_monitor(unsigned long addr, unsigned long len);
 
 /* Take the floor. Called once, from cng_run, immediately before the first guest
  * program is loaded — not merely before it runs, or the floor claims that

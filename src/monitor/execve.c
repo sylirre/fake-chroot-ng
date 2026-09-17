@@ -1018,7 +1018,7 @@ static int sweep_seen(unsigned long lo, unsigned long hi, const char *path,
         return 0; /* the stack this call is standing on */
     if (sweep_kernel_vma(path))
         return 0;
-    if (cng_own_hit(lo, hi) || cng_scr_hit(lo, hi) || cng_hits_image(lo, hi - lo))
+    if (cng_hits_monitor(lo, hi - lo))
         return 0;
     struct exec_range r = {lo, hi - lo};
     for (int i = 0; i < EXEC_GEN_MAX; i++)

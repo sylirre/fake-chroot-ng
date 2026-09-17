@@ -2412,6 +2412,31 @@ vfork/`posix_spawn` child-stack handling.
   contained-vs-reached differential the plain `getxattr` leg runs; without one
   it skips by name.
 
+- [x] **M38 — the ET_EXEC preflight guarded the image and nothing else of ours**
+  An ET_EXEC goes down MAP_FIXED at its link-time vaddr, and the header pass
+  refused the one collision it knew about: chroot-ng's own image. But the
+  image is not the only mapping of the monitor's a file can name. The
+  scratch stack the emulated execve is itself running on, the signal frame
+  it returns through, the own-map registry's regions (the floor, the pid and
+  IPC registries, the argv snapshot the exec stands on) are all kernel-placed
+  mappings at addresses just as spellable — and the exec sweep knows to leave
+  every one of them alone, but the sweep runs *after* the map pass, and the
+  map pass had already put the guest over them, past the point of no return
+  where a failure is fatal and a success is a monitor with no stack.
+  `cng_hits_monitor()` (ownmap.c) now asks the three questions the sweep
+  asks — image, registry, scratch stacks with their frames — and every
+  guest-chosen MAP_FIXED of ours asks it: the ET_EXEC header pass (ENOEXEC
+  with the caller alive), the map pass again at the last moment before the
+  MAP_FIXED (a registry can grow a chunk and a thread can claim a stack
+  between the plan and the map; a stale yes there would replace the monitor,
+  a refusal is at worst a fatal exec that says why), `shmat(SHM_REMAP)`
+  (EINVAL) and the mmap hook's anonymous stand-in (the kernel's own answer).
+  The sweep uses the same helper, so the two can no longer drift apart.
+  `-t imgtest` gained three legs against live addresses: an ET_EXEC over a
+  region recorded with `cng_own_map` (refused, and the region's contents
+  intact afterwards), one over this thread's scratch stack, and one planned
+  over a free page that becomes ours between the plan and the map.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

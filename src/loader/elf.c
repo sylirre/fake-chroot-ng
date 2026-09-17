@@ -10,6 +10,7 @@
 #include "cng/elf.h"
 #include "cng/loader.h"
 #include "cng/monitor.h"
+#include "cng/ownmap.h"
 #include "cng/rewrite.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
@@ -411,8 +412,16 @@ static int elf_read_headers(int fd, struct cng_elf_plan *plan,
      * STATUS.md). The base moved out of every real toolchain's way, but the
      * vaddr is a field in a file, so refuse the collision rather than trust
      * the layout. Refused here, in the pass that maps nothing, so an exec
-     * that would have hit it answers ENOEXEC with the caller still alive. */
-    if (eh->e_type == ET_EXEC && cng_hits_image(lo, hi - lo))
+     * that would have hit it answers ENOEXEC with the caller still alive.
+     *
+     * The image is not the only thing of ours a MAP_FIXED can land on. The
+     * scratch stack this very exec is running on, the signal frame it returns
+     * through, the registries and the argv snapshot are all kernel-placed
+     * mappings at addresses a file can name just as well — the exec sweep
+     * (execve.c) knows to leave every one of them alone, but that sweep runs
+     * after the map pass, and the map pass had already put the guest over
+     * them. cng_hits_monitor asks about all of it. */
+    if (eh->e_type == ET_EXEC && cng_hits_monitor(lo, hi - lo))
         return CNG_LOAD_ECLOBBER;
 
     plan->lo = lo;
@@ -496,6 +505,14 @@ int cng_elf_map(const struct cng_elf_plan *plan, unsigned long base_hint,
      * one actually in force. */
     if (cng_g_loader_file && !plan->file_ok)
         return CNG_LOAD_EINVAL;
+    /* So can the set of mappings that are ours: a registry can grow a chunk, a
+     * thread can claim a scratch stack, between the plan and this. The header
+     * pass gave the answer the caller could still be told; this one is asked
+     * again at the last moment before the MAP_FIXED, where a stale yes would
+     * replace the monitor and a refusal is at worst a fatal exec — which is
+     * still a process that dies saying why. */
+    if (!plan->is_dyn && cng_hits_monitor(lo, span))
+        return CNG_LOAD_ECLOBBER;
     int rc = cng_g_loader_file ? map_file(plan->fd, eh, ph, plan->is_dyn, lo,
                                           span, base_hint, &bias, &maplen)
                                : map_anon(plan->fd, eh, ph, plan->is_dyn, lo,

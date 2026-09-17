@@ -6,7 +6,9 @@
  * execve can only give the outgoing program's memory back if it can tell that
  * memory from ours, and this is where that question is answered.
  */
+#include "cng/monitor.h"
 #include "cng/ownmap.h"
+#include "cng/rt.h"
 #include "cng/syscall.h"
 #include "cng/tab.h"
 #include "cng/uapi.h"
@@ -95,6 +97,16 @@ int cng_own_hit(unsigned long lo, unsigned long hi) {
 
 int cng_own_ready(void) {
     return g_own_floored && !__atomic_load_n(&g_own_lost, __ATOMIC_ACQUIRE);
+}
+
+int cng_hits_monitor(unsigned long addr, unsigned long len) {
+    if (!len)
+        return 0; /* an empty range covers nothing */
+    unsigned long end = addr + len;
+    if (end < addr)
+        end = ~0UL;
+    return cng_hits_image(addr, len) || cng_own_hit(addr, end) ||
+           cng_scr_hit(addr, end);
 }
 
 /* ---- /proc/self/maps ----------------------------------------------------- */

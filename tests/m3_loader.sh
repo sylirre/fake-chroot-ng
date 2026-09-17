@@ -170,7 +170,15 @@ check_contains "...each refusal being the errno the kernel gives" \
 # so the collision is refused outright now. `-t imgtest` builds the three
 # objects (over the image, one page below it, and the same address as an
 # ET_DYN hint) against the live linker symbols.
-run -t imgtest >/dev/null 2>&1
-check "an ET_EXEC whose span covers chroot-ng's own image is refused" 0 $?
+# The image is not the only thing of ours a file can name: the registries, the
+# argv snapshot and the scratch stack the exec itself runs on are kernel-placed
+# mappings at addresses just as spellable, and the preflight asked about the
+# image alone. The last three fields are an ET_EXEC over a registered region,
+# one over this thread's scratch stack, and one planned over a free page that
+# became ours between the plan and the map -- refused at the map.
+out=$(run -t imgtest 2>&1); rc=$?
+check "an ET_EXEC whose span covers chroot-ng's own image is refused" 0 $rc
 check_contains "...before anything is mapped, and only for the overlap" \
-    "exec-over=-8 intact=1 exec-below=0 dyn-hint=0" "$(run -t imgtest 2>&1)"
+    "exec-over=-8 intact=1 exec-below=0 dyn-hint=0" "$out"
+check_contains "...and so is one over any other mapping of the monitor's" \
+    "own=-8 own-intact=1 scratch=-8 late=0/-8 -> OK" "$out"

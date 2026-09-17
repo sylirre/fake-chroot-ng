@@ -42,13 +42,19 @@ What that does and does not buy:
 
 One rule follows for the implementation: chroot-ng must never be the instrument.
 Wherever a **guest-chosen address** reaches a `MAP_FIXED` of ours — an `ET_EXEC`
-guest's link-time vaddr (`src/loader/elf.c`) and `shmat(SHM_REMAP)`
-(`src/monitor/shm.c`) — the range is checked against `[__cng_image_start,
-__cng_image_end)` and refused (`ENOEXEC` / `EINVAL`), because a monitor mapped
-over by its own hand has nothing left to report the failure with. That is what
-the 64 GiB link base (see the 0x400000 entry in `docs/STATUS.md`) moved out of
-the way of, and `p_vaddr` is a field in a file, so the base alone is not a
-guarantee.
+guest's link-time vaddr (`src/loader/elf.c`), `shmat(SHM_REMAP)`
+(`src/monitor/shm.c`) and the mmap hook's anonymous stand-in
+(`src/monitor/execmap.c`) — the range is checked against everything that is the
+monitor's and refused (`ENOEXEC` / `EINVAL` / the kernel's own answer):
+`cng_hits_monitor()` covers the image `[__cng_image_start, __cng_image_end)`,
+every region the own-map registry records (the floor, the registries, the argv
+snapshot an exec stands on) and the scratch stacks with the signal frame a
+dispatch returns through — the same three answers the exec sweep uses to tell
+the monitor's memory from the outgoing program's. A monitor mapped over by its
+own hand has nothing left to report the failure with. That is what the 64 GiB
+link base (see the 0x400000 entry in `docs/STATUS.md`) moved out of the way of,
+and `p_vaddr` is a field in a file, so the base alone is not a guarantee — and
+the image is not the only mapping a file can name.
 
 ## Why not the obvious approaches
 

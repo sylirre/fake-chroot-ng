@@ -6,6 +6,7 @@
 #include "cng/elf.h"
 #include "cng/loader.h"
 #include "cng/monitor.h"
+#include "cng/ownmap.h"
 #include "cng/rewrite.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
@@ -186,10 +187,11 @@ long cng_execmap(unsigned long addr, unsigned long len, long prot, long flags,
     unsigned long mlen = cng_page_up(len);
     if (!len || mlen < len || (off & (cng_page_size - 1)))
         return native;
-    /* The one address that is never ours to take (see the threat-model note in
-     * docs/DESIGN.md): mapping over the monitor would replace the code serving
-     * the mapping. Only MAP_FIXED can reach it — a hint is a hint. */
-    if ((flags & CNG_MAP_FIXED) && cng_hits_image(addr, mlen))
+    /* The addresses that are never ours to take (see the threat-model note in
+     * docs/DESIGN.md): mapping over the monitor — its image, a scratch stack,
+     * a registry — would replace the code or the state serving the mapping.
+     * Only MAP_FIXED can reach them — a hint is a hint. */
+    if ((flags & CNG_MAP_FIXED) && cng_hits_monitor(addr, mlen))
         return native;
 
     void *p = sys_mmap((void *)addr, mlen, CNG_PROT_READ | CNG_PROT_WRITE,

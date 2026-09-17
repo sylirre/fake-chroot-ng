@@ -4881,12 +4881,85 @@ int cng_cmd_imgtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     if (dyn == CNG_LOAD_OK)
         sys_munmap((void *)ld.base, 0x1000);
 
+    /* The image is not the only thing of ours a file can name. The exec sweep
+     * knows three kinds of mapping to leave alone — the image, the own-map
+     * registry, the scratch stacks — and the MAP_FIXED preflight used to ask
+     * about the first only: an ET_EXEC over a registered region or over the
+     * scratch stack the exec was running on went down, and the monitor died
+     * with the guest. Three more legs, each against a live address:
+     *   - an ET_EXEC over a region recorded with cng_own_map is refused;
+     *   - one over this thread's scratch stack is refused;
+     *   - one planned over a free page that becomes ours between the plan and
+     *     the map is refused at the map, since the answer the header pass gave
+     *     is re-asked at the last moment before the MAP_FIXED. */
+    unsigned long pg = cng_page_size;
+    int own = -1, own_still = 0;
+    void *ownp = sys_mmap(0, pg, CNG_PROT_READ | CNG_PROT_WRITE,
+                          CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (!cng_is_err((long)ownp)) {
+        *(volatile unsigned long *)ownp = 0x0e1f0e1f;
+        cng_own_map(ownp, pg);
+        struct synth_seg own_seg = {(unsigned long)ownp, SYNTH_ELF_HDRSZ, pg,
+                                    6 /*PF_R|PF_W*/, 0};
+        fd = synth_elf_memfd(2 /*ET_EXEC*/, &own_seg, 1);
+        own = fd < 0 ? (int)fd : cng_load_elf_fd((int)fd, 0, &ld);
+        if (fd >= 0)
+            sys_close((int)fd);
+        own_still = *(volatile unsigned long *)ownp == 0x0e1f0e1f;
+        cng_own_drop(ownp, pg);
+        sys_munmap(ownp, pg);
+    }
+
+    int scr = -1;
+    unsigned long scr_hi = 0;
+    if (cng_scratch_slot_for(sys_gettid(), &scr_hi) >= 0 && scr_hi) {
+        /* One page inside the stack, from its top: the slot's [lo, hi) is what
+         * cng_scr_hit tests, and hi is what the allocator hands out. */
+        struct synth_seg scr_seg = {scr_hi - pg, SYNTH_ELF_HDRSZ, pg,
+                                    6 /*PF_R|PF_W*/, 0};
+        fd = synth_elf_memfd(2 /*ET_EXEC*/, &scr_seg, 1);
+        scr = fd < 0 ? (int)fd : cng_load_elf_fd((int)fd, 0, &ld);
+        if (fd >= 0)
+            sys_close((int)fd);
+    }
+
+    int race_plan = -1, race_map = -1;
+    void *hole = sys_mmap(0, pg, CNG_PROT_READ | CNG_PROT_WRITE,
+                          CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (!cng_is_err((long)hole)) {
+        sys_munmap(hole, pg); /* a free page whose address is known */
+        struct synth_seg hole_seg = {(unsigned long)hole, SYNTH_ELF_HDRSZ, pg,
+                                     6 /*PF_R|PF_W*/, 0};
+        fd = synth_elf_memfd(2 /*ET_EXEC*/, &hole_seg, 1);
+        struct cng_elf_plan plan;
+        struct cng_loaded out;
+        race_plan = fd < 0 ? (int)fd : cng_elf_plan_fd((int)fd, &plan, &out);
+        if (race_plan == CNG_LOAD_OK) {
+            void *late = sys_mmap(hole, pg, CNG_PROT_READ | CNG_PROT_WRITE,
+                                  CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS |
+                                      CNG_MAP_FIXED_NOREPLACE,
+                                  -1, 0);
+            if (late == hole) {
+                cng_own_map(late, pg);
+                race_map = cng_elf_map(&plan, 0, &out);
+                cng_own_drop(late, pg);
+                sys_munmap(late, pg);
+            }
+            cng_elf_plan_release(&plan);
+        }
+        if (fd >= 0)
+            sys_close((int)fd);
+    }
+
     int ok = over == CNG_LOAD_ECLOBBER && intact && under == CNG_LOAD_OK &&
-             dyn == CNG_LOAD_OK;
+             dyn == CNG_LOAD_OK && own == CNG_LOAD_ECLOBBER && own_still &&
+             scr == CNG_LOAD_ECLOBBER && race_plan == CNG_LOAD_OK &&
+             race_map == CNG_LOAD_ECLOBBER;
     cng_dprintf(1,
                 "imgtest exec-over=%d intact=%d exec-below=%d dyn-hint=%d"
-                " -> %s\n",
-                over, intact, under, dyn, ok ? "OK" : "FAIL");
+                " own=%d own-intact=%d scratch=%d late=%d/%d -> %s\n",
+                over, intact, under, dyn, own, own_still, scr, race_plan,
+                race_map, ok ? "OK" : "FAIL");
     return ok ? 0 : 1;
 }
 

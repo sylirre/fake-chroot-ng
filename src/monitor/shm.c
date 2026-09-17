@@ -254,13 +254,14 @@ static long do_shmat(s32 shmid, u64 shmaddr, s32 shmflg) {
                ((shmflg & CNG_SHM_EXEC) ? CNG_PROT_EXEC : 0);
 
     /* SHM_REMAP is MAP_FIXED, and the monitor lives in the guest's own address
-     * space: an attach placed over chroot-ng's image would replace the code
-     * that is running the attach. The kernel has no such range to protect, so
-     * there is no errno to copy — EINVAL is what shmat already answers for an
-     * address it will not honor, and it is what a plain (non-REMAP) attach
-     * here produces anyway, since the range is taken. */
+     * space: an attach placed over chroot-ng's image, a scratch stack or one of
+     * its registries would replace the code or the state that is running the
+     * attach. The kernel has no such range to protect, so there is no errno to
+     * copy — EINVAL is what shmat already answers for an address it will not
+     * honor, and it is what a plain (non-REMAP) attach here produces anyway,
+     * since the range is taken. */
     long err = len ? 0 : -EINVAL;
-    if (!err && addr && cng_hits_image(addr, len))
+    if (!err && addr && cng_hits_monitor(addr, len))
         err = -EINVAL;
 
     void *p = CNG_MAP_FAILED;
