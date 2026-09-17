@@ -6696,8 +6696,15 @@ static int pt_sim_sigsys(unsigned long *auxv) {
         CNG_SYS(__NR_exit_group, pt_sim_child(fds[1]), 0, 0, 0, 0, 0);
     }
     sys_close(fds[1]);
+    /* The child's TRACEME kicks us, and the kick handler is installed without
+     * SA_RESTART on purpose (it has to interrupt a native wait4): this read
+     * comes back EINTR when the kick lands first. Returning then closed the
+     * pipe under the child's readiness write, and its very first stop was a
+     * SIGPIPE stop rather than the cooperative one — once in ten runs under
+     * load. Retry, as every real reader does. */
     char c = 0;
-    sys_read(fds[0], &c, 1);
+    while (sys_read(fds[0], &c, 1) == -EINTR)
+        ;
     sys_close(fds[0]);
     if (kid < 0) {
         cng_dprintf(1, "ptracetest sigsys tier: no fork -> FAIL\n");

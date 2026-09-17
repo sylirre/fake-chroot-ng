@@ -26,6 +26,10 @@
 #include <unistd.h>
 
 #define ROUNDS 20000
+/* Every setter is a glibc setxid broadcast — a signal to every other thread
+ * and a handshake with each — so the identity rounds are fewer: the unfixed
+ * emulation tore about one read in six, which 4000 rounds still show. */
+#define ID_ROUNDS 4000
 
 static const char *d_short = "/a";
 static char d_long[128];
@@ -69,7 +73,7 @@ static gid_t list_b[3] = {21, 22, 23};
 static void *grp_writer(void *arg) {
     (void)arg;
     void *res = 0;
-    for (int i = 0; i < ROUNDS && !res; i++) {
+    for (int i = 0; i < ID_ROUNDS && !res; i++) {
         if (setgroups(8, list_a) != 0 || setresuid(1000, 1000, 0) != 0 ||
             setresuid(0, 0, 0) != 0 || setgroups(3, list_b) != 0)
             res = (void *)1;

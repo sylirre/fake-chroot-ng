@@ -257,7 +257,9 @@ elif guest_cc "$VRD/viewrace" tests/guests/viewrace.c -pthread; then
     out=$(run_t 120 -R "$VRD/root" /bin/viewrace cwd 2>/dev/null)
     check_contains "a getcwd racing a chdir sees one directory or the other" \
         "viewrace cwd: writer=ok torn=0" "$out"
-    out=$(run_t 120 -R -u "$VRD/root" /bin/viewrace groups 2>/dev/null)
+    # Every setter is a glibc setxid broadcast, a signal to the sibling and a
+    # handshake with it: a minute on an emulated AArch64 machine.
+    out=$(run_t 300 -R -u "$VRD/root" /bin/viewrace groups 2>/dev/null)
     check_contains "a getgroups racing a setgroups sees one list or the other" \
         "viewrace groups: writer=ok torn=0" "$out"
 else

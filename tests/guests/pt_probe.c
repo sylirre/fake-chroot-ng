@@ -691,7 +691,13 @@ static int sc_step(void) {
  * back. Both threads run the same loop, so each also runs through the other's
  * planted instruction, which is the case that must wait rather than trap. Each
  * step is issued to both before either is waited for, three rounds, and the
- * pc of each must have moved on every round. */
+ * pc of each must have moved on every round.
+ *
+ * Both threads spin without a syscall: a thread attached while parked in
+ * nanosleep is stopped with a restarted syscall in front of it, and hardware
+ * single-step over a restart does not advance the pc the way it does over an
+ * instruction — the emulation, which has no restart to step over, would
+ * differ there for a reason that is not the one under test. */
 static volatile int g_spin;
 
 static void *step2_thr(void *arg) {
@@ -699,10 +705,8 @@ static void *step2_thr(void *arg) {
     pid_t me = (pid_t)syscall(SYS_gettid);
     ssize_t ignore = write(fd, &me, sizeof me);
     (void)ignore;
-    for (;;) {
+    for (;;)
         g_spin++;
-        usleep(1000);
-    }
     return 0;
 }
 
@@ -718,10 +722,8 @@ static int sc_step2(void) {
         pid_t me = (pid_t)syscall(SYS_gettid);
         ssize_t ignore = write(fds[1], &me, sizeof me);
         (void)ignore;
-        for (;;) {
+        for (;;)
             g_spin++;
-            usleep(1000);
-        }
     }
     close(fds[1]);
     pid_t tid[2];
