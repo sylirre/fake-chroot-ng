@@ -3504,7 +3504,72 @@ int cng_cmd_cloexectest(int argc, char **argv, char **envp, unsigned long *auxv)
                 ce_fl == -EBADF, pl_fl >= 0, ok ? "OK" : "FAIL");
     if (pl >= 0)
         sys_close((int)pl);
-    return ok ? 0 : 1;
+    int fails = !ok;
+
+    /* The same pass with no /proc/self/fd to read. The pass opens that
+     * directory, and a descriptor table that is full refuses it — EMFILE, from
+     * exactly the program with the most descriptors to lose, and the launcher
+     * waiting on one of them. It used to return quietly then, and every
+     * close-on-exec descriptor survived the exec. Reproduced the way it
+     * happens: the soft limit is brought down to the table's current top,
+     * /dev/null is opened until EMFILE, and the pass is run — the CLOEXEC ones
+     * (one below the fill, one at the very top of it) have to go and the plain
+     * ones have to stay, exactly as before. The limit is restored afterwards. */
+    struct cng_rlimit save, low;
+    int fb_ce_gone = -1, fb_top_gone = -1, fb_pl_kept = -1, fb_full = 0;
+    if (sys_prlimit64(0, CNG_RLIMIT_NOFILE, 0, &save) == 0) {
+        long ce2 = sys_openat(CNG_AT_FDCWD, "/dev/null",
+                              CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+        long pl2 = sys_openat(CNG_AT_FDCWD, "/dev/null", CNG_O_RDONLY, 0);
+        low.cur = (unsigned long)(pl2 > ce2 ? pl2 : ce2) + 8;
+        low.max = save.max;
+        int fill[8];
+        int nfill = 0;
+        long top = -1;
+        if (ce2 >= 0 && pl2 >= 0 && sys_prlimit64(0, CNG_RLIMIT_NOFILE, &low, 0) == 0) {
+            for (;;) {
+                long f = sys_openat(CNG_AT_FDCWD, "/dev/null",
+                                    CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+                if (f < 0) {
+                    fb_full = f == -EMFILE;
+                    break;
+                }
+                if (nfill < 8)
+                    fill[nfill++] = (int)f;
+                top = f;
+            }
+            long chk = sys_openat(CNG_AT_FDCWD, "/proc/self/fd",
+                                  CNG_O_RDONLY | CNG_O_DIRECTORY, 0);
+            if (chk >= 0) { /* the table was not full after all: no test */
+                sys_close((int)chk);
+                fb_full = 0;
+            }
+            if (fb_full) {
+                cng_close_cloexec();
+                fb_ce_gone = CNG_SYS(__NR_fcntl, (int)ce2, 1, 0, 0, 0, 0) ==
+                             -EBADF;
+                fb_top_gone = CNG_SYS(__NR_fcntl, (int)top, 1, 0, 0, 0, 0) ==
+                              -EBADF;
+                fb_pl_kept = CNG_SYS(__NR_fcntl, (int)pl2, 1, 0, 0, 0, 0) >= 0;
+            }
+            sys_prlimit64(0, CNG_RLIMIT_NOFILE, &save, 0);
+        }
+        for (int i = 0; i < nfill; i++)
+            sys_close(fill[i]);
+        if (ce2 >= 0)
+            sys_close((int)ce2);
+        if (pl2 >= 0)
+            sys_close((int)pl2);
+    }
+    int fb_ok = fb_full && fb_ce_gone == 1 && fb_top_gone == 1 &&
+                fb_pl_kept == 1;
+    cng_dprintf(1,
+                "cloexec no-proc: table_full=%d cloexec_closed=%d top_closed=%d"
+                " plain_open=%d -> %s\n",
+                fb_full, fb_ce_gone, fb_top_gone, fb_pl_kept,
+                fb_ok ? "OK" : "FAIL");
+    fails += !fb_ok;
+    return fails ? 1 : 0;
 }
 
 /* _stackswtest — validate the handler's stack switch (cng_run_on_stack): the

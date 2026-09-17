@@ -52,7 +52,10 @@ unsigned long *cng_host_auxv = 0;
  * exec-notify pipe that fork/exec launchers (git's run-command, posix_spawn)
  * open with O_CLOEXEC never closes, and the parent blocks forever waiting for
  * the EOF that signals "exec succeeded". Iterate /proc/self/fd and close each fd
- * whose FD_CLOEXEC bit is set (skipping the directory fd we are scanning). */
+ * whose FD_CLOEXEC bit is set (skipping the directory fd we are scanning) —
+ * and where that directory cannot be opened, ask about every descriptor number
+ * there can be (cloexec_scan below): the pass used to return quietly then, and
+ * an exec leaked every close-on-exec descriptor of the program it replaced. */
 /* A real execve resets signal dispositions (caught -> default, ignored kept)
  * and disables the alternate signal stack. Our in-process emulation must do the
  * same, or the new program inherits the previous one's handlers and altstack —
@@ -81,11 +84,53 @@ static void cng_reset_signals(void) {
     cng_pt_sig_exec_reset();
 }
 
+/* The pass without /proc/self/fd. Two hosts arrive here: one with no /proc to
+ * read at all (a container that mounts none, a hidepid that hides even self),
+ * and — far more often — one whose descriptor table is full, where the
+ * directory itself cannot be opened: EMFILE, from exactly the program that has
+ * the most descriptors to lose and the launcher waiting on one of them.
+ *
+ * The kernel walks its fdtable; from here the only way to ask "is this number
+ * open, and is it close-on-exec?" is F_GETFD on the number, one syscall each,
+ * a miss being EBADF. What bounds the walk is the highest number that can be
+ * open. RLIMIT_NOFILE is checked at open time against the soft limit, so a
+ * descriptor can sit above the limit in force now if the limit was lowered
+ * after it was opened — hence the larger of the two limits, and a floor under
+ * both, since the hard limit is what a process may lower but never raise.
+ * Where the hard limit is RLIM_INFINITY the ceiling is the kernel's own
+ * fs.nr_open, which defaults to 2^20 and cannot be read without /proc either.
+ * Tens of thousands of EBADFs is tens of milliseconds, once per exec, on the
+ * path that used to leak. */
+#define CLOEXEC_SCAN_FLOOR (64UL * 1024)
+#define CLOEXEC_SCAN_INF   (1UL << 20)
+static void cloexec_scan(void) {
+    unsigned long hi = CLOEXEC_SCAN_FLOOR;
+    struct cng_rlimit rl;
+    if (sys_prlimit64(0, CNG_RLIMIT_NOFILE, 0, &rl) == 0) {
+        unsigned long lim[2] = {rl.cur, rl.max};
+        for (int i = 0; i < 2; i++) {
+            unsigned long v = lim[i] == CNG_RLIM_INFINITY ? CLOEXEC_SCAN_INF
+                                                          : lim[i];
+            if (v > CLOEXEC_SCAN_INF)
+                v = CLOEXEC_SCAN_INF;
+            if (v > hi)
+                hi = v;
+        }
+    }
+    for (unsigned long fd = 0; fd < hi; fd++) {
+        long fl = CNG_SYS(__NR_fcntl, fd, 1 /*F_GETFD*/, 0, 0, 0, 0);
+        if (fl >= 0 && (fl & 1 /*FD_CLOEXEC*/))
+            sys_close((int)fd);
+    }
+}
+
 void cng_close_cloexec(void) {
     long dfd = sys_openat(CNG_AT_FDCWD, "/proc/self/fd",
                           CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
-    if (dfd < 0)
+    if (dfd < 0) {
+        cloexec_scan();
         return;
+    }
     char buf[4096];
     for (;;) {
         long n = CNG_SYS(__NR_getdents64, (int)dfd, buf, sizeof buf, 0, 0, 0);

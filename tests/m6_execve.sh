@@ -664,3 +664,10 @@ out=$(run -t cloexectest 2>&1); rc=$?
 check "cloexectest exit 0" 0 "$rc"
 check_contains "emulated execve closes FD_CLOEXEC fds" \
     "cloexec: cloexec_closed=1 plain_open=1 -> OK" "$out"
+# ...and still does when /proc/self/fd cannot be opened. The pass reads that
+# directory, and a descriptor table filled to RLIMIT_NOFILE refuses the open
+# (EMFILE) -- from exactly the program with the most descriptors to lose. It
+# used to return quietly then and leak every one of them across the exec.
+check_contains "...and with a full descriptor table, where /proc/self/fd will not open" \
+    "cloexec no-proc: table_full=1 cloexec_closed=1 top_closed=1 plain_open=1 -> OK" \
+    "$out"

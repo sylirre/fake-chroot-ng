@@ -2437,6 +2437,29 @@ vfork/`posix_spawn` child-stack handling.
   intact afterwards), one over this thread's scratch stack, and one planned
   over a free page that becomes ours between the plan and the map.
 
+- [x] **M39 — the close-on-exec pass did nothing without `/proc/self/fd`**
+  A real execve closes every FD_CLOEXEC descriptor; ours reads
+  `/proc/self/fd` and closes what it finds — and when that directory could
+  not be opened, returned quietly, so every close-on-exec descriptor of the
+  outgoing program survived into the next one. Not an exotic host: a
+  descriptor table filled to RLIMIT_NOFILE refuses the open with EMFILE, in
+  exactly the program with the most descriptors to lose, with a launcher
+  blocked on the O_CLOEXEC notify pipe that was supposed to close. A host
+  with no `/proc` to read was the same silence.
+  Where the directory will not open, the pass now asks about every
+  descriptor number there can be: F_GETFD on each, one syscall per number, a
+  miss being EBADF. The bound is the larger of the two RLIMIT_NOFILE values
+  (the soft limit is checked at open time, so a descriptor can sit above the
+  limit in force now if that was lowered after it was opened), floored at
+  64K, with RLIM_INFINITY read as the kernel's own `fs.nr_open` default of
+  2^20 — which cannot be read without `/proc` either. Tens of thousands of
+  EBADFs is tens of milliseconds, once per exec, on the path that used to
+  leak.
+  `-t cloexectest` reproduces the trigger rather than a stand-in for it: the
+  soft limit is brought down to the table's top, `/dev/null` is opened until
+  EMFILE, and the pass is run — the CLOEXEC descriptors below and at the very
+  top of the fill have to go, the plain ones have to stay.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes
