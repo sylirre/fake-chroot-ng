@@ -24,6 +24,10 @@ long cng_syscall6(long a0, long a1, long a2, long a3, long a4, long a5,
 /* Linker-provided bounds of the gate (see gate.S). */
 extern char __cng_gate_start[];
 extern char __cng_gate_end[];
+/* The bounce stub in the gate (see gate.S): where a trap frame is pointed to
+ * run a mask-taking wait in guest context, and where its completion traps. */
+extern char cng_bounce_wait[];
+extern char cng_bounce_svc_end[];
 
 #define CNG_SYS(nr, a, b, c, d, e, f)                                          \
     cng_syscall6((long)(a), (long)(b), (long)(c), (long)(d), (long)(e),        \
@@ -66,6 +70,9 @@ static inline long sys_munmap(void *a, size_t l) {
 }
 static inline long sys_getpid(void) {
     return CNG_SYS(__NR_getpid, 0, 0, 0, 0, 0, 0);
+}
+static inline long sys_exit(int code) { /* this thread alone */
+    return CNG_SYS(__NR_exit, code, 0, 0, 0, 0, 0);
 }
 static inline long sys_getppid(void) {
     return CNG_SYS(__NR_getppid, 0, 0, 0, 0, 0, 0);

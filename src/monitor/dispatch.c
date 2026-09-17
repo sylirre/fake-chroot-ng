@@ -2525,6 +2525,7 @@ void cng_clone_convert(struct cng_uregs *ur) {
     if (ret == 0) {
         cng_nnp_fork_child(nnp); /* one task, holding what we held */
         cng_rseq_fork_child(rseq_keep);
+        cng_exec_fork_child(); /* an exec another thread had in flight is not ours */
         /* The child inherited both the mappings and the attach list, so the
          * broker must count those attaches again (shm.c). */
         cng_shm_fork_child();
@@ -4471,6 +4472,61 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         /* A NULL or unmapped buffer is the -EFAULT the kernel would have given
          * for it, raised here rather than there. */
         return cng_user_copyout((void *)a0, u, sizeof u);
+    }
+
+    /* The waits that install a signal mask of their own, and the signalfd
+     * that reads from one: SIGSYS is taken out of the copy the kernel is
+     * handed, so no guest thread is ever parked with it blocked (execve.c's
+     * de_thread has to be able to reach every thread) and no signalfd ever
+     * dequeues it. The SIGSYS tier runs the waits from guest context instead
+     * (sigsys.c's bounce) and reaches here only for a stack it could not use;
+     * the -R tier, in ordinary context, re-issues in place. A set the kernel
+     * would refuse is refused as it would: a size that is not its own is
+     * EINVAL before the pointer is looked at, an unreadable set EFAULT. */
+    case __NR_rt_sigsuspend:
+    case __NR_rt_sigtimedwait:
+    case __NR_ppoll:
+    case __NR_epoll_pwait:
+#ifdef __NR_epoll_pwait2
+    case __NR_epoll_pwait2:
+#endif
+    case __NR_signalfd4: {
+        int mi = nr == __NR_rt_sigsuspend || nr == __NR_rt_sigtimedwait ? 0
+                 : nr == __NR_ppoll                                     ? 3
+                 : nr == __NR_signalfd4                                 ? 1
+                                                                        : 4;
+        int si_ = nr == __NR_rt_sigsuspend     ? 1
+                  : nr == __NR_rt_sigtimedwait ? 3
+                  : nr == __NR_ppoll           ? 4
+                  : nr == __NR_signalfd4       ? 2
+                                               : 5;
+        long a[6] = {a0, a1, a2, a3, a4, a5};
+        unsigned long set;
+        if (!a[mi])
+            return reissue(a0, a1, a2, a3, a4, a5, nr);
+        if ((unsigned long)a[si_] != sizeof(cng_sigset_t))
+            return -EINVAL;
+        if (cng_user_copyin(&set, (void *)a[mi], sizeof set) < 0)
+            return -EFAULT;
+        set &= ~(1UL << (CNG_SIGSYS - 1));
+        a[mi] = (long)&set;
+        return reissue(a[0], a[1], a[2], a[3], a[4], a[5], nr);
+    }
+    case __NR_pselect6: {
+        unsigned long sel[2], set;
+        if (!a5)
+            return reissue(a0, a1, a2, a3, a4, a5, nr);
+        if (cng_user_copyin(sel, (void *)a5, sizeof sel) < 0)
+            return -EFAULT;
+        if (sel[0]) {
+            if (sel[1] != sizeof(cng_sigset_t))
+                return -EINVAL;
+            if (cng_user_copyin(&set, (void *)sel[0], sizeof set) < 0)
+                return -EFAULT;
+            set &= ~(1UL << (CNG_SIGSYS - 1));
+            sel[0] = (unsigned long)&set;
+        }
+        return reissue(a0, a1, a2, a3, a4, (long)sel, nr);
     }
 
     /* POSIX timers do not survive an execve, and ours is emulated — the address

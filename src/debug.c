@@ -6409,6 +6409,62 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
         }
     }
 
+    /* The mask-taking waits: trapped only with a sigset pointer, which is a
+     * pointer, so both halves are tested — a pointer whose low word is zero
+     * is still a pointer. The always-trapped three and signalfd4 sit in the
+     * plain table. */
+    {
+        static const struct {
+            const char *what;
+            int nr, arg;
+            u32 lo, hi;
+            u32 want;
+        } wt[] = {
+            {"ppoll with a mask traps", __NR_ppoll, 3, 0x7ffc0000, 0x0,
+             CNG_SECCOMP_RET_TRAP},
+            {"ppoll with no mask (poll) runs native", __NR_ppoll, 3, 0, 0,
+             CNG_SECCOMP_RET_ALLOW},
+            {"ppoll with a mask whose low word is zero traps", __NR_ppoll, 3,
+             0, 0x4000, CNG_SECCOMP_RET_TRAP},
+            {"pselect6 with a sigset pair traps", __NR_pselect6, 5, 0x1234, 0,
+             CNG_SECCOMP_RET_TRAP},
+            {"pselect6 with none (select) runs native", __NR_pselect6, 5, 0,
+             0, CNG_SECCOMP_RET_ALLOW},
+            {"epoll_pwait with a mask traps", __NR_epoll_pwait, 4, 0x5678, 0,
+             CNG_SECCOMP_RET_TRAP},
+            {"epoll_pwait with none (epoll_wait) runs native",
+             __NR_epoll_pwait, 4, 0, 0, CNG_SECCOMP_RET_ALLOW},
+#ifdef __NR_epoll_pwait2
+            {"epoll_pwait2 with a mask traps", __NR_epoll_pwait2, 4, 0x9abc,
+             0, CNG_SECCOMP_RET_TRAP},
+            {"epoll_pwait2 with none runs native", __NR_epoll_pwait2, 4, 0, 0,
+             CNG_SECCOMP_RET_ALLOW},
+#endif
+            {"rt_sigsuspend always traps", __NR_rt_sigsuspend, 0, 0, 0,
+             CNG_SECCOMP_RET_TRAP},
+            {"rt_sigtimedwait always traps", __NR_rt_sigtimedwait, 0, 0, 0,
+             CNG_SECCOMP_RET_TRAP},
+            {"signalfd4 always traps", __NR_signalfd4, 0, 0, 0,
+             CNG_SECCOMP_RET_TRAP},
+        };
+        for (unsigned k = 0; k < sizeof wt / sizeof wt[0]; k++) {
+            u32 d[16];
+            int bad = 0;
+            bpf_data(d, wt[k].nr, 0x1000, 0);
+            d[4 + 2 * wt[k].arg] = wt[k].lo;
+            d[5 + 2 * wt[k].arg] = wt[k].hi;
+            u32 got = bpf_run(f, n, d, &bad);
+            int ok = !bad && got == wt[k].want;
+            cng_dprintf(1, "bpftest wait %s: %s -> %s\n", wt[k].what,
+                        bad ? "malformed"
+                        : got == CNG_SECCOMP_RET_TRAP    ? "TRAP"
+                        : got == CNG_SECCOMP_RET_ALLOW   ? "ALLOW"
+                                                         : "other",
+                        ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+    }
+
     /* A foreign architecture must be killed, not allowed. */
     {
         u32 d[16];

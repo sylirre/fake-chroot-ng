@@ -612,11 +612,13 @@ out:
 
 void cng_rewrite_lazy_reset(void) {
     /* An emulated execve is the one place the mappings these describe go away,
-     * and it happens single-threaded (a real execve kills the other threads and
-     * ours cannot, so the loader refuses to run with any) — there is nothing
-     * left running in a pool to take the lock against. Handing the address
-     * space back is the point: an exec chain must not accumulate pools the way
-     * M32 stopped it accumulating images. */
+     * and by now it is single-threaded: the exec's de_thread has killed every
+     * other thread (execve.c), so nothing is running in a pool, and nothing is
+     * inside this table — a thread killed while it held the busy flag left it
+     * set, which is why it is cleared here rather than trusted. Handing the
+     * address space back is the point: an exec chain must not accumulate pools
+     * the way M32 stopped it accumulating images. */
+    __atomic_store_n(&g_lazy_busy, 0, __ATOMIC_RELEASE);
     struct cng_tab_iter it;
     unsigned long i = 0;
     for (struct lazy_region *r = cng_tab_first(&g_lazy, &it);

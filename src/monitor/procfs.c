@@ -220,11 +220,19 @@ static void put_mounts(int fd, int fmt) {
     /* The snapshot is static (50 KiB, more than a stack here should carry)
      * and so is taken one reader at a time. */
     long me = sys_gettid();
-    for (long none = 0;
-         !__atomic_compare_exchange_n(&snap_owner, &none, me, 0,
-                                      __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
-         none = 0)
+    for (int spin = 0;; spin++) {
+        long none = 0;
+        if (__atomic_compare_exchange_n(&snap_owner, &none, me, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            break;
+        /* A holder that is gone (killed by an exec's de_thread mid-snapshot,
+         * or the thread a fork child inherited it from) is taken over. */
+        if (spin > 100 && none &&
+            CNG_SYS(__NR_tgkill, sys_getpid(), none, 0, 0, 0, 0) == -ESRCH)
+            __atomic_compare_exchange_n(&snap_owner, &none, 0, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
         CNG_SYS(__NR_sched_yield, 0, 0, 0, 0, 0, 0);
+    }
     const struct cng_fs *v;
     do {
         unsigned seq = cng_fs_read_begin(&v);

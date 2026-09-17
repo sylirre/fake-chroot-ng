@@ -88,8 +88,12 @@ vfork/`posix_spawn` child-stack handling.
   handler resident (a real execve would wipe the handler). Load failures set
   -errno for normal execve semantics. Validated: the redirect resume via
   `-t jmptest`; the load+stack half is the M3/M4 path. Real trap needs HW.
-  Caveat: the emulation runs on the main thread's large stack (multi-threaded
-  execve would want a sigaltstack — tracked with the M5 signal-stack hazard).
+  The emulation runs on the handler's own scratch stack, and an execve from a
+  multithreaded program is the kernel's: every other thread is killed first
+  (a thread-directed SIGSYS, the one signal a guest can never block — the
+  mask-taking waits are trapped so it cannot be parked out of reach either),
+  and a non-leader thread hands its exec to the group leader to carry, so the
+  program that comes out of it is one thread whose tid is its pid.
   The old program's mappings were kept too, at 66.8 MB of address space per
   generation — and, on a guest whose libc reserves address space of its own,
   gigabytes more. What the loader mapped for it is given back by M32, and what
@@ -2136,9 +2140,10 @@ vfork/`posix_spawn` child-stack handling.
   `-R` tier exists to avoid; the brk heap, the one such region with a handle on
   it, was already wound back.
   Two conditions hold it up. The process must be single-threaded — a real execve
-  kills the other threads and ours cannot, so they go on running the old code on
-  the old stacks; `fork()` clones one thread, so the ordinary fork+exec arrives
-  here alone. And the outgoing stack cannot be freed at the exec itself, because
+  kills the other threads, and since the de_thread emulation so does ours; the
+  check is that it succeeded, since a thread it could not reach would go on
+  running the old code on the old stacks. And the outgoing stack cannot be
+  freed at the exec itself, because
   the SIGSYS tier returns into the new program through a signal frame that lives
   on it: a generation is retired and handed back at the new program's first
   dispatched syscall. An ET_EXEC image lands at its link-time vaddr, so a range

@@ -73,6 +73,15 @@ static const int path_syscalls[] = {
     /* socket(): substitutes an emulated NETLINK_ROUTE socket where the host
      * denies app domains rtnetlink (netlink.c). Everything else runs native. */
     __NR_socket,
+    /* The waits that install a signal mask of their own for their duration,
+     * and the signalfd that reads from one: a guest sigset can name SIGSYS,
+     * and a thread parked with it blocked is one an emulated execve's
+     * de_thread could not reach. SIGSYS is taken out of the copy the kernel
+     * is handed (dispatch.c; the SIGSYS tier runs the wait from guest context,
+     * sigsys.c). These three always carry a set; ppoll, pselect6 and
+     * epoll_pwait[2] may not, and are trapped below only when they do — a
+     * plain poll() or epoll_wait() never pays for this. */
+    __NR_rt_sigsuspend, __NR_rt_sigtimedwait, __NR_signalfd4,
     /* POSIX timers: not a path syscall, but one whose result the emulated
      * execve has to undo. A real exec deletes every timer with the address
      * space; ours keeps the address space, and nothing enumerates a process's
@@ -531,6 +540,48 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
         CNG_BPF_RET | CNG_BPF_K, CNG_SECCOMP_RET_ALLOW); /* not the band */
     f[n++] = (struct sock_filter)CNG_BPF_STMT(
         CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* reload A=nr */
+
+    /* The mask-taking waits (see the note in path_syscalls): trapped only
+     * when the sigset argument is non-NULL. It is a pointer, so both halves
+     * are tested. Offsets: for each, "not this nr" skips the whole block;
+     * a zero low word goes on to test the high word; a zero high word allows;
+     * anything else traps. */
+    {
+        static const struct {
+            int nr;
+            int arg;
+        } waits[] = {
+            {__NR_ppoll, 3},
+            {__NR_pselect6, 5},
+            {__NR_epoll_pwait, 4},
+#ifdef __NR_epoll_pwait2
+            {__NR_epoll_pwait2, 4},
+#endif
+        };
+        for (unsigned w = 0; w < sizeof waits / sizeof waits[0]; w++) {
+            f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+                CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, (uint32_t)waits[w].nr,
+                0, 6); /* not this one -> reload nr */
+            f[n++] = (struct sock_filter)CNG_BPF_STMT(
+                CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS,
+                CNG_SD_ARGS + 8 * waits[w].arg); /* A = arg lo */
+            f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+                CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, 0, 0,
+                2); /* lo != 0 -> trap */
+            f[n++] = (struct sock_filter)CNG_BPF_STMT(
+                CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS,
+                CNG_SD_ARGS + 8 * waits[w].arg + 4); /* A = arg hi */
+            f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+                CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, 0, 1,
+                0); /* hi == 0 -> allow (NULL mask) */
+            f[n++] = (struct sock_filter)CNG_BPF_STMT(
+                CNG_BPF_RET | CNG_BPF_K, CNG_SECCOMP_RET_TRAP);
+            f[n++] = (struct sock_filter)CNG_BPF_STMT(
+                CNG_BPF_RET | CNG_BPF_K, CNG_SECCOMP_RET_ALLOW);
+            f[n++] = (struct sock_filter)CNG_BPF_STMT(
+                CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* reload */
+        }
+    }
 
     /* Synthesized-file refresh: a read on one of the high fds reserved for the
      * time-varying /proc files (loadavg, uptime, stat) must reach the

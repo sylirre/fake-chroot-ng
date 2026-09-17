@@ -254,6 +254,18 @@ See `src/monitor/ptrace.c`, `ptsig.c` and `ptstep.c`.
 ### Known hazards (why the tiers exist)
 
 - `execve` erases the in-process handler → emulate `execve` via the loader.
+- `execve` from a multithreaded program: the kernel's `de_thread` kills every
+  other thread and gives a non-leader caller the leader's identity, and neither
+  can be had from userspace directly → every sibling is sent a thread-directed
+  `SIGSYS` carrying a die request (the one signal the guest can never block),
+  and a non-leader caller hands its planned exec to the group leader over the
+  same signal and exits, so the leader carries it and the new program is one
+  thread whose tid is its pid. For that to reach every thread, the waits that
+  install a mask of their own (`rt_sigsuspend`, `rt_sigtimedwait`, `ppoll`,
+  `pselect6`, `epoll_pwait[2]`) and `signalfd4` are trapped when they carry a
+  mask and `SIGSYS` is taken out of it; on the `SIGSYS` tier such a wait is run
+  from the guest's own context through a stub in the gate, since the handler,
+  which runs with every other signal blocked, cannot run it itself.
 - The guest (notably Go) can clobber the `SIGSYS` handler or block the signal →
   virtualize `rt_sigaction`/`rt_sigprocmask`/`seccomp`/`prctl`. A guest filter is
   layered on top of ours by the kernel and governs the syscalls the handler

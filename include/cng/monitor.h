@@ -124,6 +124,25 @@ void cng_cred_setup(unsigned host_uid, unsigned host_gid);
  * of the flags is set. Applied by the emulated execve and the initial run. */
 void cng_cred_exec(const char *host);
 
+/* ---- de_thread (execve.c) ---- */
+/* Is `si` one of our thread-directed requests (a SIGSYS with SI_DETHREAD and
+ * our magic)? CNG_DT_DIE / CNG_DT_EXEC, else 0. */
+int cng_dethread_request(const cng_siginfo_t *si);
+#define CNG_DT_DIE  1
+#define CNG_DT_EXEC 2
+/* One of the waits that install a signal mask of their own (rt_sigsuspend,
+ * rt_sigtimedwait, ppoll, pselect6, epoll_pwait[2])? Trapped when they carry
+ * a mask, so SIGSYS can be taken out of it. */
+int cng_is_masked_wait(long nr);
+/* In a fork child: nothing another thread of the parent had in flight. */
+void cng_exec_fork_child(void);
+/* Is an exec a sibling planned waiting for the leader to carry it? */
+int cng_exec_pending(void);
+/* Carry it, from a signal frame: the frame is rewritten to enter the new
+ * program and 1 is returned. 0 with the frame untouched when there was nothing
+ * to carry after all (another thread took it, or the request was spurious). */
+int cng_exec_takeover_frame(struct cng_ucontext *uc);
+
 /* Emulate a credential syscall (get/set uid/gid family, groups, capabilities)
  * against cng_g_cred. Only the first three args are consumed by any of them;
  * the rest are forwarded for the (rare) non-faking re-issue path. */

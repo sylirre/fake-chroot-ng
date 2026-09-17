@@ -69,6 +69,170 @@ int cng_sig_install(int signo, cng_sighandler_t h) {
     return (int)r;
 }
 
+/* ---- the mask-taking waits ------------------------------------------------
+ *
+ * rt_sigsuspend, rt_sigtimedwait, ppoll, pselect6, epoll_pwait and
+ * epoll_pwait2 install a signal mask of the caller's for their duration. The
+ * mask is a guest sigset, and a guest sigset can name SIGSYS — sigfillset()
+ * does — which no guest thread may ever have blocked: a thread parked in
+ * ppoll(&fullmask) could not be reached by the de_thread an emulated execve
+ * on another thread needs, and the exec would wait for it as long as the
+ * poll lasted. So these are trapped when they carry a mask (the filter tests
+ * the argument; a plain poll or epoll_wait, which is what libc's
+ * poll()/epoll_wait() are, never traps), and SIGSYS is taken out of the copy
+ * the kernel is handed.
+ *
+ * The handler cannot run them itself, though. It runs with every other
+ * signal blocked — the kernel would install the guest's mask for the wait,
+ * and every guest signal that arrived would then run its handler nested
+ * inside ours, on our stack, free to siglongjmp out and leave the outer
+ * frame and the scratch-stack bookkeeping behind. So the wait is bounced: the
+ * guest's registers are saved into a record on the guest's own stack below
+ * sp, the mask argument is pointed at the stripped copy in that record, and
+ * the frame is set to resume at the gate's own svc (cng_bounce_wait) with sp
+ * lowered past the record. sigreturn then runs the wait in the guest's own
+ * context, on the guest's own mask, with the guest's handlers delivered
+ * where they belong; the svc after it traps (cng_bounce_svc_end), and the
+ * handler puts the registers back from the record and resumes the guest
+ * after its own svc with the wait's result. Two traps per masked wait. The
+ * -R trampoline tier reaches these from ordinary context and needs none of
+ * this: dispatch.c strips the copy and re-issues in place. */
+struct cng_bounce {
+    unsigned long magic;
+    unsigned long long regs[31], sp, pc, pstate;
+    unsigned long set;    /* the stripped sigset */
+    unsigned long sel[2]; /* pselect6's {sigset *, size} */
+};
+#define CNG_BOUNCE_MAGIC 0x636e67426f756e63UL
+
+/* Which argument carries the sigset pointer, and where its size is; -1 for
+ * pselect6, whose sixth argument is a {sigset *, size} pair. */
+static int wait_mask_arg(long nr, int *size_arg) {
+    switch (nr) {
+    case __NR_rt_sigsuspend:
+        *size_arg = 1;
+        return 0;
+    case __NR_rt_sigtimedwait:
+        *size_arg = 3;
+        return 0;
+    case __NR_ppoll:
+        *size_arg = 4;
+        return 3;
+    case __NR_epoll_pwait:
+#ifdef __NR_epoll_pwait2
+    case __NR_epoll_pwait2:
+#endif
+        *size_arg = 5;
+        return 4;
+    case __NR_pselect6:
+        *size_arg = -1;
+        return -1;
+    }
+    return -2;
+}
+
+int cng_is_masked_wait(long nr) {
+    int sz;
+    return wait_mask_arg(nr, &sz) != -2;
+}
+
+/* Run the wait from guest context (see above). Returns 0 when the frame was
+ * redirected, 1 with the result in x0 when the call was answered here — a
+ * mask the kernel would refuse (EINVAL, EFAULT) is refused at once; a stack
+ * the record cannot be written to is the one case the wait is re-issued from
+ * the handler with the stripped copy, which is what every blocking re-issue
+ * from here has always been. */
+static int bounce_start(struct cng_ucontext *uc, long nr) {
+    unsigned long long *r = uc->uc_mcontext.regs;
+    int size_arg, mi = wait_mask_arg(nr, &size_arg);
+    struct cng_bounce b;
+    memset(&b, 0, sizeof b);
+    b.magic = CNG_BOUNCE_MAGIC;
+    unsigned long sel[2] = {0, 0};
+    const unsigned long *setp = 0;
+    unsigned long setsz = 0;
+    if (mi >= 0) {
+        setp = (const unsigned long *)r[mi];
+        setsz = r[size_arg];
+    } else if (r[5]) {
+        if (cng_user_copyin(sel, (void *)r[5], sizeof sel) < 0) {
+            r[0] = (unsigned long long)(long)-EFAULT;
+            return 1;
+        }
+        setp = (const unsigned long *)sel[0];
+        setsz = sel[1];
+    }
+    if (setp) {
+        if (setsz != sizeof(cng_sigset_t)) {
+            r[0] = (unsigned long long)(long)-EINVAL;
+            return 1;
+        }
+        if (cng_user_copyin(&b.set, setp, sizeof b.set) < 0) {
+            r[0] = (unsigned long long)(long)-EFAULT;
+            return 1;
+        }
+        b.set &= ~(1UL << (CNG_SIGSYS - 1));
+    }
+    for (int i = 0; i < 31; i++)
+        b.regs[i] = r[i];
+    b.sp = uc->uc_mcontext.sp;
+    b.pc = uc->uc_mcontext.pc;
+    b.pstate = uc->uc_mcontext.pstate;
+    unsigned long rec = (b.sp - sizeof b) & ~15UL;
+    if (setp && mi < 0) {
+        b.sel[0] = rec + __builtin_offsetof(struct cng_bounce, set);
+        b.sel[1] = sel[1];
+    } else if (mi < 0) {
+        b.sel[0] = 0;
+        b.sel[1] = sel[1];
+    }
+    if (cng_user_copyout((void *)rec, &b, sizeof b) < 0) {
+        /* No room below the guest's sp: run it here, stripped. */
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] wait nr=%ld: no stack for the bounce\n", nr);
+        unsigned long lsel[2] = {setp ? (unsigned long)&b.set : 0, sel[1]};
+        long a[6];
+        for (int i = 0; i < 6; i++)
+            a[i] = (long)r[i];
+        if (mi >= 0) {
+            if (setp)
+                a[mi] = (long)&b.set;
+        } else if (r[5]) {
+            a[5] = (long)lsel;
+        }
+        r[0] = (unsigned long long)cng_syscall6(a[0], a[1], a[2], a[3], a[4],
+                                                a[5], nr);
+        return 1;
+    }
+    if (mi >= 0) {
+        if (setp)
+            r[mi] = rec + __builtin_offsetof(struct cng_bounce, set);
+    } else if (r[5]) {
+        r[5] = rec + __builtin_offsetof(struct cng_bounce, sel);
+    }
+    uc->uc_mcontext.sp = rec;
+    uc->uc_mcontext.pc = (unsigned long long)(unsigned long)cng_bounce_wait;
+    return 0;
+}
+
+/* The completion trap: the guest's registers back, its own pc and sp, the
+ * wait's result in x0. A frame with no record behind it is left alone. */
+static int bounce_finish(struct cng_ucontext *uc) {
+    unsigned long long *r = uc->uc_mcontext.regs;
+    struct cng_bounce b;
+    if (cng_user_copyin(&b, (void *)uc->uc_mcontext.sp, sizeof b) < 0 ||
+        b.magic != CNG_BOUNCE_MAGIC)
+        return 0;
+    unsigned long long res = r[0];
+    for (int i = 1; i < 31; i++)
+        r[i] = b.regs[i];
+    r[0] = res;
+    uc->uc_mcontext.sp = b.sp;
+    uc->uc_mcontext.pc = b.pc;
+    uc->uc_mcontext.pstate = b.pstate;
+    return 1;
+}
+
 /* The trapped syscall itself: the cases the handler must own (they need the
  * signal context), then the dispatcher for everything else. Returns 1 when the
  * result is in x0 and the caller still owes a syscall-exit stop, 0 when the
@@ -153,6 +317,10 @@ static int sigsys_syscall(struct cng_ucontext *uc, long nr) {
         return 1;
     }
 
+    /* A wait that installs a mask of its own: run from guest context. */
+    if (cng_is_masked_wait(nr))
+        return bounce_start(uc, nr);
+
     long res = cng_dispatch(nr, (long)r[0], (long)r[1], (long)r[2], (long)r[3],
                             (long)r[4], (long)r[5], /*trapped=*/1);
     if (cng_g_debug && res < 0 && res != -ENOENT)
@@ -189,6 +357,20 @@ void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si) {
     }
 
     long nr = (long)r[8];
+
+    /* The completion of a bounced wait (see bounce_start): not a syscall of
+     * the guest's, and its site is ours — never one to rewrite. What is owed
+     * is the exit stop of the syscall that was bounced, whose entry stop was
+     * reported when it trapped. */
+    if (ca == (unsigned long)cng_bounce_svc_end) {
+        if (bounce_finish(uc) && cng_pt_active()) {
+            struct cng_uregs *ur = cng_pt_uregs(uc);
+            cng_pt_set_frame(ur, uc);
+            cng_pt_syscall_exit(ur);
+            cng_pt_step_report(ur);
+        }
+        return;
+    }
 
     /* This trap is also the only proof that exists about the word behind it:
      * the CPU fetched and executed it as `svc #0`. The AoT rewriter has to
@@ -484,18 +666,44 @@ static void scr_temp_free(unsigned long base) {
  * what detects nesting: with SA_ONSTACK the nested signal is delivered on the
  * alt-stack, not on the scratch stack, so a range test would miss it and wrongly
  * re-switch, clobbering the outer dispatcher frame. */
+/* An exec handed to this thread, the group leader, by a sibling (execve.c):
+ * carried out on a stack of ours, with the guest's alt-stack disarmed like a
+ * dispatch, since the commit is the dispatcher's own code. */
+static void takeover_on_scratch(void *ucv, void *si) {
+    (void)si;
+    struct cng_ucontext *uc = ucv;
+    if (uc->uc_stack.ss_size && !(uc->uc_stack.ss_flags & CNG_SS_DISABLE)) {
+        cng_stack_t off = {0, CNG_SS_DISABLE, 0};
+        CNG_SYS(__NR_sigaltstack, (long)&off, 0, 0, 0, 0, 0);
+    }
+    cng_exec_takeover_frame(uc);
+}
+
 static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {
     (void)sig;
-    /* A SIGSYS that is not a seccomp trap is the guest's signal — kill(2),
-     * tgkill, sigqueue — and goes to the guest's own disposition, from the
-     * frame the kernel built and on the stack it chose, with no scratch stack
-     * and none of the bookkeeping below: a handler the guest installed may
-     * siglongjmp out and never come back, which a busy flag or a disarmed
-     * alt-stack would not survive. It used to be consumed here and nothing
-     * happened, where the default action is a core dump. */
-    if (si->si_code != CNG_SYS_SECCOMP) {
-        cng_pt_deliver_sigsys(si, ucv);
-        return;
+    /* A request from another thread of this process (execve.c's de_thread):
+     * die here and now — wherever this thread was, in the guest or nested
+     * inside a dispatch of its own — or carry the exec it planned. */
+    void (*fn)(void *, void *) = sigsys_on_scratch;
+    switch (cng_dethread_request(si)) {
+    case CNG_DT_DIE:
+        for (;;)
+            sys_exit(0);
+    case CNG_DT_EXEC:
+        fn = takeover_on_scratch;
+        break;
+    default:
+        /* A SIGSYS that is not a seccomp trap is the guest's signal — kill(2),
+         * tgkill, sigqueue — and goes to the guest's own disposition, from the
+         * frame the kernel built and on the stack it chose, with no scratch
+         * stack and none of the bookkeeping below: a handler the guest
+         * installed may siglongjmp out and never come back, which a busy flag
+         * or a disarmed alt-stack would not survive. It used to be consumed
+         * here and nothing happened, where the default action is a core dump. */
+        if (si->si_code != CNG_SYS_SECCOMP) {
+            cng_pt_deliver_sigsys(si, ucv);
+            return;
+        }
     }
     long tid = sys_gettid();
     int i = cng_scratch_slot(tid);
@@ -504,17 +712,19 @@ static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {
             cng_g_sigsys_frame[1] = (unsigned long)ucv;
         unsigned long base = scr_temp();
         if (!base) {
-            cng_sigsys_body((struct cng_ucontext *)ucv, si);
+            if (fn == sigsys_on_scratch)
+                cng_sigsys_body((struct cng_ucontext *)ucv, si);
+            else
+                cng_exec_takeover_frame((struct cng_ucontext *)ucv);
             return;
         }
-        cng_run_on_stack((void *)(base + CNG_SCR_SZ),
-                         (void *)sigsys_on_scratch, ucv, si);
+        cng_run_on_stack((void *)(base + CNG_SCR_SZ), (void *)fn, ucv, si);
         scr_temp_free(base);
         return;
     }
     cng_scr[i].busy = 1;
     cng_scr[i].uc = (struct cng_ucontext *)ucv;
-    cng_run_on_stack((void *)cng_scr[i].hi, (void *)sigsys_on_scratch, ucv, si);
+    cng_run_on_stack((void *)cng_scr[i].hi, (void *)fn, ucv, si);
     cng_scr[i].uc = 0;
     cng_scr[i].busy = 0;
 }

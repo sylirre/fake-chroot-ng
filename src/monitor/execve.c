@@ -24,7 +24,10 @@
  * Both halves happen only where the process is single-threaded, since another
  * thread may still be running the old program on the old program's stack, and
  * both fail closed: a guest with threads keeps every byte of the outgoing
- * generation. See the block comments on each below.
+ * generation. By the time either runs the process IS single-threaded — the
+ * exec kills every other thread first, the way a real execve does (see the
+ * de_thread note below) — so the gate is what stands between the reclaim and
+ * a thread that could not be reached. See the block comments on each below.
  */
 #include "cng/broker.h" /* cng_broker_env: no getenv in a freestanding build */
 #include "cng/l2s.h"
@@ -334,6 +337,269 @@ static long exec_args_take(struct exec_args *a, const char *path, char **argv,
     return 0;
 }
 
+/* ---- the exec in flight ---------------------------------------------------
+ *
+ * Everything an exec has decided before its point of no return, kept where a
+ * thread other than the one that decided it can carry it out. A real execve
+ * runs de_thread(): every other thread of the group is killed and, when the
+ * caller is not the group leader, the caller takes over the leader's identity
+ * — its tid becomes the pid — so the program that comes out of the exec is a
+ * single thread whose tid is its pid. Ours could do neither: the other
+ * threads went on running the old program while the exec'ing thread closed
+ * the CLOEXEC descriptors they were using, reset the signal dispositions they
+ * were relying on, wound the heap back from under them and entered the new
+ * image; a Go program calling syscall.Exec left runtime threads that then
+ * hit EBADF on their netpoll fd and aborted the NEW program.
+ *
+ * Both halves are done now, with the one thing a userspace process has that
+ * reaches every thread of it: SIGSYS, the signal the guest can never block,
+ * ignore or divert (rt_sigprocmask, rt_sigaction and the mask-taking waits are
+ * all mediated to keep it so). A thread-directed SIGSYS carrying our own
+ * si_code and magic is a request from one thread to another:
+ *
+ *  - CNG_DT_DIE: exit, now, wherever you are. Sent to every sibling by
+ *    cng_dethread(), which then waits for each to be gone — the kernel's
+ *    de_thread waits the same way. A thread parked in a syscall takes it when
+ *    the syscall is interrupted; one running takes it at once; one inside our
+ *    own dispatcher takes it nested (SA_NODEFER) and dies there, and every
+ *    lock the monitor has is either per-thread or taken over from a holder
+ *    that is gone. What cannot take it is a thread that has SIGSYS blocked,
+ *    which the mediation makes impossible for a guest short of editing its
+ *    own signal frame, and which qemu-user's own threads are: those are left
+ *    alone, since they are not the guest's.
+ *  - CNG_DT_EXEC: carry out the exec I planned. Sent by a non-leader thread
+ *    to the group leader, with the plan in g_job; the requester then exits.
+ *    The leader kills the rest, maps the images, runs the commit and enters
+ *    the new program from its own signal frame — so the program that comes
+ *    out of the exec runs on the leader, tid == pid, with the requester's
+ *    signal mask, exactly as the kernel arranges it. A leader that cannot be
+ *    reached (a zombie: it called pthread_exit) or that has SIGSYS blocked
+ *    is not handed anything, and the requester carries the exec itself: the
+ *    old shape, one divergence (its tid), no hang.
+ *
+ * One exec at a time per process (g_exec_claim, the exec'ing thread's tid): a
+ * second thread reaching execve while one is in flight is one the first will
+ * kill, so it simply exits — unless it is the leader with a handoff pending,
+ * in which case it carries that exec instead of its own, which is what the
+ * kernel does with the loser's thread too (kills it; the winner's exec is the
+ * one that happens). */
+#define CNG_SI_DETHREAD (-7) /* SI_DETHREAD: the kernel's own code for this */
+#define CNG_DT_MAGIC    0x636e6744 /* "cngD" */
+#define CNG_DT_DIE      1
+#define CNG_DT_EXEC     2
+
+struct exec_job {
+    char host[CNG_PATH_MAX]; /* the image's resolved host path */
+    char sheb_interp[SHEB_MAX][SHEB_WORD], sheb_arg[SHEB_MAX][SHEB_WORD];
+    int sheb_hasarg[SHEB_MAX];
+    int depth;
+    int gfd;
+    int dirfd, flags;
+    const char *path; /* the guest's spelling (in the snapshot) */
+    char **argv, **envp;
+    struct cng_elf_plan pplan, iplan;
+    struct cng_loaded prog, interp;
+    int have_interp;
+    struct exec_args args;  /* the snapshot: owned by whoever commits */
+    unsigned long sigmask;  /* the requester's guest mask, for the leader */
+    long requester;         /* its tid */
+    int pending;            /* a handoff the leader has not taken yet */
+};
+
+static struct exec_job g_job;
+static long g_exec_claim;
+
+int cng_exec_pending(void) {
+    return __atomic_load_n(&g_job.pending, __ATOMIC_ACQUIRE);
+}
+
+/* A fork child has one thread, and an exec some other thread of the parent
+ * had in flight — its claim, and a plan it had handed to the parent's leader
+ * — is not the child's to carry: the plan names the parent's program, and its
+ * argv snapshot is a mapping the child would then unmap from under nothing. */
+void cng_exec_fork_child(void) {
+    if (__atomic_exchange_n(&g_job.pending, 0, __ATOMIC_RELAXED))
+        exec_args_free(&g_job.args); /* the child's own copy of the snapshot */
+    __atomic_store_n(&g_exec_claim, 0, __ATOMIC_RELAXED);
+}
+
+/* Send a de_thread request to `tid`. */
+static void dethread_send(long tid, int what) {
+    struct {
+        int signo, errno_, code;
+        int pad;
+        int pid;
+        unsigned uid;
+        int sival_int;
+        int pad2;
+        unsigned long rest[12];
+    } si;
+    memset(&si, 0, sizeof si);
+    si.signo = CNG_SIGSYS;
+    si.code = CNG_SI_DETHREAD;
+    si.pid = (int)sys_getpid();
+    si.uid = (unsigned)sys_getuid();
+    si.sival_int = CNG_DT_MAGIC + what;
+    CNG_SYS(__NR_rt_tgsigqueueinfo, sys_getpid(), tid, CNG_SIGSYS, &si, 0, 0);
+}
+
+int cng_dethread_request(const cng_siginfo_t *si) {
+    if (si->si_code != CNG_SI_DETHREAD || (int)si->_u._pad[0] != sys_getpid())
+        return 0;
+    int v = (int)si->_u._pad[1] - CNG_DT_MAGIC;
+    return v == CNG_DT_DIE || v == CNG_DT_EXEC ? v : 0;
+}
+
+/* The line of a status file that begins with `key` (a newline and the field
+ * name), or 0. */
+static const char *status_field(const char *buf, const char *key) {
+    size_t kl = strlen(key);
+    for (const char *p = buf; *p; p++)
+        if (*p == '\n' && !strncmp(p, key, kl))
+            return p;
+    return 0;
+}
+
+/* A task of this process, as its status file has it: TASK_LIVE for one that
+ * can be sent a SIGSYS, TASK_GONE for one that is not there or is a zombie
+ * (for good), TASK_BLOCKED for one that has SIGSYS blocked — which no guest
+ * thread has except for the few microseconds a writer of ours holds every
+ * signal off, and which qemu-user's own threads always do. */
+#define TASK_LIVE    0
+#define TASK_GONE    1
+#define TASK_BLOCKED 2
+
+static int task_state(long tid) {
+    char path[64], buf[4096];
+    cng_snprintf(path, sizeof path, "/proc/self/task/%ld/status", tid);
+    long fd = sys_openat(CNG_AT_FDCWD, path, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    if (fd < 0)
+        return TASK_GONE;
+    long n = sys_read((int)fd, buf, sizeof buf - 1);
+    sys_close((int)fd);
+    if (n <= 0)
+        return TASK_GONE;
+    buf[n] = '\0';
+    const char *st = status_field(buf, "\nState:");
+    if (st && (st[7] == '\t' || st[7] == ' ') && st[8] == 'Z')
+        return TASK_GONE;
+    const char *sb = status_field(buf, "\nSigBlk:");
+    if (sb) {
+        sb += 8;
+        while (*sb == ' ' || *sb == '\t')
+            sb++;
+        unsigned long m = 0;
+        for (; *sb; sb++) {
+            int d = (*sb >= '0' && *sb <= '9')   ? *sb - '0'
+                    : (*sb >= 'a' && *sb <= 'f') ? *sb - 'a' + 10
+                    : (*sb >= 'A' && *sb <= 'F') ? *sb - 'A' + 10
+                                                 : -1;
+            if (d < 0)
+                break;
+            m = (m << 4) | (unsigned)d;
+        }
+        if (m & (1UL << (CNG_SIGSYS - 1)))
+            return TASK_BLOCKED;
+    }
+    return TASK_LIVE;
+}
+
+/* Every task of this process but the caller, into `out` (at most `cap`);
+ * returns the count, or -1 when /proc cannot be read. */
+static int tasks_but_me(long *out, int cap) {
+    long fd = sys_openat(CNG_AT_FDCWD, "/proc/self/task",
+                         CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
+    if (fd < 0)
+        return -1;
+    long me = sys_gettid();
+    int n = 0;
+    char buf[1024];
+    for (;;) {
+        long r = CNG_SYS(__NR_getdents64, fd, buf, sizeof buf, 0, 0, 0);
+        if (r <= 0)
+            break;
+        for (long o = 0; o + 19 <= r;) {
+            unsigned short reclen;
+            memcpy(&reclen, buf + o + 16, 2);
+            if (reclen == 0 || o + reclen > r)
+                break;
+            const char *nm = buf + o + 19;
+            o += reclen;
+            long tid = 0;
+            if (*nm < '1' || *nm > '9')
+                continue;
+            for (; *nm >= '0' && *nm <= '9'; nm++)
+                tid = tid * 10 + (*nm - '0');
+            if (tid != me && n < cap)
+                out[n++] = tid;
+        }
+    }
+    sys_close((int)fd);
+    return n;
+}
+
+/* Kill every other thread of the process and wait for each to be gone: the
+ * kernel's de_thread. A thread that cannot take the signal (see
+ * task_unkillable) is not waited for, and one that stops being able to while
+ * we wait — a signal frame edited to block SIGSYS is the one way — is given
+ * up on after a while rather than waited for forever: the exec then proceeds
+ * beside it, which is what every exec did before. */
+#define DETHREAD_MAX 4096
+
+static void cng_dethread(void) {
+    static long tids[DETHREAD_MAX];
+    long pid = sys_getpid();
+    int n = tasks_but_me(tids, DETHREAD_MAX);
+    if (n <= 0)
+        return;
+    int live = 0;
+    for (int i = 0; i < n; i++) {
+        int st = task_state(tids[i]);
+        if (st == TASK_GONE) {
+            tids[i] = 0;
+            continue;
+        }
+        /* One holding every signal off is told anyway: the request waits in
+         * its pending set for the mask to come back. qemu-user's own threads
+         * never take it, and are given up on below. */
+        dethread_send(tids[i], CNG_DT_DIE);
+        live++;
+    }
+    if (cng_g_debug && live)
+        cng_dprintf(2, "[cng] exec: de_thread: %d sibling thread(s)\n", live);
+    for (unsigned spin = 0; live; spin++) {
+        live = 0;
+        for (int i = 0; i < n; i++) {
+            if (!tids[i])
+                continue;
+            if (CNG_SYS(__NR_tgkill, pid, tids[i], 0, 0, 0, 0) == -ESRCH) {
+                tids[i] = 0;
+                continue;
+            }
+            /* Once a second: is it one that cannot take the request? */
+            if (spin && spin % 10000 == 0 && task_state(tids[i]) != TASK_LIVE) {
+                if (cng_g_debug)
+                    cng_dprintf(2, "[cng] exec: de_thread: tid %ld cannot be "
+                                   "reached; going on without it\n",
+                                tids[i]);
+                tids[i] = 0;
+                continue;
+            }
+            live++;
+        }
+        if (live) {
+            struct cng_timespec nap = {0, 100 * 1000}; /* 100 us */
+            CNG_SYS(__NR_nanosleep, &nap, 0, 0, 0, 0, 0);
+        }
+    }
+}
+
+/* Is the group leader a thread that could carry an exec: alive, not a zombie
+ * (main() returned into pthread_exit), able to take a SIGSYS right now? */
+static int leader_reachable(void) {
+    return task_state(sys_getpid()) == TASK_LIVE;
+}
+
 /* Emulation body: resolve the target (shebang-aware), plan the program and its
  * ELF interpreter, map them, build the stack, and pass the commit point (close
  * FD_CLOEXEC fds, reset signal dispositions, retarget /proc/self/exe). Returns
@@ -567,10 +833,12 @@ static void cng_rseq_exec_reset(void) {
  * Two conditions, both of them load-bearing:
  *
  *  - The process must be single-threaded. A real execve kills the other threads
- *    (de_thread); ours cannot, so they go on running the old program's code on
- *    the old program's stacks, and unmapping either would fault them where today
- *    they merely keep running. fork() clones one thread, so the ordinary
- *    fork+exec — which is how nearly every exec happens — arrives here alone.
+ *    (de_thread), and so does ours now (cng_dethread), before anything is
+ *    mapped; what this checks is that it succeeded — a thread it could not
+ *    reach goes on running the old program's code on the old program's stack,
+ *    and unmapping either would fault it where it merely keeps running. fork()
+ *    clones one thread, so the ordinary fork+exec — which is how nearly every
+ *    exec happens — arrives here alone either way.
  *
  *  - The old stack cannot be handed back at the exec itself. The SIGSYS tier
  *    returns into the new program through rt_sigreturn, and the frame that
@@ -1002,16 +1270,21 @@ static int l2s_exe_name(int dirfd, const char *path, char *out, size_t sz) {
     return 0;
 }
 
-static long execve_load(int dirfd, const char *path, char **argv, char **envp,
-                        int flags, unsigned long *out_sp,
-                        unsigned long *out_entry) {
-    char host[CNG_PATH_MAX];
-    char sheb_interp[SHEB_MAX][SHEB_WORD], sheb_arg[SHEB_MAX][SHEB_WORD];
-    int sheb_hasarg[SHEB_MAX];
+static long execve_plan(struct exec_job *j, int dirfd, const char *path,
+                        char **argv, char **envp, int flags) {
+    char *host = j->host;
+    char (*sheb_interp)[SHEB_WORD] = j->sheb_interp;
+    char (*sheb_arg)[SHEB_WORD] = j->sheb_arg;
+    int *sheb_hasarg = j->sheb_hasarg;
     const char *cur = path; /* the guest path of the image at this level */
     int gfd = -1;           /* an open fd for the image, when we have one */
     int nofollow = (flags & CNG_AT_SYMLINK_NOFOLLOW) != 0;
     int depth = 0;          /* how many #! levels were followed */
+    j->dirfd = dirfd;
+    j->flags = flags;
+    j->path = path;
+    j->argv = argv;
+    j->envp = envp;
 
     /* Whatever the last exec retired, before this one maps anything. It cannot
      * be given back after: an ET_EXEC image goes down at its link-time vaddr,
@@ -1033,7 +1306,7 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
          * its AT_SYMLINK_NOFOLLOW; every level after it is an interpreter path
          * from a #! line, which is absolute or cwd-relative by definition. */
         if (depth == 0) {
-            if (cng_resolve_at(dirfd, cur, !nofollow, host, sizeof host) != 0) {
+            if (cng_resolve_at(dirfd, cur, !nofollow, host, sizeof j->host) != 0) {
                 if (cng_g_debug)
                     cng_dprintf(2, "[cng] execve %s -> unresolved\n", cur);
                 return -ENOENT;
@@ -1051,7 +1324,7 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
                     if (!(cng_g_l2s &&
                           cng_l2s_resolve(host, data, sizeof data, 0) == 1))
                         return -ELOOP;
-                    cng_strlcpy(host, data, sizeof host);
+                    cng_strlcpy(host, data, sizeof j->host);
                 }
             }
         } else {
@@ -1074,7 +1347,7 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
                                 cur, -dd);
                 return dd;
             }
-            if (cng_resolve(cur, 1, host, sizeof host) != 0) {
+            if (cng_resolve(cur, 1, host, sizeof j->host) != 0) {
                 if (cng_g_debug)
                     cng_dprintf(2, "[cng] execve interp %s -> unresolved\n",
                                 cur);
@@ -1208,10 +1481,10 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
     /* Header pass, program and ELF interpreter both: read, validate, map
      * nothing. Every refusal an execve can produce has to be produced here,
      * because the map pass below is what replaces the calling program. */
-    struct cng_elf_plan pplan, iplan;
-    struct cng_loaded prog;
-    int rc = gfd >= 0 ? cng_elf_plan_fd(gfd, &pplan, &prog)
-                      : cng_elf_plan(host, &pplan, &prog);
+    struct cng_elf_plan *pplan = &j->pplan, *iplan = &j->iplan;
+    struct cng_loaded *prog = &j->prog, *interp = &j->interp;
+    int rc = gfd >= 0 ? cng_elf_plan_fd(gfd, pplan, prog)
+                      : cng_elf_plan(host, pplan, prog);
     if (rc != CNG_LOAD_OK) {
         /* A failed exec tells the guest what the kernel would: the errno, and
          * nothing else. This was an unconditional line on the guest's own
@@ -1223,11 +1496,11 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
         if (cng_g_debug)
             cng_dprintf(2, "[cng] exec %s (%s): load failed rc=%d\n", path,
                         host, rc);
-        return exec_load_errno(rc, &pplan, 0);
+        return exec_load_errno(rc, pplan, 0);
     }
     if (cng_g_debug)
         cng_dprintf(2, "[cng]   prog dyn=%d lo=%lx hi=%lx interp=%d\n",
-                    pplan.is_dyn, pplan.lo, pplan.hi, prog.has_interp);
+                    pplan->is_dyn, pplan->lo, pplan->hi, prog->has_interp);
 
     /* The interpreter is planned here rather than loaded after the program,
      * which is the whole point of the split: a rootfs without the loader the
@@ -1235,23 +1508,47 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
      * a musl binary under glibc — and the kernel answers it with ENOENT while
      * the caller keeps running. Loading it *after* the program answered the same
      * ENOENT into a program that had already been overwritten. */
-    struct cng_loaded interp;
     int have_interp = 0;
-    if (prog.has_interp) {
+    if (prog->has_interp) {
         char ip[CNG_PATH_MAX];
-        iplan.err = -ENOENT; /* a name that did not resolve has no open to ask */
-        int irc = cng_resolve(prog.interp, 1, ip, sizeof ip) != 0
+        iplan->err = -ENOENT; /* a name that did not resolve has no open to ask */
+        int irc = cng_resolve(prog->interp, 1, ip, sizeof ip) != 0
                       ? CNG_LOAD_EOPEN
-                      : cng_elf_plan(ip, &iplan, &interp);
+                      : cng_elf_plan(ip, iplan, interp);
         if (irc != CNG_LOAD_OK) {
             if (cng_g_debug) /* guest-visible stderr: see the load failure above */
                 cng_dprintf(2, "[cng] exec %s: interp %s load failed rc=%d\n",
-                            path, prog.interp, irc);
-            cng_elf_plan_release(&pplan);
-            return exec_load_errno(irc, &iplan, 1);
+                            path, prog->interp, irc);
+            cng_elf_plan_release(pplan);
+            return exec_load_errno(irc, iplan, 1);
         }
         have_interp = 1;
     }
+    /* Everything that can be refused has been. What follows is the job. */
+    j->depth = depth;
+    j->gfd = gfd;
+    j->have_interp = have_interp;
+    return 0;
+}
+
+/* The exec from its point of no return: map, build the stack, run the commit.
+ * On the thread that carries the exec, which may not be the one that planned
+ * it. Returns 0 with the sp and entry set; a failure here is fatal (exec_fatal),
+ * since the address space is being taken apart. */
+static long execve_commit(struct exec_job *j, unsigned long *out_sp,
+                          unsigned long *out_entry) {
+    char *host = j->host;
+    char (*sheb_interp)[SHEB_WORD] = j->sheb_interp;
+    char (*sheb_arg)[SHEB_WORD] = j->sheb_arg;
+    int *sheb_hasarg = j->sheb_hasarg;
+    int depth = j->depth, gfd = j->gfd, dirfd = j->dirfd;
+    const char *path = j->path;
+    const char *cur = depth ? sheb_interp[depth - 1] : path;
+    char **argv = j->argv, **envp = j->envp;
+    struct cng_elf_plan *pplan = &j->pplan, *iplan = &j->iplan;
+    struct cng_loaded *prog = &j->prog, *interp = &j->interp;
+    int have_interp = j->have_interp;
+    (void)gfd;
 
     /* --- point of no return ------------------------------------------------
      * Both images are known good; from here the address space is being taken
@@ -1268,23 +1565,23 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
      * this line can fail non-fatally, so there is no registration to give
      * back. */
     cng_rseq_exec_reset();
-    rc = cng_elf_map(&pplan, 0, &prog);
-    cng_elf_plan_release(&pplan);
+    int rc = cng_elf_map(pplan, 0, prog);
+    cng_elf_plan_release(pplan);
     if (rc != CNG_LOAD_OK)
         exec_fatal(path, "mapping the program", rc);
     if (cng_g_debug)
         cng_dprintf(2, "[cng]   prog base=%lx entry=%lx phdr=%lx lo=%lx hi=%lx\n",
-                    prog.base, prog.entry, prog.phdr, prog.load_lo,
-                    prog.load_hi);
+                    prog->base, prog->entry, prog->phdr, prog->load_lo,
+                    prog->load_hi);
     if (have_interp) {
-        rc = cng_elf_map(&iplan, 0, &interp);
-        cng_elf_plan_release(&iplan);
+        rc = cng_elf_map(iplan, 0, interp);
+        cng_elf_plan_release(iplan);
         if (rc != CNG_LOAD_OK)
             exec_fatal(path, "mapping the ELF interpreter", rc);
         if (cng_g_debug)
             cng_dprintf(2, "[cng]   interp %s base=%lx entry=%lx lo=%lx hi=%lx\n",
-                        prog.interp, interp.base, interp.entry, interp.load_lo,
-                        interp.load_hi);
+                        prog->interp, interp->base, interp->entry,
+                        interp->load_lo, interp->load_hi);
     }
 
     /* The argv the kernel would have built for a #! chain: each level's
@@ -1334,11 +1631,11 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
      * SHEB_RESERVE entries of SHEB_WORD) far inside the margin. Raise that clamp
      * and the arithmetic stops holding, which is what this line is here to say. */
     unsigned long sp = cng_build_stack(argc, eff_argv, envp, cng_host_auxv,
-                                       &prog, have_interp ? &interp : 0,
+                                       prog, have_interp ? interp : 0,
                                        argc > 0 ? eff_argv[0] : path);
     if (!sp)
         exec_fatal(path, "building the initial stack", -E2BIG);
-    unsigned long entry = have_interp ? interp.entry : prog.entry;
+    unsigned long entry = have_interp ? interp->entry : prog->entry;
     if (cng_g_debug)
         cng_dprintf(2, "[cng]   argc=%d sp=%lx entry=%lx -> enter\n", argc, sp,
                     entry);
@@ -1413,7 +1710,7 @@ static long execve_load(int dirfd, const char *path, char **argv, char **envp,
     /* ...and the address space itself: the images and stack just mapped are the
      * generation now running, and the one they replace is retired. After the
      * republish above, which is the last reader of the outgoing stack. */
-    cng_exec_generation(&prog, have_interp ? &interp : 0, cng_g_stack_lo,
+    cng_exec_generation(prog, have_interp ? interp : 0, cng_g_stack_lo,
                         cng_g_stack_len);
 
     *out_sp = sp;
@@ -1444,9 +1741,17 @@ static const char *dbg_str(const char *s, char *buf, unsigned long sz) {
 /* Shared emulation core: the checks that need nothing but the arguments as they
  * arrive, then the snapshot (see exec_args_take), and from there on every check
  * reads the snapshot rather than the guest's own memory. */
+/* execve_core's answer when the caller is the group leader and a sibling has
+ * handed it an exec: the caller carries that one instead of its own. */
+#define CNG_EXEC_TAKEOVER 1
+
+static void exec_claim_release(void) {
+    __atomic_store_n(&g_exec_claim, 0, __ATOMIC_RELEASE);
+}
+
 static long execve_core(int dirfd, const char *path, char **argv, char **envp,
-                        int flags, unsigned long *out_sp,
-                        unsigned long *out_entry) {
+                        int flags, unsigned long guest_mask,
+                        unsigned long *out_sp, unsigned long *out_entry) {
     if (cng_g_debug) {
         char pb[CNG_PATH_MAX];
         cng_dprintf(2, "[cng] execve enter path=%s flags=%x\n",
@@ -1555,30 +1860,205 @@ static long execve_core(int dirfd, const char *path, char **argv, char **envp,
         return dd;
     }
 
-    rc = execve_load(dirfd, a.path, a.argv, a.envp, flags, out_sp, out_entry);
-    /* The new stack owns its own copy of everything by now (on the failure paths
-     * nothing was consumed at all), so the snapshot goes either way. */
-    exec_args_free(&a);
+    /* One exec at a time (see the exec-in-flight note above). */
+    long me = sys_gettid(), pid = sys_getpid();
+    for (;;) {
+        long none = 0;
+        if (__atomic_compare_exchange_n(&g_exec_claim, &none, me, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            break;
+        if (cng_exec_pending()) {
+            /* A sibling planned an exec and handed it to the leader. The
+             * leader carries it; so does anyone, if the leader is gone. */
+            exec_args_free(&a);
+            if (me == pid || !leader_reachable())
+                return CNG_EXEC_TAKEOVER;
+            sys_exit(0); /* the exec in flight is about to kill this thread */
+        }
+        if (CNG_SYS(__NR_tgkill, pid, none, 0, 0, 0, 0) == -ESRCH) {
+            /* Held by a thread that is gone: a fork child inherited it, or a
+             * requester died before it could hand off. Ours to take. */
+            __atomic_compare_exchange_n(&g_exec_claim, &none, 0, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+            continue;
+        }
+        if (me != pid) {
+            exec_args_free(&a);
+            sys_exit(0); /* the holder's de_thread would kill us; go now */
+        }
+        /* The leader, with a sibling mid-plan: it will hand off to us or
+         * give the claim back. Either way, ask again. */
+        CNG_SYS(__NR_sched_yield, 0, 0, 0, 0, 0, 0);
+    }
+
+    rc = execve_plan(&g_job, dirfd, a.path, a.argv, a.envp, flags);
+    if (rc < 0) {
+        exec_claim_release();
+        exec_args_free(&a);
+        return rc;
+    }
+    g_job.args = a;
+    g_job.sigmask = guest_mask;
+    g_job.requester = me;
+
+    /* A non-leader thread hands the exec to the leader and leaves (see the
+     * exec-in-flight note): the program that comes out of the exec is then
+     * the leader, tid == pid, as the kernel would have it. */
+    if (me != pid && leader_reachable()) {
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] exec: handing off to the leader (tid %ld)\n",
+                        pid);
+        __atomic_store_n(&g_job.pending, 1, __ATOMIC_RELEASE);
+        dethread_send(pid, CNG_DT_EXEC);
+        /* Gone once the leader has it. A leader that dies first — main()
+         * returning into pthread_exit between the check above and the signal
+         * — would leave the exec with nobody to carry it, so it is watched
+         * for, and the exec is then ours again (exec_takeover settles who,
+         * the leader's signal being possibly in flight still). A leader that
+         * merely has every signal held off for the moment is waited for; one
+         * that stays so — a signal frame edited to block SIGSYS — is given up
+         * on after a couple of seconds. */
+        unsigned long blocked_ns = 0;
+        for (unsigned long nap = 100 * 1000;; nap = nap < 10000000 ? nap * 2 : nap) {
+            if (!cng_exec_pending())
+                for (;;)
+                    sys_exit(0);
+            int st = task_state(pid);
+            if (st == TASK_GONE || (st == TASK_BLOCKED && blocked_ns > 2000000000UL))
+                return CNG_EXEC_TAKEOVER;
+            blocked_ns = st == TASK_BLOCKED ? blocked_ns + nap : 0;
+            struct cng_timespec ts = {0, (long)nap};
+            CNG_SYS(__NR_nanosleep, &ts, 0, 0, 0, 0, 0);
+        }
+    }
+
+    cng_dethread();
+    rc = execve_commit(&g_job, out_sp, out_entry);
+    /* The new stack owns its own copy of everything by now, so the snapshot
+     * goes. */
+    exec_args_free(&g_job.args);
+    exec_claim_release();
     return rc;
+}
+
+/* The leader carrying an exec a sibling handed it: the point of no return
+ * onwards, on this thread. 0 with the sp and entry set, or -1 when nothing was
+ * pending after all (the request was answered from the leader's own execve
+ * before its signal arrived). */
+static long exec_takeover(unsigned long *out_sp, unsigned long *out_entry,
+                          unsigned long *mask_out) {
+    /* The claim first, from the requester that holds it, and only then the
+     * pending flag: a thread finding the flag down must find the claim held
+     * by a LIVE thread, or it would take a claim left by the dead requester
+     * and start an exec of its own beside this one. Whoever clears the flag
+     * carries the exec; the other — the leader's signal and the requester's
+     * watch can both get here — finds nothing to do. */
+    long req = __atomic_load_n(&g_job.requester, __ATOMIC_ACQUIRE);
+    long me = sys_gettid();
+    if (!__atomic_load_n(&g_job.pending, __ATOMIC_ACQUIRE))
+        return -1;
+    if (!__atomic_compare_exchange_n(&g_exec_claim, &req, me, 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_RELAXED) &&
+        req != me)
+        return -1; /* someone else already holds it: theirs to carry */
+    int one = 1;
+    if (!__atomic_compare_exchange_n(&g_job.pending, &one, 0, 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+        /* Lost the flag to the other taker after winning the claim: hand the
+         * claim on to it, which is what it expects to find. */
+        return -1;
+    }
+    if (cng_g_debug)
+        cng_dprintf(2, "[cng] exec: the leader takes over from tid %ld\n",
+                    g_job.requester);
+    cng_dethread();
+    long rc = execve_commit(&g_job, out_sp, out_entry);
+    exec_args_free(&g_job.args);
+    *mask_out = g_job.sigmask & ~(1UL << (CNG_SIGSYS - 1));
+    exec_claim_release();
+    return rc;
+}
+
+/* The frame the new program is entered through, from a signal handler: the
+ * registers cleared, the entry state in sp/pc, the requester's mask (the
+ * thread's own, on the direct path), and no alternate signal stack — a real
+ * execve has none, and this frame is what rt_sigreturn restores the
+ * alt-stack settings from, so the disable cng_reset_signals issued would
+ * otherwise be undone on the way out. */
+static void exec_frame(struct cng_ucontext *uc, unsigned long sp,
+                       unsigned long entry, const unsigned long *mask) {
+    unsigned long long *r = uc->uc_mcontext.regs;
+    for (int i = 0; i < 31; i++)
+        r[i] = 0;
+    uc->uc_mcontext.sp = sp;
+    uc->uc_mcontext.pc = entry;
+    if (mask)
+        uc->uc_sigmask.sig[0] = *mask;
+    uc->uc_stack.ss_sp = 0;
+    uc->uc_stack.ss_flags = CNG_SS_DISABLE;
+    uc->uc_stack.ss_size = 0;
+}
+
+int cng_exec_takeover_frame(struct cng_ucontext *uc) {
+    unsigned long sp, entry, mask;
+    if (exec_takeover(&sp, &entry, &mask) != 0)
+        return 0; /* nothing pending: the frame is left exactly as it was */
+    exec_frame(uc, sp, entry, &mask);
+    /* This thread may have been inside a dispatch of its own when the
+     * request arrived, and never returns to it. */
+    cng_scratch_leave();
+    cng_pt_set_frame(cng_pt_uregs(uc), uc);
+    cng_pt_report_exec(cng_pt_uregs(uc));
+    return 1;
+}
+
+static _Noreturn void exec_takeover_enter(void) {
+    unsigned long sp, entry, mask;
+    if (exec_takeover(&sp, &entry, &mask) != 0) {
+        /* Another thread is carrying it, and its de_thread is about to
+         * reach this one: nothing to enter here, so go. */
+        for (;;)
+            sys_exit(0);
+    }
+    CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, &mask, 0, 8, 0, 0);
+    if (cng_pt_active()) {
+        struct cng_uregs regs;
+        memset(&regs, 0, sizeof regs);
+        regs.sp = sp;
+        regs.pc = entry;
+        cng_pt_set_frame(&regs, 0);
+        cng_pt_report_exec(&regs);
+        sp = regs.sp;
+        entry = regs.pc;
+        cng_pt_set_frame(0, 0);
+    }
+    cng_scratch_leave();
+    cng_enter(sp, entry);
 }
 
 void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
                         char **argv, char **envp, int flags) {
     unsigned long long *r = uc->uc_mcontext.regs;
     unsigned long sp, entry;
-    long rc = execve_core(dirfd, path, argv, envp, flags, &sp, &entry);
+    long rc = execve_core(dirfd, path, argv, envp, flags, uc->uc_sigmask.sig[0],
+                          &sp, &entry);
     if (rc < 0) {
         r[0] = (unsigned long long)rc;
+        return;
+    }
+    if (rc == CNG_EXEC_TAKEOVER) {
+        /* Ours to carry — or another thread's already, whose de_thread is
+         * about to reach this one: then there is nothing to resume here. */
+        if (!cng_exec_takeover_frame(uc))
+            for (;;)
+                sys_exit(0);
         return;
     }
 
     /* Rewrite the signal context to the new program's fresh entry state, then
      * return: rt_sigreturn resumes at `entry` with the new stack, handler and
      * filter still installed. */
-    for (int i = 0; i < 31; i++)
-        r[i] = 0;
-    uc->uc_mcontext.sp = sp;
-    uc->uc_mcontext.pc = entry;
+    exec_frame(uc, sp, entry, 0);
     /* The post-execve stop. A real execve traps to the tracer with SIGTRAP once
      * the new image is in place — the stop strace waits for before it starts
      * following the program it launched, and the one our emulation would
@@ -1589,10 +2069,14 @@ void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
 
 long cng_execve_tramp(int dirfd, const char *path, char **argv, char **envp,
                       int flags) {
-    unsigned long sp, entry;
-    long rc = execve_core(dirfd, path, argv, envp, flags, &sp, &entry);
+    unsigned long sp, entry, mask = 0;
+    /* Ordinary call context: the live mask is the guest's own. */
+    CNG_SYS(__NR_rt_sigprocmask, 0 /*SIG_BLOCK*/, 0, &mask, 8, 0, 0);
+    long rc = execve_core(dirfd, path, argv, envp, flags, mask, &sp, &entry);
     if (rc < 0)
         return rc;
+    if (rc == CNG_EXEC_TAKEOVER)
+        exec_takeover_enter();
     /* Ordinary call context (no signal frame): abandon the old program's stack
      * and enter the new image directly, like the initial `run` does. */
     if (cng_pt_active()) {

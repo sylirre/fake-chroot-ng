@@ -486,6 +486,63 @@ else
 fi
 rm -rf "$ECD"
 
+# --- execve from a multithreaded process --------------------------------------
+# A real execve kills every other thread (de_thread) and, when the caller is
+# not the group leader, gives it the leader's identity, so what comes out of
+# the exec is one thread whose tid is its pid. The emulation used to do
+# neither: the old threads went on running the old program beside the new one
+# (a Go program's runtime threads hit EBADF on their CLOEXEC-closed netpoll fd
+# and aborted the NEW program), and a non-leader exec'er kept its own tid.
+# Now every sibling is told to die through the one signal a guest can never
+# block, and a non-leader hands its exec to the leader to carry. The helpers
+# are parked in every shape there is, including the waits that install a full
+# signal mask (ppoll, pselect, epoll_pwait, sigsuspend, sigwait): those are
+# trapped so SIGSYS can be taken out of the mask, or the exec would wait for
+# them forever — so completing in time is part of the answer. Differential
+# against the kernel; under qemu-user the thread count includes the
+# emulator's own thread on both sides.
+TED=$(mktemp -d)
+if ! guest_xlate_ready "multithreaded execve"; then
+    :
+elif ! guest_cc "$TED/threadexec" tests/guests/threadexec.c -pthread; then
+    skip "multithreaded execve: could not build tests/guests/threadexec.c with -pthread"
+else
+    mkdir -p "$TED/bin"; cp "$TED/threadexec" "$TED/bin/threadexec"
+    for mode in leader nonleader; do
+        te_k=$(cd "$TED/bin" && emu_t 60 ./threadexec $mode 2>/dev/null)
+        te_g=$(run_t 90 -R "$TED" /bin/threadexec $mode 2>/dev/null)
+        if [ -n "$te_k" ] && [ "$te_k" = "$te_g" ]; then
+            pass=$((pass + 1))
+            printf '  ok   execve by the %s thread matches the kernel (%s)\n' "$mode" "$te_g"
+        else
+            fail=$((fail + 1))
+            printf '  FAIL execve by the %s thread diverges from the kernel\n' "$mode"
+            printf '       kernel: %s\n       guest : %s\n' "$te_k" "$te_g"
+        fi
+    done
+    # ...and the waits themselves still behave as the kernel's: the mask the
+    # call installs is in force for the wait, the caller's own mask is back
+    # afterwards, the result and errno are the kernel's, a full mask still
+    # works, and a set the kernel would refuse is refused as it would.
+    if guest_cc "$TED/maskwait" tests/guests/maskwait.c -pthread; then
+        cp "$TED/maskwait" "$TED/bin/maskwait"
+        mw_k=$(emu_t 60 "$TED/maskwait" 2>/dev/null)
+        mw_g=$(run_t 90 -R "$TED" /bin/maskwait 2>/dev/null)
+        if [ -n "$mw_k" ] && [ "$mw_k" = "$mw_g" ]; then
+            pass=$((pass + 1))
+            echo "  ok   the mask-taking waits answer as the kernel's, SIGSYS taken out"
+        else
+            fail=$((fail + 1))
+            echo "  FAIL the mask-taking waits diverge from the kernel"
+            printf '       kernel: %s\n       guest : %s\n' \
+                "$(echo "$mw_k" | tr '\n' '|')" "$(echo "$mw_g" | tr '\n' '|')"
+        fi
+    else
+        skip "masked waits: could not build tests/guests/maskwait.c with -pthread"
+    fi
+fi
+rm -rf "$TED"
+
 # ...and the same chain by a program with far more mappings than one sweep
 # pass holds. The sweep collects a table's worth of victims per walk of
 # /proc/self/maps and walks again while a pass fills it; the passes were capped
