@@ -290,4 +290,9 @@ AArch64-kernel integration; the loader and path logic are fully testable under
 qemu.
 
 The binary is freestanding (`-nostdlib`, own `_start`, own syscall gate) so it
-never depends on libc and the SIGSYS handler has no re-entrancy hazards.
+never depends on libc and the SIGSYS handler has no re-entrancy hazards. Its
+syscall numbers are its own table too (`include/cng/unistd.h`, the stable
+AArch64 ABI spelled out) rather than the build host's `<asm/unistd.h>`: what
+the filter traps and refuses must not depend on how old the headers were where
+the binary happened to be built, and `src/rt/unistd_check.c` holds the table
+against those headers at build time where the host has them.

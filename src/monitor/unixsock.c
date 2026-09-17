@@ -38,8 +38,6 @@
 #include "cng/uapi.h"
 #include "cng/unixsock.h"
 
-#include <asm/unistd.h>
-
 int cng_g_share_abstract = 0;
 
 #define SUN_PATH_MAX 108

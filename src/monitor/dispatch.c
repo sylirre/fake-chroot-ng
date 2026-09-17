@@ -24,8 +24,6 @@
 #include "cng/syscall.h"
 #include "cng/uapi.h"
 
-#include <asm/unistd.h>
-
 /* cng_g_fs, the published fs view, lives in path.c. */
 
 /* The fake-identity globals (cng_g_fake_id, cng_g_cred, ...) live in cred.c. */
@@ -1073,7 +1071,6 @@ int cng_resolve_at(long dirfd, const char *path, int deref, char *out,
     return cng_strlcpy(out + k, path, sz - k) >= sz - k ? -1 : 0;
 }
 
-#ifdef __NR_openat2
 /* Is guest path `x` at or below the directory `base`? Both canonical, `base`
  * without a trailing slash except for the root, which everything is under. */
 static int guest_under(const char *x, const char *base) {
@@ -1201,8 +1198,6 @@ static long scope_canon(const char *gdir, const char *gp, int beneath,
         n = 0; /* the root is spelled "/", not "" — do not double the slash */
     return cng_strlcpy(out + n, rel, sz - n) >= sz - n ? -1 : 0;
 }
-
-#endif /* __NR_openat2 */
 
 /* --- :ro binds, through the link2symlink emulation -----------------------
  *
@@ -1346,7 +1341,6 @@ static const char *xlate_lim(long dirfd, const char *gp, char *buf,
                              struct cng_res_limit *lim) {
     if (!gp)
         return gp;
-#ifdef __NR_openat2
     /* A scoped openat2 is always walked, and from the scope the caller
      * anchored rather than from the cwd or the dirfd: the fast path below
      * would hand the kernel a name with the scope's own rules never applied,
@@ -1357,7 +1351,6 @@ static const char *xlate_lim(long dirfd, const char *gp, char *buf,
             return buf;
         return XLATE_TOOLONG; /* the caller reads lim->err where it is set */
     }
-#endif
     int dfd = (int)dirfd; /* int arg: the x-register's top half may be dirty */
     if (gp[0] == '/' || dfd == CNG_AT_FDCWD) {
         if (cng_resolve_lim(gp, deref_final, buf, bufsz, lim) == 0)
@@ -1818,28 +1811,26 @@ static void path_args_of(long nr, long a0, long a1, long a2, long a3,
     pa->i1 = pa->i2 = -1;
     switch (nr) {
     case __NR_openat:
-#ifdef __NR_openat2
     case __NR_openat2:
-#endif
     case __NR_mkdirat:
     case __NR_mknodat:
-#ifdef __NR_name_to_handle_at
     case __NR_name_to_handle_at:
-#endif
     case __NR_faccessat:
-#ifdef __NR_faccessat2
     case __NR_faccessat2:
-#endif
     case __NR_fchmodat:
-#ifdef __NR_fchmodat2
     case __NR_fchmodat2:
-#endif
     case __NR_unlinkat:
     case __NR_utimensat:
     case __NR_newfstatat:
     case __NR_statx:
     case __NR_fchownat:
     case __NR_readlinkat:
+    case __NR_setxattrat:
+    case __NR_getxattrat:
+    case __NR_listxattrat:
+    case __NR_removexattrat:
+    case __NR_file_getattr:
+    case __NR_file_setattr:
         pa->d1 = a0;
         pa->p1 = (const char *)a1;
         pa->i1 = 1;
@@ -1943,7 +1934,6 @@ long cng_dotdot_verdict(long dirfd, const char *path) {
     return lim.dotdot_err;
 }
 
-#ifdef __NR_openat2
 /* RESOLVE_BENEATH / RESOLVE_IN_ROOT scope the whole resolution to `dirfd`, and
  * the kernel is the only thing that can apply them exactly — so where the
  * guest's namespace has nothing to add under that directory (which is what
@@ -2097,7 +2087,6 @@ static long how_precheck(const struct cng_open_how *how) {
     }
     return (r == -ENOENT || r == -EAGAIN) ? 0 : r;
 }
-#endif
 
 /* May the *first* path argument of `nr` legitimately be the empty string? Only
  * where the call names the dirfd itself instead: AT_EMPTY_PATH where the guest
@@ -2113,14 +2102,18 @@ static int empty_path_ok(long nr, long a0, long a2, long a3, long a4) {
     case __NR_fchownat:
     case __NR_linkat:
         return ((int)a4 & CNG_AT_EMPTY_PATH) != 0;
-#ifdef __NR_faccessat2
     case __NR_faccessat2:
         return ((int)a3 & CNG_AT_EMPTY_PATH) != 0;
-#endif
-#ifdef __NR_name_to_handle_at
     case __NR_name_to_handle_at:
         return ((int)a4 & CNG_AT_EMPTY_PATH) != 0;
-#endif
+    case __NR_setxattrat:
+    case __NR_getxattrat:
+    case __NR_listxattrat:
+    case __NR_removexattrat:
+        return ((int)a2 & CNG_AT_EMPTY_PATH) != 0;
+    case __NR_file_getattr:
+    case __NR_file_setattr:
+        return ((int)a4 & CNG_AT_EMPTY_PATH) != 0;
     case __NR_readlinkat:
         return (int)a0 != CNG_AT_FDCWD; /* with no dirfd there is no link */
     default:
@@ -2652,32 +2645,20 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     switch (nr) {
     /* Simple translate + reissue: dirfd = a0, path = a1. */
     case __NR_openat:
-#ifdef __NR_openat2
     case __NR_openat2:
-#endif
     case __NR_mkdirat:
     case __NR_mknodat:
-#ifdef __NR_name_to_handle_at
-    case __NR_name_to_handle_at:
-#endif
-    {
+    case __NR_name_to_handle_at: {
         /* openat2 carries its flags in the open_how it points at. */
-#ifdef __NR_openat2
         int is_open = (nr == __NR_openat || nr == __NR_openat2);
-#else
-        int is_open = (nr == __NR_openat);
-#endif
         long oflags = 0;
-#ifdef __NR_openat2
         struct cng_open_how how;
         struct cng_res_limit lim = {0}; /* every field: see the header */
         unsigned long resolve = 0;
         char sdir[CNG_PATH_MAX]; /* a scoped openat2's scope, as a guest path */
         int scoped = 0;          /* ...and whether this is one */
-#endif
         if (is_open) {
             oflags = a2;
-#ifdef __NR_openat2
             /* openat2's flags live in the open_how it points at, so reading
              * them is a guest dereference like any other — and so is the
              * `resolve` beside them, which constrains a resolution WE are the
@@ -2689,9 +2670,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 oflags = (long)how.flags;
                 resolve = how.resolve;
             }
-#endif
         }
-#ifdef __NR_openat2
         /* RESOLVE_BENEATH / RESOLVE_IN_ROOT scope the whole resolution to
          * `dirfd`, which the guest can only hold because we handed it over —
          * so it already names a directory inside the view, and the kernel's
@@ -2725,7 +2704,6 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             lim.scope = sdir;
             lim.xdev_base = sdir; /* NO_XDEV starts where the scope does */
         }
-#endif
         /* O_NOFOLLOW must reach the kernel as a symlink, or it has nothing to
          * refuse: resolving the final component here would hand over the
          * target and the open would succeed where it must ELOOP. (An l2s link
@@ -2733,7 +2711,6 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * the guest believes that name IS the file.) */
         int deref = !(nr == __NR_mkdirat || nr == __NR_mknodat) &&
                     !(is_open && (oflags & CNG_O_NOFOLLOW));
-#ifdef __NR_name_to_handle_at
         /* ...except this one, whose flag runs the other way: it does NOT follow
          * a final symlink unless AT_SYMLINK_FOLLOW is given, where every other
          * *at() call follows unless told not to. Taken as a follower, it
@@ -2742,7 +2719,6 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * back ENOENT (measured both ways). */
         if (nr == __NR_name_to_handle_at)
             deref = ((int)a4 & CNG_AT_SYMLINK_FOLLOW) != 0;
-#endif
         /* A read-only open of a /proc file that would describe chroot-ng
          * instead of the guest is served from an in-memory copy of the guest
          * view (see procfs.c). */
@@ -2750,7 +2726,6 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * guest's own, which for an ordinary call is the one it passed. */
         long rkd = a0;
         const char *rkp = (const char *)a1;
-#ifdef __NR_openat2
         /* For a scoped call it is not: the scope re-roots and clamps the name,
          * so neither that question nor the synthesized-/proc lookup below is
          * about the join of the dirfd and the name that every other call
@@ -2764,7 +2739,6 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             rkd = CNG_AT_FDCWD;
             rkp = have_scanon ? scanon : 0;
         }
-#endif
         if (is_open) {
             const char *gp = (const char *)a1;
             char canon[CNG_PATH_MAX];
@@ -2773,7 +2747,6 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
              * a real dirfd costs a readlink, so it is resolved only when the
              * name could be a synthesized file at all. */
             int have = 0;
-#ifdef __NR_openat2
             if (scoped) {
                 /* Already spelled out above, and it is not the join of the
                  * dirfd and the name: where the scope refuses the name there
@@ -2782,9 +2755,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                  * does and so is the one entitled to answer EXDEV. */
                 if ((have = have_scanon))
                     cng_strlcpy(canon, scanon, sizeof canon);
-            } else
-#endif
-            if (gp && (gp[0] == '/' || (int)a0 == CNG_AT_FDCWD))
+            } else if (gp && (gp[0] == '/' || (int)a0 == CNG_AT_FDCWD))
                 have = cng_fs_abscanon(cng_g_fs, gp, canon, sizeof canon) == 0;
             else if (gp && leaf_may_synth(gp))
                 have = at_canon(a0, gp, canon, sizeof canon) == 0;
@@ -2792,7 +2763,6 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 cng_procfs_open(canon, oflags, &pr))
                 return pr;
         }
-#ifdef __NR_openat2
         if (resolve) {
             /* The rest constrain the walk itself, and are answered against the
              * GUEST's namespace — the one the guest described — then stripped.
@@ -2814,9 +2784,6 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                       (resolve && nr == __NR_openat2) ? &lim : 0);
         if (lim.err)
             return lim.err;
-#else
-        const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
-#endif
         if (p == XLATE_TOOLONG)
             return -ENAMETOOLONG;
         /* :ro bind — mkdirat/mknodat always create; an open only offends with
@@ -2842,7 +2809,6 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             }
         }
         long ha2 = a2, ha3 = a3;
-#ifdef __NR_openat2
         if (nr == __NR_openat2) {
             /* Our copy, never the guest's struct: the constraints we answered
              * are cleared for the re-issue, and editing guest memory would
@@ -2859,7 +2825,6 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             ha2 = (long)&how;
             ha3 = (long)sizeof how;
         }
-#endif
         /* An l2s name asked about without following it (see l2s_nofollow_data)
          * is answered from its backing file. For a plain O_NOFOLLOW open that
          * is done after the fact, on the ELOOP the kernel draws for the link —
@@ -2871,11 +2836,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * without AT_SYMLINK_FOLLOW, which encoded a handle to the link. The
          * backing path is absolute, so the dirfd is simply ignored. */
         char l2d[CNG_PATH_MAX];
-        int l2nf = (is_open && (oflags & CNG_O_NOFOLLOW) && (oflags & CNG_O_PATH))
-#ifdef __NR_name_to_handle_at
-                   || (nr == __NR_name_to_handle_at && !deref)
-#endif
-            ;
+        int l2nf = (is_open && (oflags & CNG_O_NOFOLLOW) && (oflags & CNG_O_PATH)) ||
+                   (nr == __NR_name_to_handle_at && !deref);
         if (l2nf && l2s_nofollow_data(rkd, rkp, 0, 0, l2d, sizeof l2d))
             p = l2d;
         long r = reissue(a0, (long)p, ha2, ha3, a4, a5, nr);
@@ -2898,18 +2860,13 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * X requires at least one execute bit. mode is a2 for both variants. This is
      * what "check-then-write" tools (package managers, `test -w`) rely on. */
     case __NR_faccessat:
-#ifdef __NR_faccessat2
-    case __NR_faccessat2:
-#endif
-    {
+    case __NR_faccessat2: {
         /* faccessat2 has a real flags word, so unlike its predecessor it can ask
          * about the symlink itself. Resolving the final component here would
          * hand the kernel the target and answer for the wrong file. */
         int deref = 1;
-#ifdef __NR_faccessat2
         if (nr == __NR_faccessat2 && ((int)a3 & CNG_AT_SYMLINK_NOFOLLOW))
             deref = 0;
-#endif
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
         if (p == XLATE_TOOLONG)
             return -ENAMETOOLONG;
@@ -2919,12 +2876,9 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * AT_SYMLINK_NOFOLLOW at random: on a symlink that answers about the
          * link (mode 0777, so X_OK is always granted) rather than the target. */
         long fl = 0;
-#ifdef __NR_faccessat2
         if (nr == __NR_faccessat2)
             fl = a3;
-#endif
         long dfd = a0;
-#ifdef __NR_faccessat2
         /* faccessat2 with AT_SYMLINK_NOFOLLOW on an l2s name must report on
          * the backing file — to the guest, the name IS a regular file. */
         char fdata[CNG_PATH_MAX];
@@ -2939,7 +2893,6 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 fl = a3 & ~CNG_AT_SYMLINK_NOFOLLOW;
             }
         }
-#endif
         long r = reissue(dfd, (long)p, a2, fl, a4, a5, nr);
         /* Only what root actually bypasses, which is a *permission* denial.
          * This used to fire on any negative answer at all, and the stat below
@@ -2998,7 +2951,6 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
 
     /* fchmodat2(dirfd, path, mode, flags): same as fchmodat but with a real
      * flags word, so unlike its predecessor it can chmod a symlink itself. */
-#ifdef __NR_fchmodat2
     case __NR_fchmodat2: {
         int deref = !((int)a3 & CNG_AT_SYMLINK_NOFOLLOW);
         /* An l2s name, not followed: the mode belongs to the backing file
@@ -3021,7 +2973,6 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             return ro;
         return chattr_result(reissue(a0, (long)p, a2, a3, a4, a5, nr));
     }
-#endif
 
     /* unlinkat: on removing one of our link2symlink names, drop the group's
      * refcount (and reclaim the backing file on the last reference). */
@@ -3433,19 +3384,10 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * outright, so they are served from the broker instead of the host kernel
      * — see shm.c. Trapped unconditionally (seccomp.c), so the guest gets one
      * shm namespace whatever the host's own SysV IPC would have allowed. */
-#ifdef __NR_shmget
     case __NR_shmget:
-#endif
-#ifdef __NR_shmat
     case __NR_shmat:
-#endif
-#ifdef __NR_shmdt
     case __NR_shmdt:
-#endif
-#ifdef __NR_shmctl
-    case __NR_shmctl:
-#endif
-    {
+    case __NR_shmctl: {
         long r = cng_shm_handle(nr, a0, a1, a2);
         if (cng_g_debug)
             cng_dprintf(2, "[cng] sysv-shm nr=%ld -> %ld\n", nr, r);
@@ -3488,9 +3430,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         return cng_syscall6(a0, a1, a2, a3, a4, a5, nr);
     case __NR_pread64:
     case __NR_preadv:
-#ifdef __NR_preadv2
     case __NR_preadv2:
-#endif
         cng_procfs_pre_read((int)a0, a3);
         return cng_syscall6(a0, a1, a2, a3, a4, a5, nr);
 
@@ -3503,11 +3443,9 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_execve:
         return cng_execve_tramp(CNG_AT_FDCWD, (const char *)a0, (char **)a1,
                                 (char **)a2, 0);
-#ifdef __NR_execveat
     case __NR_execveat:
         return cng_execve_tramp((int)a0, (const char *)a1, (char **)a2,
                                 (char **)a3, (int)a4);
-#endif
 
     /* rename: two translated paths. If the destination is one of our
      * link2symlink names, it is replaced by the rename, so drop its group's
@@ -4166,6 +4104,45 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         return reissue((long)p, a1, a2, a3, a4, a5, nr);
     }
 
+    /* The dirfd-relative forms of the same (6.13): setxattrat, getxattrat,
+     * listxattrat and removexattrat take (dirfd, path, at_flags, ...), where
+     * AT_SYMLINK_NOFOLLOW is the l-prefix and AT_EMPTY_PATH the f-prefix. And
+     * file_getattr/file_setattr (6.17), the FS_IOC_FS[GS]ETXATTR ioctl pair
+     * asked by path — (dirfd, path, attr, size, at_flags), the same two flags
+     * with the word at the end. Handled as the eight above are, with the flag
+     * read from where each keeps it: an l2s name asked about without following
+     * lands on the backing file, a setter or remover answers EROFS under a :ro
+     * bind, and everything else is translate + reissue. */
+    case __NR_setxattrat:
+    case __NR_getxattrat:
+    case __NR_listxattrat:
+    case __NR_removexattrat:
+    case __NR_file_getattr:
+    case __NR_file_setattr: {
+        int fattr = (nr == __NR_file_getattr || nr == __NR_file_setattr);
+        unsigned at = (unsigned)(fattr ? a4 : a2);
+        int deref = !(at & CNG_AT_SYMLINK_NOFOLLOW);
+        int writes = (nr == __NR_setxattrat || nr == __NR_removexattrat ||
+                      nr == __NR_file_setattr);
+        char hnf[CNG_PATH_MAX], data[CNG_PATH_MAX];
+        if (!deref && l2s_nofollow_data(a0, (const char *)a1, hnf, sizeof hnf,
+                                        data, sizeof data)) {
+            if (writes && ro_denied(hnf))
+                return -EROFS;
+            return reissue(CNG_AT_FDCWD, (long)data, a2, a3, a4, a5, nr);
+        }
+        const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
+        if (p == XLATE_TOOLONG)
+            return -ENAMETOOLONG;
+        if (writes) {
+            long ro = ro_refusal_name(a0, (const char *)a1, p,
+                                      deref ? 0 : CNG_AT_SYMLINK_NOFOLLOW);
+            if (ro)
+                return ro;
+        }
+        return reissue(a0, (long)p, a2, a3, a4, a5, nr);
+    }
+
     /* inotify_add_watch(fd, path, mask): a path-bearing syscall whose a0 is the
      * inotify instance rather than a dirfd, so the name is always absolute or
      * cwd-relative. Untranslated it was exactly inverted — a watch on
@@ -4487,9 +4464,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_rt_sigtimedwait:
     case __NR_ppoll:
     case __NR_epoll_pwait:
-#ifdef __NR_epoll_pwait2
     case __NR_epoll_pwait2:
-#endif
     case __NR_signalfd4: {
         int mi = nr == __NR_rt_sigsuspend || nr == __NR_rt_sigtimedwait ? 0
                  : nr == __NR_ppoll                                     ? 3
@@ -4553,7 +4528,6 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * hand, with the exact area, length and signature — so they are recorded
      * here (per thread; see the table in execve.c). The call itself runs as
      * the kernel answers it, EBUSY, EINVAL and all. */
-#ifdef __NR_rseq
     case __NR_rseq: {
         long r = reissue(a0, a1, a2, a3, a4, a5, nr);
         if (r == 0) {
@@ -4565,7 +4539,6 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         }
         return r;
     }
-#endif
 
     /* prctl: the four ops that describe OUR confinement rather than the guest's.
      * Only these are trapped (seccomp.c tests args[0] in BPF); every other op is

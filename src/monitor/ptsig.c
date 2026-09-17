@@ -33,8 +33,6 @@
 #include "cng/syscall.h"
 #include "cng/uapi.h"
 
-#include <asm/unistd.h>
-
 #define PT_NSIG 64
 
 #define SIG_KILL_  9

@@ -11,8 +11,6 @@
 #include "cng/tab.h"
 #include "cng/uapi.h"
 
-#include <asm/unistd.h>
-
 /* The registry grows as it is written to (cng_tab): the floor takes about
  * twenty-five records on a device, the monitor's long-lived regions a dozen
  * more, and the tables that grow — a shm attach list, the ptrace registry,

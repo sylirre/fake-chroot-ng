@@ -288,7 +288,42 @@ else
         "getxa: errno $xa_real" \
         "$(run -t dtest -r "$ROOT" getxa /etc/greeting 2>&1)"
 fi
+# getxattrat (6.13) is the same question by (dirfd, path), and was in no table
+# at all: the numbers came from the build host's headers, which ended before
+# it. Only a kernel that has the call can show the difference between reached
+# and contained (ENOSYS says nothing about the path); the dispatcher's own
+# handling of it is covered by the `newat` op below on every host.
+xaat_real=$(printf '%s\n' "$xa_ctl" |
+    sed -n 's/.*getxaat: errno \([0-9]*\).*/\1/p' | head -1)
+if [ -z "$xaat_real" ] || [ "$xaat_real" = 38 ]; then
+    skip "getxattrat legs: this kernel has no getxattrat (errno ${xaat_real:-?})"
+elif [ "$xaat_real" = 2 ]; then
+    skip "getxattrat legs: no errno on this filesystem distinguishes reached from contained"
+else
+    check_contains "getxattrat on a host-only path is contained" \
+        "getxaat: errno 2" \
+        "$(run -t dtest -r "$ROOT" getxa "$XAH" 2>&1)"
+    check_contains "getxattrat reaches the rootfs file, so it is translated" \
+        "getxaat: errno $xaat_real" \
+        "$(run -t dtest -r "$ROOT" getxa /etc/greeting 2>&1)"
+fi
 rm -f "$XAH"
+# What the dispatcher decides about the six new calls before any kernel is
+# asked: the path is read from the right register, ".." through a file is
+# ENOTDIR, an empty name is ENOENT unless the family's own AT_EMPTY_PATH slot
+# says otherwise.
+out=$(run -t dtest -r "$ROOT" newat /etc/greeting 2>&1); rc=$?
+check "the 6.13/6.17 dirfd calls are dispatched as path syscalls" 0 "$rc"
+for _leg in getxattrat setxattrat listxattrat removexattrat file_getattr \
+    file_setattr; do
+    check_contains "$_leg reads its path from (a0, a1)" \
+        "newat $_leg-dotdot: rc=-20 -> OK" "$out"
+done
+check_contains "an empty name without AT_EMPTY_PATH is ENOENT for both families" \
+    "newat file_getattr-empty: rc=-2 -> OK" "$out"
+check_contains "...and AT_EMPTY_PATH is read from each family's own slot" \
+    "newat empty-path-flag: getxattrat=" "$out"
+check_absent "no newat leg failed" "-> FAIL" "$out"
 
 # inotify_add_watch is the last path-bearing syscall with no dirfd form, and the
 # only one whose a0 is not one — which is how it was missed. Untranslated it was
@@ -317,6 +352,11 @@ check_contains ":ro bind refuses unlinkat" \
     "robind ro unlinkat: rc=-30 -> OK" "$out"
 check_contains ":ro bind refuses rename" \
     "robind ro renameat: rc=-30 -> OK" "$out"
+# The 6.13/6.17 dirfd-relative setters, which were in no table at all.
+check_contains ":ro bind refuses setxattrat" \
+    "robind ro setxattrat: rc=-30 -> OK" "$out"
+check_contains ":ro bind refuses file_setattr" \
+    "robind ro file_setattr: rc=-30 -> OK" "$out"
 # access(W_OK) reports a read-only filesystem — SuS requires it and the kernel
 # does it — so `test -w` inside a :ro bind agrees with what the write would do
 # rather than with the host file's own mode. R_OK on the same name still passes.
@@ -378,7 +418,7 @@ check_contains ":ro bind still serves reads of an l2s name" \
 check_contains ":ro bind still answers access(R_OK) on an l2s name" \
     "l2sro ro access-r: rc=0 -> OK" "$out"
 for _leg in open-w open-trunc access-w truncate fchmodat fchownat utimensat \
-    setxattr unlinkat; do
+    setxattr setxattrat file_setattr unlinkat; do
     check_contains ":ro bind refuses $_leg on an l2s name" \
         "l2sro ro $_leg: rc=-30 -> OK" "$out"
 done
@@ -593,6 +633,21 @@ check_contains "shm is still emulated rather than refused" \
     "bpftest shmget still traps for emulation: TRAP -> OK" "$out"
 check_contains "fchmodat2 is translated, not refused" \
     "bpftest fchmodat2 traps for translation: TRAP -> OK" "$out"
+# The syscall numbers are our own table now (include/cng/unistd.h), not the
+# build host's headers: a number the headers did not know used to fall out of
+# the filter altogether, and the filter's default is ALLOW -- so a guest on a
+# newer kernel reached the host by the raw number, untranslated and unrefused.
+# These are the path-bearing calls born after the previous table's last entry
+# (6.13's *xattrat family, 6.17's file_[gs]etattr, 6.15's open_tree_attr).
+for _leg in setxattrat getxattrat listxattrat removexattrat file_getattr \
+    file_setattr openat2 execveat; do
+    check_contains "$_leg is in the filter whatever headers built this binary" \
+        "bpftest $_leg traps for " "$out"
+done
+for _leg in open_tree_attr open_tree statmount; do
+    check_contains "$_leg is refused whatever headers built this binary" \
+        "bpftest $_leg is refused ENOSYS: ERRNO -> OK" "$out"
+done
 check_contains "plain clone still traps for the vfork conversion" \
     "bpftest plain clone still traps for the conversion: TRAP -> OK" "$out"
 

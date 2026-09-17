@@ -136,7 +136,7 @@ check_contains "l2s O_NOFOLLOW opens the link, still ELOOPs real symlinks" \
 # (fires for a change through another name), fchmodat2(AT_SYMLINK_NOFOLLOW),
 # and openat2's O_NOFOLLOW and RESOLVE_NO_SYMLINKS. Each used to operate on the
 # emulation's own symlink. Fields the host cannot issue (openat2 under qemu-user,
-# fchmodat2 with older headers) read -1 and are not failures; the rest must be 1.
+# fchmodat2 on a kernel before 6.6) read -1 and are not failures; the rest must be 1.
 check_contains "l2s no-follow calls all land on the backing file" \
     "l2s-nofollow-rest: opath_reg=1 handle=1 xattr=1 watch=1" "$out"
 check_absent "...and none of them failed" "-> FAIL (-1 = not issuable here)" "$out"

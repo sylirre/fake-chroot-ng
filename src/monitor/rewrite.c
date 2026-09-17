@@ -9,8 +9,6 @@
 #include "cng/tab.h"
 #include "cng/uapi.h"
 
-#include <asm/unistd.h>
-
 #include <stdint.h>
 
 int cng_g_rewrite = 0;

@@ -2376,6 +2376,42 @@ vfork/`posix_spawn` child-stack handling.
   `shm_open` at all — Android uses ashmem — which is the same reason the guests
   that need this are the rootfs ones.
 
+- [x] **M37 — the trapped set was a property of the build host**
+  Every syscall number in the tree came from `<asm/unistd.h>`, and every
+  number younger than the headers on the machine doing the build sat behind an
+  `#ifdef __NR_*`: forty of them, over openat2, execveat, clone3, the io_uring
+  three, the mount API, statmount/listmount, the mqueue six, fchmodat2 and
+  more. A binary built against old headers — an old NDK, an old distro
+  sysroot — simply had no entry for those, and the filter's default action is
+  ALLOW, so a guest on a newer kernel reached the host filesystem by the raw
+  number: untranslated, unrefused, and with nothing to say so. The numbers are
+  the stable ABI (arm64 takes the asm-generic table unchanged, and a number is
+  never reused), so they now live in `include/cng/unistd.h` beside the rest of
+  the local UAPI constants, generated from the 6.17 kernel's
+  `scripts/syscall.tbl` and cross-checked against the cross toolchain's own
+  header and the running kernel. Nothing else includes the system header; the
+  gates are gone, and `src/rt/unistd_check.c` holds the table against the
+  build host's `<asm/unistd.h>` where there is one — a differing value is a
+  build error (`-Werror` on that one unit), a missing one is silence, which is
+  exactly the host the table exists for.
+  Doing that turned up the same hole with nothing to do with headers: the
+  table's own last entry was 461, and 6.13 added the dirfd-relative xattr
+  family (`setxattrat`, `getxattrat`, `listxattrat`, `removexattrat`), 6.15
+  `open_tree_attr`, 6.17 `file_getattr`/`file_setattr` — seven path-bearing
+  syscalls, live on the dev host's kernel, that no table here named. The six
+  that take (dirfd, path) are translated like their predecessors (an
+  `AT_SYMLINK_NOFOLLOW` l2s name lands on the backing file, a setter under a
+  `:ro` bind is EROFS, `AT_EMPTY_PATH` read from each family's own slot — a2
+  for the xattr four, a4 for the file-attribute pair); `open_tree_attr` joins
+  `open_tree` in the designed-ENOSYS set.
+  Validated by `-t bpftest` (each of the new numbers traps or is refused, and
+  the previously gated ones are asserted the same way), `-t dtest newat` (the
+  decisions taken on the guest's own spelling before any kernel is asked:
+  `..` through a file, the empty name with and without the flag) and the
+  `:ro`/l2s mutator tables. A kernel that has `getxattrat` also runs the
+  contained-vs-reached differential the plain `getxattr` leg runs; without one
+  it skips by name.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

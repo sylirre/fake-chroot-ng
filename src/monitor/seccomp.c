@@ -15,38 +15,32 @@
 #include "cng/syscall.h"
 #include "cng/uapi.h"
 
-#include <asm/unistd.h>
-
 /* Must match the set handled in dispatch.c. */
 static const int path_syscalls[] = {
-    __NR_openat,
-#ifdef __NR_openat2
-    __NR_openat2,
-#endif
-    __NR_newfstatat, __NR_statx,   __NR_faccessat,
-#ifdef __NR_faccessat2
-    __NR_faccessat2,
-#endif
-    __NR_readlinkat, __NR_mkdirat, __NR_mknodat,   __NR_unlinkat,
-    __NR_fchownat,   __NR_fchmodat, __NR_utimensat, __NR_symlinkat,
-    __NR_linkat,     __NR_renameat, __NR_renameat2, __NR_truncate,
-    __NR_statfs,     __NR_chdir,    __NR_fchdir,    __NR_getcwd,
-    __NR_chroot,
+    __NR_openat,     __NR_openat2,  __NR_newfstatat, __NR_statx,
+    __NR_faccessat,  __NR_faccessat2, __NR_readlinkat, __NR_mkdirat,
+    __NR_mknodat,    __NR_unlinkat, __NR_fchownat,  __NR_fchmodat,
+    __NR_utimensat,  __NR_symlinkat, __NR_linkat,   __NR_renameat,
+    __NR_renameat2,  __NR_truncate, __NR_statfs,    __NR_chdir,
+    __NR_fchdir,     __NR_getcwd,   __NR_chroot,
     /* signal control: keep SIGSYS unblocked / our handler in place */
     __NR_rt_sigprocmask, __NR_rt_sigaction,
-    __NR_execve,
-#ifdef __NR_execveat
-    __NR_execveat,
-#endif
-#ifdef __NR_name_to_handle_at
-    __NR_name_to_handle_at,
-#endif
+    __NR_execve,     __NR_execveat, __NR_name_to_handle_at,
     /* Extended attributes. Eight path-bearing forms, all with the path in a0
      * and no dirfd; the f* variants act on an fd and need no translation. The
      * getters leak host state and answer existence questions about it; the
      * setters and removers *write* the host filesystem. */
     __NR_setxattr,    __NR_lsetxattr,    __NR_getxattr,    __NR_lgetxattr,
     __NR_listxattr,   __NR_llistxattr,   __NR_removexattr, __NR_lremovexattr,
+    /* ...and the dirfd-relative forms (6.13), which fold the l- and f- prefixes
+     * into an at_flags word: the same four questions, asked of (dirfd, path).
+     * file_getattr/file_setattr (6.17) are the FS_IOC_FS[GS]ETXATTR ioctl pair
+     * asked by path, with the same flags word. These six were the newest
+     * path-bearing syscalls in the table and were in no table here at all:
+     * the build's headers ended before them, and the guest reached the host
+     * with the name it spelled. */
+    __NR_setxattrat,  __NR_getxattrat,   __NR_listxattrat, __NR_removexattrat,
+    __NR_file_getattr, __NR_file_setattr,
     /* inotify_add_watch: the last path-bearing syscall with no dirfd form, and
      * the only one whose a0 is not one. Left native it armed the watch on the
      * HOST's copy of the name while the rootfs's own answered ENOENT — the
@@ -67,9 +61,7 @@ static const int path_syscalls[] = {
     /* fchmodat2 (6.6+) is what glibc >= 2.39 reaches for first, and the only
      * way to chmod a symlink itself. Translated rather than refused, so the
      * guest keeps the capability. */
-#ifdef __NR_fchmodat2
     __NR_fchmodat2,
-#endif
     /* socket(): substitutes an emulated NETLINK_ROUTE socket where the host
      * denies app domains rtnetlink (netlink.c). Everything else runs native. */
     __NR_socket,
@@ -91,9 +83,7 @@ static const int path_syscalls[] = {
      * unregister it, which takes the exact area, length and signature the
      * guest gave — recorded as it registers (dispatch.c), or the kernel goes
      * on writing cpu ids into a TCB the next program no longer has. */
-#ifdef __NR_rseq
     __NR_rseq,
-#endif
     /* uname: the host's release describes the device, not the rootfs, and on
      * Android carries vendor suffixes that identify it. Faked to a fixed
      * identity that /proc/version repeats verbatim (procfs.c). */
@@ -135,18 +125,7 @@ static const int id_syscalls[] = {
  * makes, and the reason a guest cannot reach a host semaphore or have its
  * queues turn up in the host's `ipcs`. */
 static const int ipc_syscalls[] = {
-#ifdef __NR_shmget
-    __NR_shmget,
-#endif
-#ifdef __NR_shmat
-    __NR_shmat,
-#endif
-#ifdef __NR_shmdt
-    __NR_shmdt,
-#endif
-#ifdef __NR_shmctl
-    __NR_shmctl,
-#endif
+    __NR_shmget,      __NR_shmat,       __NR_shmdt,       __NR_shmctl,
     __NR_semget,      __NR_semop,       __NR_semctl,      __NR_semtimedop,
     __NR_msgget,      __NR_msgsnd,      __NR_msgrcv,      __NR_msgctl,
 };
@@ -171,15 +150,9 @@ static const int ipc_syscalls[] = {
  * signal, no handler, and it holds even where nested SIGSYS delivery does not.
  * cng_denied_syscall() covers the -R trampoline tier, which has no filter. */
 static const int enosys_syscalls[] = {
-#ifdef __NR_io_uring_setup
     __NR_io_uring_setup,
-#endif
-#ifdef __NR_io_uring_enter
     __NR_io_uring_enter,
-#endif
-#ifdef __NR_io_uring_register
     __NR_io_uring_register,
-#endif
     /* clone3. Its flags live in a `struct clone_args` behind args[0], so BPF —
      * which can only read scalars out of seccomp_data — cannot tell a thread
      * from a vfork here, and the CLONE_VFORK conversion below is exactly what
@@ -192,9 +165,7 @@ static const int enosys_syscalls[] = {
      *
      * We never issue clone3 ourselves (sys_fork uses __NR_clone), so refusing it
      * ahead of the gate allowlist costs nothing. */
-#ifdef __NR_clone3
     __NR_clone3,
-#endif
     /* The mount family. Each takes one or two paths, and none of them was
      * trapped or refused, so the guest's own untranslated spelling went to the
      * host kernel to be judged. In the target environment that judgement is
@@ -212,9 +183,7 @@ static const int enosys_syscalls[] = {
     __NR_mount,
     __NR_umount2,
     __NR_pivot_root,
-#ifdef __NR_mount_setattr
     __NR_mount_setattr,
-#endif
     /* Process accounting names a file by path and is the same story — the last
      * path-bearing syscall in the table that was neither trapped nor refused.
      * It is also the one that cannot be translated even in principle: what it
@@ -224,47 +193,26 @@ static const int enosys_syscalls[] = {
     __NR_acct,
     /* Quotas and swap name a block device by path and are the same story. */
     __NR_quotactl,
-#ifdef __NR_quotactl_fd
     __NR_quotactl_fd,
-#endif
     __NR_swapon,
     __NR_swapoff,
     /* Path-bearing syscalls we do not model. Each takes a path or names a mount
      * and would otherwise reach the host filesystem untranslated; all are
      * privileged in practice, so an unprivileged guest saw EPERM rather than an
      * escape — but ENOSYS is the honest answer and the oracle's. */
-#ifdef __NR_open_tree
     __NR_open_tree, /* unprivileged without OPEN_TREE_CLONE: a path->fd lookup */
-#endif
-#ifdef __NR_move_mount
+    __NR_open_tree_attr, /* open_tree with a mount_attr applied (6.15) */
     __NR_move_mount,
-#endif
-#ifdef __NR_fsopen
     __NR_fsopen,
-#endif
-#ifdef __NR_fsconfig
     __NR_fsconfig,
-#endif
-#ifdef __NR_fsmount
     __NR_fsmount,
-#endif
-#ifdef __NR_fspick
     __NR_fspick,
-#endif
-#ifdef __NR_open_by_handle_at
     __NR_open_by_handle_at, /* name_to_handle_at is trapped; keep the pair even */
-#endif
-#ifdef __NR_fanotify_mark
     __NR_fanotify_mark,
-#endif
     /* statmount/listmount would hand the guest the HOST mount tree, defeating
      * the synthesized /proc/self/mounts entirely. */
-#ifdef __NR_statmount
     __NR_statmount,
-#endif
-#ifdef __NR_listmount
     __NR_listmount,
-#endif
     /* seccomp(2). A guest filter is layered on top of ours by the kernel and
      * applies to every thread it is installed on — including the syscalls the
      * SIGSYS handler re-issues through the gate, which the guest's filter knows
@@ -275,9 +223,7 @@ static const int enosys_syscalls[] = {
      * its syscall number with ops we must keep working). We never issue
      * seccomp(2) ourselves — the filter goes in via prctl — so refusing it ahead
      * of the gate allowlist costs nothing. */
-#ifdef __NR_seccomp
     __NR_seccomp,
-#endif
     /* POSIX message queues — the same escape as the System V family's, in the
      * one namespace the emulation cannot take over. An mq name is not a
      * filesystem path: it names an entry in the per-IPC-namespace mqueue mount,
@@ -292,24 +238,12 @@ static const int enosys_syscalls[] = {
      * descriptor-taking four are listed with the two name-taking ones: without a
      * queue there is nothing to send on, and a bare mq_getsetattr on some other
      * fd must not half-work. */
-#ifdef __NR_mq_open
     __NR_mq_open,
-#endif
-#ifdef __NR_mq_unlink
     __NR_mq_unlink,
-#endif
-#ifdef __NR_mq_timedsend
     __NR_mq_timedsend,
-#endif
-#ifdef __NR_mq_timedreceive
     __NR_mq_timedreceive,
-#endif
-#ifdef __NR_mq_notify
     __NR_mq_notify,
-#endif
-#ifdef __NR_mq_getsetattr
     __NR_mq_getsetattr,
-#endif
 };
 #define NENOSYS ((int)(sizeof(enosys_syscalls) / sizeof(enosys_syscalls[0])))
 
@@ -554,9 +488,7 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
             {__NR_ppoll, 3},
             {__NR_pselect6, 5},
             {__NR_epoll_pwait, 4},
-#ifdef __NR_epoll_pwait2
             {__NR_epoll_pwait2, 4},
-#endif
         };
         for (unsigned w = 0; w < sizeof waits / sizeof waits[0]; w++) {
             f[n++] = (struct sock_filter)CNG_BPF_JUMP(
@@ -596,9 +528,7 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
     if (cng_g_synth_fd_base > 0) {
         static const int read_family[] = {
             __NR_read, __NR_pread64, __NR_readv, __NR_preadv,
-#ifdef __NR_preadv2
             __NR_preadv2,
-#endif
         };
         int nrf = (int)(sizeof read_family / sizeof read_family[0]);
         for (int i = 0; i < nrf; i++)

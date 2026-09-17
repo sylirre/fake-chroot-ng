@@ -17,29 +17,18 @@
 #include "cng/uapi.h"
 #include "cng/ucontext.h"
 
-#include <asm/unistd.h>
-
 unsigned char cng_blocked[CNG_NR_MAX];
 
 /* Candidate syscalls: the set dispatch may re-issue to the real kernel. */
 static const int probe_set[] = {
-    __NR_openat,
-#ifdef __NR_openat2
-    __NR_openat2,
-#endif
-    __NR_newfstatat, __NR_statx,     __NR_faccessat,
-#ifdef __NR_faccessat2
-    __NR_faccessat2,
-#endif
-    __NR_readlinkat, __NR_mkdirat,   __NR_mknodat,    __NR_unlinkat,
-    __NR_fchownat,   __NR_fchmodat,  __NR_utimensat,  __NR_symlinkat,
-    __NR_linkat,     __NR_renameat,  __NR_renameat2,  __NR_truncate,
-    __NR_statfs,     __NR_chdir,     __NR_fchown,     __NR_fchmod,
-    __NR_fstat,
+    __NR_openat,     __NR_openat2,   __NR_newfstatat, __NR_statx,
+    __NR_faccessat,  __NR_faccessat2, __NR_readlinkat, __NR_mkdirat,
+    __NR_mknodat,    __NR_unlinkat,  __NR_fchownat,   __NR_fchmodat,
+    __NR_utimensat,  __NR_symlinkat, __NR_linkat,     __NR_renameat,
+    __NR_renameat2,  __NR_truncate,  __NR_statfs,     __NR_chdir,
+    __NR_fchown,     __NR_fchmod,    __NR_fstat,
     __NR_getdents64,
-#ifdef __NR_name_to_handle_at
     __NR_name_to_handle_at,
-#endif
     __NR_setxattr,   __NR_lsetxattr,  __NR_getxattr,   __NR_lgetxattr,
     __NR_listxattr,  __NR_llistxattr, __NR_removexattr, __NR_lremovexattr,
     __NR_inotify_add_watch,
@@ -61,12 +50,14 @@ static const int probe_set[] = {
      * dispatcher with no handler behind them, and reissue() must know. (The
      * probe's arguments, -1 for an area and 0 for a length, are refused
      * EINVAL before anything is registered.) */
-#ifdef __NR_rseq
     __NR_rseq,
-#endif
-#ifdef __NR_fchmodat2
     __NR_fchmodat2,
-#endif
+    /* The 6.13/6.17 dirfd forms of the xattr and file-attribute calls. A kernel
+     * without them answers ENOSYS itself, which is not a trap and not a mark;
+     * an Android filter that predates them traps, and the mark keeps their
+     * re-issue out of the handler. */
+    __NR_setxattrat, __NR_getxattrat, __NR_listxattrat, __NR_removexattrat,
+    __NR_file_getattr, __NR_file_setattr,
     __NR_bind,       __NR_connect,    __NR_sendto,     __NR_sendmsg,
     __NR_getsockname, __NR_getpeername, __NR_accept,   __NR_accept4,
     __NR_recvfrom,   __NR_recvmsg,    __NR_sendmmsg,   __NR_recvmmsg,

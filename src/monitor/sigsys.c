@@ -19,8 +19,6 @@
 #include "cng/uapi.h"
 #include "cng/ucontext.h"
 
-#include <asm/unistd.h>
-
 /* Kernel struct sigaction for AArch64 (generic layout). */
 struct cng_ksigaction {
     void *handler;
@@ -119,9 +117,7 @@ static int wait_mask_arg(long nr, int *size_arg) {
         *size_arg = 4;
         return 3;
     case __NR_epoll_pwait:
-#ifdef __NR_epoll_pwait2
     case __NR_epoll_pwait2:
-#endif
         *size_arg = 5;
         return 4;
     case __NR_pselect6:
@@ -301,13 +297,11 @@ static int sigsys_syscall(struct cng_ucontext *uc, long nr) {
                            (char **)r[2], 0);
         return cng_is_err((long)r[0]); /* success redirected the context */
     }
-#ifdef __NR_execveat
     if (nr == __NR_execveat) {
         cng_emulate_execve(uc, (int)r[0], (const char *)r[1], (char **)r[2],
                            (char **)r[3], (int)r[4]);
         return cng_is_err((long)r[0]);
     }
-#endif
 
     /* clone: the vfork-style kinds the filter traps are converted to a COW
      * fork, and the child's stack goes into the context for sigreturn to

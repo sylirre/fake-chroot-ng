@@ -11,8 +11,6 @@
 #include "cng/syscall.h"
 #include "cng/uapi.h"
 
-#include <asm/unistd.h>
-
 int cng_g_execmap_force = 0;
 
 /* MAP_TYPE: the low bits that say SHARED / PRIVATE / SHARED_VALIDATE. */

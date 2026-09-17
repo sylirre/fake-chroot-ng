@@ -32,8 +32,6 @@
 #include "cng/sysvipc.h"
 #include "cng/uapi.h"
 
-#include <asm/unistd.h>
-
 #define SEM_SET_MAX    CNG_SEMMNI /* concurrent sets in one namespace */
 #define MSG_QUEUE_MAX  CNG_MSGMNI /* concurrent queues */
 #define SEM_UNDO_MAX   4096       /* (pid, set) SEM_UNDO rows, daemon-wide */

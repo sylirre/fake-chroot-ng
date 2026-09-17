@@ -26,8 +26,6 @@
 #include "cng/syscall.h"
 #include "cng/uapi.h"
 
-#include <asm/unistd.h>
-
 /* ---- namespace key ------------------------------------------------------ */
 
 static u64 g_session;

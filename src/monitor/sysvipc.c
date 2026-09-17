@@ -27,8 +27,6 @@
 #include "cng/sysvipc.h"
 #include "cng/uapi.h"
 
-#include <asm/unistd.h>
-
 #define IPC_64 0x100 /* callers OR this into every *ctl cmd on arm64 */
 
 /* An internal semctl command shared with the daemon: a set's nsems with no

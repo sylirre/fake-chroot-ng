@@ -25,8 +25,6 @@
 #include "cng/syscall.h"
 #include "cng/uapi.h"
 
-#include <asm/unistd.h>
-
 /* IPC_64: callers OR this into the shmctl command on every arch whose libc
  * uses the 64-bit ipc structs, which on arm64 is the only layout there is. */
 #define IPC_64 0x100
@@ -407,22 +405,14 @@ static long do_shmctl(s32 shmid, int cmd, void *buf) {
 
 long cng_shm_handle(long nr, long a0, long a1, long a2) {
     switch (nr) {
-#ifdef __NR_shmget
     case __NR_shmget:
         return do_shmget((s32)a0, (u64)a1, (s32)a2);
-#endif
-#ifdef __NR_shmat
     case __NR_shmat:
         return do_shmat((s32)a0, (u64)a1, (s32)a2);
-#endif
-#ifdef __NR_shmdt
     case __NR_shmdt:
         return do_shmdt((u64)a0);
-#endif
-#ifdef __NR_shmctl
     case __NR_shmctl:
         return do_shmctl((s32)a0, (int)a1, (void *)a2);
-#endif
     default:
         return -ENOSYS;
     }

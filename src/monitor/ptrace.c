@@ -28,8 +28,6 @@
 #include "cng/syscall.h"
 #include "cng/uapi.h"
 
-#include <asm/unistd.h>
-
 int cng_g_no_ptrace = 0;
 
 /* Set once the SIGSYS handler is installed (cng_install_monitor). The stacked

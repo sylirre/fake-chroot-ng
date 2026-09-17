@@ -10,7 +10,6 @@
 #include "cng/syscall.h"
 #include "cng/uapi.h"
 
-#include <asm/unistd.h>
 #include <asm-generic/errno.h>
 
 int cng_g_l2s = 0;

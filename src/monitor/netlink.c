@@ -48,8 +48,6 @@
 
 #include "cng/broker.h" /* cng_broker_env: no getenv in a freestanding build */
 
-#include <asm/unistd.h>
-
 int cng_nl_force_block = 0;
 int cng_nl_no_relay = 0;
 int cng_nl_deny_getlink = 0;

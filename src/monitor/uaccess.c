@@ -58,8 +58,6 @@
 #include "cng/syscall.h"
 #include "cng/uapi.h"
 
-#include <asm/unistd.h>
-
 #define UA_CHUNK       4096
 #define UA_ZERO_OFF    0    /* [0,4096): never written — the write probe reads it */
 #define UA_SCRATCH_OFF 4096 /* [4096,8192): where the read probe lands */

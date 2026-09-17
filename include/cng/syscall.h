@@ -12,7 +12,8 @@
 #ifndef CNG_SYSCALL_H
 #define CNG_SYSCALL_H
 
-#include <asm/unistd.h>
+#include "cng/unistd.h"
+
 #include <asm-generic/errno.h>
 #include <stddef.h>
 #include <stdint.h>

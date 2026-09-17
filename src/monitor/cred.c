@@ -21,8 +21,6 @@
 #include "cng/syscall.h"
 #include "cng/uapi.h"
 
-#include <asm/unistd.h>
-
 int cng_g_fake_id = 0;
 int cng_g_fake_id_explicit = 0;
 unsigned cng_g_fake_uid = 0;

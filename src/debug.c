@@ -27,8 +27,6 @@
 #include "cng/uapi.h"
 #include "cng/ucontext.h"
 
-#include <asm/unistd.h>
-
 /* aarch64 struct stat accessors (for _l2stest). */
 #define ST_INO(b)   (*(unsigned long long *)((char *)(b) + 8))
 #define ST_MODE(b)  (*(unsigned *)((char *)(b) + 16))
@@ -289,7 +287,90 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
         long r = cng_dispatch(__NR_getxattr, (long)gpath, (long)"user.cng.probe",
                               (long)val, sizeof val, 0, 0, 0);
         cng_dprintf(1, "getxa: errno %d\n", r < 0 ? (int)-r : 0);
+        /* The dirfd form (6.13) asks the same question of (dirfd, path), and
+         * was in no table at all: the build's headers ended before it. A host
+         * without it says ENOSYS, which the leg reads as "cannot be asked
+         * here" rather than as an answer. */
+        struct {
+            unsigned long value;
+            unsigned size, flags;
+        } xa = {(unsigned long)val, sizeof val, 0};
+        r = cng_dispatch(__NR_getxattrat, CNG_AT_FDCWD, (long)gpath, 0,
+                         (long)"user.cng.probe", (long)&xa, sizeof xa, 0);
+        cng_dprintf(1, "getxaat: errno %d\n", r < 0 ? (int)-r : 0);
         return 0;
+    }
+    /* The six path-bearing syscalls born after the old table's last entry
+     * (setxattrat, getxattrat, listxattrat, removexattrat; file_getattr,
+     * file_setattr), checked for what can be checked without a kernel that
+     * has them: the decisions the dispatcher takes on the guest's own spelling
+     * BEFORE the re-issue. A ".." walked through a file is ENOTDIR — which
+     * proves the path was read from a1 with the dirfd from a0 — and an empty
+     * name is ENOENT without AT_EMPTY_PATH and passes with it (the flag's own
+     * slot differs between the two families). `gpath` names a regular file. */
+    if (!strcmp(op, "newat")) {
+        char dd[CNG_PATH_MAX];
+        size_t gl = cng_strlcpy(dd, gpath, sizeof dd);
+        cng_strlcpy(dd + gl, "/../x", sizeof dd - gl);
+        char val[64];
+        struct {
+            unsigned long value;
+            unsigned size, flags;
+        } xa = {(unsigned long)val, sizeof val, 0};
+        unsigned long fa[3] = {0, 0, 0}; /* struct file_attr: 24 bytes */
+        struct {
+            const char *name;
+            long want;
+            long r;
+        } t[] = {
+            {"getxattrat-dotdot", -ENOTDIR,
+             cng_dispatch(__NR_getxattrat, CNG_AT_FDCWD, (long)dd, 0,
+                          (long)"user.x", (long)&xa, sizeof xa, 0)},
+            {"setxattrat-dotdot", -ENOTDIR,
+             cng_dispatch(__NR_setxattrat, CNG_AT_FDCWD, (long)dd, 0,
+                          (long)"user.x", (long)&xa, sizeof xa, 0)},
+            {"listxattrat-dotdot", -ENOTDIR,
+             cng_dispatch(__NR_listxattrat, CNG_AT_FDCWD, (long)dd, 0,
+                          (long)val, sizeof val, 0, 0)},
+            {"removexattrat-dotdot", -ENOTDIR,
+             cng_dispatch(__NR_removexattrat, CNG_AT_FDCWD, (long)dd, 0,
+                          (long)"user.x", 0, 0, 0)},
+            {"file_getattr-dotdot", -ENOTDIR,
+             cng_dispatch(__NR_file_getattr, CNG_AT_FDCWD, (long)dd, (long)fa,
+                          sizeof fa, 0, 0, 0)},
+            {"file_setattr-dotdot", -ENOTDIR,
+             cng_dispatch(__NR_file_setattr, CNG_AT_FDCWD, (long)dd, (long)fa,
+                          sizeof fa, 0, 0, 0)},
+            {"getxattrat-empty", -ENOENT,
+             cng_dispatch(__NR_getxattrat, CNG_AT_FDCWD, (long)"", 0,
+                          (long)"user.x", (long)&xa, sizeof xa, 0)},
+            {"file_getattr-empty", -ENOENT,
+             cng_dispatch(__NR_file_getattr, CNG_AT_FDCWD, (long)"", (long)fa,
+                          sizeof fa, 0, 0, 0)},
+        };
+        int fails = 0;
+        for (unsigned i = 0; i < sizeof t / sizeof *t; i++) {
+            int ok = t[i].r == t[i].want;
+            cng_dprintf(1, "newat %s: rc=%d -> %s\n", t[i].name, (int)t[i].r,
+                        ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+        /* With the flag, the empty name is the dirfd itself and goes over: any
+         * answer but the ENOENT of the check above says the flag was read from
+         * the right slot (a kernel without the call says ENOSYS, one with it
+         * answers for the cwd). */
+        long ge = cng_dispatch(__NR_getxattrat, CNG_AT_FDCWD, (long)"",
+                               CNG_AT_EMPTY_PATH, (long)"user.x", (long)&xa,
+                               sizeof xa, 0);
+        long fe = cng_dispatch(__NR_file_getattr, CNG_AT_FDCWD, (long)"",
+                               (long)fa, sizeof fa, CNG_AT_EMPTY_PATH, 0, 0);
+        int ok = ge != -ENOENT && fe != -ENOENT;
+        cng_dprintf(1, "newat empty-path-flag: getxattrat=%d file_getattr=%d"
+                       " -> %s\n",
+                    (int)ge, (int)fe, ok ? "OK" : "FAIL");
+        fails += !ok;
+        cng_dprintf(1, "newat: %d failures\n", fails);
+        return fails ? 1 : 0;
     }
     /* inotify_add_watch was never trapped either, and its a0 is the inotify
      * instance rather than a dirfd, so the guest's absolute path went to the
@@ -379,30 +460,14 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
             const char *name;
             long nr;
         } d[] = {
-#ifdef __NR_io_uring_setup
             {"io_uring_setup", __NR_io_uring_setup},
-#endif
-#ifdef __NR_io_uring_enter
             {"io_uring_enter", __NR_io_uring_enter},
-#endif
-#ifdef __NR_io_uring_register
             {"io_uring_register", __NR_io_uring_register},
-#endif
-#ifdef __NR_clone3
             {"clone3", __NR_clone3},
-#endif
-#ifdef __NR_statmount
             {"statmount", __NR_statmount},
-#endif
-#ifdef __NR_open_tree
             {"open_tree", __NR_open_tree},
-#endif
-#ifdef __NR_mq_open
             {"mq_open", __NR_mq_open},
-#endif
-#ifdef __NR_mq_timedsend
             {"mq_timedsend", __NR_mq_timedsend},
-#endif
             {"mount", __NR_mount},
             {"umount2", __NR_umount2},
             {"pivot_root", __NR_pivot_root},
@@ -477,7 +542,6 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
         cng_dprintf(1, "access: %s\n", r == 0 ? "ok" : "no");
         return r == 0 ? 0 : 1;
     }
-#ifdef __NR_faccessat2
     /* faccessat2's AT_SYMLINK_NOFOLLOW asks about the link itself, so a
      * dangling one exists (F_OK) where following it is ENOENT. Resolving the
      * final component during translation answered for the target instead. */
@@ -497,7 +561,6 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
         cng_dprintf(1, "accessnf: nofollow=%d follow=%d\n", (int)f, (int)d);
         return 0;
     }
-#endif
     /* faccessat(2) takes three arguments — dirfd, path, mode — and has no flags
      * word at all; only faccessat2 does. x3 is therefore whatever the caller
      * happened to leave there, and no part of the answer may depend on it. The
@@ -729,6 +792,13 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
                                        0, 0, 0, 0, 0)},
             {"fchownat", cng_dispatch(__NR_fchownat, CNG_AT_FDCWD, (long)gpath, 0,
                                       0, 0, 0, 0)},
+            /* The 6.13/6.17 dirfd forms: setters, so EROFS under :ro. */
+            {"setxattrat",
+             cng_dispatch(__NR_setxattrat, CNG_AT_FDCWD, (long)gpath, 0,
+                          (long)"user.cng", 0, 0, 0)},
+            {"file_setattr",
+             cng_dispatch(__NR_file_setattr, CNG_AT_FDCWD, (long)gpath, 0, 24, 0,
+                          0, 0)},
         };
         for (unsigned i = 0; i < sizeof t / sizeof *t; i++) {
             int is_read = !strcmp(t[i].name, "read") ||
@@ -836,6 +906,12 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
             {"setxattr",
              cng_dispatch(__NR_setxattr, (long)gpath, (long)"user.cng",
                           (long)"1", 1, 0, 0, 0)},
+            {"setxattrat",
+             cng_dispatch(__NR_setxattrat, CNG_AT_FDCWD, (long)gpath,
+                          CNG_AT_SYMLINK_NOFOLLOW, (long)"user.cng", 0, 0, 0)},
+            {"file_setattr",
+             cng_dispatch(__NR_file_setattr, CNG_AT_FDCWD, (long)gpath, 0, 24,
+                          0, 0, 0)},
             {"unlinkat", cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)gsib, 0,
                                       0, 0, 0, 0)},
         };
@@ -3138,9 +3214,9 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
      * was EOPNOTSUPP; openat2 drew ELOOP from O_NOFOLLOW, and from
      * RESOLVE_NO_SYMLINKS in our own walk. Each lands on the data now, shown
      * through ANOTHER name of the group where the call has an effect to show.
-     * Legs the host cannot issue (no openat2 under qemu-user, a build whose
-     * headers predate fchmodat2, a filesystem without user xattrs or file
-     * handles) report themselves skipped rather than failed. */
+     * Legs the host cannot issue (no openat2 under qemu-user, a kernel that
+     * predates fchmodat2, a filesystem without user xattrs or file handles)
+     * report themselves skipped rather than failed. */
     {
         int opath_reg = 0, handle_same = -1, xattr = -1, watch = 0, chmod2 = -1,
             o2_nofollow = -1, o2_nosym = -1;
@@ -3209,7 +3285,6 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
             sys_close((int)ifd);
         }
         /* (e) fchmodat2(AT_SYMLINK_NOFOLLOW): the mode lands on the data */
-#ifdef __NR_fchmodat2
         long cm = cng_dispatch(__NR_fchmodat2, CNG_AT_FDCWD, (long)"/w/f", 0640,
                                CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0);
         if (cm == 0) {
@@ -3222,9 +3297,7 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
         } else if (cm != -ENOSYS) {
             chmod2 = 0;
         }
-#endif
         /* (f) openat2: O_NOFOLLOW in the how, and RESOLVE_NO_SYMLINKS */
-#ifdef __NR_openat2
         struct cng_open_how how = {CNG_O_RDONLY | CNG_O_NOFOLLOW, 0, 0};
         long o2 = cng_dispatch(__NR_openat2, CNG_AT_FDCWD, (long)"/w/f",
                                (long)&how, sizeof how, 0, 0, 0);
@@ -3248,7 +3321,6 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
         } else if (o2 != -ENOSYS) {
             o2_nosym = 0;
         }
-#endif
         int ok = opath_reg && handle_same != 0 && xattr != 0 && watch &&
                  chmod2 != 0 && o2_nofollow != 0 && o2_nosym != 0;
         cng_dprintf(1,
@@ -4526,7 +4598,6 @@ int cng_cmd_o2test(int argc, char **argv, char **envp, unsigned long *auxv) {
 #undef O2_WANT
 #undef O2_RESOLVE
 
-#ifdef __NR_openat2
     /* End to end, through the dispatcher: a scoped openat2 whose name lands on
      * a file chroot-ng synthesizes. The kernel cannot produce that answer — the
      * pass-through route would hand it the HOST's /proc/mounts, or, on a host
@@ -4629,7 +4700,6 @@ int cng_cmd_o2test(int argc, char **argv, char **envp, unsigned long *auxv) {
                     small, e2big, bad, over, zero, ok ? "OK" : "FAIL");
         fails += !ok;
     }
-#endif
 
     cng_dprintf(1, "o2test: %d failure(s)\n", fails);
     return fails ? 1 : 0;
@@ -6227,10 +6297,8 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
          CNG_SECCOMP_RET_ALLOW},
         {"preadv of a synth fd traps", __NR_preadv, 0x1000, 1023,
          CNG_SECCOMP_RET_TRAP},
-#ifdef __NR_preadv2
         {"preadv2 of an ordinary fd runs native", __NR_preadv2, 0x1000, 7,
          CNG_SECCOMP_RET_ALLOW},
-#endif
         {"write is never trapped", __NR_write, 0x1000, 1008,
          CNG_SECCOMP_RET_ALLOW},
         /* System V shm: always trapped, so the guest gets the emulated
@@ -6242,24 +6310,16 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
         /* Designed-ENOSYS: io_uring must be refused by the filter itself. Its
          * ring operations never execute an svc, so a created ring would reach
          * the host filesystem with no trap and no translation. */
-#ifdef __NR_io_uring_setup
         {"io_uring_setup is refused ENOSYS", __NR_io_uring_setup, 0x1000, 0,
          CNG_SECCOMP_RET_ERRNO | 38 /*ENOSYS*/},
-#endif
-#ifdef __NR_io_uring_enter
         {"io_uring_enter is refused ENOSYS", __NR_io_uring_enter, 0x1000, 0,
          CNG_SECCOMP_RET_ERRNO | 38},
-#endif
-#ifdef __NR_io_uring_register
         {"io_uring_register is refused ENOSYS", __NR_io_uring_register, 0x1000,
          0, CNG_SECCOMP_RET_ERRNO | 38},
-#endif
         /* ...including from inside the gate. The gate exempts our own
          * re-issues, but we never issue io_uring, so it must not be a hole. */
-#ifdef __NR_io_uring_setup
         {"in-gate io_uring is refused too", __NR_io_uring_setup, gate, 0,
          CNG_SECCOMP_RET_ERRNO | 38},
-#endif
         /* acct(2) carries a path and reached the host with the guest's own
          * spelling: unprivileged that is EPERM, but chroot-ng run as root would
          * have turned on the machine's process accounting to whatever the guest
@@ -6271,10 +6331,8 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
          * pthread_create back on __NR_clone, which the conversion below
          * handles. A CLONE_VM|CLONE_VFORK clone3 would otherwise reach the
          * emulated execve with the parent's address space still shared. */
-#ifdef __NR_clone3
         {"clone3 is refused ENOSYS", __NR_clone3, 0x1000, 0,
          CNG_SECCOMP_RET_ERRNO | 38},
-#endif
         /* SysV sem/msg: emulated from the same broker as shm, and trapped
          * unconditionally for the same reason — one guest namespace whatever
          * the host's own IPC would have allowed. */
@@ -6287,38 +6345,51 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
         /* POSIX mqueue: the same leak in the namespace next door. An mq name is
          * not a path, so nothing translates it — left native the guest opened
          * queues in the HOST's mqueue namespace. */
-#ifdef __NR_mq_open
         {"mq_open is refused ENOSYS", __NR_mq_open, 0x1000, 0,
          CNG_SECCOMP_RET_ERRNO | 38},
-#endif
-#ifdef __NR_mq_timedsend
         {"mq_timedsend is refused ENOSYS", __NR_mq_timedsend, 0x1000, 0,
          CNG_SECCOMP_RET_ERRNO | 38},
-#endif
-#ifdef __NR_mq_getsetattr
         {"mq_getsetattr is refused ENOSYS", __NR_mq_getsetattr, 0x1000, 0,
          CNG_SECCOMP_RET_ERRNO | 38},
-#endif
         /* ...while shm stays emulated, not refused. */
         {"shmget still traps for emulation", __NR_shmget, 0x1000, 0,
          CNG_SECCOMP_RET_TRAP},
-#ifdef __NR_fchmodat2
         /* fchmodat2 is translated, not refused: it is glibc's modern chmod. */
         {"fchmodat2 traps for translation", __NR_fchmodat2, 0x1000, 0,
          CNG_SECCOMP_RET_TRAP},
-#endif
-#ifdef __NR_clone3
+        /* The path-bearing syscalls born after this table's last entry: the
+         * numbers come from our own table now, so a binary built anywhere
+         * traps them on a kernel that has them (6.13 and 6.17). */
+        {"setxattrat traps for translation", __NR_setxattrat, 0x1000, 0,
+         CNG_SECCOMP_RET_TRAP},
+        {"getxattrat traps for translation", __NR_getxattrat, 0x1000, 0,
+         CNG_SECCOMP_RET_TRAP},
+        {"listxattrat traps for translation", __NR_listxattrat, 0x1000, 0,
+         CNG_SECCOMP_RET_TRAP},
+        {"removexattrat traps for translation", __NR_removexattrat, 0x1000, 0,
+         CNG_SECCOMP_RET_TRAP},
+        {"file_getattr traps for translation", __NR_file_getattr, 0x1000, 0,
+         CNG_SECCOMP_RET_TRAP},
+        {"file_setattr traps for translation", __NR_file_setattr, 0x1000, 0,
+         CNG_SECCOMP_RET_TRAP},
+        {"open_tree_attr is refused ENOSYS", __NR_open_tree_attr, 0x1000, 0,
+         CNG_SECCOMP_RET_ERRNO | 38},
+        {"open_tree is refused ENOSYS", __NR_open_tree, 0x1000, 0,
+         CNG_SECCOMP_RET_ERRNO | 38},
+        {"statmount is refused ENOSYS", __NR_statmount, 0x1000, 0,
+         CNG_SECCOMP_RET_ERRNO | 38},
+        {"openat2 traps for translation", __NR_openat2, 0x1000, 0,
+         CNG_SECCOMP_RET_TRAP},
+        {"execveat traps for emulation", __NR_execveat, 0x1000, 0,
+         CNG_SECCOMP_RET_TRAP},
         {"plain clone still traps for the conversion", __NR_clone, 0x1000,
          CNG_CLONE_VM | CNG_CLONE_VFORK, CNG_SECCOMP_RET_TRAP},
-#endif
         /* seccomp(2): a guest filter would also govern the syscalls the handler
          * re-issues through the gate. Refused by the filter itself. */
-#ifdef __NR_seccomp
         {"seccomp(2) is refused ENOSYS", __NR_seccomp, 0x1000, 0,
          CNG_SECCOMP_RET_ERRNO | 38},
         {"in-gate seccomp(2) is refused too", __NR_seccomp, gate, 0,
          CNG_SECCOMP_RET_ERRNO | 38},
-#endif
         /* prctl is selective: the four ops that describe OUR confinement are
          * trapped, and the rest of the syscall — real process state, some of it
          * on the hot path — is not. */
@@ -6434,12 +6505,10 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
              CNG_SECCOMP_RET_TRAP},
             {"epoll_pwait with none (epoll_wait) runs native",
              __NR_epoll_pwait, 4, 0, 0, CNG_SECCOMP_RET_ALLOW},
-#ifdef __NR_epoll_pwait2
             {"epoll_pwait2 with a mask traps", __NR_epoll_pwait2, 4, 0x9abc,
              0, CNG_SECCOMP_RET_TRAP},
             {"epoll_pwait2 with none runs native", __NR_epoll_pwait2, 4, 0, 0,
              CNG_SECCOMP_RET_ALLOW},
-#endif
             {"rt_sigsuspend always traps", __NR_rt_sigsuspend, 0, 0, 0,
              CNG_SECCOMP_RET_TRAP},
             {"rt_sigtimedwait always traps", __NR_rt_sigtimedwait, 0, 0, 0,
@@ -7160,7 +7229,6 @@ int cng_cmd_shmtest(int argc, char **argv, char **envp, unsigned long *auxv) {
                     ok ? "OK" : "FAIL");
         fails += !ok;
     }
-
 
     /* 1) create, attach, and see the memory. */
     long id = shm_call(__NR_shmget, 0 /*IPC_PRIVATE*/, SHMT_SZ,

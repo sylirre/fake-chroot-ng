@@ -94,6 +94,11 @@ $(BUILD)/%.c.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
+# The syscall table is ours (include/cng/unistd.h); this unit holds it against
+# the build host's <asm/unistd.h>, and a number the two spell differently is a
+# macro redefinition — an error here, so it cannot be built past.
+$(BUILD)/src/rt/unistd_check.c.o: CFLAGS += -Werror
+
 $(BUILD)/%.S.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
