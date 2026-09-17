@@ -56,6 +56,7 @@ int cng_cmd_sigsystest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_argvtest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_stackguardtest(int argc, char **argv, char **envp,
                            unsigned long *auxv);
+int cng_cmd_execmaptest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_elfspan(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_elfinterp(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_imgtest(int argc, char **argv, char **envp, unsigned long *auxv);
@@ -92,6 +93,7 @@ static const struct test_entry g_tests[] = {
     {"exectest", cng_cmd_exectest},     {"cloexectest", cng_cmd_cloexectest},
     {"stackswtest", cng_cmd_stackswtest}, {"argvtest", cng_cmd_argvtest},
     {"stackguardtest", cng_cmd_stackguardtest},
+    {"execmaptest", cng_cmd_execmaptest},
     {"nesttest", cng_cmd_nesttest},     {"sigsystest", cng_cmd_sigsystest},
     {"elfspan", cng_cmd_elfspan},
     {"elfinterp", cng_cmd_elfinterp},

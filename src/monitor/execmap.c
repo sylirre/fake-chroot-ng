@@ -199,9 +199,9 @@ long cng_execmap(unsigned long addr, unsigned long len, long prot, long flags,
     if (cng_is_err((long)p))
         return native;
 
-    /* Fill it. Past end-of-file this leaves zeroes where a real file mapping
-     * would fault SIGBUS — the more forgiving of the two, and the same thing
-     * the loader's anonymous strategy does with a segment's bss tail. */
+    /* Fill it. The bytes of the partial page past end-of-file stay zero, which
+     * is what a file mapping reads there too; the pages wholly past it are
+     * dealt with below, once the copy is protected. */
     long got = fill_from_file(mfd, (char *)p, mlen, off);
     if (got < 0) {
         sys_munmap(p, mlen);
@@ -220,10 +220,33 @@ long cng_execmap(unsigned long addr, unsigned long len, long prot, long flags,
     }
     if (prot & CNG_PROT_EXEC)
         cng_flush_icache(p, (char *)p + mlen);
+
+    /* The pages wholly past end-of-file. A file mapping answers a fault on one
+     * of those with SIGBUS — the kernel checks the file's size at fault time,
+     * page by page, and only the partial last page reads as zeroes — so a
+     * truncated object dies at the first touch past its end. The copy read on
+     * with zeroes instead: a page of zero words is `udf #0`, so code ran to a
+     * SIGILL some way past the truncation, and data read as zero with no word
+     * said. The tail goes back under the file: a file mapping without
+     * PROT_EXEC is one no mount and no policy refuses for a file we could
+     * pread, and every page of it past EOF faults exactly as the kernel's would
+     * — and stops faulting if the file grows, as the kernel's would. Where even
+     * that is refused, PROT_NONE: SIGSEGV for SIGBUS, at the same place. A
+     * mapping that starts past EOF (got == 0) is the tail entire. */
+    unsigned long have = cng_page_up((unsigned long)got);
+    if (have < mlen) {
+        void *t = sys_mmap((char *)p + have, mlen - have,
+                           (int)prot & ~CNG_PROT_EXEC,
+                           CNG_MAP_PRIVATE | CNG_MAP_FIXED, mfd,
+                           (long)(off + have));
+        if (cng_is_err((long)t))
+            sys_mprotect((char *)p + have, mlen - have, CNG_PROT_NONE);
+    }
     if (cng_g_debug)
         cng_dprintf(2,
                     "[cng] execmap fd=%d off=%lu len=%lu prot=%ld -> %p"
-                    " (anon copy of %ld bytes, %d svc sites)\n",
-                    mfd, off, mlen, prot, p, got, sites);
+                    " (anon copy of %ld bytes, %d svc sites, %lu past eof)\n",
+                    mfd, off, mlen, prot, p, got, sites,
+                    have < mlen ? mlen - have : 0);
     return (long)p;
 }

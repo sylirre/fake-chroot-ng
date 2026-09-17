@@ -8,6 +8,7 @@
  */
 #include "cng/broker.h"
 #include "cng/elf.h"
+#include "cng/execmap.h"
 #include "cng/l2s.h"
 #include "cng/loader.h"
 #include "cng/monitor.h"
@@ -4089,6 +4090,111 @@ int cng_cmd_stackguardtest(int argc, char **argv, char **envp,
     if (lo && len)
         sys_munmap((void *)lo, len);
     return ok ? 0 : 1;
+}
+
+/* _execmaptest — the mmap hook's anonymous copy, past the end of the file.
+ *
+ * A file mapping longer than its file answers a fault on any page wholly past
+ * EOF with SIGBUS (the kernel checks i_size at fault time, page by page) and
+ * reads the partial last page as zeroes past the end. The copy cng_execmap
+ * makes pread what the file had and left the rest zero, so a truncated object
+ * read on where the kernel's mapping would have died. Differential: the same
+ * three-page mapping of a one-and-a-bit-page file, once from the hook (forced
+ * onto the anonymous route) and once as the kernel's own PROT_READ mapping,
+ * probed page by page from a child — the signal, or none, must agree; and a
+ * mapping that begins past EOF, which is the tail entire. */
+static int execmap_probe(unsigned long addr) {
+    long p = sys_fork();
+    if (p == 0) {
+        volatile unsigned char *b = (volatile unsigned char *)addr;
+        sys_exit_group(b[0] == 0x5a ? 1 : 2);
+    }
+    if (p < 0)
+        return -1;
+    int st = 0;
+    sys_wait4((int)p, &st, 0, 0);
+    if (st & 0x7f)
+        return 100 + (st & 0x7f); /* 107 SIGBUS, 111 SIGSEGV */
+    return (st >> 8) & 0xff;      /* 1: the marker, 2: something else */
+}
+
+int cng_cmd_execmaptest(int argc, char **argv, char **envp,
+                        unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    unsigned long pg = cng_page_size;
+    long fd = sys_memfd_create("cng-execmap-eof", 0);
+    if (fd < 0) {
+        cng_dprintf(1, "execmap: memfd_create errno=%d -> SKIP\n", (int)-fd);
+        return 0;
+    }
+    /* One page and 100 bytes of 0x5a. */
+    unsigned char buf[256];
+    memset(buf, 0x5a, sizeof buf);
+    for (unsigned long w = 0; w < pg + 100;) {
+        unsigned long n = pg + 100 - w;
+        if (n > sizeof buf)
+            n = sizeof buf;
+        if (sys_write((int)fd, buf, n) != (long)n) {
+            cng_dprintf(1, "execmap: write failed -> FAIL\n");
+            return 1;
+        }
+        w += n;
+    }
+
+    cng_g_execmap_force = 1;
+    long ours = cng_execmap(0, 3 * pg, CNG_PROT_READ | CNG_PROT_EXEC,
+                            CNG_MAP_PRIVATE, fd, 0);
+    long tail = cng_execmap(0, pg, CNG_PROT_READ | CNG_PROT_EXEC,
+                            CNG_MAP_PRIVATE, fd, 4 * pg);
+    cng_g_execmap_force = 0;
+    void *ref = sys_mmap(0, 3 * pg, CNG_PROT_READ, CNG_MAP_PRIVATE, (int)fd, 0);
+    void *rtail = sys_mmap(0, pg, CNG_PROT_READ, CNG_MAP_PRIVATE, (int)fd,
+                           (long)(4 * pg));
+    int fails = 0;
+    if (cng_is_err(ours) || cng_is_err(tail) || cng_is_err((long)ref) ||
+        cng_is_err((long)rtail)) {
+        cng_dprintf(1, "execmap: mapping failed (ours=%ld tail=%ld ref=%ld"
+                       " rtail=%ld) -> FAIL\n",
+                    ours, tail, (long)ref, (long)rtail);
+        return 1;
+    }
+    /* Page 0: the marker. Page 1: the marker up to byte 100, then zeroes
+     * (the partial page). Page 2: wholly past EOF. Then the tail mapping. */
+    struct {
+        const char *what;
+        unsigned long o, r;
+    } legs[] = {
+        {"page0", (unsigned long)ours, (unsigned long)ref},
+        {"page1-head", (unsigned long)ours + pg + 50, (unsigned long)ref + pg + 50},
+        {"page1-zeroes", (unsigned long)ours + pg + 200,
+         (unsigned long)ref + pg + 200},
+        {"page2-past-eof", (unsigned long)ours + 2 * pg,
+         (unsigned long)ref + 2 * pg},
+        {"whole-mapping-past-eof", (unsigned long)tail, (unsigned long)rtail},
+    };
+    for (unsigned i = 0; i < sizeof legs / sizeof legs[0]; i++) {
+        int o = execmap_probe(legs[i].o), r = execmap_probe(legs[i].r);
+        int ok = o == r;
+        cng_dprintf(1, "execmap %s: ours=%d kernel=%d -> %s\n", legs[i].what, o,
+                    r, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+    /* ...and the kernel's answer for the pages past EOF really is SIGBUS, so
+     * an agreement above is not two mappings that both merely died. */
+    int sb = execmap_probe((unsigned long)ref + 2 * pg) == 107;
+    cng_dprintf(1, "execmap kernel past-eof is SIGBUS: %d -> %s\n", sb,
+                sb ? "OK" : "FAIL");
+    fails += !sb;
+    sys_munmap((void *)ours, 3 * pg);
+    sys_munmap((void *)tail, pg);
+    sys_munmap(ref, 3 * pg);
+    sys_munmap(rtail, pg);
+    sys_close((int)fd);
+    cng_dprintf(1, "execmap: %d failure(s)\n", fails);
+    return fails ? 1 : 0;
 }
 
 /* _elfspan — a PT_LOAD whose file part reaches past its memory part, and the

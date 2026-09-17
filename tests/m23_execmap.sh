@@ -26,6 +26,25 @@ check_contains "an anonymous executable mapping runs native" \
 check_contains "an ordinary RW allocation runs native" \
     "bpftest mmap an anonymous RW allocation runs native: ALLOW -> OK" "$out"
 
+# What lies past the end of the file. A file mapping longer than its file
+# answers a fault on any page wholly past EOF with SIGBUS, and a truncated
+# object dies there; the anonymous copy pread what the file had and left the
+# rest zero, so the same object ran on -- into pages of `udf #0` for code, and
+# into zeroes with no word said for data. The tail is put back under the file
+# now (a mapping without PROT_EXEC is one no mount refuses), and the self-test
+# is a differential against the kernel's own mapping of the same file, page by
+# page, from a child that touches each.
+out=$(run -t execmaptest 2>&1); rc=$?
+check "execmaptest exit 0" 0 $rc
+check_contains "a page wholly past EOF faults as the kernel's would" \
+    "execmap page2-past-eof: ours=107 kernel=107 -> OK" "$out"
+check_contains "...and so does a mapping that begins past EOF" \
+    "execmap whole-mapping-past-eof: ours=107 kernel=107 -> OK" "$out"
+check_contains "the partial last page still reads as zeroes, as the kernel's does" \
+    "execmap page1-zeroes: ours=2 kernel=2 -> OK" "$out"
+check_contains "and the kernel's answer really is SIGBUS, not two mappings that both died" \
+    "execmap kernel past-eof is SIGBUS: 1 -> OK" "$out"
+
 XMR=$(mktemp -d)
 mkdir -p "$XMR/bin" "$XMR/etc"
 printf 'GREETING-VIA-EXECMAP' > "$XMR/etc/greeting"

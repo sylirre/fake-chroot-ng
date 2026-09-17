@@ -2483,6 +2483,33 @@ vfork/`posix_spawn` child-stack handling.
   stack, and an unbounded one dies of SIGSEGV where it used to write into its
   neighbour.
 
+- [x] **M41 — the mmap hook's copy read on past the end of the file**
+  A file mapping longer than its file answers a fault on any page wholly
+  past EOF with SIGBUS (the kernel checks `i_size` at fault time, page by
+  page), and only the partial last page reads as zeroes past the end — so a
+  truncated object dies at the first touch past its end. The anonymous copy
+  `cng_execmap` makes in place of a refused PROT_EXEC file mapping pread what
+  the file had and left the rest zero, and the same object ran on: a page of
+  zero words is `udf #0`, so code reached a SIGILL some way past the
+  truncation, and data read as zero with no word said. Measured with
+  `-t execmaptest` before the fix: a page past EOF read 0 from the copy where
+  the kernel's own mapping of the same file died of SIGBUS.
+  The tail goes back under the file: a file mapping without PROT_EXEC is one
+  no mount and no policy refuses for a file we could pread, so the pages
+  wholly past EOF are MAP_FIXED from the file at the same offset with the
+  guest's protection minus execute — every one faults exactly as the
+  kernel's would, and stops faulting if the file grows, as the kernel's
+  would. Where even that is refused the tail is PROT_NONE: SIGSEGV for
+  SIGBUS, at the same place. A mapping that begins past EOF is the tail
+  entire; the partial last page already matched.
+  `-t execmaptest` is a differential: the same three-page mapping of a
+  one-and-a-bit-page file, once from the hook (forced onto the anonymous
+  route) and once as the kernel's own PROT_READ mapping, probed page by page
+  from a child — the marker page, the partial page's head and zero tail, the
+  page past EOF and a mapping that begins past EOF must answer alike, and the
+  kernel's answer for the pages past EOF is checked to be SIGBUS, so an
+  agreement is not two mappings that both merely died.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes
