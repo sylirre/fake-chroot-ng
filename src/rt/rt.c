@@ -3,10 +3,48 @@
 #include "cng/rt.h"
 #include "cng/syscall.h"
 
-/* ---- mem/str ---------------------------------------------------------- */
+/* ---- mem/str ----------------------------------------------------------
+ *
+ * Word-at-a-time, on the general registers only: the Makefile builds the
+ * monitor with -mgeneral-regs-only because on the -R tier this code runs on
+ * the guest's own register file, so there is no SIMD to be had and the wide
+ * loads and stores are 64-bit. A copy reads its source at whatever alignment
+ * it arrives with — AArch64 takes an unaligned access of Normal memory in
+ * stride — and aligns only its stores, which is what the prologue byte loops
+ * are for. The string scans are stricter: a word is loaded only ALIGNED, and
+ * only once some byte of the string is known to lie in it, so no load ever
+ * reaches past the page that byte is on — a string ending on the last byte of
+ * a mapping is read to its terminator and not one byte further. That is the
+ * one rule an unaligned word load would break (a 2-byte string at the end of
+ * a page has 6 bytes of the next page in its word), and why cng_strlcpy
+ * aligns on the SOURCE, not on the destination like the copies do.
+ */
+
+/* An 8-byte access the compiler may make at any address (aligned(1)) and
+ * through any pointer (may_alias); the aligned twin is for the scans. */
+typedef u64 __attribute__((__may_alias__, __aligned__(1))) u64_ua;
+typedef u64 __attribute__((__may_alias__)) u64_al;
+
+#define RT_ONES  0x0101010101010101ULL
+#define RT_HIGHS 0x8080808080808080ULL
+/* Non-zero iff some byte of `w` is zero. Bits above the first zero byte may be
+ * set spuriously, so a hit is followed by a byte scan of the word; a miss is
+ * exact. */
+#define RT_HAS_ZERO(w) ((((w) - RT_ONES) & ~(w)) & RT_HIGHS)
+
+static inline int rt_unaligned(const void *p) { return (uintptr_t)p & 7; }
 
 void *memset(void *d, int c, size_t n) {
     unsigned char *p = d;
+    if (n >= 16) {
+        u64 w = (unsigned char)c * RT_ONES;
+        while (rt_unaligned(p)) {
+            *p++ = (unsigned char)c;
+            n--;
+        }
+        for (; n >= 8; n -= 8, p += 8)
+            *(u64_al *)p = w;
+    }
     while (n--)
         *p++ = (unsigned char)c;
     return d;
@@ -15,20 +53,52 @@ void *memset(void *d, int c, size_t n) {
 void *memcpy(void *d, const void *s, size_t n) {
     unsigned char *a = d;
     const unsigned char *b = s;
+    if (n >= 16) {
+        while (rt_unaligned(a)) {
+            *a++ = *b++;
+            n--;
+        }
+        for (; n >= 8; n -= 8, a += 8, b += 8)
+            *(u64_al *)a = *(const u64_ua *)b;
+    }
     while (n--)
         *a++ = *b++;
     return d;
 }
 
+/* Overlap is safe either way round with whole words: copying upwards for
+ * d < s, a store lands below the next load; copying downwards for d > s, it
+ * lands above it. */
 void *memmove(void *d, const void *s, size_t n) {
     unsigned char *a = d;
     const unsigned char *b = s;
+    if (a == b || !n)
+        return d;
     if (a < b) {
+        if (n >= 16) {
+            while (rt_unaligned(a)) {
+                *a++ = *b++;
+                n--;
+            }
+            for (; n >= 8; n -= 8, a += 8, b += 8)
+                *(u64_al *)a = *(const u64_ua *)b;
+        }
         while (n--)
             *a++ = *b++;
     } else {
         a += n;
         b += n;
+        if (n >= 16) {
+            while (rt_unaligned(a)) {
+                *--a = *--b;
+                n--;
+            }
+            for (; n >= 8; n -= 8) {
+                a -= 8;
+                b -= 8;
+                *(u64_al *)a = *(const u64_ua *)b;
+            }
+        }
         while (n--)
             *--a = *--b;
     }
@@ -37,6 +107,11 @@ void *memmove(void *d, const void *s, size_t n) {
 
 int memcmp(const void *a, const void *b, size_t n) {
     const unsigned char *x = a, *y = b;
+    /* Whole words while they agree; the first that does not is left to the
+     * byte loop, which finds the differing byte within it. */
+    for (; n >= 8; n -= 8, x += 8, y += 8)
+        if (*(const u64_ua *)x != *(const u64_ua *)y)
+            break;
     while (n--) {
         if (*x != *y)
             return (int)*x - (int)*y;
@@ -48,15 +123,28 @@ int memcmp(const void *a, const void *b, size_t n) {
 
 size_t strlen(const char *s) {
     const char *p = s;
-    while (*p)
-        p++;
+    for (; rt_unaligned(p); p++)
+        if (!*p)
+            return (size_t)(p - s);
+    const u64_al *w = (const u64_al *)p;
+    while (!RT_HAS_ZERO(*w))
+        w++;
+    for (p = (const char *)w; *p; p++)
+        ;
     return (size_t)(p - s);
 }
 
 size_t cng_strnlen(const char *s, size_t max) {
     size_t i = 0;
-    while (i < max && s[i])
-        i++;
+    for (; i < max && rt_unaligned(s + i); i++)
+        if (!s[i])
+            return i;
+    /* A word is loaded only when all 8 of its bytes are within the bound,
+     * so this is exactly the read the byte loop would have made. */
+    for (; max - i >= 8 && !RT_HAS_ZERO(*(const u64_al *)(s + i)); i += 8)
+        ;
+    for (; i < max && s[i]; i++)
+        ;
     return i;
 }
 
@@ -80,9 +168,28 @@ int strncmp(const char *a, const char *b, size_t n) {
     return 0;
 }
 
+/* The scans for a byte look for two things per word — the byte and the
+ * terminator — with the zero test applied to the word XORed with the byte
+ * repeated, which turns every occurrence of the byte into a zero. */
 char *strchr(const char *s, int c) {
-    for (;; s++) {
-        if (*s == (char)c)
+    unsigned char ch = (unsigned char)c;
+    if (!ch)
+        return (char *)s + strlen(s);
+    for (; rt_unaligned(s); s++) {
+        if ((unsigned char)*s == ch)
+            return (char *)s;
+        if (!*s)
+            return 0;
+    }
+    u64 pat = ch * RT_ONES;
+    const u64_al *w = (const u64_al *)s;
+    for (;; w++) {
+        u64 v = *w;
+        if (RT_HAS_ZERO(v) | RT_HAS_ZERO(v ^ pat))
+            break;
+    }
+    for (s = (const char *)w;; s++) {
+        if ((unsigned char)*s == ch)
             return (char *)s;
         if (!*s)
             return 0;
@@ -90,24 +197,56 @@ char *strchr(const char *s, int c) {
 }
 
 char *strrchr(const char *s, int c) {
+    unsigned char ch = (unsigned char)c;
+    if (!ch)
+        return (char *)s + strlen(s);
     const char *r = 0;
-    for (;; s++) {
-        if (*s == (char)c)
+    for (; rt_unaligned(s); s++) {
+        if ((unsigned char)*s == ch)
             r = s;
         if (!*s)
-            break;
+            return (char *)r;
     }
-    return (char *)r;
+    u64 pat = ch * RT_ONES;
+    for (const u64_al *w = (const u64_al *)s;; w++) {
+        u64 v = *w;
+        if (!(RT_HAS_ZERO(v) | RT_HAS_ZERO(v ^ pat)))
+            continue;
+        const char *p = (const char *)w;
+        for (int i = 0; i < 8; i++, p++) {
+            if ((unsigned char)*p == ch)
+                r = p;
+            if (!*p)
+                return (char *)r;
+        }
+    }
 }
 
+/* One pass over the source: the bytes are copied as the terminator is looked
+ * for, a word at a time while the source is aligned and the room admits a
+ * whole word (the store is at whatever alignment `dst` has). Only what does
+ * not fit is measured separately, for the return value. The destination is
+ * NUL-terminated whenever `size` is non-zero, and `dst` may not overlap `src`
+ * from above, exactly as before. */
 size_t cng_strlcpy(char *dst, const char *src, size_t size) {
-    size_t len = strlen(src);
-    if (size) {
-        size_t n = len < size - 1 ? len : size - 1;
-        memcpy(dst, src, n);
-        dst[n] = '\0';
+    size_t room = size ? size - 1 : 0, n = 0;
+    while (n < room) {
+        if (!rt_unaligned(src + n) && room - n >= 8) {
+            u64 w = *(const u64_al *)(src + n);
+            if (!RT_HAS_ZERO(w)) {
+                *(u64_ua *)(dst + n) = w;
+                n += 8;
+                continue;
+            }
+        }
+        char c = src[n];
+        if (!c)
+            break;
+        dst[n++] = c;
     }
-    return len;
+    if (size)
+        dst[n] = '\0';
+    return n + strlen(src + n);
 }
 
 /* ---- I/O -------------------------------------------------------------- */

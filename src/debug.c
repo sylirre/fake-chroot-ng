@@ -9086,3 +9086,186 @@ int cng_cmd_pintest(int argc, char **argv, char **envp, unsigned long *auxv) {
     cng_dprintf(1, "pintest: %d failure(s)\n", fails);
     return fails ? 1 : 0;
 }
+
+/* _rttest — the freestanding mem/str primitives (src/rt/rt.c), which run
+ * word-at-a-time and so have edges a byte loop never had: the alignment
+ * prologues, the tail below a word, the overlap direction in memmove, and the
+ * rule that a scan loads a word only aligned and only once a byte of the
+ * string is known to be in it. Each is held against a byte-wise reference
+ * over every combination of source and destination alignment and every
+ * length up to a few words, with a canary around the destination; the scans
+ * are then run on strings whose terminator is the LAST byte before a
+ * PROT_NONE page, which is where an over-read is a fault and not a wrong
+ * answer. */
+static void *rt_ref_memcpy(void *d, const void *s, size_t n) {
+    unsigned char *a = d;
+    const unsigned char *b = s;
+    while (n--)
+        *a++ = *b++;
+    return d;
+}
+
+static int rt_bytes_eq(const void *a, const void *b, size_t n) {
+    const unsigned char *x = a, *y = b;
+    while (n--)
+        if (*x++ != *y++)
+            return 0;
+    return 1;
+}
+
+static void rt_fill(unsigned char *p, size_t n, unsigned seed) {
+    for (size_t i = 0; i < n; i++)
+        p[i] = (unsigned char)(seed * 31u + i * 7u + 1u); /* never 0 */
+}
+
+int cng_cmd_rttest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    int fails = 0;
+    enum { W = 8, LMAX = 3 * W + 5, PAD = 2 * W, BUF = 256 };
+    static unsigned char src[BUF], dst[BUF], want[BUF];
+
+    /* 1) memcpy / memset / memcmp at every alignment pair, every length */
+    {
+        unsigned long cases = 0, bad = 0;
+        for (unsigned so = 0; so < 2 * W; so++)
+            for (unsigned dof = 0; dof < 2 * W; dof++)
+                for (size_t n = 0; n <= LMAX; n++) {
+                    rt_fill(src, BUF, so + 3);
+                    rt_fill(dst, BUF, dof + 11);
+                    rt_ref_memcpy(want, dst, BUF);
+                    rt_ref_memcpy(want + PAD + dof, src + PAD + so, n);
+                    void *r = memcpy(dst + PAD + dof, src + PAD + so, n);
+                    cases++;
+                    if (r != dst + PAD + dof || !rt_bytes_eq(dst, want, BUF))
+                        bad++;
+
+                    rt_fill(dst, BUF, dof + 5);
+                    rt_ref_memcpy(want, dst, BUF);
+                    for (size_t i = 0; i < n; i++)
+                        want[PAD + dof + i] = (unsigned char)(0x80 + so);
+                    r = memset(dst + PAD + dof, (int)(0x80 + so), n);
+                    cases++;
+                    if (r != dst + PAD + dof || !rt_bytes_eq(dst, want, BUF))
+                        bad++;
+
+                    /* memcmp: equal, then a single differing byte at every
+                     * position, with the sign of the answer checked */
+                    rt_fill(src, BUF, 7);
+                    rt_ref_memcpy(dst + PAD + dof, src + PAD + so, n);
+                    cases++;
+                    if (memcmp(dst + PAD + dof, src + PAD + so, n) != 0)
+                        bad++;
+                    for (size_t k = 0; k < n; k++) {
+                        dst[PAD + dof + k] = (unsigned char)(src[PAD + so + k] + 1);
+                        int got = memcmp(dst + PAD + dof, src + PAD + so, n);
+                        int ref = (int)dst[PAD + dof + k] - (int)src[PAD + so + k];
+                        cases++;
+                        if ((got > 0) != (ref > 0) || (got < 0) != (ref < 0))
+                            bad++;
+                        dst[PAD + dof + k] = src[PAD + so + k];
+                    }
+                }
+        cng_dprintf(1, "rttest memcpy/memset/memcmp: %lu cases, %lu wrong -> %s\n",
+                    cases, bad, bad ? "FAIL" : "OK");
+        fails += bad != 0;
+    }
+
+    /* 2) memmove over every overlap: the destination from 3 words below the
+     *    source to 3 words above it, every length */
+    {
+        unsigned long cases = 0, bad = 0;
+        for (int delta = -3 * W; delta <= 3 * W; delta++)
+            for (unsigned so = 0; so < W; so++)
+                for (size_t n = 0; n <= LMAX; n++) {
+                    rt_fill(dst, BUF, (unsigned)(delta + 64) + so);
+                    rt_ref_memcpy(want, dst, BUF);
+                    unsigned char tmp[BUF];
+                    unsigned char *s = dst + 4 * W + so, *d = s + delta;
+                    rt_ref_memcpy(tmp, s, n); /* the reference: via a copy */
+                    rt_ref_memcpy(want + (d - dst), tmp, n);
+                    void *r = memmove(d, s, n);
+                    cases++;
+                    if (r != d || !rt_bytes_eq(dst, want, BUF))
+                        bad++;
+                }
+        cng_dprintf(1, "rttest memmove: %lu cases, %lu wrong -> %s\n", cases,
+                    bad, bad ? "FAIL" : "OK");
+        fails += bad != 0;
+    }
+
+    /* 3) the scans, on strings ending exactly at a PROT_NONE page: strlen,
+     *    strnlen, strchr, strrchr (the byte present at every position, then
+     *    absent), and strlcpy into every size from 0 to past the string */
+    {
+        unsigned long cases = 0, bad = 0;
+        long pg = 4096;
+        char *map = sys_mmap(0, (size_t)(2 * pg), CNG_PROT_READ | CNG_PROT_WRITE,
+                             CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+        int ok = !cng_is_err((long)map) &&
+                 sys_mprotect(map + pg, (size_t)pg, CNG_PROT_NONE) == 0;
+        for (size_t len = 0; ok && len <= LMAX; len++) {
+            /* The terminator is the page's last byte, so every alignment of
+             * the start is covered by the lengths. */
+            char *s = map + pg - 1 - (long)len;
+            for (size_t i = 0; i < len; i++)
+                s[i] = (char)('a' + (i % 26));
+            s[len] = '\0';
+            cases++;
+            if (strlen(s) != len)
+                bad++;
+            for (size_t max = 0; max <= len + 2; max++) {
+                size_t ref = len < max ? len : max;
+                cases++;
+                if (cng_strnlen(s, max) != ref)
+                    bad++;
+            }
+            /* No 'A' anywhere: both scans run to the terminator. */
+            cases += 3;
+            if (strchr(s, 'A') != 0 || strrchr(s, 'A') != 0 ||
+                strchr(s, 0) != s + len || strrchr(s, 0) != s + len)
+                bad++;
+            for (size_t k = 0; k < len; k++) {
+                /* 'A' at k alone: strchr and strrchr both find it there; then
+                 * also at the first position: strrchr still says k. */
+                s[k] = 'A';
+                cases += 2;
+                if (strchr(s, 'A') != s + k || strrchr(s, 'A') != s + k)
+                    bad++;
+                if (k) {
+                    s[0] = 'A';
+                    cases += 2;
+                    if (strchr(s, 'A') != s || strrchr(s, 'A') != s + k)
+                        bad++;
+                    s[0] = 'a';
+                }
+                s[k] = (char)('a' + (k % 26));
+            }
+            for (size_t size = 0; size <= len + 3; size++) {
+                for (unsigned dof = 0; dof < W; dof++) {
+                    rt_fill(dst, BUF, (unsigned)len + dof);
+                    rt_ref_memcpy(want, dst, BUF);
+                    size_t keep = size ? (len < size - 1 ? len : size - 1) : 0;
+                    rt_ref_memcpy(want + PAD + dof, s, keep);
+                    if (size)
+                        want[PAD + dof + keep] = 0;
+                    size_t r = cng_strlcpy((char *)dst + PAD + dof, s, size);
+                    cases++;
+                    if (r != len || !rt_bytes_eq(dst, want, BUF))
+                        bad++;
+                }
+            }
+        }
+        if (!ok)
+            bad++;
+        cng_dprintf(1, "rttest strlen/strnlen/strchr/strrchr/strlcpy at a page "
+                       "edge: %lu cases, %lu wrong -> %s\n",
+                    cases, bad, bad ? "FAIL" : "OK");
+        fails += bad != 0;
+    }
+
+    cng_dprintf(1, "rttest: %d failure(s)\n", fails);
+    return fails ? 1 : 0;
+}

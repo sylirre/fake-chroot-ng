@@ -75,6 +75,7 @@ int cng_cmd_ipctest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_faulttest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_prctltest(int argc, char **argv, char **envp, unsigned long *auxv);
 int cng_cmd_selfproc(int argc, char **argv, char **envp, unsigned long *auxv);
+int cng_cmd_rttest(int argc, char **argv, char **envp, unsigned long *auxv);
 
 /* Internal self-tests, exposed via `-t/--test NAME`. Hidden from --help; the
  * argument that would be a <rootfs> can never begin with '-', so there is no
@@ -108,7 +109,7 @@ static const struct test_entry g_tests[] = {
     {"faulttest", cng_cmd_faulttest},
     {"prctltest", cng_cmd_prctltest}, {"selfproc", cng_cmd_selfproc},
     {"tabtest", cng_cmd_tabtest},     {"lazytest", cng_cmd_lazytest},
-    {"pintest", cng_cmd_pintest},
+    {"pintest", cng_cmd_pintest},     {"rttest", cng_cmd_rttest},
 };
 
 static int dispatch_test(const char *name, int argc, char **argv, char **envp,

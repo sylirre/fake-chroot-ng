@@ -807,3 +807,15 @@ elif guest_cc_report "$TSD/trailslash" tests/guests/trailslash.c; then
         "$(run_t 60 -R $GUEST_BINDS "$TSD" /trailslash "" contain 2>/dev/null)"
 fi
 rm -rf "$TSD"
+
+# The freestanding mem/str primitives run word-at-a-time (src/rt/rt.c) and are
+# what every path copy, dirent record and /proc line goes through. The
+# self-test holds each against a byte-wise reference at every alignment and
+# length, memmove over every overlap, and the scans on strings ending at a
+# PROT_NONE page -- where an over-read is a fault, not a wrong answer.
+out=$(run_t 60 -t rttest 2>&1); rc=$?
+check "rt primitives self-test rc" 0 $rc
+check_contains "memcpy/memset/memcmp agree with the byte loops" \
+    "memcpy/memset/memcmp: " "$out"
+check_absent "no primitive case went wrong" "FAIL" "$out"
+check_contains "the scans stop at a page edge" "at a page edge: " "$out"
