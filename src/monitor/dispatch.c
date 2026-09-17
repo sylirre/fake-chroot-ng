@@ -2623,6 +2623,13 @@ void cng_nnp_fork_child(int val) {
     __atomic_store_n(&g_nnp_floor, val, __ATOMIC_RELEASE);
 }
 
+/* Does the hidden-process view hide `pid` (a pid_t argument: an int)? See the
+ * process_vm_readv case. */
+static int pid_hidden(long pid) {
+    int p = (int)pid;
+    return !cng_g_no_proc && p > 0 && !cng_procreg_has_task(p);
+}
+
 /* FIDEDUPERANGE: the descriptor is the source, and the destinations are the
  * dest_fd fields of the argument — each of which the kernel takes write
  * access on the mount for (vfs_dedupe_file_range_one), answering per
@@ -4800,15 +4807,30 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * When the peer is one of our stopped tracees they are served from the
      * ptrace mailbox, because the host has no reason to believe the caller is
      * attached to it and may refuse (Yama ptrace_scope, SELinux). Any other
-     * peer runs natively. */
+     * peer runs natively — once the hidden-process view has been asked. The
+     * view hides a host process by path, and this pair and pidfd_open are the
+     * routes to a process that carry no path: with a ptrace policy that
+     * permits same-uid access, a guest read and wrote the memory of a process
+     * its /proc said did not exist, and a pidfd on it reaches everything a
+     * pidfd reaches (signals, its descriptors, waitid). A pid the view does
+     * not show is ESRCH, which is what /proc/<pid> answers for it — a task of
+     * a guest process counts, as the kernel finds a task by any tid it has.
+     * Off with --no-proc, where nothing is hidden. A pid the kernel would
+     * refuse before it looked anything up (zero, negative) is left to it. */
     case __NR_process_vm_readv:
     case __NR_process_vm_writev: {
         long out;
         if (cng_pt_vm_rw(nr, a0, (u64)a1, (u64)a2, (u64)a3, (u64)a4, (u64)a5,
                          &out))
             return out;
+        if (pid_hidden(a0))
+            return -ESRCH;
         return reissue(a0, a1, a2, a3, a4, a5, nr);
     }
+    case __NR_pidfd_open:
+        if (pid_hidden(a0))
+            return -ESRCH;
+        return reissue(a0, a1, a2, a3, a4, a5, nr);
 
     /* pidfd_getfd imports a descriptor out of another process's table, which
      * is the third way one can arrive from outside the view (see cng_fd_admit

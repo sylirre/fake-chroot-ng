@@ -11,6 +11,10 @@
  * how such a dirfd used to arrive: leaked across the exec that started
  * chroot-ng, and inherited by the guest as they were.
  *
+ * The last section is the same view by pid rather than by path: a process
+ * /proc hides is ESRCH to process_vm_readv and pidfd_open as well, while a
+ * guest process (a forked child) is reachable by both.
+ *
  * Run with fd 7 open on a host directory outside the rootfs and fd 8 on a host
  * file outside it, plus a rootfs holding /etc/marker (guest content), /sub
  * (a directory) with /sub/lnk -> /etc/marker, and a /dev directory. Each
@@ -18,10 +22,14 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static void content(const char *what, int fd) {
@@ -140,6 +148,40 @@ int main(void) {
     int f = open("/etc/marker", O_RDONLY);
     scm_self("scm-view-file", f);
     (void)st;
+    fflush(stdout);
+
+    /* By pid. Pid 1 is the host's init, which the guest's /proc does not
+     * show; the child is a guest process, and its parent may read it under
+     * any ptrace policy (Yama's scope 1 allows descendants). The child parks
+     * on a pipe so its memory is there to read. */
+    int pp[2];
+    if (pipe(pp) < 0)
+        return 0;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        char c;
+        close(pp[1]);
+        if (read(pp[0], &c, 1) < 0)
+            _exit(1);
+        _exit(0);
+    }
+    close(pp[0]);
+    char local[8], remote_probe = 0;
+    struct iovec lio = {local, sizeof local};
+    struct iovec rio = {&remote_probe, 1};
+    rc("pvm-read-hidden", syscall(SYS_process_vm_readv, 1, &lio, 1, &rio, 1, 0));
+    rc("pvm-read-guest",
+       syscall(SYS_process_vm_readv, child, &lio, 1, &rio, 1, 0));
+    rc("pidfd-open-hidden", syscall(SYS_pidfd_open, 1, 0));
+    long pf = syscall(SYS_pidfd_open, child, 0);
+    rc("pidfd-open-guest", pf);
+    if (pf >= 0)
+        close(pf);
+    if (write(pp[1], "x", 1) < 0)
+        kill(child, SIGKILL);
+    close(pp[1]);
+    waitpid(child, NULL, 0);
     fflush(stdout);
     return 0;
 }

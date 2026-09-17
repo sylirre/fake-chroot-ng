@@ -2690,6 +2690,34 @@ vfork/`posix_spawn` child-stack handling.
     destination judged where the kernel has dedupe at all) and `-t bpftest`
     legs that simulate the filter with and without a `:ro` bind.
 
+- [x] **M46 — the hidden-process view hid a process by path and not by pid**
+  `/proc` hides a host process from the guest — by path, and from listings —
+  but `process_vm_readv`, `process_vm_writev` and `pidfd_open` name a
+  process by pid and carry no path, and all three ran native (the first two
+  trapped only for a ptrace tracer). With a ptrace policy that permits
+  same-uid access, a guest read and wrote the memory of a process its
+  `/proc` said did not exist, and a pidfd on it reaches everything a pidfd
+  reaches: signals, its descriptors through `pidfd_getfd`, `waitid`.
+  - A pid the view does not show answers `ESRCH` from all three, which is
+    what `/proc/<pid>` answers for it (`pid_hidden`); a task of a guest
+    process counts, as the kernel finds a task by any tid it has
+    (`cng_procreg_has_task`). Trapped only while there is a view — `--no-proc`
+    hides nothing, and they run native there. A pid the kernel would refuse
+    before it looked anything up (zero, negative) is left to it, so the
+    `EINVAL`/`ESRCH` it gives stays its own. `pidfd_getfd` is M43's: what it
+    imports is judged whatever the view.
+  - Out of scope, and deliberately: the signal family (`kill`, `tgkill`,
+    `pidfd_send_signal` on a pidfd the guest could only have got from a
+    process it may see) and the scheduler and priority calls name a pid too
+    and stay native — trapping `kill` for every guest is the cost the ptrace
+    emulation stacks its filter on demand to avoid, and a signal to a hidden
+    same-uid process is what a real chroot allows.
+  - Validated by the last section of `tests/guests/fdescape.c` in
+    `tests/m25_fdview.sh` (pid 1 `ESRCH` from both, a forked child reachable
+    by both — the latter sits out where the host has no `process_vm_readv`
+    for the guest at all, as qemu-user has not) and a `-t bpftest` leg that
+    simulates the filter with and without the view.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

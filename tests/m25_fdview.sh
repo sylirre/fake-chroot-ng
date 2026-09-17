@@ -97,5 +97,34 @@ elif guest_cc_report "$FVR/fdescape" tests/guests/fdescape.c; then
     check_contains "a directory of the view survives a trip over a socket" \
         "scm-view-dir=usable" "$out"
     check_contains "so does a file" "scm-view-file=usable" "$out"
+    # The hidden-process view by pid. /proc hides a host process by path, and
+    # process_vm_readv/writev and pidfd_open were the routes to a process that
+    # carry no path: with a ptrace policy that permits same-uid access a guest
+    # could read and write the memory of a process its /proc said did not
+    # exist, and a pidfd reaches everything a pidfd reaches. ESRCH now, which
+    # is what /proc/<pid> answers -- where a guest process stays reachable.
+    # Where the host has no process_vm_readv or pidfd_open to reach a guest
+    # process with (qemu-user implements neither for every guest; an old
+    # kernel has no pidfd_open) the allowed leg says so and sits out; the
+    # hidden one is answered before the kernel is asked, and is ESRCH either
+    # way.
+    check_contains "process_vm_readv on a hidden process is ESRCH" \
+        "pvm-read-hidden=No such process" "$out"
+    case "$out" in
+    *"pvm-read-guest=Function not implemented"*)
+        skip "process_vm_readv on a guest process: no process_vm_readv here" ;;
+    *)
+        check_contains "process_vm_readv on a guest process is allowed" \
+            "pvm-read-guest=ok" "$out" ;;
+    esac
+    check_contains "pidfd_open on a hidden process is ESRCH" \
+        "pidfd-open-hidden=No such process" "$out"
+    case "$out" in
+    *"pidfd-open-guest=Function not implemented"*)
+        skip "pidfd_open on a guest process: no pidfd_open here" ;;
+    *)
+        check_contains "pidfd_open on a guest process is allowed" \
+            "pidfd-open-guest=ok" "$out" ;;
+    esac
 fi
 rm -rf "$FVR" "$FVO"

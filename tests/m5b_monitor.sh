@@ -642,6 +642,13 @@ check_contains "the rest of prctl stays untrapped" \
 check_contains "fstat is trapped for fake-id and /proc synthesis, and only then" \
     "bpftest fake-id: fstat_off=1 fstat_proc=1 fstat_on=1 fchmod_on=1 -> OK" \
     "$out"
+# The hidden-process view by pid: process_vm_readv/writev and pidfd_open are
+# the routes to a process that carry no path, so they trap while there is a
+# view to apply and run native under --no-proc, where nothing is hidden.
+# pidfd_getfd's import is judged whatever the view, and traps either way.
+check_contains "the pid-keyed routes trap with the /proc view and not without" \
+    "bpftest hidden-pid: pvm_proc=1 pidfd_proc=1 pvm_off=1 pidfd_off=1 getfd_always=1 -> OK" \
+    "$out"
 # SysV sem/msg are emulated from the same broker as shm, so they trap rather
 # than being refused -- and they trap unconditionally, so the guest gets its own
 # namespace whatever the host's own IPC would have allowed.

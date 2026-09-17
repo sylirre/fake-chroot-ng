@@ -324,7 +324,7 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
 
     /* Build the trapped syscall list (path set + SysV IPC set, plus the id set
      * when faking, plus the conditional entries below). */
-    int nr[NPATH + NIPC + NID + NROFD + 3];
+    int nr[NPATH + NIPC + NID + NROFD + 6];
     int nsys = 0;
     for (int i = 0; i < NPATH; i++)
         nr[nsys++] = path_syscalls[i];
@@ -355,6 +355,15 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
         nr[nsys++] = __NR_fstat;
     if (!cng_g_no_proc)
         nr[nsys++] = __NR_fstatfs;
+    /* The hidden-process view, for the routes to a process that carry no
+     * path: process_vm_readv/writev and pidfd_open name a pid, and the view
+     * has to answer ESRCH for one it hides (dispatch.c). Only while there is
+     * a view — --no-proc hides nothing, and these then run native. */
+    if (!cng_g_no_proc) {
+        nr[nsys++] = __NR_process_vm_readv;
+        nr[nsys++] = __NR_process_vm_writev;
+        nr[nsys++] = __NR_pidfd_open;
+    }
     /* getdents64 does three jobs, and it has to be trapped for any one of them:
      * it hides the l2s backing files, it filters host processes out of a /proc
      * listing (what `ls /proc` and `ps` actually read), and it splices in the

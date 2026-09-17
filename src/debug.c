@@ -7210,6 +7210,36 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
                     off_ok, proc_ok, on_ok, ch_ok, ok2 ? "OK" : "FAIL");
         fails += !ok2;
 
+        /* The hidden-process view by pid (M46): process_vm_readv/writev and
+         * pidfd_open trap while there is a view to apply, and run native
+         * under --no-proc, where nothing is hidden. */
+        cng_g_no_proc = 0;
+        int nh = cng_build_seccomp(f, CNG_SECCOMP_MAX_INSNS);
+        bpf_data(d, __NR_process_vm_readv, 0x1000, 1);
+        int pvm_on = nh > 0 && bpf_run(f, nh, d, &bad) == CNG_SECCOMP_RET_TRAP;
+        bpf_data(d, __NR_process_vm_writev, 0x1000, 1);
+        pvm_on &= nh > 0 && bpf_run(f, nh, d, &bad) == CNG_SECCOMP_RET_TRAP;
+        bpf_data(d, __NR_pidfd_open, 0x1000, 1);
+        int pfd_on = nh > 0 && bpf_run(f, nh, d, &bad) == CNG_SECCOMP_RET_TRAP;
+        cng_g_no_proc = 1;
+        int nq = cng_build_seccomp(f, CNG_SECCOMP_MAX_INSNS);
+        bpf_data(d, __NR_process_vm_readv, 0x1000, 1);
+        int pvm_off = nq > 0 && bpf_run(f, nq, d, &bad) == CNG_SECCOMP_RET_ALLOW;
+        bpf_data(d, __NR_pidfd_open, 0x1000, 1);
+        int pfd_off = nq > 0 && bpf_run(f, nq, d, &bad) == CNG_SECCOMP_RET_ALLOW;
+        /* ...while pidfd_getfd, whose import is judged whatever the view,
+         * traps either way. */
+        bpf_data(d, __NR_pidfd_getfd, 0x1000, 1);
+        int getfd_off = nq > 0 && bpf_run(f, nq, d, &bad) == CNG_SECCOMP_RET_TRAP;
+        cng_g_no_proc = was_np;
+        int ok3 = !bad && pvm_on && pfd_on && pvm_off && pfd_off && getfd_off;
+        cng_dprintf(1,
+                    "bpftest hidden-pid: pvm_proc=%d pidfd_proc=%d pvm_off=%d "
+                    "pidfd_off=%d getfd_always=%d -> %s\n",
+                    pvm_on, pfd_on, pvm_off, pfd_off, getfd_off,
+                    ok3 ? "OK" : "FAIL");
+        fails += !ok3;
+
         /* The descriptor side of a :ro bind (M45): with one in the view,
          * fchmod, fchown and the fd xattr setters trap, and so does every
          * ioctl request that writes the mount — one JEQ each in the ioctl
