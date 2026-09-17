@@ -869,6 +869,58 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
             fails += !ok;
         }
 
+        /* Then through the fd magic link of a descriptor opened read-only (and
+         * one opened O_PATH) under the bind: the link resolves to a host path
+         * that names no bind, and a write-open of it used to go straight
+         * through — the file was written, and O_TRUNC emptied it. A real
+         * read-only mount answers EROFS, the description having been opened
+         * through it. Both spellings, since /dev/fd is the same link. The
+         * read-only reopen is the control: the description is reachable, and
+         * only the write intent is refused. */
+        long rfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
+                                CNG_O_RDONLY, 0, 0, 0, 0);
+        long pfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
+                                CNG_O_PATH, 0, 0, 0, 0);
+        char fl[48], dl[48], pl[48];
+        cng_snprintf(fl, sizeof fl, "/proc/self/fd/%d", (int)rfd);
+        cng_snprintf(dl, sizeof dl, "/dev/fd/%d", (int)rfd);
+        cng_snprintf(pl, sizeof pl, "/proc/self/fd/%d", (int)pfd);
+        struct {
+            const char *name;
+            long r;
+        } fdl[] = {
+            {"fdlink-read", cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)fl,
+                                         CNG_O_RDONLY, 0, 0, 0, 0)},
+            {"fdlink-open-w", cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)fl,
+                                           CNG_O_WRONLY, 0, 0, 0, 0)},
+            {"fdlink-open-trunc",
+             cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)fl,
+                          CNG_O_RDONLY | CNG_O_TRUNC, 0, 0, 0, 0)},
+            {"devfd-open-w", cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)dl,
+                                          CNG_O_WRONLY, 0, 0, 0, 0)},
+            {"pathfd-open-w", cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)pl,
+                                           CNG_O_WRONLY, 0, 0, 0, 0)},
+            {"fdlink-truncate",
+             cng_dispatch(__NR_truncate, (long)fl, 0, 0, 0, 0, 0, 0)},
+            {"fdlink-chmod", cng_dispatch(__NR_fchmodat, CNG_AT_FDCWD, (long)fl,
+                                          0644, 0, 0, 0, 0)},
+        };
+        for (unsigned i = 0; i < sizeof fdl / sizeof *fdl; i++) {
+            int is_read = !strcmp(fdl[i].name, "fdlink-read");
+            int ok = is_read ? fdl[i].r >= 0
+                             : (ro ? fdl[i].r == -EROFS : fdl[i].r != -EROFS);
+            if (fdl[i].r >= 0 && strncmp(fdl[i].name, "fdlink-truncate", 15) &&
+                strncmp(fdl[i].name, "fdlink-chmod", 12))
+                sys_close((int)fdl[i].r);
+            cng_dprintf(1, "robind %s %s: rc=%d -> %s\n", ro ? "ro" : "rw",
+                        fdl[i].name, (int)fdl[i].r, ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+        if (rfd >= 0)
+            sys_close((int)rfd);
+        if (pfd >= 0)
+            sys_close((int)pfd);
+
         struct {
             const char *name;
             long r;
@@ -1036,6 +1088,26 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
                         t[i].name, (int)t[i].r, ok ? "OK" : "FAIL");
             fails += !ok;
         }
+        /* The fd magic link of a descriptor opened read-only through the
+         * name: it is on the data file, which no bind covers, and which name
+         * it came through is not something a description remembers. Its
+         * access mode is: read-only, it is judged as the :ro name's while the
+         * view has a :ro bind (fd_link_ro in dispatch.c); the rw control has
+         * none, and reopens. */
+        long rfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
+                                CNG_O_RDONLY, 0, 0, 0, 0);
+        char fl[48];
+        cng_snprintf(fl, sizeof fl, "/proc/self/fd/%d", (int)rfd);
+        long rw = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)fl,
+                               CNG_O_WRONLY, 0, 0, 0, 0);
+        int okw = ro ? rw == -EROFS : rw >= 0;
+        if (rw >= 0)
+            sys_close((int)rw);
+        if (rfd >= 0)
+            sys_close((int)rfd);
+        cng_dprintf(1, "l2sro %s fdlink-open-w: rc=%d -> %s\n", ro ? "ro" : "rw",
+                    (int)rw, okw ? "OK" : "FAIL");
+        fails += !okw;
         cng_dprintf(1, "l2sro: %d failures\n", fails);
         return fails ? 1 : 0;
     }

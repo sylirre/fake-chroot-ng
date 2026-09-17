@@ -78,13 +78,77 @@ static long chattr_result(long r) {
     return r;
 }
 
+static int fs_has_ro(void);
+static size_t proc_pid_prefix(const char *p, int self_only);
+static long parse_int_run(const char **p);
+
+/* --- :ro binds, through an fd magic link ----------------------------------
+ *
+ * "/proc/<pid>/fd/<n>" resolves to a host path that names no mount of ours,
+ * so a write-open of it passed every :ro check: open a file under the bind
+ * read-only (or O_PATH), reopen its fd link with O_WRONLY or O_TRUNC, and the
+ * host file was written. On a real read-only mount the reopen inherits the
+ * vfsmount the description was opened through and answers EROFS. Here the
+ * mount is a prefix of the description's own path — which the link reports —
+ * so that is what the question is asked about. (A link with components after
+ * the fd is expanded by the walk into the directory's guest name, so the host
+ * path that arrives here is already the file's own.)
+ *
+ * Except through the link2symlink emulation. A descriptor opened through an
+ * l2s name is on the group's DATA file, in the store under the rootfs where no
+ * bind covers it, and which name it was opened through is not something a
+ * description remembers. What it does remember is its access mode: a writable
+ * one came through a writable name, since every write-open under a :ro name is
+ * refused by name, so it may be reopened; a read-only or O_PATH one is judged
+ * as if it had come through the :ro bind whenever the view has one at all.
+ * That over-refuses exactly one shape — a read-only descriptor on a hardlinked
+ * file opened through a writable name and then reopened for writing through
+ * its fd link, while some :ro bind exists — and nothing else.
+ *
+ * Returns 1 for a link on a file the guest may not write, 0 for one it may
+ * (an anonymous description too: a pipe or a memfd is on no mount of ours),
+ * and -1 when `host` is not an fd link at all. */
+static int fd_link_ro(const char *host) {
+    size_t pl = proc_pid_prefix(host, 0);
+    if (!pl || strncmp(host + pl, "fd/", 3) != 0)
+        return -1;
+    const char *d = host + pl + 3;
+    if (parse_int_run(&d) < 0 || *d)
+        return -1; /* the fd directory, or a name below the link: not this */
+    char real[CNG_PATH_MAX];
+    long n = sys_readlinkat(CNG_AT_FDCWD, host, real, sizeof real - 1);
+    if (n <= 0 || real[0] != '/')
+        return 0;
+    real[n] = '\0';
+    if (cng_fs_host_ro(cng_g_fs, real))
+        return 1;
+    if (cng_g_l2s && fs_has_ro()) {
+        const char *b = strrchr(real, '/');
+        if (cng_l2s_hidden(b ? b + 1 : real)) {
+            int fd = cng_proc_self_fd(host);
+            long fl = fd >= 0 ? sys_fcntl(fd, CNG_F_GETFL, 0) : -1;
+            /* Another process's descriptor cannot be asked (fl < 0): it is
+             * taken as read-only, the side that refuses. */
+            if (fl < 0 || (fl & CNG_O_ACCMODE) == CNG_O_RDONLY)
+                return 1;
+        }
+    }
+    return 0;
+}
+
 /* A mutating syscall whose target lands under a `:ro` bind must answer -EROFS,
  * the way it would on a real read-only mount. Keyed on the already-resolved
  * HOST path, so a guest symlink that leads into the bind is covered however the
- * path got there. Checked before the reissue, and before chattr_result — a
+ * path got there — and an fd magic link is asked about the file it stands for
+ * (fd_link_ro). Checked before the reissue, and before chattr_result — a
  * read-only mount is a genuine error that fake-root does not paper over. */
 static int ro_denied(const char *host) {
-    return host && cng_g_fs && cng_fs_host_ro(cng_g_fs, host);
+    if (!host || !cng_g_fs)
+        return 0;
+    int l = fd_link_ro(host);
+    if (l >= 0)
+        return l;
+    return cng_fs_host_ro(cng_g_fs, host);
 }
 
 /* ...but a real read-only mount refuses at the point the kernel reaches it, and

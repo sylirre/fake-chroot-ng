@@ -376,6 +376,20 @@ check_contains ":ro bind refuses an unlink through a dirfd" \
     "robind ro at-unlink: rc=-30 -> OK" "$out"
 check_contains ":ro bind still reads through a dirfd" \
     "robind ro at-read: rc=" "$out"
+# ...and through the fd magic link of a descriptor opened read-only (or
+# O_PATH) under the bind. The link resolves to a host path that names no
+# bind, so a write-open of it went straight through: open the file read-only,
+# reopen /proc/self/fd/N with O_WRONLY or O_TRUNC, and the host file was
+# written. A real read-only mount refuses the reopen — the description was
+# opened through it — and so does this now, keyed on the file the link stands
+# for. The read-only reopen is the control that the link itself still works.
+check_contains ":ro bind still reopens read-only through an fd link" \
+    "robind ro fdlink-read: rc=" "$out"
+for _leg in fdlink-open-w fdlink-open-trunc devfd-open-w pathfd-open-w \
+    fdlink-truncate fdlink-chmod; do
+    check_contains ":ro bind refuses $_leg through an fd link" \
+        "robind ro $_leg: rc=-30 -> OK" "$out"
+done
 # A read-only mount refuses where the kernel reaches it, and for the calls that
 # must operate on an existing name that is *after* the path has resolved -- so a
 # name that is not there is ENOENT, the same answer a writable mount gives. The
@@ -418,7 +432,7 @@ check_contains ":ro bind still serves reads of an l2s name" \
 check_contains ":ro bind still answers access(R_OK) on an l2s name" \
     "l2sro ro access-r: rc=0 -> OK" "$out"
 for _leg in open-w open-trunc access-w truncate fchmodat fchownat utimensat \
-    setxattr setxattrat file_setattr unlinkat; do
+    setxattr setxattrat file_setattr unlinkat fdlink-open-w; do
     check_contains ":ro bind refuses $_leg on an l2s name" \
         "l2sro ro $_leg: rc=-30 -> OK" "$out"
 done

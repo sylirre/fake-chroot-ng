@@ -2615,6 +2615,39 @@ vfork/`posix_spawn` child-stack handling.
     rootfs's marker each time, with the reopen, the `fchdir` and the
     in-view socket trip as the controls that still work.
 
+- [x] **M44 — a `:ro` bind was read-only to every name but `/proc/self/fd/<n>`**
+  The `:ro` refusal is keyed on the resolved host path, and an fd magic link
+  resolves to a host path that names no bind of ours: `/proc/self/fd/<n>`
+  is the path the kernel is handed, and `cng_fs_host_ro` had nothing to say
+  about it. So a guest opened a file under the bind read-only (or `O_PATH`),
+  reopened its fd link with `O_WRONLY` or `O_TRUNC`, and the host file was
+  written — emptied, in the `O_TRUNC` case (measured, through both the
+  `/proc` and the `/dev/fd` spellings). A real read-only mount refuses the
+  reopen: the description was opened through the mount, and the reopen
+  inherits its vfsmount. Here the mount is a prefix of the description's own
+  path — which the link reports — so that is what `ro_denied` now asks about
+  (`fd_link_ro`): the link is read, and the file it stands for is judged like
+  any other host path. Anonymous descriptions (a pipe, a memfd) are on no
+  mount of ours. A link with components after the fd is already the walk's
+  business (M43): it arrives here as the file's own host path.
+  - The link2symlink emulation is the one case the path cannot settle. A
+    descriptor opened through an l2s name is on the group's data file, in
+    the store under the rootfs where no bind covers it, and which name it
+    was opened through is not something a description remembers. Its access
+    mode is: a writable descriptor came through a writable name (a
+    write-open under a `:ro` name is refused by name), so it may be
+    reopened; a read-only or `O_PATH` one is judged as the `:ro` name's
+    whenever the view has a `:ro` bind at all. That over-refuses exactly one
+    shape — a read-only descriptor on a hardlinked file that was opened
+    through a writable name and is reopened for writing through its fd link
+    while some `:ro` bind exists — and nothing else.
+  - Validated by new legs of `-t dtest robind` and `l2sro` in
+    `tests/m5b_monitor.sh`: the fd link of a read-only and of an `O_PATH`
+    descriptor under the bind, reopened `O_WRONLY`, `O_TRUNC`, through
+    `/dev/fd`, and named to `truncate` and `chmod`, all `EROFS` where the
+    read-only reopen still works; the same through an l2s name; the rw
+    control run reopens every one of them.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes
