@@ -149,6 +149,12 @@ int cng_fs_translate(const struct cng_fs *fs, const char *path, char *out,
 int cng_fs_translate_mnt(const struct cng_fs *fs, const char *path, char *out,
                          size_t outsz, int *mount_out);
 
+/* The mount alone, for a path that is already canonical (an absolute guest
+ * path with no ".", ".." or doubled slashes: what the resolver's walk holds).
+ * The same verdict cng_fs_translate_mnt reports, without the host path being
+ * built — RESOLVE_NO_XDEV asks this of every component it walks. */
+int cng_fs_mount_of(const struct cng_fs *fs, const char *canon);
+
 /* Reverse translation: map a host path back to the guest path it represents
  * (strip rootfs / reverse binds). Returns 0 on success, -1 if the host path is
  * outside the guest view. Used to keep the virtual cwd in sync after fchdir. */

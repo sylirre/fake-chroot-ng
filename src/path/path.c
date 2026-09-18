@@ -141,43 +141,56 @@ void cng_dev_shm_init(void) {
     }
 }
 
-/* Fill `out` for a guest path inside the /dev zone. Returns 1 when it did, 0 to
- * fall through to ordinary rootfs prefixing, -1 when the name did not fit. */
-static int dev_zone(const char *canon, char *out, size_t outsz) {
+/* The whitelist node a canonical guest path names, itself or by a subpath:
+ * its index, with `*rest` the part below it ("" or "/..."); -1 when the path
+ * is not the zone's to answer and falls through to the rootfs — "/dev"
+ * itself included, which is the rootfs directory the whitelist is listed
+ * into. */
+static int dev_zone_node(const char *canon, const char **rest) {
     if (cng_g_no_dev)
-        return 0;
+        return -1;
     if (strncmp(canon, "/dev", 4) != 0 || (canon[4] && canon[4] != '/'))
-        return 0;
+        return -1;
     if (!canon[4])
-        return 0; /* "/dev" itself is the rootfs directory we list into */
+        return -1;
     const char *leaf = canon + 5;
     for (int i = 0; i < cng_dev_nnodes; i++) {
         size_t nl = strlen(cng_dev_nodes[i].name);
         if (strncmp(leaf, cng_dev_nodes[i].name, nl) != 0)
             continue;
         char c = leaf[nl];
-        if (c == '\0') {
-            cng_strlcpy(out, cng_dev_nodes[i].host, outsz);
-            return 1;
-        }
-        /* A subpath rides along on the host node, whichever kind it is. For the
-         * directory-valued entries that is the entry the guest asked for
-         * (pts/<n>, shm/<name>, fd/<n>). For a device node it is a name *under*
-         * a character device, and the host kernel answers the ENOTDIR Linux
-         * gives for /dev/null/x — which is the point: falling through to the
-         * rootfs instead made the answer depend on the tree, so a rootfs
-         * carrying a real dev/null/x had it opened, reached through a name the
-         * guest was told is a device. The std* aliases resolve through the fd
-         * they name, exactly as following the symlink they are on Linux does. */
-        if (c == '/') {
-            size_t n = cng_strlcpy(out, cng_dev_nodes[i].host, outsz);
-            if (n >= outsz ||
-                cng_strlcpy(out + n, leaf + nl, outsz - n) >= outsz - n)
-                return -1; /* truncated: the caller must not use `out` */
-            return 1;
+        if (c == '\0' || c == '/') {
+            *rest = leaf + nl;
+            return i;
         }
     }
-    return 0;
+    return -1;
+}
+
+/* Fill `out` for a guest path inside the /dev zone. Returns 1 when it did, 0 to
+ * fall through to ordinary rootfs prefixing, -1 when the name did not fit. */
+static int dev_zone(const char *canon, char *out, size_t outsz) {
+    const char *rest;
+    int i = dev_zone_node(canon, &rest);
+    if (i < 0)
+        return 0;
+    if (!*rest) {
+        cng_strlcpy(out, cng_dev_nodes[i].host, outsz);
+        return 1;
+    }
+    /* A subpath rides along on the host node, whichever kind it is. For the
+     * directory-valued entries that is the entry the guest asked for
+     * (pts/<n>, shm/<name>, fd/<n>). For a device node it is a name *under*
+     * a character device, and the host kernel answers the ENOTDIR Linux
+     * gives for /dev/null/x — which is the point: falling through to the
+     * rootfs instead made the answer depend on the tree, so a rootfs
+     * carrying a real dev/null/x had it opened, reached through a name the
+     * guest was told is a device. The std* aliases resolve through the fd
+     * they name, exactly as following the symlink they are on Linux does. */
+    size_t n = cng_strlcpy(out, cng_dev_nodes[i].host, outsz);
+    if (n >= outsz || cng_strlcpy(out + n, rest, outsz - n) >= outsz - n)
+        return -1; /* truncated: the caller must not use `out` */
+    return 1;
 }
 
 /* The hidden-process view: a numeric entry of the host's real /proc that is not
@@ -705,15 +718,12 @@ int cng_fs_translate(const struct cng_fs *fs, const char *path, char *out,
     return cng_fs_translate_mnt(fs, path, out, outsz, 0);
 }
 
-static int translate_mnt_1(const struct cng_fs *fs, const char *path,
-                           char *out, size_t outsz, int *mount_out) {
-    char canon[CNG_PATH_MAX];
-    if (mount_out)
-        *mount_out = CNG_MOUNT_ROOTFS;
-    if (abscanon_1(fs, path, canon, sizeof canon) < 0)
-        return -1;
-
-    /* Longest-prefix bind match. */
+/* Which mount answers a canonical guest path: the longest-prefix bind, else
+ * the /proc passthrough, else a /dev whitelist node, else the rootfs. The one
+ * statement of that precedence — the translation below fills `out` from the
+ * verdict, and cng_fs_mount_of reports it alone. A bind wins over both
+ * zones: an explicit -b DIR:/proc is the user overriding the host view. */
+static int mount_of_1(const struct cng_fs *fs, const char *canon) {
     int best = -1;
     unsigned blen = 0;
     for (int i = 0; i < fs->nbinds; i++) {
@@ -726,6 +736,38 @@ static int translate_mnt_1(const struct cng_fs *fs, const char *path,
             }
         }
     }
+    if (best >= 0)
+        return best;
+    if (proc_zone(canon))
+        return CNG_MOUNT_PROC;
+    const char *rest;
+    if (dev_zone_node(canon, &rest) >= 0)
+        return CNG_MOUNT_DEV;
+    return CNG_MOUNT_ROOTFS;
+}
+
+int cng_fs_mount_of(const struct cng_fs *fs, const char *canon) {
+    if (!fs_live(fs))
+        return mount_of_1(fs, canon);
+    for (;;) {
+        unsigned s = cng_fs_read_begin(&fs);
+        int r = mount_of_1(fs, canon);
+        if (!cng_fs_read_retry(s))
+            return r;
+    }
+}
+
+static int translate_mnt_1(const struct cng_fs *fs, const char *path,
+                           char *out, size_t outsz, int *mount_out) {
+    char canon[CNG_PATH_MAX];
+    if (mount_out)
+        *mount_out = CNG_MOUNT_ROOTFS;
+    if (abscanon_1(fs, path, canon, sizeof canon) < 0)
+        return -1;
+
+    int m = mount_of_1(fs, canon);
+    if (mount_out)
+        *mount_out = m;
 
     /* A prefix that does not fit is a failure, never a shorter path. cng_strlcpy
      * reports what the source needed, so truncation is visible — and it has to
@@ -733,26 +775,17 @@ static int translate_mnt_1(const struct cng_fs *fs, const char *path,
      * name that exists, so an unlink deletes the wrong entry and an O_CREAT
      * makes the wrong file. The caller answers -ENAMETOOLONG, which is what a
      * kernel whose PATH_MAX the name exceeded would have said. */
-    int dz = 0;
-    if (best >= 0) {
-        const char *suffix = canon + blen; /* "" or "/rest" */
-        size_t n = cng_strlcpy(out, fs->binds[best].host, outsz);
+    if (m >= 0) {
+        const char *suffix = canon + fs->binds[m].glen; /* "" or "/rest" */
+        size_t n = cng_strlcpy(out, fs->binds[m].host, outsz);
         if (n >= outsz || cng_strlcpy(out + n, suffix, outsz - n) >= outsz - n)
             return -1;
-        if (mount_out)
-            *mount_out = best;
-    } else if (proc_zone(canon)) {
-        /* A bind wins over the passthrough (checked first, above): an explicit
-         * -b DIR:/proc is the user overriding the host view. */
+    } else if (m == CNG_MOUNT_PROC) {
         if (cng_strlcpy(out, canon, outsz) >= outsz)
             return -1;
-        if (mount_out)
-            *mount_out = CNG_MOUNT_PROC;
-    } else if ((dz = dev_zone(canon, out, outsz)) != 0) {
-        if (dz < 0)
+    } else if (m == CNG_MOUNT_DEV) {
+        if (dev_zone(canon, out, outsz) < 0)
             return -1; /* filled by the zone, unless it did not fit */
-        if (mount_out)
-            *mount_out = CNG_MOUNT_DEV;
     } else {
         size_t n = cng_strlcpy(out, fs->rootfs, outsz); /* "" or "/root" */
         if (n >= outsz || cng_strlcpy(out + n, canon, outsz - n) >= outsz - n)

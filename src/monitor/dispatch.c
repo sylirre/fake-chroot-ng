@@ -995,12 +995,11 @@ again:
 
 /* Which guest mount a canonical guest path belongs to, for RESOLVE_NO_XDEV.
  * Asked of the path layer rather than reimplemented, so it can never disagree
- * with where the path actually resolves. */
+ * with where the path actually resolves: cng_fs_mount_of is the classifier
+ * the translation itself is built on, asked without the host path being
+ * spelled out (a walk asks this per component). */
 static int mount_of(const char *canon) {
-    char tmp[CNG_PATH_MAX];
-    int m = CNG_MOUNT_ROOTFS;
-    cng_fs_translate_mnt(cng_g_fs, canon, tmp, sizeof tmp, &m);
-    return m;
+    return cng_fs_mount_of(cng_g_fs, canon);
 }
 
 /* Has the walk left the mount it started in? Records the violation so the
