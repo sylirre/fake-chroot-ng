@@ -852,15 +852,6 @@ static long xlate_errno(const char *p) {
     return p == XLATE_OUTSIDE ? -EACCES : -ENAMETOOLONG;
 }
 
-/* The canonical GUEST directory an open fd names, for the getdents64 overlay
- * splicing below. Returns 0/-1. */
-static int dirfd_guest_dir(long dirfd, char *out, size_t sz) {
-    char hdir[CNG_PATH_MAX];
-    if (dirfd_host((int)dirfd, hdir, sizeof hdir) != 0)
-        return -1;
-    return cng_fs_untranslate(cng_g_fs, hdir, out, sz);
-}
-
 /* Append one synthesized linux_dirent64. Layout is a fixed kernel ABI:
  * d_ino @0, d_off @8, d_reclen @16 (u16), d_type @18, d_name @19, records
  * 8-byte aligned. `d_off` is an opaque stream cookie, so a high constant keeps
@@ -2357,13 +2348,28 @@ __attribute__((noinline)) static long do_getdents64(long a0, long a1, long a2,
      * readdir buffer: musl reads 2 KiB at a time where glibc reads 32 KiB,
      * so a bind mount point in a directory of any size was listed on a
      * Debian rootfs and invisible on an Alpine one. */
-    char injdir[CNG_PATH_MAX];
-    int inject = a1 && sys_lseek((int)a0, 0, CNG_SEEK_CUR) == 0 &&
-                 dirfd_guest_dir(a0, injdir, sizeof injdir) == 0;
+    char injdir[CNG_PATH_MAX], hdir[CNG_PATH_MAX];
+    int first = a1 && sys_lseek((int)a0, 0, CNG_SEEK_CUR) == 0;
+    int named = first && dirfd_host((int)a0, hdir, sizeof hdir) == 0;
+    int inject = named &&
+                 cng_fs_untranslate(cng_g_fs, hdir, injdir, sizeof injdir) == 0;
     /* Whether anything here is going to look at the records at all. When
      * nothing is — no injection, no l2s, no hidden-process view — the call is
-     * a plain pass-through and the guest's own buffer size is honored whole. */
-    int bounce = inject || cng_g_l2s || !cng_g_no_proc;
+     * a plain pass-through and the guest's own buffer size is honored whole.
+     *
+     * The hidden-process view has records to drop from one directory only,
+     * the host's real /proc (fd_is_host_proc), and whether this is that is
+     * settled before the read rather than after it: with the zone on, every
+     * listing used to be bounced — copied back out of the guest's buffer and
+     * scanned for a numeric name — to find out, for all but `ls /proc`, that
+     * there was nothing to do. On the first read of a stream the readback
+     * above has already named the directory; a later read (a directory too
+     * big for one batch) asks for it again, which is one readlink against a
+     * copy of the whole batch. */
+    int at_proc = a1 && !cng_g_no_proc &&
+                  (first ? named && strcmp(hdir, "/proc") == 0
+                         : fd_is_host_proc(a0));
+    int bounce = inject || cng_g_l2s || at_proc;
     char bnc[DENTS_BOUNCE];
     long ask = (long)a2;
     if (bounce && ask > DENTS_BOUNCE)
@@ -2430,10 +2436,10 @@ __attribute__((noinline)) static long do_getdents64(long a0, long a1, long a2,
         return -EFAULT;
     /* Hidden-process view, listing side: the path layer makes a host
      * process's /proc entry unreachable, but `ls /proc` and `ps` read the
-     * directory, so the numeric entries have to go as well. Deciding that
-     * costs a readlink of the fd, so it is asked only when this batch
-     * actually holds a numeric name — outside /proc almost nothing does. */
-    int at_proc = !cng_g_no_proc && dents_have_pid(kb, n) && fd_is_host_proc(a0);
+     * directory, so the numeric entries have to go as well (at_proc, decided
+     * above). A batch of it with no numeric name has nothing to drop. */
+    if (at_proc && !dents_have_pid(kb, n))
+        at_proc = 0;
     if (!cng_g_l2s && !at_proc)
         return pre + n;
     int at_root = cng_g_l2s && fd_is_rootfs_root(a0);
