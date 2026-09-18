@@ -143,8 +143,13 @@ if guest_xlate_ready "NULL-pathname leg" &&
     fi
     check_contains "linkat's source name is no exception" "linkat_src=14" "$nul_g"
     check_contains "...nor is its destination" "linkat_dst=14" "$nul_g"
+    # The flagged NULL is whatever this kernel says: EFAULT from 6.10 on, and
+    # before that the ENOENT an unprivileged caller gets for the flag itself,
+    # ahead of the name — both are the kernel's to order, so the oracle's own
+    # line is the needle.
+    _w=$(printf '%s\n' "$nul_k" | grep "^linkat_src_empty_flag=")
     check_contains "...and AT_EMPTY_PATH does not make a NULL an empty name" \
-        "linkat_src_empty_flag=14" "$nul_g"
+        "$_w" "$nul_g"
     check_contains "a dirfd still names itself through a NULL utimensat" \
         "utimensat_dirfd=0" "$nul_g"
 fi

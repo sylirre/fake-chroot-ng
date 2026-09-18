@@ -228,6 +228,27 @@ elif guest_cc_report "$EPD/emptypath" tests/guests/emptypath.c; then
         printf '    kernel: %s\n' "$(echo "$ep_k" | tr '\n' '|')"
         printf '    cng   : %s\n' "$(echo "$ep_g" | tr '\n' '|')"
     fi
+    # linkat's half of the flag is a capability question, and the kernel's
+    # answer is what the differential above pins: before 6.10 an unprivileged
+    # caller is refused with ENOENT ahead of everything else, and it used to
+    # get the link anyway, made through the descriptor's /proc link. Under
+    # fake root the capability is faked the way chroot's CAP_SYS_CHROOT is, so
+    # the descriptor links on every kernel — and the number still has to be
+    # one: AT_FDCWD is the working directory (EPERM: no link to a directory),
+    # a negative or closed number is EBADF, as root would have had them.
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+    ep_r=$(run_t 60 -R -u 0:0 $GUEST_BINDS "$EPD" /emptypath 2>/dev/null)
+    check_contains "fake root links by descriptor on every kernel" \
+        "link_byfd=0" "$ep_r"
+    check_contains "...and AT_FDCWD is still the working directory there" \
+        "link_cwd=1" "$ep_r"
+    check_contains "...a number that is no descriptor is still EBADF" \
+        "link_negfd=9" "$ep_r"
+    check_contains "...a closed one too" "link_closedfd=9" "$ep_r"
+    check_contains "...and an unknown flag bit is still EINVAL" \
+        "link_badflag=22" "$ep_r"
+    check_contains "...and the flag beside a real name links it" \
+        "link_named_flag=0" "$ep_r"
 fi
 rm -rf "$EPD"
 

@@ -4336,6 +4336,101 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * shared inode. Without -l the host's refusal reaches the guest unchanged. */
     case __NR_linkat: {
         const char *sp = (const char *)a1;
+        const char *dp = (const char *)a3;
+        int fl = (int)a4;
+        /* The flags word is judged before either name is read: a bit outside
+         * the two the call knows is EINVAL ahead of a NULL name's EFAULT
+         * (measured). Dropped on the way to the re-issue, as it was, such a
+         * bit made a link the kernel would have refused. */
+        if (fl & ~(CNG_AT_SYMLINK_FOLLOW | CNG_AT_EMPTY_PATH))
+            return -EINVAL;
+        int follow = (fl & CNG_AT_SYMLINK_FOLLOW) ? 1 : 0;
+        int empty = (fl & CNG_AT_EMPTY_PATH) && (!sp || !sp[0]);
+        /* The flag beside a name that is not empty does nothing to the
+         * lookup, but the capability rule below is asked of the flag, not
+         * the name: before 6.10 the call is ENOENT without the capability
+         * whatever the name says. So it is kept on the re-issue — the pinned
+         * directory is one we opened, so the newer rule passes it as the
+         * guest's own would have — and dropped under fake root, whose
+         * capability it is. */
+        int flagged = (fl & CNG_AT_EMPTY_PATH) && !empty && !cng_fake_root();
+        int force = cng_g_l2s && cng_g_l2s_force; /* CNG_L2S_FORCE: exercise
+                                                    * the fallback directly */
+        char srch[CNG_PATH_MAX], dsth[CNG_PATH_MAX];
+        long r;
+        /* AT_SYMLINK_FOLLOW is applied at guest level (the host must never
+         * follow a guest symlink's target itself); the host call then runs
+         * with no flags. Link-by-fd (AT_EMPTY_PATH, the O_TMPFILE publish
+         * idiom) is spelled as the descriptor's /proc link, which the host
+         * must follow: that is what the l2s fallback links from, and what
+         * the fake root's retry below re-issues on. */
+        if (empty) {
+            /* The number has to be a descriptor before it can be spelled as
+             * one. AT_FDCWD is not: the kernel resolves the empty name against
+             * the working directory and answers about *that* — EEXIST if the
+             * new name is taken, EPERM otherwise, a directory being unlinkable
+             * — so it goes through the resolver like any other path. Without
+             * this, proc_fd_path spelled AT_FDCWD as "/proc/self/fd/0" and
+             * the link was made to stdin. */
+            if ((int)a0 == CNG_AT_FDCWD) {
+                if (cng_resolve_at(CNG_AT_FDCWD, ".", 1, srch, sizeof srch) != 0)
+                    return -ENOENT;
+            } else {
+                proc_fd_path(a0, srch);
+            }
+        }
+        if (empty && !force) {
+            /* Whether the caller may name the source by descriptor at all is
+             * the kernel's question, and the kernels in the field answer it
+             * two ways. Before 6.10 the flag takes CAP_DAC_READ_SEARCH, and
+             * without it the call is ENOENT ahead of everything but the
+             * flags check — a NULL name, a number that is no descriptor, the
+             * destination, all of it comes after. From 6.10 the descriptor's
+             * open-time credentials have to be the caller's own. Made through
+             * the /proc link, which every kernel follows for anyone, the call
+             * answered like a root's on the older ones (measured on 6.8:
+             * link_byfd=2 natively, 0 here). So it goes to the kernel as the
+             * guest made it, with the destination translated and nothing
+             * else. The empty name is a constant of ours: the guest's own
+             * buffer could turn into a relative name between our read of it
+             * and the kernel's, and resolve untranslated against the
+             * descriptor. A NULL is handed over as a NULL, and a NULL
+             * destination too — its EFAULT comes after the source's verdict,
+             * and the kernel never looks at the dirfd beside it. */
+            long ddfd = a2, dst = 0;
+            if (dp) {
+                if (cng_resolve_at(a2, dp, 0, dsth, sizeof dsth) != 0) {
+                    if (cng_g_debug)
+                        cng_dprintf(2, "[cng] linkat: dst unresolved (%s)\n", dp);
+                    return -ENOENT;
+                }
+                if (ro_denied(dsth))
+                    return -EROFS;
+                ddfd = CNG_AT_FDCWD;
+                dst = (long)dsth;
+            }
+            r = reissue(a0, sp ? (long)"" : 0, ddfd, dst, fl, 0, __NR_linkat);
+            /* Under fake root the capability is faked, as chroot's
+             * CAP_SYS_CHROOT and the DAC bypass are. Root's AT_EMPTY_PATH
+             * links the inode the descriptor holds, and so does a link made
+             * through its /proc link, so an ENOENT is retried that way below
+             * — where a NULL name and a number that is no descriptor come
+             * out as root would have had them, EFAULT and EBADF. (A
+             * destination whose parent is missing is ENOENT again.) */
+            if (r == -ENOENT && cng_fake_root())
+                goto by_link;
+            if (cng_g_debug && r != 0)
+                cng_dprintf(2, "[cng] linkat %s -> %s real=%ld\n", srch,
+                            dp ? dsth : "(null)", r);
+            /* An ENOENT here is the flag's refusal or the destination's, and
+             * neither is a hardlink denial for the fallback to paper over —
+             * the guest gets it as it would natively, and its own /proc idiom
+             * then comes through the path route. */
+            if (r == -ENOENT || !dp)
+                return r;
+            goto fallback;
+        }
+    by_link:
         /* The kernel copies both names in before it looks at either, so a NULL
          * one is -EFAULT: not an empty name, and not the -ENOENT the
          * unresolvable arm below would otherwise have answered for it. Every
@@ -4343,44 +4438,22 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * the kernel — xlate_lim passes one straight through, and the re-issue
          * lets the kernel say what it says, which is also how utimensat and
          * statx keep the two spellings where a NULL pathname is legitimate.
-         * This one resolves both ends itself and re-issues neither. */
-        if (!sp || !a3)
+         * This route resolves both ends itself and re-issues neither. */
+        if (!sp || !dp)
             return -EFAULT;
-        int follow = ((int)a4 & CNG_AT_SYMLINK_FOLLOW) ? 1 : 0;
-        int empty = ((int)a4 & CNG_AT_EMPTY_PATH) && !sp[0];
-        char srch[CNG_PATH_MAX], dsth[CNG_PATH_MAX];
-        /* AT_SYMLINK_FOLLOW is applied at guest level (the host must never
-         * follow a guest symlink's target itself); the host call then runs
-         * with no flags. Link-by-fd (AT_EMPTY_PATH, the O_TMPFILE publish
-         * idiom) goes through /proc/self/fd, which the host must follow. */
         if (empty) {
-            /* The number has to be a descriptor before it can be spelled as
-             * one. AT_FDCWD is not: the kernel resolves the empty name against
-             * the working directory and answers about *that* — EEXIST if the
-             * new name is taken, EPERM otherwise, a directory being unlinkable
-             * — so it goes through the resolver like any other path. Every
-             * other negative, and every number that is not open, is EBADF, the
-             * same test execveat's own AT_EMPTY_PATH makes. Without either,
-             * proc_fd_path spelled AT_FDCWD as "/proc/self/fd/0" and the link
-             * was made to stdin. */
-            if ((int)a0 == CNG_AT_FDCWD) {
-                if (cng_resolve_at(CNG_AT_FDCWD, ".", 1, srch, sizeof srch) != 0)
-                    return -ENOENT;
-            } else if (sys_fcntl((int)a0, CNG_F_GETFD, 0) < 0) {
+            /* Every negative but AT_FDCWD, and every number that is not open,
+             * is EBADF, the same test execveat's own AT_EMPTY_PATH makes. */
+            if ((int)a0 != CNG_AT_FDCWD && sys_fcntl((int)a0, CNG_F_GETFD, 0) < 0)
                 return -EBADF;
-            } else {
-                proc_fd_path(a0, srch);
-            }
         } else if (cng_resolve_at(a0, sp, follow, srch, sizeof srch) != 0) {
             if (cng_g_debug)
-                cng_dprintf(2, "[cng] linkat: src unresolved (%s)\n",
-                            sp ? sp : "(null)");
+                cng_dprintf(2, "[cng] linkat: src unresolved (%s)\n", sp);
             return -ENOENT;
         }
-        if (cng_resolve_at(a2, (const char *)a3, 0, dsth, sizeof dsth) != 0) {
+        if (cng_resolve_at(a2, dp, 0, dsth, sizeof dsth) != 0) {
             if (cng_g_debug)
-                cng_dprintf(2, "[cng] linkat: dst unresolved (%s)\n",
-                            a3 ? (const char *)a3 : "(null)");
+                cng_dprintf(2, "[cng] linkat: dst unresolved (%s)\n", dp);
             return -ENOENT;
         }
         /* Only the new name is created, so only the destination end matters —
@@ -4388,12 +4461,14 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * after both ends resolve so a bad source still reports ENOENT. */
         if (ro_denied(dsth))
             return -EROFS;
-        long r;
-        if (cng_g_l2s && cng_g_l2s_force)
-            r = -EPERM; /* CNG_L2S_FORCE: exercise the fallback directly */
+        if (force)
+            r = -EPERM;
         else
             r = reissue(CNG_AT_FDCWD, (long)srch, CNG_AT_FDCWD, (long)dsth,
-                        empty ? CNG_AT_SYMLINK_FOLLOW : 0, 0, __NR_linkat);
+                        empty     ? CNG_AT_SYMLINK_FOLLOW
+                        : flagged ? CNG_AT_EMPTY_PATH
+                                  : 0,
+                        0, __NR_linkat);
         if (cng_g_debug && r != 0)
             cng_dprintf(2, "[cng] linkat %s -> %s real=%ld\n", srch, dsth, r);
         /* Some Android builds deny app-data hardlinks with ENOENT rather
@@ -4406,6 +4481,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             if (cng_pin_fstatat(srch, stt, CNG_AT_SYMLINK_NOFOLLOW) == 0)
                 r = -EPERM;
         }
+    fallback:
         if (cng_g_l2s &&
             (r == -EPERM || r == -EMLINK || r == -EXDEV || r == -ENOSYS ||
              r == -EACCES || r == -EOPNOTSUPP)) {

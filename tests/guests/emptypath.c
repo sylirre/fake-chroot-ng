@@ -72,12 +72,12 @@ static void probe(const char *tag, const char *name) {
 /* The errno of one linkat, or 0 — the whole answer, since a hardlink either
  * happens or does not. The destination is removed on both sides of the call, so
  * one run cannot answer EEXIST for the previous one's leftovers. */
-static void linkprobe(const char *tag, int fd, const char *name) {
+static void linkprobe(const char *tag, int fd, const char *name, int flags) {
     char p[512];
     snprintf(p, sizeof p, "%s/%s", base, name);
     unlink(p);
     errno = 0;
-    int r = linkat(fd, "", AT_FDCWD, p, AT_EMPTY_PATH);
+    int r = linkat(fd, "", AT_FDCWD, p, flags);
     printf("%s=%d\n", tag, r < 0 ? errno : 0);
     unlink(p);
 }
@@ -125,7 +125,15 @@ int main(int argc, char **argv) {
      * and the destination would otherwise straddle a mount point and answer
      * EXDEV before any of what is under test is reached.
      *
-     *  - a real descriptor IS the file, and the link is made;
+     *  - a real descriptor IS the file, and the link is made — by a caller
+     *    the kernel lets name one that way. Whether it does is the kernel's
+     *    own rule, and it changed in 6.10: before, the flag takes
+     *    CAP_DAC_READ_SEARCH and is ENOENT without it, ahead of everything
+     *    below; since, the descriptor's open-time credentials have to be the
+     *    caller's. The emulation used to make the link through the
+     *    descriptor's /proc link, which every kernel follows for anyone, and
+     *    so answered like a root on the older kernels. It has to ask instead,
+     *    which is what this differential settles on whichever kernel runs it;
      *  - AT_FDCWD is not a descriptor. The kernel resolves the empty name
      *    against the working directory and answers about that directory, which
      *    is EPERM: there is no hardlink to a directory. Spelling it as one
@@ -133,7 +141,14 @@ int main(int argc, char **argv) {
      *    so the guest's own stdin was linked into the filesystem instead;
      *  - every other negative number, and every number that is not open, is
      *    EBADF, where a /proc/self/fd name that happens not to exist is
-     *    ENOENT. */
+     *    ENOENT;
+     *  - a flag bit the call does not know is EINVAL, judged before either
+     *    name — and it used to be dropped on the way to the host, so the link
+     *    was made where the kernel refuses it;
+     *  - the flag beside a name that is NOT empty changes nothing about the
+     *    lookup, but the capability rule is asked of the flag: the older
+     *    kernels refuse the call all the same, and the newer ones make the
+     *    link. The emulation dropped the flag there too. */
     char src[512];
     snprintf(src, sizeof src, "%s/f", base);
     if (chdir(base[0] ? base : "/") != 0) {
@@ -145,11 +160,23 @@ int main(int argc, char **argv) {
         printf("link_open=failed\n");
         return 0;
     }
-    linkprobe("link_byfd", lf, "lk_ok");
-    linkprobe("link_cwd", AT_FDCWD, "lk_cwd");
-    linkprobe("link_negfd", -5, "lk_neg");
+    linkprobe("link_byfd", lf, "lk_ok", AT_EMPTY_PATH);
+    linkprobe("link_cwd", AT_FDCWD, "lk_cwd", AT_EMPTY_PATH);
+    linkprobe("link_negfd", -5, "lk_neg", AT_EMPTY_PATH);
+    linkprobe("link_badflag", lf, "lk_bad", AT_EMPTY_PATH | 0x8);
     close(lf);
-    linkprobe("link_closedfd", lf, "lk_closed");
+    linkprobe("link_closedfd", lf, "lk_closed", AT_EMPTY_PATH);
+    {
+        int bd = open(base[0] ? base : "/", O_RDONLY | O_DIRECTORY);
+        char np[512];
+        snprintf(np, sizeof np, "%s/lk_named", base);
+        unlink(np);
+        errno = 0;
+        int r = linkat(bd, "f", AT_FDCWD, np, AT_EMPTY_PATH);
+        printf("link_named_flag=%d\n", r < 0 ? errno : 0);
+        unlink(np);
+        close(bd);
+    }
 
     /* execveat(AT_EMPTY_PATH), which reads the number the same way and then
      * has to open what it names for execution. None of these can succeed, so

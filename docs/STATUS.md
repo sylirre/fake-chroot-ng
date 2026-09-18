@@ -2857,6 +2857,46 @@ vfork/`posix_spawn` child-stack handling.
   it are unchanged. Measured on 6.8: `beneath_abs=-18`, `inroot_abs=ok`,
   `beneath_abslink=-18`, `beneath_link=ok`, `inroot_abslink=ok`, as natively.
 
+- [x] **M51 — `linkat` named the descriptor by its `/proc` link, whatever the kernel allowed**
+  `linkat(fd, "", …, AT_EMPTY_PATH)` — the O_TMPFILE publish idiom — was made
+  as a `linkat` of "/proc/self/fd/N" with `AT_SYMLINK_FOLLOW`, which every
+  kernel follows for anyone. Whether the caller may name the source by
+  descriptor is the kernel's question, and the kernels in the field answer it
+  two ways: before 6.10 the flag takes `CAP_DAC_READ_SEARCH`, and without it
+  the call is `ENOENT` ahead of everything but the flags check (a NULL name,
+  a number that is no descriptor, the destination — all of it comes after);
+  from 6.10 the descriptor's open-time credentials have to be the caller's
+  own. So on 6.8 the emulation answered like a root's: `link_byfd=0` where
+  the kernel says 2, and a NULL source under the flag `EFAULT` where the
+  kernel says `ENOENT` first — the two differential legs (`m5b`, `m17`) that
+  failed on that kernel alone. A flag bit outside the two the call knows was
+  dropped on the way to the host, too, and the link made where the kernel
+  answers `EINVAL` before either name.
+  - The flagged call goes to the kernel as the guest made it, with the
+    destination translated and pinned and nothing else: the empty name as a
+    constant of ours (the guest's buffer could turn into a relative name
+    between our read and the kernel's, and resolve untranslated against the
+    descriptor), a NULL as a NULL, a NULL destination too — its `EFAULT`
+    comes after the source's verdict, and the kernel never looks at the dirfd
+    beside it. The flag beside a name that is not empty is kept on the
+    re-issue as well: the older kernels refuse the call for the flag whatever
+    the name says, and the pinned directory is one we opened, so the newer
+    rule passes it as the guest's own would have.
+  - Under fake root the capability is faked, as `chroot`'s `CAP_SYS_CHROOT`
+    and the DAC bypass are: an `ENOENT` is retried through the descriptor's
+    `/proc` link, which links the inode root's `AT_EMPTY_PATH` would have
+    (`link_byfd=0`, and `AT_FDCWD` still `EPERM`, a number that is none still
+    `EBADF`, as root has them on every kernel).
+  - The `-l` fallback is taken for the filesystem's refusals of the flagged
+    call as before (`EPERM`, `EACCES`, `EXDEV`, …), from the `/proc` link it
+    always linked from; an `ENOENT` there is the flag's or the destination's
+    and never a hardlink denial to paper over, so the "ENOENT is only
+    believable when the source is absent" reading stays on the path route.
+    `CNG_L2S_FORCE` still routes every `linkat` through the emulation.
+  - `tests/guests/emptypath.c` gained `link_badflag` and `link_named_flag`;
+    `m5b` runs it once more under `-u 0:0` for root's answers, and `m17`'s
+    flagged-NULL needle is the oracle's own line.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes
