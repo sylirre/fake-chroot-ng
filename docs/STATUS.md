@@ -2838,6 +2838,25 @@ vfork/`posix_spawn` child-stack handling.
     `tests/guests/uxreply.c` has two unrelated invocations exchange
     datagrams on their own bound names and read each other's back.
 
+- [x] **M50 — a scoped `openat2` was pinned, and the pin undid the scope**
+  `RESOLVE_BENEATH` / `RESOLVE_IN_ROOT` go to the kernel untranslated where
+  the guest's namespace adds nothing under the dirfd (M24): the scoping is
+  the kernel's to apply within one resolution, and there is no walk whose
+  product a second resolution could move. M49's `reissue()` pinned the call
+  all the same, and the pin is built for a walk's product: an absolute name
+  was split at its last slash and re-aimed at the directory it spelled — the
+  HOST root, where `BENEATH` had nothing left to refuse and `IN_ROOT` nothing
+  to re-root, so both answered `ENOENT` for the `EXDEV` and the re-rooted
+  open the kernel gives — and `RESOLVE_NO_SYMLINKS` was added to every open,
+  which turned the relative and absolute links the scope would have followed
+  or refused into `ELOOP`. Five legs of the `m24` differential, against a
+  native kernel (the legs are host-gated: no qemu-user build has `openat2`,
+  which is why the local suite never saw it). The scoped route makes the
+  call raw now, the guest's name against the guest's own descriptor, with the
+  `cng_blocked` check kept; the `:ro` refusal and the hidden-pid check around
+  it are unchanged. Measured on 6.8: `beneath_abs=-18`, `inroot_abs=ok`,
+  `beneath_abslink=-18`, `beneath_link=ok`, `inroot_abslink=ok`, as natively.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

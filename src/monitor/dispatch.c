@@ -2677,7 +2677,7 @@ long cng_dotdot_verdict(long dirfd, const char *path) {
  * Returns the syscall result. */
 static long how_precheck(const struct cng_open_how *how);
 
-static long openat2_scoped(long dirfd, long path, long a4, long a5,
+static long openat2_scoped(long dirfd, long path,
                            const struct cng_open_how *how) {
     char hdir[CNG_PATH_MAX];
     int have_dir = (int)dirfd == CNG_AT_FDCWD
@@ -2715,8 +2715,25 @@ static long openat2_scoped(long dirfd, long path, long a4, long a5,
         return -EROFS;
     }
 
-    long r = reissue(dirfd, path, (long)how, (long)sizeof *how, a4, a5,
-                     __NR_openat2);
+    /* Raw, not reissue(): the pin is for a walk's product — a host path the
+     * kernel would resolve a second time — and there is no walk here. The
+     * name goes over as the guest spelled it, against the guest's own
+     * descriptor, and the scoping is the kernel's to apply within that one
+     * resolution: an absolute name is EXDEV under BENEATH and re-rooted onto
+     * the directory under IN_ROOT, a symlink on the way is followed under the
+     * same rule, and a rename racing a `..` is its EAGAIN. Whatever the tree
+     * does meanwhile, the answer stays under the directory. Pinned, the name
+     * was split at its last slash and re-aimed at the directory it spelled —
+     * an absolute one at the HOST root, where BENEATH had nothing left to
+     * refuse and IN_ROOT nothing to re-root (ENOENT for both) — and
+     * RESOLVE_NO_SYMLINKS was added, which turned every link the scope would
+     * have followed or refused into ELOOP. */
+    if (cng_blocked[__NR_openat2]) {
+        cng_note_blocked(__NR_openat2);
+        return -ENOSYS;
+    }
+    long r = cng_syscall6(dirfd, path, (long)how, (long)sizeof *how, 0, 0,
+                          __NR_openat2);
     if (r >= 0 && have_dir && !cng_g_no_proc && !strncmp(hdir, "/proc", 5) &&
         (!hdir[5] || hdir[5] == '/')) {
         char land[CNG_PATH_MAX];
@@ -3500,7 +3517,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             if (walk < 0)
                 return -EACCES; /* a directory the guest has no name for */
             if (!walk)
-                return openat2_scoped(a0, a1, a4, a5, &how);
+                return openat2_scoped(a0, a1, &how);
             /* From here we answer in place of the kernel, so the how has to be
              * judged the way it would have been: build_open_flags() runs before
              * any lookup, and BENEATH and IN_ROOT together are one of the things
