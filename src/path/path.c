@@ -354,9 +354,11 @@ static int fs_live(const struct cng_fs *fs) {
  * NUL within its bounds whatever prefix has been copied over it. */
 static void fs_copy(struct cng_fs *dst, const struct cng_fs *src) {
     cng_strlcpy(dst->rootfs, src->rootfs, sizeof dst->rootfs);
+    dst->rlen = src->rlen;
     for (int i = 0; i < src->nbinds; i++)
         dst->binds[i] = src->binds[i];
     dst->nbinds = src->nbinds;
+    dst->has_ro = src->has_ro;
     cng_strlcpy(dst->cwd, src->cwd, sizeof dst->cwd);
 }
 
@@ -436,9 +438,23 @@ size_t cng_fs_rootfs(char *out, size_t sz) {
 int cng_fs_init(struct cng_fs *fs, const char *rootfs) {
     memset(fs, 0, sizeof *fs);
     int r = canon_host_root(fs->rootfs, sizeof fs->rootfs, rootfs ? rootfs : "/");
+    fs->rlen = (unsigned)strlen(fs->rootfs);
     fs->cwd[0] = '/';
     fs->cwd[1] = '\0';
     return r;
+}
+
+/* The cached lengths of a bind whose strings are set: see the struct. The
+ * guest prefix is canonical, so its last component follows its last slash,
+ * and for "/" that is the empty name. */
+static void bind_measure(struct cng_bind *b) {
+    b->glen = (unsigned)strlen(b->guest);
+    b->hlen = (unsigned)strlen(b->host);
+    unsigned base = 0;
+    for (unsigned i = 0; i < b->glen; i++)
+        if (b->guest[i] == '/')
+            base = i + 1;
+    b->base = base;
 }
 
 int cng_fs_add_bind(struct cng_fs *fs, const char *guest, const char *host,
@@ -460,18 +476,22 @@ int cng_fs_add_bind(struct cng_fs *fs, const char *guest, const char *host,
         return -1;
     if (canon_host_root(b->host, sizeof b->host, host) != 0)
         return -1;
-    b->glen = (unsigned)strlen(b->guest);
+    bind_measure(b);
     b->ro = ro ? 1u : 0u;
     fs->nbinds++;
+    if (b->ro)
+        fs->has_ro = 1;
     return 0;
 }
 
 static int host_ro_1(const struct cng_fs *fs, const char *host) {
+    if (!fs->has_ro)
+        return 0;
     int best = -1;
     size_t blen = 0;
     for (int i = 0; i < fs->nbinds; i++) {
         const char *bh = fs->binds[i].host;
-        size_t hl = strlen(bh);
+        size_t hl = fs->binds[i].hlen;
         if (hl && strncmp(host, bh, hl) == 0 &&
             (host[hl] == '/' || host[hl] == '\0') && hl > blen) {
             best = i;
@@ -521,6 +541,7 @@ static void chroot_1(struct cng_fs *fs, const char *guest_root,
      * the rest fall out of the guest's view. A bind *at* the new root needs no
      * entry — its host side becomes the rootfs below. */
     int w = 0;
+    fs->has_ro = 0;
     for (int i = 0; i < fs->nbinds; i++) {
         char g[sizeof fs->binds[0].guest];
         if (!rebase(g, sizeof g, fs->binds[i].guest, root, rlen) ||
@@ -529,7 +550,9 @@ static void chroot_1(struct cng_fs *fs, const char *guest_root,
         if (w != i)
             fs->binds[w] = fs->binds[i];
         cng_strlcpy(fs->binds[w].guest, g, sizeof fs->binds[w].guest);
-        fs->binds[w].glen = (unsigned)strlen(fs->binds[w].guest);
+        bind_measure(&fs->binds[w]);
+        if (fs->binds[w].ro)
+            fs->has_ro = 1;
         w++;
     }
     fs->nbinds = w;
@@ -541,6 +564,7 @@ static void chroot_1(struct cng_fs *fs, const char *guest_root,
         cng_strlcpy(fs->cwd, "/", sizeof fs->cwd);
 
     normalize_root(fs->rootfs, sizeof fs->rootfs, host_root);
+    fs->rlen = (unsigned)strlen(fs->rootfs);
 }
 
 void cng_fs_chroot(struct cng_fs *fs, const char *guest_root,
@@ -798,14 +822,14 @@ static int untranslate_1(const struct cng_fs *fs, const char *host, char *out,
      * when a dirfd was resolved back through here. */
     int best = -2; /* -2 nothing matched, -1 the rootfs, >= 0 that bind */
     size_t blen = 0;
-    size_t rl = strlen(fs->rootfs); /* "" for an identity rootfs */
+    size_t rl = fs->rlen; /* 0 for an identity rootfs */
     if (host_under(host, fs->rootfs, rl)) {
         best = -1;
         blen = rl;
     }
     for (int i = 0; i < fs->nbinds; i++) {
         const char *bh = fs->binds[i].host;
-        size_t hl = strlen(bh);
+        size_t hl = fs->binds[i].hlen;
         if (hl > blen && host_under(host, bh, hl)) {
             best = i;
             blen = hl;

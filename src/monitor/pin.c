@@ -62,13 +62,13 @@ static size_t prefix_of(const char *h, char *out, size_t sz) {
         do {
             unsigned seq = cng_fs_read_begin(&v);
             best = 0;
-            size_t rl = strlen(v->rootfs);
+            size_t rl = v->rlen;
             if (rl && host_under(h, v->rootfs, rl)) {
                 best = cng_strlcpy(out, v->rootfs, sz);
             }
             for (int i = 0; i < v->nbinds; i++) {
                 const char *bh = v->binds[i].host;
-                size_t hl = strlen(bh);
+                size_t hl = v->binds[i].hlen;
                 if (hl > best && host_under(h, bh, hl))
                     best = cng_strlcpy(out, bh, sz);
             }

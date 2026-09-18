@@ -13,17 +13,26 @@
 #define CNG_PATH_MAX  4096
 #define CNG_MAX_BINDS 64
 
+/* The lengths and the basename offset are kept with the strings because the
+ * view is walked on the hot paths — every relative name asks whether it could
+ * be a bind's basename, every mutating call whether the view has a :ro bind at
+ * all, every reverse lookup how long each host prefix is — and they are
+ * written only by cng_fs_add_bind and cng_fs_chroot, which keep them right. */
 struct cng_bind {
     char guest[256];  /* canonical guest prefix */
     char host[512];   /* host path, no trailing slash */
     unsigned glen;    /* strlen(guest) */
+    unsigned hlen;    /* strlen(host) */
+    unsigned base;    /* guest + base is its last component ("" for "/") */
     unsigned ro;      /* ":ro" mount: mutating syscalls under it get -EROFS */
 };
 
 struct cng_fs {
     char rootfs[512]; /* host root, normalized: no trailing slash; "" == "/" */
+    unsigned rlen;    /* strlen(rootfs): 0 for the identity root */
     struct cng_bind binds[CNG_MAX_BINDS];
     int nbinds;
+    int has_ro;       /* any bind with ro set */
     char cwd[CNG_PATH_MAX]; /* canonical guest cwd, default "/" */
 };
 

@@ -930,12 +930,9 @@ again:
     /* Bind mount points whose parent is exactly this directory. */
     for (int i = 0; i < v->nbinds; i++) {
         const char *g = v->binds[i].guest;
-        const char *slash = 0;
-        for (const char *p = g; *p; p++)
-            if (*p == '/')
-                slash = p;
-        if (!slash || !slash[1])
-            continue;
+        if (!v->binds[i].base || !g[v->binds[i].base])
+            continue; /* "/" itself: no parent to list it in */
+        const char *slash = g + v->binds[i].base - 1;
         char parent[CNG_PATH_MAX];
         size_t plen = (size_t)(slash - g);
         if (plen == 0)
@@ -1633,9 +1630,8 @@ static int name_may_overlay(const char *name) {
         unsigned seq = cng_fs_read_begin(&v);
         hit = 0;
         for (int i = 0; i < v->nbinds && !hit; i++) {
-            const char *g = v->binds[i].guest;
-            const char *s = strrchr(g, '/');
-            if (s && s[1] && strcmp(s + 1, name) == 0)
+            const char *bn = v->binds[i].guest + v->binds[i].base;
+            if (bn[0] && strcmp(bn, name) == 0)
                 hit = 1;
         }
         if (!cng_fs_read_retry(seq))
@@ -1661,9 +1657,7 @@ static int fs_has_ro(void) {
     int ro;
     do {
         unsigned seq = cng_fs_read_begin(&v);
-        ro = 0;
-        for (int i = 0; i < v->nbinds && !ro; i++)
-            ro = v->binds[i].ro != 0;
+        ro = v->has_ro;
         if (!cng_fs_read_retry(seq))
             break;
     } while (1);
