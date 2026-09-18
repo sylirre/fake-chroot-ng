@@ -37,6 +37,59 @@ struct proc_tab {
 static struct proc_tab *g_tab; /* MAP_SHARED region, or NULL if unavailable */
 static int g_tab_n;
 
+/* The slot holding `pid`, or -1.
+ *
+ * This is the scan every lookup is — and for a pid that is not a guest's,
+ * which is most of what a /proc listing asks about, it is the whole 4096-slot
+ * array. So it is made cheap: two slots per 64-bit load, relaxed, with the
+ * acquire — what orders the slot's payload after its claim — as one fence at
+ * the hit instead of an ordering load per slot, which cannot be pipelined and
+ * reloads the table pointer under it every time. The table is 8-byte aligned
+ * (the pid array is its first member) and its size is even.
+ *
+ * One entry is remembered: the last slot found, with the pid it held. A hit
+ * is taken only after the slot is seen to hold that pid still, so a stale or
+ * torn entry (two threads may write it) costs a rescan and nothing else. It
+ * is our own slot most of the time — every chdir refreshes it and every
+ * /proc/self read consults it — and a child inherits its parent's, which
+ * holds the parent's pid and so is rescanned once. */
+typedef u64 __attribute__((__may_alias__)) pid_pair;
+static int g_hint_slot = -1;
+static int g_hint_pid;
+
+static int slot_of(int pid) {
+    if (!g_tab || pid <= 0)
+        return -1;
+    const s32 *tab = g_tab->pid;
+    int n = g_tab_n;
+    int h = __atomic_load_n(&g_hint_slot, __ATOMIC_RELAXED);
+    if (h >= 0 && h < n && __atomic_load_n(&g_hint_pid, __ATOMIC_RELAXED) == pid &&
+        __atomic_load_n(&tab[h], __ATOMIC_RELAXED) == pid) {
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        return h;
+    }
+    int i = 0, found = -1;
+    for (; i + 1 < n; i += 2) {
+        u64 w = __atomic_load_n((const pid_pair *)&tab[i], __ATOMIC_RELAXED);
+        if ((s32)(u32)w == pid) {
+            found = i;
+            break;
+        }
+        if ((s32)(u32)(w >> 32) == pid) {
+            found = i + 1;
+            break;
+        }
+    }
+    if (found < 0 && i < n && __atomic_load_n(&tab[i], __ATOMIC_RELAXED) == pid)
+        found = i; /* an odd slot count: the last one on its own */
+    if (found < 0)
+        return -1;
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    __atomic_store_n(&g_hint_slot, found, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_hint_pid, pid, __ATOMIC_RELAXED);
+    return found;
+}
+
 /* starttime, field 22 of /proc/<pid>/stat: skip past the last ')' (comm may
  * contain spaces and parens), then take the 20th field after it. 0 when the
  * process is gone or /proc is unreadable — which is also how a dead slot is
@@ -392,9 +445,9 @@ static struct proc_ent *slot_take(int i, s32 want, int pid) {
 static struct proc_ent *slot_for(int pid) {
     if (!g_tab || pid <= 0)
         return 0;
-    for (int i = 0; i < g_tab_n; i++)
-        if (__atomic_load_n(&g_tab->pid[i], __ATOMIC_ACQUIRE) == pid)
-            return &g_tab->ent[i];
+    int have = slot_of(pid);
+    if (have >= 0)
+        return &g_tab->ent[have];
     for (int i = 0; i < g_tab_n; i++) {
         if (__atomic_load_n(&g_tab->pid[i], __ATOMIC_ACQUIRE) != 0)
             continue;
@@ -510,15 +563,10 @@ void cng_procreg_fork(int child) {
 void cng_procreg_set_cwd(const char *cwd_guest) {
     if (!g_tab)
         return;
-    int pid = (int)sys_getpid();
-    struct proc_ent *e = 0;
-    for (int i = 0; i < g_tab_n; i++)
-        if (__atomic_load_n(&g_tab->pid[i], __ATOMIC_ACQUIRE) == pid) {
-            e = &g_tab->ent[i];
-            break;
-        }
-    if (!e)
+    int slot = slot_of((int)sys_getpid());
+    if (slot < 0)
         return;
+    struct proc_ent *e = &g_tab->ent[slot];
     u32 s = seq_acquire(e, 4096);
     if (!s)
         return; /* contended refresh: the next chdir writes the live value */
@@ -531,48 +579,35 @@ int cng_procreg_has(int pid) {
         return 0;
     if (pid == (int)sys_getpid())
         return 1; /* always ourselves, registry or not */
-    if (!g_tab)
+    int i = slot_of(pid);
+    if (i < 0)
         return 0;
-    for (int i = 0; i < g_tab_n; i++) {
-        if (__atomic_load_n(&g_tab->pid[i], __ATOMIC_ACQUIRE) != pid)
-            continue;
-        /* The pid-reuse guard. Exit is not a trapped syscall (and a SIGKILL
-         * never could be), so a slot outlives its process and the host may
-         * hand the number to a foreign process — which must not inherit guest
-         * visibility through the hidden view. An unstamped slot (a claim whose
-         * payload write hasn't landed, or never did) stays invisible: every
-         * completed publish stamps a starttime. */
-        u64 start = __atomic_load_n(&g_tab->ent[i].start, __ATOMIC_ACQUIRE);
-        if (!start)
-            return 0;
-        u64 live = cng_proc_starttime(pid, 0);
-        if (live != start) {
-            if (live) { /* a true reuse: scrub the slot for the free list */
-                s32 expect = (s32)pid;
-                __atomic_compare_exchange_n(&g_tab->pid[i], &expect, 0, 0,
-                                            __ATOMIC_ACQ_REL,
-                                            __ATOMIC_RELAXED);
-            } /* gone (or unreadable): slot_for reclaims it lazily */
-            return 0;
-        }
-        return 1;
+    /* The pid-reuse guard. Exit is not a trapped syscall (and a SIGKILL
+     * never could be), so a slot outlives its process and the host may
+     * hand the number to a foreign process — which must not inherit guest
+     * visibility through the hidden view. An unstamped slot (a claim whose
+     * payload write hasn't landed, or never did) stays invisible: every
+     * completed publish stamps a starttime. */
+    u64 start = __atomic_load_n(&g_tab->ent[i].start, __ATOMIC_ACQUIRE);
+    if (!start)
+        return 0;
+    u64 live = cng_proc_starttime(pid, 0);
+    if (live != start) {
+        if (live) { /* a true reuse: scrub the slot for the free list */
+            s32 expect = (s32)pid;
+            __atomic_compare_exchange_n(&g_tab->pid[i], &expect, 0, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+        } /* gone (or unreadable): slot_for reclaims it lazily */
+        return 0;
     }
-    return 0;
+    return 1;
 }
 
 int cng_procreg_get(int pid, struct cng_procsnap *out) {
-    if (!g_tab || pid <= 0)
+    int slot = slot_of(pid);
+    if (slot < 0)
         return 0;
-    struct proc_ent *e = 0;
-    int slot = -1;
-    for (int i = 0; i < g_tab_n; i++)
-        if (__atomic_load_n(&g_tab->pid[i], __ATOMIC_ACQUIRE) == pid) {
-            e = &g_tab->ent[i];
-            slot = i;
-            break;
-        }
-    if (!e)
-        return 0;
+    struct proc_ent *e = &g_tab->ent[slot];
     for (int tries = 0; tries < 100; tries++) {
         u32 s1 = __atomic_load_n(&e->seq, __ATOMIC_RELAXED);
         if (s1 & 1)
