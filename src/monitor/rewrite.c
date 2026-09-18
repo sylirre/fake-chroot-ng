@@ -27,11 +27,12 @@ extern char cng_svc_tramp_back[];
 #define MOVZ_X8      0xD2800008u
 #define NR_RT_SIGRETURN 139u
 
-/* Section headers we are willing to walk, and how many at a time (a page's
- * worth would be 64; the biggest object in a Debian/Alpine aarch64 rootfs has
- * 61 sections in total, so the loop runs twice for the worst of them). */
+/* Section headers we are willing to walk, and how many at a time: a page's
+ * worth, which is 4 KiB of the caller's frame — the loader's, or the
+ * dispatcher's on its 256 KiB scratch stack — and one pread for any object
+ * in a Debian/Alpine aarch64 rootfs (the biggest has 61 sections). */
 #define MAX_SHDR   1024
-#define SHDR_CHUNK 8
+#define SHDR_CHUNK 64
 
 /* How far back a candidate's syscall number may have been set, in
  * instructions. Measured over ~1800 real `svc` sites in Alpine/Debian aarch64
@@ -315,6 +316,7 @@ struct lazy_region {
  * own. */
 static struct cng_tab g_lazy = CNG_TAB_INIT(struct lazy_region);
 static unsigned long g_lazy_n;
+static struct lazy_region *g_lazy_last; /* the entry the last lookup found */
 static int g_lazy_nomaps; /* no /proc to read: stop asking */
 /* Not a lock to wait on: a thread that finds the table busy leaves this site to
  * the floor, which is what would have answered it anyway. That also keeps a
@@ -487,14 +489,22 @@ static unsigned long lazy_pool(unsigned long lo, unsigned long hi,
 /* The table entry for the mapping holding `site`, or nothing. An entry with no
  * pool is a mapping we know we cannot patch, kept precisely so the next trap
  * out of it costs nothing — not even the read of /proc/self/maps, which is the
- * whole reason the table exists. */
+ * whole reason the table exists. The entry found last is tried first: the
+ * sites that keep arriving are the ones a mapping that cannot be patched
+ * traps out of, and they arrive in runs. Read and written under the busy
+ * flag, like the table. */
 static struct lazy_region *lazy_known(unsigned long site) {
+    struct lazy_region *last = g_lazy_last;
+    if (last && site >= last->lo && site < last->hi)
+        return last;
     struct cng_tab_iter it;
     unsigned long i = 0;
     for (struct lazy_region *r = cng_tab_first(&g_lazy, &it);
          r && i < g_lazy_n; r = cng_tab_next(&g_lazy, &it), i++)
-        if (site >= r->lo && site < r->hi)
+        if (site >= r->lo && site < r->hi) {
+            g_lazy_last = r;
             return r;
+        }
     return 0;
 }
 
@@ -624,4 +634,5 @@ void cng_rewrite_lazy_reset(void) {
         if (r->pool)
             sys_munmap((void *)r->pool, LAZY_POOL);
     g_lazy_n = 0;
+    g_lazy_last = 0;
 }
