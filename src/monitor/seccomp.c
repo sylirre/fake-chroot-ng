@@ -252,11 +252,43 @@ static const int enosys_syscalls[] = {
 };
 #define NENOSYS ((int)(sizeof(enosys_syscalls) / sizeof(enosys_syscalls[0])))
 
+/* The same set as a bitset, for the -R tier: there every rewritten site calls
+ * into the dispatcher and asks this before anything else, so a walk of the
+ * list above was paid on every syscall of the process. Built from the list on
+ * first use rather than at some init point, because the self-tests reach the
+ * dispatcher without the monitor installed. Two threads may build it at once;
+ * each stores the same complete words, then releases the flag, so a reader
+ * that sees the flag sees every bit. */
+#define DENIED_WORDS 8 /* 512 numbers: the table ends at 469 (cng/unistd.h) */
+static u64 g_denied[DENIED_WORDS];
+static int g_denied_built;
+
+static void denied_build(void) {
+    u64 set[DENIED_WORDS] = {0};
+    for (int i = 0; i < NENOSYS; i++) {
+        unsigned nr = (unsigned)enosys_syscalls[i];
+        if (nr < DENIED_WORDS * 64)
+            set[nr >> 6] |= 1ULL << (nr & 63);
+    }
+    for (int i = 0; i < DENIED_WORDS; i++)
+        __atomic_store_n(&g_denied[i], set[i], __ATOMIC_RELAXED);
+    __atomic_store_n(&g_denied_built, 1, __ATOMIC_RELEASE);
+}
+
 int cng_denied_syscall(long nr) {
-    for (int i = 0; i < NENOSYS; i++)
-        if (nr == enosys_syscalls[i])
-            return 1;
-    return 0;
+    if ((unsigned long)nr >= DENIED_WORDS * 64) {
+        /* Beyond the bitset (no number is today): the list itself is the
+         * policy, so it is still the answer rather than a silent "allowed". */
+        for (int i = 0; i < NENOSYS; i++)
+            if (nr == enosys_syscalls[i])
+                return 1;
+        return 0;
+    }
+    if (!__atomic_load_n(&g_denied_built, __ATOMIC_ACQUIRE))
+        denied_build();
+    return (int)((__atomic_load_n(&g_denied[nr >> 6], __ATOMIC_RELAXED) >>
+                  (nr & 63)) &
+                 1);
 }
 
 /* The descriptor-keyed side of a :ro bind (dispatch.c, fd_ro). A read-only
