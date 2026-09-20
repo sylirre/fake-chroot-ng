@@ -422,6 +422,11 @@ check_contains "a symlink on the registry name is declined, and its target kept"
     "sharedtest symlinked registry declined=1 victim_intact=1 -> OK" "$out"
 check_contains "so is a file with permission our own 0600 creation never gives" \
     "sharedtest world-readable registry declined=1 -> OK" "$out"
-check_contains "...while an unplanted name is adopted, so those are refusals" \
-    "sharedtest an unplanted name is adopted=1 -> OK" "$out"
+# ...and one exactly as our own creation leaves it, but naming another rootfs
+# in the record at the table's end: the name is a hash of the rootfs path,
+# and two rootfs of one user could share it; the record is the whole path.
+check_contains "so is a well-formed file of another rootfs, left as it was" \
+    "sharedtest another rootfs' registry declined=1 intact=1 -> OK" "$out"
+check_contains "...while an unplanted name is adopted, and joined, so those are refusals" \
+    "sharedtest an unplanted name is adopted=2 -> OK" "$out"
 rm -rf "$SHT"

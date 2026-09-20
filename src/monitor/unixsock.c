@@ -47,10 +47,13 @@ int cng_g_share_abstract = 0;
 /* The per-rootfs abstract tag: NUL is already there, then 0x01 (so a collision
  * with a real host name is effectively impossible — host software does not put
  * a control byte first) then "cn", a byte saying which of the two forms below
- * this is, and 8 hex digits of the rootfs hash.
+ * this is, and 16 hex digits of the rootfs hash (the broker's 64-bit key;
+ * it was 32 bits and 8 digits, which two rootfs of one user could share
+ * within a birthday's reach, and there is no daemon here to compare the
+ * paths themselves).
  *
  *   'g'  the name follows the tag, unchanged. What almost every abstract name
- *        gets, and what makes the readback a plain matter of taking 12 bytes
+ *        gets, and what makes the readback a plain matter of taking 20 bytes
  *        back off the front.
  *   'H'  the tag is followed by 16 hex digits of a hash of the name, and the
  *        name itself is not on the wire at all. For a name with no room left
@@ -58,7 +61,7 @@ int cng_g_share_abstract = 0;
  *
  * Two spellings so the readback can tell them apart: a tagged name is otherwise
  * free to begin with 16 hex digits of its own. */
-#define ABS_TAG_LEN 12
+#define ABS_TAG_LEN 20
 #define ABS_DIG_LEN (ABS_TAG_LEN + 16)
 
 static int abs_tag_kind(char *out, char kind) {
@@ -66,29 +69,18 @@ static int abs_tag_kind(char *out, char kind) {
     char root[CNG_PATH_MAX];
     if (!cng_g_fs || !cng_fs_rootfs(root, sizeof root))
         cng_strlcpy(root, "/", sizeof root);
-    u32 h = cng_broker_key_hash(root);
+    u64 h = cng_broker_key_hash(root);
     out[0] = 0x01;
     out[1] = 'c';
     out[2] = 'n';
     out[3] = kind;
-    for (int i = 0; i < 8; i++)
-        out[4 + i] = hex[(h >> ((7 - i) * 4)) & 0xf];
+    for (int i = 0; i < 16; i++)
+        out[4 + i] = hex[(h >> ((15 - i) * 4)) & 0xf];
     return ABS_TAG_LEN;
 }
 
 static int abs_tag(char *out) {
     return abs_tag_kind(out, 'g');
-}
-
-/* FNV-1a over the name's bytes — a name may carry NULs, so it is taken by
- * length rather than as a C string. */
-static u64 abs_hash(const char *p, unsigned long n) {
-    u64 h = 1469598103934665603ULL;
-    for (unsigned long i = 0; i < n; i++) {
-        h ^= (unsigned char)p[i];
-        h *= 1099511628211ULL;
-    }
-    return h;
 }
 
 /* The 'H' form: the rootfs tag, then the name reduced to 16 hex digits. Both
@@ -98,7 +90,9 @@ static u64 abs_hash(const char *p, unsigned long n) {
 static void abs_digest(char *out, const char *name, unsigned long n) {
     static const char hex[] = "0123456789abcdef";
     abs_tag_kind(out, 'H');
-    u64 h = abs_hash(name, n);
+    /* FNV-1a over the name's bytes: a name may carry NULs, so it is taken by
+     * length rather than as a C string. */
+    u64 h = cng_broker_hash(name, n);
     for (int i = 0; i < 16; i++)
         out[ABS_TAG_LEN + i] = hex[(h >> ((15 - i) * 4)) & 0xf];
 }
@@ -411,7 +405,7 @@ int cng_sun_in(struct cng_sun_xlate *x, int fd, const void *addr, long alen,
         /* No room left under 108 bytes to carry the tag as well. This used to
          * pass through untagged, which put the guest's own name straight into
          * the HOST's global abstract namespace — the one escape the tag exists
-         * to close, available to any guest willing to spell its name with 96
+         * to close, available to any guest willing to spell its name with 88
          * bytes or more: two rootfs collide on it, and a host service listening
          * on such a name is reachable. It was not even a visible limitation,
          * since a name that long simply worked.

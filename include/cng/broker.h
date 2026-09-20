@@ -27,6 +27,10 @@
  *   default        per invocation, keyed by cng_broker_session() — one launch's
  *                  process tree shares a shm namespace, separate launches stay
  *                  isolated.
+ * The name is a hash of what it stands for; the daemon is started for the
+ * thing itself (the rootfs path, or the nonce) and every client presents it
+ * on connecting, so a name two keys happen to share is still one daemon per
+ * key (broker.c, broker_hello).
  *
  * Clients keep no persistent broker fd: every exchange connects, asks, and
  * closes. The daemon uses the registries themselves as its liveness signal and
@@ -143,9 +147,13 @@ const char *cng_broker_shared_dir(void);
  * deliberately clean vector (see cng_run) and is never consulted. */
 const char *cng_broker_env(const char *name);
 
-/* The namespace key hash (fnv1a32), shared with procreg.c's file tier so the
- * socket name and the file name agree on what identifies a rootfs. */
-u32 cng_broker_key_hash(const char *s);
+/* The namespace key hash (FNV-1a, 64 bits), shared with procreg.c's file tier
+ * and unixsock.c's abstract-socket tag so every name that stands for a rootfs
+ * is derived the same way. A name is a hash; what a rootfs IS is its path,
+ * and the daemon and the file tier both compare that in full before serving
+ * or sharing anything. cng_broker_hash is the same over any bytes. */
+u64 cng_broker_key_hash(const char *s);
+u64 cng_broker_hash(const void *p, unsigned long n);
 
 /* ---- transport, shared with the sem/msg registry (ipcreg.c) -------------
  * The semaphore and message-queue operations stream a payload alongside the
@@ -157,6 +165,10 @@ u32 cng_broker_key_hash(const char *s);
 /* The abstract rendezvous name this process's IPC calls use: per-rootfs under
  * --shared-proc, else per-invocation. Returns the sockaddr length. */
 unsigned cng_broker_self_addr(struct cng_sockaddr_un *a);
+
+/* Testing (-t shmtest): reach the daemon of `rootfs` presenting `key` as the
+ * rootfs; 0 if answered, -1 if hung up on. */
+int cng_broker_test_hello(const char *rootfs, const char *key);
 
 /* cng_broker_recv: the peer closed with nothing sent at all. Distinguished from
  * a plain -1 because it is the one failure a caller may safely retry — the peer

@@ -53,7 +53,7 @@ void cng_broker_seed_session(void) {
     g_session = ((u64)sys_getpid() << 32) ^
                 ((u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec);
     if (!g_session)
-        g_session = 1; /* 0 means "per-rootfs" in broker_addr */
+        g_session = 1; /* 0 means "per-rootfs" in broker_ns */
 }
 
 static u64 session(void) {
@@ -62,52 +62,116 @@ static u64 session(void) {
     return g_session;
 }
 
-u32 cng_broker_key_hash(const char *s) {
-    u32 h = 2166136261u;
-    for (; *s; s++) {
-        h ^= (u8)*s;
-        h *= 16777619u;
+u64 cng_broker_key_hash(const char *s) {
+    return cng_broker_hash(s, strlen(s));
+}
+
+u64 cng_broker_hash(const void *p, unsigned long n) {
+    u64 h = 1469598103934665603ULL;
+    for (unsigned long i = 0; i < n; i++) {
+        h ^= ((const u8 *)p)[i];
+        h *= 1099511628211ULL;
     }
     return h;
 }
 
-/* Abstract rendezvous name (path[0] == NUL => no filesystem entry), keyed by
- * uid plus either the rootfs hash (`sess` == 0: --shared-proc, one daemon per
- * rootfs) or the per-invocation nonce. The version tag covers the request
- * protocol AND struct proc_ent's layout: bump it if either changes, so a
- * differently versioned build never joins an incompatible daemon. (v2 added the
- * semaphore and message-queue operations, which widened struct cng_breq.)
- * Returns the sockaddr length. */
-static unsigned broker_addr(struct cng_sockaddr_un *a, u32 hash, u64 sess) {
+/* A namespace: its abstract rendezvous name (path[0] == NUL => no filesystem
+ * entry), keyed by uid plus either the rootfs hash (--shared-proc, one daemon
+ * per rootfs) or the per-invocation nonce, and the KEY the name stands for —
+ * the rootfs path itself, or the nonce's digits — which the daemon is
+ * started with and every client presents on connecting (see broker_hello).
+ * The name is a hash and the key is not: two rootfs of one user could in
+ * principle share a name (64 bits of it, since M55; the old 32 were within
+ * reach of a birthday), and they must never share a daemon, so the daemon
+ * compares the whole path and serves nobody else's.
+ *
+ * The version tag covers the request protocol AND struct proc_ent's layout:
+ * bump it if either changes, so a differently versioned build never joins an
+ * incompatible daemon. (v2 added the semaphore and message-queue operations,
+ * which widened struct cng_breq; v3 added the hello, and widened the hash.) */
+struct broker_ns {
+    struct cng_sockaddr_un addr;
+    unsigned alen;
+    char key[CNG_PATH_MAX];
+    unsigned klen;
+};
+
+static void broker_ns(struct broker_ns *ns, const char *rootfs, u64 sess) {
+    struct cng_sockaddr_un *a = &ns->addr;
     memset(a, 0, sizeof *a);
     a->family = CNG_AF_UNIX;
     size_t n;
-    if (sess)
-        n = cng_snprintf(a->path + 1, sizeof a->path - 1, "cng-ipc.v2.%u.s%016llx",
-                         (unsigned)sys_getuid(), (unsigned long long)sess);
-    else
-        n = cng_snprintf(a->path + 1, sizeof a->path - 1, "cng-ipc.v2.%u.%08x",
-                         (unsigned)sys_getuid(), hash);
+    if (sess) {
+        n = cng_snprintf(a->path + 1, sizeof a->path - 1,
+                         "cng-ipc.v3.%u.s%016llx", (unsigned)sys_getuid(),
+                         (unsigned long long)sess);
+        cng_snprintf(ns->key, sizeof ns->key, "%016llx",
+                     (unsigned long long)sess);
+    } else {
+        n = cng_snprintf(a->path + 1, sizeof a->path - 1,
+                         "cng-ipc.v3.%u.%016llx", (unsigned)sys_getuid(),
+                         (unsigned long long)cng_broker_key_hash(rootfs));
+        cng_strlcpy(ns->key, rootfs, sizeof ns->key);
+    }
+    ns->klen = (unsigned)strlen(ns->key);
     /* cng_snprintf reports what the format would have produced, so clamp to
      * what it actually wrote before this becomes an addrlen. These names are
      * ~40 bytes against sun_path's 108 and cannot overflow, but an addrlen past
      * the buffer would be the kind of thing nobody notices until it is. */
     if (n > sizeof a->path - 2)
         n = sizeof a->path - 2;
-    return (unsigned)(sizeof a->family + 1 + n);
+    ns->alen = (unsigned)(sizeof a->family + 1 + n);
 }
 
 /* This process's namespace: per-rootfs under --shared-proc (the same daemon
  * procreg.c fetches its table from), else per-invocation. */
-unsigned cng_broker_self_addr(struct cng_sockaddr_un *a) {
+static void ipc_ns(struct broker_ns *ns) {
     char root[CNG_PATH_MAX];
     if (cng_g_shared_proc && cng_g_fs && cng_fs_rootfs(root, sizeof root))
-        return broker_addr(a, cng_broker_key_hash(root), 0);
-    return broker_addr(a, 0, session());
+        broker_ns(ns, root, 0);
+    else
+        broker_ns(ns, 0, session());
 }
 
-static unsigned ipc_addr(struct cng_sockaddr_un *a) {
-    return cng_broker_self_addr(a);
+unsigned cng_broker_self_addr(struct cng_sockaddr_un *a) {
+    struct broker_ns ns;
+    ipc_ns(&ns);
+    *a = ns.addr;
+    return ns.alen;
+}
+
+/* The hello: what a client sends first on every connection, ahead of its
+ * request, and what the daemon reads first and compares with the key it was
+ * started for, byte for byte. A client with another key is not answered — it
+ * is a rootfs whose name collided with this daemon's, and it degrades as a
+ * client refused by peer_pid does. No round trip: the request follows on the
+ * same stream. */
+#define BROKER_HELLO_MAGIC 0x6f6c6863u /* "chlo" */
+
+struct broker_hello {
+    u32 magic;
+    u32 len;
+};
+
+static int broker_hello_send(int sock, const struct broker_ns *ns) {
+    struct broker_hello h = {BROKER_HELLO_MAGIC, ns->klen};
+    return cng_broker_write_full(sock, &h, sizeof h) == 0 &&
+                   cng_broker_write_full(sock, ns->key, ns->klen) == 0
+               ? 0
+               : -1;
+}
+
+/* Daemon side: 0 for a client of this namespace, -1 for anyone else. */
+static int broker_hello_check(int sock, const struct broker_ns *ns) {
+    struct broker_hello h;
+    if (cng_broker_read_full(sock, &h, sizeof h) != 0 ||
+        h.magic != BROKER_HELLO_MAGIC || h.len != ns->klen)
+        return -1;
+    char key[CNG_PATH_MAX];
+    if (h.len > sizeof key ||
+        cng_broker_read_full(sock, key, h.len) != 0)
+        return -1;
+    return memcmp(key, ns->key, h.len) == 0 ? 0 : -1;
 }
 
 /* Who is the process on the other end of this connection?
@@ -119,7 +183,11 @@ static unsigned ipc_addr(struct cng_sockaddr_un *a) {
  * table it trusts for /proc, a memfd it maps as shared memory, a message queue
  * it reads), or connect to ours and read whatever a guest put in a segment. The
  * kernel will tell us who is there, so ask: SO_PEERCRED reports the credentials
- * the peer had at connect(), which no client can forge.
+ * the peer had at connect(), which no client can forge. (Which rootfs a
+ * same-uid client is from is a different question, answered by the hello: a
+ * process of ours can only ever present the path it was started over, and a
+ * process that is not ours could present anything, but it could just as well
+ * have named that rootfs on its own command line.)
  *
  * The identity is the uid the socket NAME is keyed on, so the two always agree:
  * a guest that really changes its uid computes a different name and gets its own
@@ -890,12 +958,12 @@ static int ipc_serve(int cfd, const struct cng_breq *q, void **tab) {
  * everyone else. A timed wait's deadline bounds the poll directly, so it expires
  * on time rather than at tick granularity; the tick is only for the /proc reads
  * that notice a dead waiter or apply a dead process's SEM_UNDO. */
-static _Noreturn void broker_main(struct cng_sockaddr_un *a, unsigned al) {
+static _Noreturn void broker_main(const struct broker_ns *ns) {
     long ls = CNG_SYS(__NR_socket, CNG_AF_UNIX,
                       CNG_SOCK_STREAM | CNG_SOCK_CLOEXEC, 0, 0, 0, 0);
     if (ls < 0)
         sys_exit_group(0);
-    if (CNG_SYS(__NR_bind, ls, a, al, 0, 0, 0) != 0)
+    if (CNG_SYS(__NR_bind, ls, &ns->addr, ns->alen, 0, 0, 0) != 0)
         sys_exit_group(0); /* lost the spawn race: the winner serves */
     if (CNG_SYS(__NR_listen, ls, 64, 0, 0, 0, 0) != 0)
         sys_exit_group(0);
@@ -953,7 +1021,9 @@ static _Noreturn void broker_main(struct cng_sockaddr_un *a, unsigned al) {
                             &tv, sizeof tv, 0);
                     struct cng_breq q;
                     int parked = 0;
-                    if (cng_broker_recv((int)c, &q, sizeof q, 0) == 0) {
+                    /* Ours by uid; now ours by namespace, or not answered. */
+                    if (broker_hello_check((int)c, ns) == 0 &&
+                        cng_broker_recv((int)c, &q, sizeof q, 0) == 0) {
                         /* The kernel's answer replaces the client's claim. Every
                          * legitimate client stamps exactly this (cng_broker_open
                          * calls getpid), and it is the field the registries key
@@ -1089,7 +1159,7 @@ static long broker_fork(void) {
     return sys_fork();
 }
 
-static void broker_spawn(struct cng_sockaddr_un *a, unsigned al) {
+static void broker_spawn(const struct broker_ns *ns) {
     long p = broker_fork();
     if (p < 0)
         return;
@@ -1112,14 +1182,14 @@ static void broker_spawn(struct cng_sockaddr_un *a, unsigned al) {
         CNG_SYS(__NR_dup3, nul, 2, 0, 0, 0, 0);
     }
     broker_close_inherited();
-    broker_main(a, al); /* never returns */
+    broker_main(ns); /* never returns */
 }
 
 /* ---- client ------------------------------------------------------------- */
 
-/* Connect to the namespace daemon, starting it if nobody has. Returns a
- * connected socket or -1. */
-static int broker_connect(struct cng_sockaddr_un *a, unsigned al) {
+/* Connect to the namespace daemon, starting it if nobody has, and present the
+ * key. Returns a connected socket with the hello sent, or -1. */
+static int broker_connect(const struct broker_ns *ns) {
     int spawns = 0;
     for (int attempt = 0; attempt < 100; attempt++) {
         long s = CNG_SYS(__NR_socket, CNG_AF_UNIX,
@@ -1131,16 +1201,24 @@ static int broker_connect(struct cng_sockaddr_un *a, unsigned al) {
                 sizeof tv, 0);
         CNG_SYS(__NR_setsockopt, s, CNG_SOL_SOCKET, CNG_SO_SNDTIMEO, &tv,
                 sizeof tv, 0);
-        long cr = CNG_SYS(__NR_connect, s, a, al, 0, 0, 0);
+        long cr = CNG_SYS(__NR_connect, s, &ns->addr, ns->alen, 0, 0, 0);
         if (cr == 0) {
-            if (peer_pid((int)s) > 0)
+            if (peer_pid((int)s) <= 0) {
+                /* Somebody else holds the name. They will keep holding it,
+                 * so there is nothing to retry and nothing to spawn: the
+                 * caller fails the IPC call, and --shared-proc's registry
+                 * degrades to its file tier rather than joining a namespace
+                 * we do not own. */
+                sys_close((int)s);
+                return -1;
+            }
+            if (broker_hello_send((int)s, ns) == 0)
                 return (int)s;
-            /* Somebody else holds the name. They will keep holding it, so
-             * there is nothing to retry and nothing to spawn: the caller fails
-             * the IPC call, and --shared-proc's registry degrades to its file
-             * tier rather than joining a namespace we do not own. */
+            /* The daemon hung up between the accept and our first byte: it
+             * is on its way out, and the connect that follows is refused and
+             * starts a fresh one. */
             sys_close((int)s);
-            return -1;
+            continue;
         }
         sys_close((int)s);
         if (cr != -ECONNREFUSED && cr != -ENOENT)
@@ -1149,7 +1227,7 @@ static int broker_connect(struct cng_sockaddr_un *a, unsigned al) {
          * re-spawn only occasionally as a safety net (a loser of the bind race
          * whose winner then died). */
         if (spawns == 0 || attempt % 16 == 0) {
-            broker_spawn(a, al);
+            broker_spawn(ns);
             spawns++;
         }
         struct cng_timespec ms = {0, 1000000}; /* 1 ms for the bind */
@@ -1175,9 +1253,9 @@ int cng_broker_open(struct cng_breq *q) {
         q->uid = (u32)sys_geteuid();
         q->gid = (u32)sys_getegid();
     }
-    struct cng_sockaddr_un a;
-    unsigned al = ipc_addr(&a);
-    return broker_connect(&a, al);
+    struct broker_ns ns;
+    ipc_ns(&ns);
+    return broker_connect(&ns);
 }
 
 int cng_broker_rpc(struct cng_breq *q, struct cng_bresp *r, int *fd_out) {
@@ -1211,6 +1289,35 @@ int cng_broker_rpc(struct cng_breq *q, struct cng_bresp *r, int *fd_out) {
     return -1;
 }
 
+/* Testing: a client of the namespace `rootfs` names — its daemon started if
+ * need be — that presents `key` as its rootfs, asking the one question that
+ * changes nothing (IPC_INFO). 0 when the daemon answered, -1 when it hung
+ * up on the hello, or nobody could be reached. There is no other way to
+ * reach a daemon with a key that is not its own: a client always presents
+ * the path its name was made from, and a second rootfs with the same name
+ * is a 64-bit coincidence. */
+int cng_broker_test_hello(const char *rootfs, const char *key) {
+    struct broker_ns ns;
+    broker_ns(&ns, rootfs, 0);
+    cng_strlcpy(ns.key, key, sizeof ns.key);
+    ns.klen = (unsigned)strlen(ns.key);
+    int s = broker_connect(&ns);
+    if (s < 0)
+        return -1;
+    struct cng_breq q;
+    memset(&q, 0, sizeof q);
+    q.op = CNG_REQ_SHMCTL;
+    q.arg = CNG_IPC_INFO;
+    q.pid = (s32)sys_getpid();
+    struct cng_bresp r;
+    int rc = cng_broker_send(s, &q, sizeof q, -1) == 0 &&
+                     cng_broker_recv(s, &r, sizeof r, 0) == 0
+                 ? 0
+                 : -1;
+    sys_close(s);
+    return rc;
+}
+
 int cng_broker_table_fd(const char *rootfs_key) {
     /* Fail fast where memfd is unavailable (pre-3.17 kernel, or a seccomp
      * filter blocking it) so we degrade without spawning a doomed daemon. */
@@ -1219,9 +1326,9 @@ int cng_broker_table_fd(const char *rootfs_key) {
         return -1;
     sys_close((int)probe);
 
-    struct cng_sockaddr_un a;
-    unsigned al = broker_addr(&a, cng_broker_key_hash(rootfs_key), 0);
-    int s = broker_connect(&a, al);
+    struct broker_ns ns;
+    broker_ns(&ns, rootfs_key, 0);
+    int s = broker_connect(&ns);
     if (s < 0)
         return -1;
     struct cng_breq q;

@@ -279,55 +279,138 @@ static int open_broker(const char *key, unsigned long size) {
 }
 
 /* Named-file fallback: a 0600 file keyed by uid + rootfs hash that every
- * invocation maps MAP_SHARED. The ftruncate is idempotent under racing
- * creators and guarantees a fully-backed, zero-filled mapping (a fresh file
- * is an all-free table, since pid == 0 means free). Registry writes are rare
- * (exec/fork/chdir), so a non-tmpfs dir costs nothing noticeable.
+ * invocation maps MAP_SHARED. Registry writes are rare (exec/fork/chdir), so
+ * a non-tmpfs dir costs nothing noticeable.
  *
  * Unlike the shm backing file, this name cannot be random: it IS the
  * rendezvous — separate invocations of --shared-proc find each other by
  * computing it. So the file is proved to be ours after it is opened instead.
  * The directory is /tmp or /dev/shm, writable by everyone on the machine, and
  * without this any of them could leave a symlink or a file of their own on the
- * name: the ftruncate below would then have cut down whatever it pointed at,
- * and the mapping would have been shared with its owner — a table this process
- * publishes its pids, cwd and exe path into, and trusts when answering /proc.
- * O_NOFOLLOW stops the symlink; the fstat stops the rest. A name that fails
- * either is not adopted and not touched: the caller degrades to the
- * per-process anonymous tier, which is a lost namespace but never a shared
- * one. */
+ * name: it would then have been mapped and shared with its owner — a table
+ * this process publishes its pids, cwd and exe path into, and trusts when
+ * answering /proc. O_NOFOLLOW stops the symlink; the fstat stops the rest.
+ *
+ * And the name is a hash of the rootfs where the file is for one rootfs, so
+ * the file names its rootfs itself: a record past the table's end (the table
+ * is mapped from offset 0 as before) carrying the path in full, sealed by
+ * the hash of its own bytes, and every joiner compares that path with its
+ * own. The file is made whole before it has the name — sized and written
+ * under a name of the creator's own, then moved onto the rendezvous name
+ * without replacing anything, so exactly one creator wins and what a joiner
+ * finds under the name is never half-made. A name that fails any of this is
+ * not adopted and not touched: the caller degrades to the per-process
+ * anonymous tier, which is a lost namespace but never a shared one. */
+struct file_key {
+    u64 seal; /* cng_broker_hash of key[0..len) */
+    u32 len;
+    u32 pad;
+    char key[CNG_PATH_MAX];
+};
+
+/* The record at `off`: 1 for this rootfs, -1 for another's or none. */
+static int file_key_check(int fd, unsigned long off, const char *key,
+                          unsigned klen) {
+    struct file_key k;
+    if (sys_pread64(fd, &k, sizeof k, (long)off) != (long)sizeof k ||
+        k.len > sizeof k.key || cng_broker_hash(k.key, k.len) != k.seal)
+        return -1;
+    return k.len == klen && memcmp(k.key, key, klen) == 0 ? 1 : -1;
+}
+
+static int file_key_write(int fd, unsigned long off, const char *key,
+                          unsigned klen) {
+    struct file_key k;
+    memset(&k, 0, sizeof k);
+    k.len = klen;
+    memcpy(k.key, key, klen);
+    k.seal = cng_broker_hash(k.key, klen);
+    return CNG_SYS(__NR_pwrite64, fd, &k, sizeof k, off, 0, 0) ==
+                   (long)sizeof k
+               ? 0
+               : -1;
+}
+
+/* A private regular file of ours, of the size the layout says? */
+static int file_ours(int fd, unsigned long full) {
+    char st[144];
+    if (sys_fstat(fd, st) != 0)
+        return 0;
+    unsigned mode = *(unsigned *)(st + 16); /* st_mode */
+    unsigned uid = *(unsigned *)(st + 24);  /* st_uid  */
+    unsigned long size = *(unsigned long *)(st + 48);
+    return (mode & 0170000) == 0100000 && (mode & 077) == 0 &&
+           uid == (unsigned)sys_getuid() && size == full;
+}
+
+/* Make the file whole under a name of our own and move it onto `path`. The
+ * fd of the file now under `path` (ours or the winner's), or -1. */
+static long file_create(const char *dir, const char *path, unsigned long size,
+                        unsigned long full, const char *key, unsigned klen) {
+    char tmp[CNG_PATH_MAX + 64];
+    if (cng_snprintf(tmp, sizeof tmp, "%s/.chroot-ng-procreg.%u.%ld", dir,
+                     (unsigned)sys_getuid(), (long)sys_getpid()) >= sizeof tmp)
+        return -1;
+    long fd = sys_openat(CNG_AT_FDCWD, tmp,
+                         CNG_O_RDWR | CNG_O_CREAT | CNG_O_EXCL | CNG_O_NOFOLLOW |
+                             CNG_O_CLOEXEC,
+                         0600);
+    if (fd == -EEXIST) {
+        /* Left by a process that had this pid and died mid-way: nobody
+         * else's, since a live one with the pid is this one. */
+        CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, tmp, 0, 0, 0, 0);
+        fd = sys_openat(CNG_AT_FDCWD, tmp,
+                        CNG_O_RDWR | CNG_O_CREAT | CNG_O_EXCL | CNG_O_NOFOLLOW |
+                            CNG_O_CLOEXEC,
+                        0600);
+    }
+    if (fd < 0)
+        return -1;
+    long r = -1;
+    if (sys_ftruncate((int)fd, (long)full) == 0 &&
+        file_key_write((int)fd, size, key, klen) == 0) {
+        r = CNG_SYS(__NR_renameat2, CNG_AT_FDCWD, tmp, CNG_AT_FDCWD, path,
+                    CNG_RENAME_NOREPLACE, 0);
+        /* A filesystem without RENAME_NOREPLACE: a link is the same
+         * "exactly one wins" and fails the same way on a name in use. */
+        if (r == -EINVAL || r == -ENOSYS)
+            r = CNG_SYS(__NR_linkat, CNG_AT_FDCWD, tmp, CNG_AT_FDCWD, path, 0,
+                        0);
+    }
+    CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, tmp, 0, 0, 0, 0);
+    if (r == 0)
+        return fd; /* ours is the one under the name */
+    sys_close((int)fd);
+    if (r != -EEXIST)
+        return -1;
+    /* Somebody's is: theirs to join, on the same terms as any other. */
+    return sys_openat(CNG_AT_FDCWD, path,
+                      CNG_O_RDWR | CNG_O_NOFOLLOW | CNG_O_CLOEXEC, 0);
+}
+
 static int open_shared_file(const char *key, unsigned long size) {
     const char *dir = cng_broker_shared_dir();
     if (!dir)
         return 0;
     char path[CNG_PATH_MAX + 64];
-    size_t n = cng_snprintf(path, sizeof path, "%s/chroot-ng-procreg.v1.%u.%x",
-                            dir, (unsigned)sys_getuid(),
-                            cng_broker_key_hash(key));
+    size_t n = cng_snprintf(path, sizeof path,
+                            "%s/chroot-ng-procreg.v2.%u.%016llx", dir,
+                            (unsigned)sys_getuid(),
+                            (unsigned long long)cng_broker_key_hash(key));
     if (n >= sizeof path)
         return 0;
+    unsigned klen = (unsigned)strlen(key);
+    unsigned long full = size + sizeof(struct file_key);
     long fd = sys_openat(CNG_AT_FDCWD, path,
-                         CNG_O_RDWR | CNG_O_CREAT | CNG_O_NOFOLLOW |
-                             CNG_O_CLOEXEC,
-                         0600);
+                         CNG_O_RDWR | CNG_O_NOFOLLOW | CNG_O_CLOEXEC, 0);
+    if (fd == -ENOENT)
+        fd = file_create(dir, path, size, full, key, klen);
     if (fd < 0)
         return 0;
-    char st[144];
-    unsigned mode, uid;
-    if (CNG_SYS(__NR_fstat, fd, (long)st, 0, 0, 0, 0) != 0) {
+    if (!file_ours((int)fd, full) ||
+        file_key_check((int)fd, size, key, klen) != 1) {
         sys_close((int)fd);
-        return 0;
-    }
-    mode = *(unsigned *)(st + 16); /* st_mode */
-    uid = *(unsigned *)(st + 24);  /* st_uid  */
-    if ((mode & 0170000) != 0100000 || (mode & 077) != 0 ||
-        uid != (unsigned)sys_getuid()) {
-        sys_close((int)fd);
-        return 0; /* not a private regular file of ours: leave it alone */
-    }
-    if (sys_ftruncate((int)fd, (long)size) != 0) {
-        sys_close((int)fd);
-        return 0;
+        return 0; /* not a private file of ours for this rootfs: leave it */
     }
     void *p = cng_own_map(sys_mmap(0, size, CNG_PROT_READ | CNG_PROT_WRITE,
                                    CNG_MAP_SHARED, (int)fd, 0),

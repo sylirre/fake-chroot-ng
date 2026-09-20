@@ -5257,9 +5257,10 @@ int cng_cmd_sharedtest(int argc, char **argv, char **envp, unsigned long *auxv) 
     }
     /* A key nobody else can be using: the scratch directory mktemp made. */
     char path[CNG_PATH_MAX];
-    size_t n = cng_snprintf(path, sizeof path, "%s/chroot-ng-procreg.v1.%u.%x",
-                            dir, (unsigned)sys_getuid(),
-                            cng_broker_key_hash(scratch));
+    size_t n = cng_snprintf(path, sizeof path,
+                            "%s/chroot-ng-procreg.v2.%u.%016llx", dir,
+                            (unsigned)sys_getuid(),
+                            (unsigned long long)cng_broker_key_hash(scratch));
     if (n >= sizeof path) {
         cng_dprintf(1, "sharedtest: name does not fit -> SKIP\n");
         return 0;
@@ -5322,8 +5323,58 @@ int cng_cmd_sharedtest(int argc, char **argv, char **envp, unsigned long *auxv) 
     fails += !ok;
     CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, (long)path, 0, 0, 0, 0);
 
-    /* ...and the control: with nothing planted, the tier IS adopted, so the two
-     * refusals above are refusals and not a tier that never engages. */
+    /* Case 3: a file exactly as our own creation leaves it — private, regular,
+     * the layout's size, a sealed record at the table's end — for ANOTHER
+     * rootfs, which is what a hash collision between two rootfs of one user
+     * looks like on disk (the name is 64 bits of the path; the record is all
+     * of it). Declined, and left as it was. */
+    struct {
+        u64 seal;
+        u32 len, pad;
+        char key[CNG_PATH_MAX];
+    } rec;
+    memset(&rec, 0, sizeof rec);
+    const char *other = "/some/other/rootfs";
+    rec.len = (u32)strlen(other);
+    memcpy(rec.key, other, rec.len);
+    rec.seal = cng_broker_hash(rec.key, rec.len);
+    unsigned long tabsz = cng_procreg_table_size();
+    long ofd = sys_openat(CNG_AT_FDCWD, path,
+                          CNG_O_RDWR | CNG_O_CREAT | CNG_O_TRUNC, 0600);
+    int planted = ofd >= 0 && sys_ftruncate((int)ofd, (long)(tabsz + sizeof rec)) == 0 &&
+                  CNG_SYS(__NR_pwrite64, ofd, &rec, sizeof rec, tabsz, 0, 0) ==
+                      (long)sizeof rec;
+    if (ofd >= 0)
+        sys_close((int)ofd);
+    int declined3 = 0, intact3 = 0;
+    if (planted) {
+        long p = sys_fork();
+        if (p == 0)
+            sys_exit_group(shared_child(scratch));
+        int st = 0;
+        sys_wait4((int)p, &st, 0, 0);
+        declined3 = ((st & 0x7f) == 0 && ((st >> 8) & 0xff) == 0);
+        long rfd = sys_openat(CNG_AT_FDCWD, path, CNG_O_RDONLY, 0);
+        char back[sizeof rec];
+        intact3 = rfd >= 0 &&
+                  sys_pread64((int)rfd, back, sizeof back, (long)tabsz) ==
+                      (long)sizeof back &&
+                  memcmp(back, &rec, sizeof rec) == 0;
+        if (rfd >= 0)
+            sys_close((int)rfd);
+    }
+    ok = planted && declined3 && intact3;
+    cng_dprintf(1,
+                "sharedtest another rootfs' registry declined=%d intact=%d "
+                "-> %s\n",
+                declined3, intact3, ok ? "OK" : "FAIL");
+    fails += !ok;
+    CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, (long)path, 0, 0, 0, 0);
+
+    /* ...and the control: with nothing planted, the tier IS adopted, so the
+     * refusals above are refusals and not a tier that never engages; and a
+     * second joiner of the same rootfs adopts the same file, which is the
+     * tier doing its job. */
     int adopted = 0;
     {
         long p = sys_fork();
@@ -5332,10 +5383,18 @@ int cng_cmd_sharedtest(int argc, char **argv, char **envp, unsigned long *auxv) 
         int st = 0;
         sys_wait4((int)p, &st, 0, 0);
         adopted = ((st & 0x7f) == 0 && ((st >> 8) & 0xff) == 1);
+        if (adopted) {
+            p = sys_fork();
+            if (p == 0)
+                sys_exit_group(shared_child(scratch));
+            st = 0;
+            sys_wait4((int)p, &st, 0, 0);
+            adopted = ((st & 0x7f) == 0 && ((st >> 8) & 0xff) == 1) ? 2 : 0;
+        }
     }
     cng_dprintf(1, "sharedtest an unplanted name is adopted=%d -> %s\n", adopted,
-                adopted ? "OK" : "FAIL");
-    fails += !adopted;
+                adopted == 2 ? "OK" : "FAIL");
+    fails += adopted != 2;
     CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, (long)path, 0, 0, 0, 0);
     CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, (long)victim, 0, 0, 0, 0);
 
@@ -8402,6 +8461,33 @@ int cng_cmd_shmtest(int argc, char **argv, char **envp, unsigned long *auxv) {
                     e1, e2, ok ? "OK" : "FAIL");
         fails += !ok;
         cng_broker_seed_session(); /* leave the poisoned namespace behind */
+    }
+
+    /* 17) a client of another rootfs is not answered.
+     *
+     *     The --shared-proc rendezvous name is a hash of the rootfs path and
+     *     the peer check is by uid, so two rootfs of one user whose paths
+     *     hashed alike met at one daemon and shared a /proc view, a SysV
+     *     namespace and a process table between them. The hash is 64 bits
+     *     now, and the daemon is started for one path and told the client's
+     *     on every connection: a client presenting another is hung up on,
+     *     and degrades as one refused by uid does. Driven at the hello, since
+     *     no client of ours presents anything but its own path: the same
+     *     daemon, once with its own key and once with another's, on a rootfs
+     *     name nobody else is using (the daemon needs no directory behind it;
+     *     it leaves after its grace window). */
+    {
+        char root[64];
+        cng_snprintf(root, sizeof root, "/cng-shmtest-rootfs-%d", self);
+        int own = cng_broker_test_hello(root, root);
+        int other = cng_broker_test_hello(root, "/some/other/rootfs");
+        int own2 = cng_broker_test_hello(root, root);
+        int ok = own == 0 && other == -1 && own2 == 0;
+        cng_dprintf(1,
+                    "shmtest a client of another rootfs is not answered "
+                    "own=%d other=%d own_again=%d -> %s\n",
+                    own, other, own2, ok ? "OK" : "FAIL");
+        fails += !ok;
     }
 
     cng_dprintf(1, "shmtest: %d failure(s)\n", fails);

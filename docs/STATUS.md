@@ -1994,6 +1994,9 @@ vfork/`posix_spawn` child-stack handling.
   - Not covered by the suite: the peer-credential *refusal*, which needs a
     second uid to produce. What the suite does hold is the other direction —
     every broker-backed leg in M11/M12/M20/M22 goes through the check.
+  - Which *rootfs* a same-uid client is from was not asked until M55: the
+    daemon now compares the client's full path (the hello) rather than
+    trusting that two rootfs never hash alike.
 
 - [x] **M26 — the span that could not carry its own trampoline pool**
   `elf_read_headers` checks each `PT_LOAD` for a `p_vaddr + size` that wraps,
@@ -2959,6 +2962,35 @@ vfork/`posix_spawn` child-stack handling.
   fallback missing and nothing said. It is refused now like `-w` is, with
   the errno, before the guest is entered; three `m17_workdir` legs, one with
   the program reachable through a bind, where the old binary ran it.
+
+- [x] **M55 — a rootfs was its 32-bit hash, to the daemon, the registry file and the abstract tag alike**
+  Everything that stands for a rootfs on the host was derived from one FNV-1a
+  hash of its path: the `--shared-proc` rendezvous name (8 hex digits), the
+  registry's named-file tier, and the tag spliced into every abstract AF_UNIX
+  name. The peer check is by uid and nothing finer — deliberately, and a
+  same-uid process can name any rootfs on its own command line, so a crafted
+  collision buys an attacker nothing it did not have — but two rootfs of one
+  user whose paths merely *happened* to hash alike met at one daemon: one
+  `/proc` view, one System V namespace, one process table, one abstract
+  socket scope, between guests that were meant to be apart, and nothing to
+  say so. The hash is 64 bits now, and where there is something to compare
+  the path is compared in full: the daemon is started for its path (or the
+  session's nonce) and every connection opens with a hello carrying the
+  client's, which the daemon reads ahead of the request and hangs up on if
+  it is not its own — no round trip, and a mismatched client degrades as one
+  refused by uid does; the registry file carries a sealed record of its path
+  past the table's end, is made whole under a private name and moved onto
+  the rendezvous name without replacing anything (`RENAME_NOREPLACE`, a
+  `linkat` where that is refused), so exactly one creator wins and a joiner
+  never sees a half-made file, and a file naming another rootfs is left as
+  it was; the abstract tag, which has no daemon behind it, carries the whole
+  key (12 → 20 bytes, so a name of up to 88 bytes carries it, 96 before). The
+  rendezvous name is `v3` and the file `v2`, so no build joins the other's.
+  Legs: `shmtest` reaches one daemon with its own key and with another's
+  (answered, hung up on, answered again); `sharedtest` plants a file exactly
+  as our own creation leaves it but naming another rootfs (declined, intact)
+  and joins an unplanted one twice; `m15` reads the sixteen digits back off
+  the wire.
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 

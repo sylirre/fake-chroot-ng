@@ -123,7 +123,12 @@ else
     wait $m15bg 2>/dev/null
     case "$hostview" in
     *cng*tagprobe) pass=$((pass + 1))
-        echo "  ok   m15 the abstract name is tagged on the wire" ;;
+        echo "  ok   m15 the abstract name is tagged on the wire"
+        # ...with the whole 64-bit rootfs key: sixteen hex digits between the
+        # kind byte (the g of "cng") and the name; eight, before the key was widened.
+        m15hex=$(printf '%s' "$hostview" | sed -n 's/^.*cng\([0-9a-f]*\)tagprobe$/\1/p')
+        check "m15 ...and the tag carries the 64-bit rootfs key" 16 "${#m15hex}"
+        ;;
     "") skip "abstract-tag-on-the-wire leg: /proc/net/unix unreadable" ;;
     *) fail=$((fail + 1))
         echo "  FAIL m15 the abstract name is not tagged on the wire"
@@ -155,9 +160,10 @@ else
     # well used to be passed through untagged — the guest's own name straight
     # into the HOST's global abstract namespace, which is the one escape the tag
     # exists to close, and available to any guest willing to spell its name with
-    # 96 bytes or more. A digest of the name stands in for it now, so the
-    # containment holds and the name still works; the binder records what it
-    # bound, so the readback is unchanged.
+    # 88 bytes or more (96, before the tag grew with the 64-bit key). A digest
+    # of the name stands in for it now, so the containment holds and the name
+    # still works; the binder records what it bound, so the readback is
+    # unchanged.
     M15LONG=
     while [ ${#M15LONG} -lt 100 ]; do M15LONG="${M15LONG}L"; done
     out=$(m15run -R "$R1" /bin/uxsock "$M15LONG" abstract 2>&1)

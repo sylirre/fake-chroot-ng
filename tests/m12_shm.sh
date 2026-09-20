@@ -67,6 +67,11 @@ check_contains "a request cannot name a process other than its sender" \
     "shmtest a forged caller pid is not believed -> OK" "$out"
 check_contains "an unidentifiable peer is refused by both ends" \
     "shmtest an unidentifiable peer is refused client=-28 daemon=-28 -> OK" "$out"
+# ...and the name is a hash of the rootfs path, which two rootfs could share:
+# the daemon is started for one path and told the client's on every
+# connection, and hangs up on any other.
+check_contains "a client presenting another rootfs is not answered" \
+    "shmtest a client of another rootfs is not answered own=0 other=-1 own_again=0 -> OK" "$out"
 check_contains "IPC_SET writes the permission triad back" \
     "shmtest ipc_set -> OK" "$out"
 check_contains "execve detaches every attachment" \
