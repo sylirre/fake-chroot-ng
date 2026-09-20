@@ -2897,6 +2897,34 @@ vfork/`posix_spawn` child-stack handling.
     `m5b` runs it once more under `-u 0:0` for root's answers, and `m17`'s
     flagged-NULL needle is the oracle's own line.
 
+- [x] **M52 — the de_thread listed its siblings once, into a table of 4096**
+  The emulated `execve` kills every other thread of the process before
+  anything is mapped (a thread-directed `SIGSYS` carrying a die request), and
+  it found them with one read of `/proc/self/task` into a fixed table: the
+  4097th sibling and everything after it was never told, and the exec went
+  ahead beside them — old threads running the old program through the fd
+  cleanup, the signal reset and the mapping reclaim — without a word, since a
+  full table read the same as a complete one. A thread a sibling cloned
+  between being listed and taking its request was missed the same way, at
+  any thread count. The listing is the kernel's own now, read afresh every
+  round until it is empty, and every listed sibling is told again each round
+  (a request already pending is not queued twice, and the answer doubles as
+  the existence probe — which also reaches a thread that took over the tid
+  of one that died); a listing that takes more than one read can skip an
+  entry while threads exit under it, so the kernel's own count (`Threads:`)
+  has the last word. What cannot take the request — a zombie, or a thread
+  that keeps `SIGSYS` blocked: qemu-user's own, or a guest that edited its
+  signal frame — is given up on after a second as before, kept apart in a
+  small table that grows, and looked at again once a second; a blocked
+  thread is sampled ten times a millisecond apart first, so a writer of ours
+  holding every signal off for a moment is not mistaken for one. The status
+  fields are read by streaming the file: a `Groups:` line of a process with
+  many supplementary groups runs past any one buffer, and every field wanted
+  comes after it. `tests/guests/spawnexec.c` execs from 4500 parked threads
+  and from sixteen chains that clone their successor at birth; the old
+  binary reports 407 and ~20 threads after the exec, the kernel and the fix
+  report 2 (qemu-user's own thread included) — the `m6` legs.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

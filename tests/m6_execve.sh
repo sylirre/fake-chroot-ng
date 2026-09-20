@@ -543,6 +543,40 @@ else
 fi
 rm -rf "$TED"
 
+# ...and from a process with more siblings than the de_thread's table held,
+# and from one whose siblings keep making threads. The siblings used to be
+# listed once into a table of 4096 and those told: the 4097th and everything
+# after it went on running the old program beside the new one, without a
+# word — and so did a thread a sibling cloned between being listed and taking
+# its request, which nothing ever told. The list is now the kernel's own,
+# read afresh until its count of threads says nothing but the exec'er (and
+# what cannot take a signal at all: under qemu-user, the emulator's own
+# thread) remains. Differential against the kernel; the chain shape keeps 16
+# chains cloning, where one missed newcomer keeps its chain going for good.
+SED=$(mktemp -d)
+if ! guest_xlate_ready "de_thread beyond a table"; then
+    :
+elif ! guest_cc "$SED/spawnexec" tests/guests/spawnexec.c -pthread; then
+    skip "de_thread beyond a table: could not build tests/guests/spawnexec.c with -pthread"
+else
+    mkdir -p "$SED/bin"; cp "$SED/spawnexec" "$SED/bin/spawnexec"
+    for shape in "many 4500" "chain 16"; do
+        # shellcheck disable=SC2086  # the shape is two words
+        se_k=$(cd "$SED/bin" && emu_t 180 ./spawnexec $shape 2>/dev/null | grep '^report:')
+        # shellcheck disable=SC2086
+        se_g=$(run_t 240 -R "$SED" /bin/spawnexec $shape 2>/dev/null | grep '^report:')
+        if [ -n "$se_k" ] && [ "$se_k" = "$se_g" ]; then
+            pass=$((pass + 1))
+            printf '  ok   execve reaches every sibling (%s) as the kernel does (%s)\n' "$shape" "$se_g"
+        else
+            fail=$((fail + 1))
+            printf '  FAIL execve leaves siblings behind (%s)\n' "$shape"
+            printf '       kernel: %s\n       guest : %s\n' "$se_k" "$se_g"
+        fi
+    done
+fi
+rm -rf "$SED"
+
 # ...and the same chain by a program with far more mappings than one sweep
 # pass holds. The sweep collects a table's worth of victims per walk of
 # /proc/self/maps and walks again while a pass fills it; the passes were capped

@@ -469,8 +469,8 @@ void cng_exec_fork_child(void) {
     __atomic_store_n(&g_exec_claim, 0, __ATOMIC_RELAXED);
 }
 
-/* Send a de_thread request to `tid`. */
-static void dethread_send(long tid, int what) {
+/* Send a de_thread request to `tid`: 0, or -errno (-ESRCH: no such thread). */
+static long dethread_send(long tid, int what) {
     struct {
         int signo, errno_, code;
         int pad;
@@ -486,7 +486,8 @@ static void dethread_send(long tid, int what) {
     si.pid = (int)sys_getpid();
     si.uid = (unsigned)sys_getuid();
     si.sival_int = CNG_DT_MAGIC + what;
-    CNG_SYS(__NR_rt_tgsigqueueinfo, sys_getpid(), tid, CNG_SIGSYS, &si, 0, 0);
+    return CNG_SYS(__NR_rt_tgsigqueueinfo, sys_getpid(), tid, CNG_SIGSYS, &si, 0,
+                   0);
 }
 
 int cng_dethread_request(const cng_siginfo_t *si) {
@@ -496,42 +497,126 @@ int cng_dethread_request(const cng_siginfo_t *si) {
     return v == CNG_DT_DIE || v == CNG_DT_EXEC ? v : 0;
 }
 
-/* The line of a status file that begins with `key` (a newline and the field
- * name), or 0. */
-static const char *status_field(const char *buf, const char *key) {
-    size_t kl = strlen(key);
-    for (const char *p = buf; *p; p++)
-        if (*p == '\n' && !strncmp(p, key, kl))
-            return p;
-    return 0;
+/* The fields of a status file (/proc/<pid>/status, /proc/<pid>/task/<tid>/
+ * status) wanted below, each as the remainder of its line after the field
+ * name, NUL-terminated in `out[i]`: a bitmask of the ones found. The file is
+ * read through in pieces rather than into one buffer, since a process with
+ * many supplementary groups has a Groups: line that runs to hundreds of
+ * kilobytes, and every field wanted here comes after it. A line that could
+ * not be one of these — longer than a key without beginning with it — is
+ * skipped however far it runs. */
+#define STATUS_LINE 80
+
+static unsigned status_scan(const char *path, const char *const *keys, int nkeys,
+                            char (*out)[STATUS_LINE]) {
+    char buf[1024];
+    long fd = sys_openat(CNG_AT_FDCWD, path, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    if (fd < 0)
+        return 0;
+    unsigned found = 0, all = (1u << nkeys) - 1, have = 0;
+    int skip = 0; /* inside a line that is none of them: drop it to its end */
+    while (found != all) {
+        long n = sys_read((int)fd, buf + have, sizeof buf - have);
+        if (n <= 0)
+            break;
+        have += (unsigned)n;
+        unsigned s = 0;
+        while (s < have) {
+            unsigned len = 0;
+            while (s + len < have && buf[s + len] != '\n')
+                len++;
+            int whole = s + len < have;
+            if (skip) {
+                s += whole ? len + 1 : len;
+                skip = !whole;
+                continue;
+            }
+            int k = -1;
+            unsigned kl = 0;
+            for (int i = 0; i < nkeys; i++) {
+                kl = (unsigned)strlen(keys[i]);
+                if (len >= kl && !strncmp(buf + s, keys[i], kl)) {
+                    k = i;
+                    break;
+                }
+            }
+            if (k < 0) {
+                /* Not one of them, or too short to say yet: a whole line is
+                 * done with; a partial one is kept for the next piece
+                 * unless it already runs past every key. */
+                unsigned longest = 0;
+                for (int i = 0; i < nkeys; i++)
+                    if (strlen(keys[i]) > longest)
+                        longest = (unsigned)strlen(keys[i]);
+                if (whole) {
+                    s += len + 1;
+                    continue;
+                }
+                if (len >= longest) {
+                    s = have;
+                    skip = 1;
+                }
+                break;
+            }
+            if (!whole)
+                break; /* the wanted line, cut short: read on */
+            unsigned l = len - kl;
+            if (l >= STATUS_LINE)
+                l = STATUS_LINE - 1;
+            memcpy(out[k], buf + s + kl, l);
+            out[k][l] = '\0';
+            found |= 1u << k;
+            s += len + 1;
+        }
+        memmove(buf, buf + s, have - s);
+        have -= s;
+        if (have == sizeof buf) {
+            have = 0; /* a candidate line longer than the buffer: none of ours */
+            skip = 1;
+        }
+    }
+    sys_close((int)fd);
+    return found;
+}
+
+/* The number in a status field, or -1. */
+static long status_num(const char *v) {
+    while (*v == ' ' || *v == '\t')
+        v++;
+    if (*v < '0' || *v > '9')
+        return -1;
+    long n = 0;
+    for (; *v >= '0' && *v <= '9'; v++)
+        n = n * 10 + (*v - '0');
+    return n;
 }
 
 /* A task of this process, as its status file has it: TASK_LIVE for one that
- * can be sent a SIGSYS, TASK_GONE for one that is not there or is a zombie
- * (for good), TASK_BLOCKED for one that has SIGSYS blocked — which no guest
- * thread has except for the few microseconds a writer of ours holds every
- * signal off, and which qemu-user's own threads always do. */
+ * can be sent a SIGSYS, TASK_NONE for one that is not there (any more),
+ * TASK_ZOMBIE for one that is a zombie (for good: a leader whose main()
+ * returned into pthread_exit, or a thread a tracer has yet to reap),
+ * TASK_BLOCKED for one that has SIGSYS blocked — which no guest thread has
+ * except for the few microseconds a writer of ours holds every signal off,
+ * and which qemu-user's own threads always do. */
 #define TASK_LIVE    0
-#define TASK_GONE    1
-#define TASK_BLOCKED 2
+#define TASK_NONE    1
+#define TASK_ZOMBIE  2
+#define TASK_BLOCKED 3
 
 static int task_state(long tid) {
-    char path[64], buf[4096];
+    static const char *const keys[] = {"State:", "SigBlk:"};
+    char path[64], v[2][STATUS_LINE];
     cng_snprintf(path, sizeof path, "/proc/self/task/%ld/status", tid);
-    long fd = sys_openat(CNG_AT_FDCWD, path, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
-    if (fd < 0)
-        return TASK_GONE;
-    long n = sys_read((int)fd, buf, sizeof buf - 1);
-    sys_close((int)fd);
-    if (n <= 0)
-        return TASK_GONE;
-    buf[n] = '\0';
-    const char *st = status_field(buf, "\nState:");
-    if (st && (st[7] == '\t' || st[7] == ' ') && st[8] == 'Z')
-        return TASK_GONE;
-    const char *sb = status_field(buf, "\nSigBlk:");
-    if (sb) {
-        sb += 8;
+    unsigned got = status_scan(path, keys, 2, v);
+    if (!(got & 1))
+        return TASK_NONE;
+    const char *st = v[0];
+    while (*st == ' ' || *st == '\t')
+        st++;
+    if (*st == 'Z')
+        return TASK_ZOMBIE;
+    if (got & 2) {
+        const char *sb = v[1];
         while (*sb == ' ' || *sb == '\t')
             sb++;
         unsigned long m = 0;
@@ -550,94 +635,190 @@ static int task_state(long tid) {
     return TASK_LIVE;
 }
 
-/* Every task of this process but the caller, into `out` (at most `cap`);
- * returns the count, or -1 when /proc cannot be read. */
-static int tasks_but_me(long *out, int cap) {
+/* The process's thread count as the kernel has it (Threads: in its status
+ * file): every task of the group not yet released, listed or not. -1 when it
+ * cannot be read. */
+static long nr_threads(void) {
+    static const char *const keys[] = {"Threads:"};
+    char v[1][STATUS_LINE];
+    if (!(status_scan("/proc/self/status", keys, 1, v) & 1))
+        return -1;
+    return status_num(v[0]);
+}
+
+/* Is `tid` a task the de_thread request cannot reach: a zombie, or one that
+ * keeps SIGSYS blocked? Sampled a few times a millisecond apart before the
+ * answer is yes, since a writer of ours holds every signal off for a few
+ * microseconds and must not be mistaken for one. A task that is not there
+ * is not unreachable, merely gone. */
+static int task_unreachable(long tid) {
+    for (int i = 0; i < 10; i++) {
+        int st = task_state(tid);
+        if (st == TASK_LIVE || st == TASK_NONE)
+            return 0;
+        if (st == TASK_ZOMBIE)
+            return 1;
+        struct cng_timespec nap = {0, 1000 * 1000}; /* 1 ms */
+        CNG_SYS(__NR_nanosleep, &nap, 0, 0, 0, 0, 0);
+    }
+    return 1;
+}
+
+/* Kill every other thread of the process and wait for each to be gone: the
+ * kernel's de_thread.
+ *
+ * The siblings are the kernel's list, /proc/self/task, read afresh every
+ * round and each listed one told again — a request already pending is not
+ * queued twice, and the answer says whether the thread is there at all — so
+ * that neither the count of them nor a thread that arrives late is a
+ * problem: a table of them used to hold 4096, and the exec went ahead beside
+ * the rest without a word; and a sibling can clone a thread between being
+ * listed and taking the request. One with the request pending cannot (the
+ * kernel restarts its clone into the handler, which never comes back; under
+ * qemu-user the one clone in flight completes, and no other), so each
+ * round's newcomers were cloned by an earlier round's threads before their
+ * own request landed, and the rounds end. A listing that takes more
+ * than one read can skip a thread while others exit under it, so the
+ * kernel's count of them (Threads: in the status file, which covers every
+ * task a listing could show) has the last word: as long as it exceeds this
+ * thread plus what was given up on, something remains and the next round
+ * lists it.
+ *
+ * What cannot take the request is not waited for forever: a zombie (see
+ * task_state), or a thread that keeps SIGSYS blocked — qemu-user's own
+ * threads, or a signal frame the guest edited — is given up on after a
+ * second, and the exec then proceeds beside it, which is what every exec did
+ * before. Those are kept apart (g_dt_left) so as not to be told again or
+ * counted, and are looked at again once a second: a zombie a tracer reaps
+ * has its tid free to be reused by a thread that is the guest's. A thread
+ * that is reachable and merely slow — parked in an uninterruptible wait, say
+ * — is waited for as long as it takes, as the kernel would; telling it
+ * again each round is also what reaches a thread that took over the tid of
+ * one that died. */
+static struct cng_tab g_dt_left = CNG_TAB_INIT(long);
+static unsigned long g_dt_nleft;
+
+static int dt_left(long tid) {
+    for (unsigned long i = 0; i < g_dt_nleft; i++)
+        if (*(long *)cng_tab_peek(&g_dt_left, i) == tid)
+            return 1;
+    return 0;
+}
+
+static void dt_leave(long tid) {
+    if (cng_g_debug)
+        cng_dprintf(2, "[cng] exec: de_thread: tid %ld cannot be reached; "
+                       "going on without it\n",
+                    tid);
+    long *slot = cng_tab_at(&g_dt_left, g_dt_nleft);
+    if (slot) {
+        *slot = tid;
+        g_dt_nleft++;
+    }
+    /* No page for the record: the thread is told and counted again next
+     * round, and given up on again at the next mark. */
+}
+
+/* Once a second: the given-up set, less those gone or reachable after all;
+ * returns how many of them the kernel still counts. */
+static long dt_left_revisit(long pid) {
+    long present = 0;
+    for (unsigned long i = 0; i < g_dt_nleft;) {
+        long *slot = cng_tab_peek(&g_dt_left, i);
+        int st = task_state(*slot);
+        if (st == TASK_NONE || st == TASK_LIVE ||
+            CNG_SYS(__NR_tgkill, pid, *slot, 0, 0, 0, 0) == -ESRCH) {
+            *slot = *(long *)cng_tab_peek(&g_dt_left, --g_dt_nleft);
+            continue;
+        }
+        present++;
+        i++;
+    }
+    return present;
+}
+
+/* One round: every task the kernel lists but the caller and the given-up is
+ * told to die, and counted if still there. At a mark (once a second, the
+ * first round included) each is first asked whether it can take the request
+ * at all, and given up on if not — except at the first mark, where one with
+ * every signal held off is told anyway and waited for: the request waits in
+ * its pending set for the mask to come back. Returns the count still there,
+ * or -1 when the list cannot be read (no /proc: nothing here can be done,
+ * and the exec goes ahead as it always did). */
+static char g_dt_dents[16384];
+
+static long dt_round(long pid, long me, int mark, int first, long *told) {
     long fd = sys_openat(CNG_AT_FDCWD, "/proc/self/task",
                          CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
     if (fd < 0)
         return -1;
-    long me = sys_gettid();
-    int n = 0;
-    char buf[1024];
+    long live = 0;
     for (;;) {
-        long r = CNG_SYS(__NR_getdents64, fd, buf, sizeof buf, 0, 0, 0);
+        long r = CNG_SYS(__NR_getdents64, fd, g_dt_dents, sizeof g_dt_dents, 0,
+                         0, 0);
         if (r <= 0)
             break;
         for (long o = 0; o + 19 <= r;) {
             unsigned short reclen;
-            memcpy(&reclen, buf + o + 16, 2);
+            memcpy(&reclen, g_dt_dents + o + 16, 2);
             if (reclen == 0 || o + reclen > r)
                 break;
-            const char *nm = buf + o + 19;
+            const char *nm = g_dt_dents + o + 19;
             o += reclen;
             long tid = 0;
             if (*nm < '1' || *nm > '9')
                 continue;
             for (; *nm >= '0' && *nm <= '9'; nm++)
                 tid = tid * 10 + (*nm - '0');
-            if (tid != me && n < cap)
-                out[n++] = tid;
+            if (tid == me || dt_left(tid))
+                continue;
+            if (mark) {
+                int st = task_state(tid);
+                if (st == TASK_NONE)
+                    continue;
+                if (st == TASK_ZOMBIE ||
+                    (st == TASK_BLOCKED && !first && task_unreachable(tid))) {
+                    dt_leave(tid);
+                    continue;
+                }
+            }
+            if (dethread_send(tid, CNG_DT_DIE) == -ESRCH)
+                continue;
+            live++;
+            (*told)++;
         }
     }
     sys_close((int)fd);
-    return n;
+    return live;
 }
 
-/* Kill every other thread of the process and wait for each to be gone: the
- * kernel's de_thread. A thread that cannot take the signal (see
- * task_unkillable) is not waited for, and one that stops being able to while
- * we wait — a signal frame edited to block SIGSYS is the one way — is given
- * up on after a while rather than waited for forever: the exec then proceeds
- * beside it, which is what every exec did before. */
-#define DETHREAD_MAX 4096
-
 static void cng_dethread(void) {
-    static long tids[DETHREAD_MAX];
-    long pid = sys_getpid();
-    int n = tasks_but_me(tids, DETHREAD_MAX);
-    if (n <= 0)
-        return;
-    int live = 0;
-    for (int i = 0; i < n; i++) {
-        int st = task_state(tids[i]);
-        if (st == TASK_GONE) {
-            tids[i] = 0;
-            continue;
+    long pid = sys_getpid(), me = sys_gettid(), told = 0;
+    g_dt_nleft = 0;
+    for (unsigned spin = 0;; spin++) {
+        int mark = spin % 10000 == 0; /* once a second */
+        if (mark && spin)
+            dt_left_revisit(pid);
+        long live = dt_round(pid, me, mark, !spin, &told);
+        if (live < 0)
+            return;
+        if (!spin && cng_g_debug && live)
+            cng_dprintf(2, "[cng] exec: de_thread: %ld sibling thread(s)\n",
+                        live);
+        if (!live) {
+            /* Nothing listed remains. Nothing unlisted either? The kernel's
+             * count covers the given-up still there, so they are probed
+             * for; what is over is a thread the listing skipped. */
+            long n = nr_threads();
+            if (n < 0 || n <= 1 + dt_left_revisit(pid))
+                break;
         }
-        /* One holding every signal off is told anyway: the request waits in
-         * its pending set for the mask to come back. qemu-user's own threads
-         * never take it, and are given up on below. */
-        dethread_send(tids[i], CNG_DT_DIE);
-        live++;
+        struct cng_timespec nap = {0, 100 * 1000}; /* 100 us */
+        CNG_SYS(__NR_nanosleep, &nap, 0, 0, 0, 0, 0);
     }
-    if (cng_g_debug && live)
-        cng_dprintf(2, "[cng] exec: de_thread: %d sibling thread(s)\n", live);
-    for (unsigned spin = 0; live; spin++) {
-        live = 0;
-        for (int i = 0; i < n; i++) {
-            if (!tids[i])
-                continue;
-            if (CNG_SYS(__NR_tgkill, pid, tids[i], 0, 0, 0, 0) == -ESRCH) {
-                tids[i] = 0;
-                continue;
-            }
-            /* Once a second: is it one that cannot take the request? */
-            if (spin && spin % 10000 == 0 && task_state(tids[i]) != TASK_LIVE) {
-                if (cng_g_debug)
-                    cng_dprintf(2, "[cng] exec: de_thread: tid %ld cannot be "
-                                   "reached; going on without it\n",
-                                tids[i]);
-                tids[i] = 0;
-                continue;
-            }
-            live++;
-        }
-        if (live) {
-            struct cng_timespec nap = {0, 100 * 1000}; /* 100 us */
-            CNG_SYS(__NR_nanosleep, &nap, 0, 0, 0, 0, 0);
-        }
-    }
+    if (cng_g_debug && told)
+        cng_dprintf(2, "[cng] exec: de_thread: done, %ld request(s) sent\n",
+                    told);
 }
 
 /* Is the group leader a thread that could carry an exec: alive, not a zombie
@@ -1971,7 +2152,8 @@ static long execve_core(int dirfd, const char *path, char **argv, char **envp,
                 for (;;)
                     sys_exit(0);
             int st = task_state(pid);
-            if (st == TASK_GONE || (st == TASK_BLOCKED && blocked_ns > 2000000000UL))
+            if (st == TASK_NONE || st == TASK_ZOMBIE ||
+                (st == TASK_BLOCKED && blocked_ns > 2000000000UL))
                 return CNG_EXEC_TAKEOVER;
             blocked_ns = st == TASK_BLOCKED ? blocked_ns + nap : 0;
             struct cng_timespec ts = {0, (long)nap};
