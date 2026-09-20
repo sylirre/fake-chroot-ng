@@ -2925,6 +2925,28 @@ vfork/`posix_spawn` child-stack handling.
   binary reports 407 and ~20 threads after the exec, the kernel and the fix
   report 2 (qemu-user's own thread included) — the `m6` legs.
 
+- [x] **M53 — the ptrace per-task table filled for good, and an attach was consumed before it could be kept**
+  A traced or tracing task keeps its state (the frame it stopped on, its
+  resume mode, its step breakpoint, the link to its tracer) in a tid-keyed
+  slot, and the slots were 128 and never given back — a task's exit cleared
+  its fields and left its tid in place — so the 129th task ever traced or
+  tracing in a process found none. `PTRACE_ATTACH`/`SEIZE` had answered 0
+  to the tracer by then (the kick and the pending flag are all it needs),
+  and the tracee cleared the flag before asking for a slot: with none, it
+  simply went on, and the tracer waited for a stop that never came. The
+  table is a `cng_tab` now: a slot goes back at its task's own exit — the
+  de_thread's die request reports the death first too, as the kernel's
+  `SIGKILL` reaches a tracer — and one whose task died without passing there
+  (`exit_group`, a fatal signal) is taken over by the next claimant once no
+  free slot is left, with any step breakpoint it still had planted put back
+  first, since its record is the only account of the original word; only
+  then does the table grow. The pending flag is consumed after the slot is
+  in hand, so a slot that cannot be had (the host refusing a page) leaves
+  the attach pending for the next stop point rather than lost. `pt_probe`'s
+  `attachmany` attaches to two hundred short-lived threads of one process in
+  turn; the old binary hung at the 129th, and the leg is a kernel
+  differential.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

@@ -144,6 +144,10 @@ else
     pt_case step2
     # PTRACE_ATTACH to a process that is already running, and DETACH.
     pt_case attach
+    # ...and to two hundred tasks of one process, one after another: the
+    # tracee's per-task state used to sit in 128 slots that were never given
+    # back, so the 129th attach was reported a success and never stopped.
+    pt_case attachmany
     # process_vm_readv against a stopped tracee — strace's fast path, served
     # from the mailbox because the host may refuse it. The iovec counts are a
     # tracer's to choose and the emulation walks the arrays by them, so this

@@ -830,6 +830,83 @@ static int sc_attach(void) {
     return 0;
 }
 
+/* PTRACE_ATTACH to thread after thread of one process, each a fresh task:
+ * attached, stopped, detached, released to exit, two hundred times over. The
+ * per-task state a tracee keeps for its stops used to sit in a table of 128
+ * slots that were never given back, so the 129th task ever traced in a
+ * process found none: its attach was reported a success and it never
+ * stopped, and the tracer waited forever. The count is what the tracer got a
+ * stop from; a wait that hangs is what the alarm is for. */
+#define AM_ROUNDS 200
+
+static int g_am_go[2];
+
+static void *am_thread(void *a) {
+    int fd = (int)(long)a;
+    pid_t me = (pid_t)syscall(SYS_gettid);
+    ssize_t ignore = write(fd, &me, sizeof me);
+    (void)ignore;
+    char c;
+    while (read(g_am_go[0], &c, 1) < 0 && errno == EINTR)
+        ;
+    return 0;
+}
+
+static int sc_attachmany(void) {
+    int fds[2];
+    if (pipe(fds) != 0 || pipe(g_am_go) != 0)
+        return 1;
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(fds[0]);
+        close(g_am_go[1]);
+        for (int k = 0; k < AM_ROUNDS; k++) {
+            pthread_t t;
+            if (pthread_create(&t, 0, am_thread, (void *)(long)fds[1]) != 0)
+                _exit(3);
+            pthread_join(t, 0);
+        }
+        for (;;)
+            pause(); /* the tracer's kill is the one way out: no race on it */
+    }
+    close(fds[1]);
+    close(g_am_go[0]);
+    alarm(50);
+    int stopped = 0, st;
+    for (int k = 0; k < AM_ROUNDS; k++) {
+        pid_t tid;
+        if (read(fds[0], &tid, sizeof tid) != (ssize_t)sizeof tid) {
+            printf("round %d: no thread\n", k);
+            break;
+        }
+        if (ptrace(PTRACE_ATTACH, tid, 0, 0) != 0) {
+            printf("round %d: attach failed %d\n", k, errno);
+            break;
+        }
+        pid_t w;
+        do {
+            w = waitpid(tid, &st, __WALL);
+        } while (w < 0 && errno == EINTR);
+        if (w != tid || !WIFSTOPPED(st)) {
+            printf("round %d: no stop\n", k);
+            break;
+        }
+        stopped++;
+        if (ptrace(PTRACE_DETACH, tid, 0, 0) != 0) {
+            printf("round %d: detach failed %d\n", k, errno);
+            break;
+        }
+        ssize_t ignore = write(g_am_go[1], "x", 1);
+        (void)ignore;
+    }
+    alarm(0);
+    printf("stopped %d of %d\n", stopped, AM_ROUNDS);
+    kill(pid, SIGKILL);
+    wait_for(pid, &st);
+    show(st);
+    return 0;
+}
+
 /* process_vm_readv against a stopped tracee: the fast path strace takes before
  * falling back to PEEKDATA, and the one the emulation has to serve itself
  * because the host has no reason to believe we are attached.
@@ -1406,6 +1483,8 @@ int main(int argc, char **argv) {
         return sc_step2();
     if (!strcmp(s, "attach"))
         return sc_attach();
+    if (!strcmp(s, "attachmany"))
+        return sc_attachmany();
     if (!strcmp(s, "vmrw"))
         return sc_vmrw();
     if (!strcmp(s, "sigact"))

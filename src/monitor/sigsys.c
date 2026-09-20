@@ -681,6 +681,10 @@ static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {
     void (*fn)(void *, void *) = sigsys_on_scratch;
     switch (cng_dethread_request(si)) {
     case CNG_DT_DIE:
+        /* Killed by a sibling's exec, which is a SIGKILL from the kernel's
+         * de_thread: a tracer of this thread is shown that death, and the
+         * per-task ptrace state goes back with the task. */
+        cng_pt_exit_report(9 /*SIGKILL*/);
         for (;;)
             sys_exit(0);
     case CNG_DT_EXEC:

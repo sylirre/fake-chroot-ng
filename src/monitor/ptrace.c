@@ -26,6 +26,7 @@
 #include "cng/ptrace.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
+#include "cng/tab.h"
 #include "cng/uapi.h"
 
 int cng_g_no_ptrace = 0;
@@ -112,7 +113,15 @@ static struct pt_tab *g_tab;
  * threads, whose TPIDR_EL0 belongs to the guest's libc, so a thread-local of
  * ours would be resolved against the guest's TLS block. Per-task state is
  * therefore a tid-keyed table, claimed lock-free exactly like the SIGSYS
- * handler's scratch stacks. Only traced or tracing tasks ever claim a slot. */
+ * handler's scratch stacks. Only traced or tracing tasks ever claim a slot.
+ *
+ * The table grows (cng_tab), and a slot is given back: by the task's own
+ * exit, or — for one whose task died without passing there (exit_group, a
+ * fatal signal, an exec's de_thread) — taken over by the next claimant once
+ * no free slot is left, as the scratch-stack table does. It used to be 128
+ * slots that were never given back, so the 129th task ever traced or tracing
+ * in a process found none: a tracer was told its attach succeeded, and the
+ * tracee, with nowhere to keep its state, never stopped for it. */
 struct pt_self {
     long tid; /* 0 = free */
     struct pt_link *link;
@@ -129,8 +138,7 @@ struct pt_self {
     int tracer_armed;        /* the tracer filter is installed here */
     struct cng_pt_step bkpt; /* the single-step breakpoint this task planted */
 };
-#define PT_SELF_N 128
-static struct pt_self g_self[PT_SELF_N];
+static struct cng_tab g_self = CNG_TAB_INIT(struct pt_self);
 
 /* Does this *process* have any traced or tracing task? An ordinary global, so
  * it is inherited by fork exactly as the seccomp filter and the dispositions
@@ -339,50 +347,81 @@ void cng_pt_kick(s32 tgid, s32 tid, int magic) {
 
 /* ---- per-task state ---- */
 
-/* Claim `*p` from 0 to `tid` (inline LL/SC; same as sigsys.c's scratch table). */
-static int pt_claim_slot(volatile long *p, long tid) {
-    long old;
-    int fail;
-    __asm__ volatile("1: ldaxr %[old], [%[p]]\n"
-                     "   cbnz  %[old], 2f\n"
-                     "   stlxr %w[f], %[tid], [%[p]]\n"
-                     "   cbnz  %w[f], 1b\n"
-                     "   b     3f\n"
-                     "2: clrex\n"
-                     "   mov   %w[f], #1\n"
-                     "3:\n"
-                     : [old] "=&r"(old), [f] "=&r"(fail)
-                     : [p] "r"(p), [tid] "r"(tid)
-                     : "cc", "memory");
-    return fail == 0;
+static struct pt_self *pt_self_find(long tid) {
+    struct cng_tab_iter it;
+    for (struct pt_self *s = cng_tab_first(&g_self, &it); s;
+         s = cng_tab_next(&g_self, &it))
+        if (__atomic_load_n(&s->tid, __ATOMIC_ACQUIRE) == tid)
+            return s;
+    return 0;
 }
 
+/* A slot just claimed, its fields cleared for the new owner. `tid` is already
+ * ours, and the step record is already down (see pt_self_get). */
+static struct pt_self *pt_self_init(struct pt_self *s) {
+    s->link = 0;
+    s->regs = 0;
+    s->uc = 0;
+    s->active = s->armed = s->step = 0;
+    s->entry_seen = s->skip_exit_stop = s->in_stop = 0;
+    s->traceall = s->tracer_armed = 0;
+    memset(&s->bkpt, 0, sizeof s->bkpt);
+    return s;
+}
+
+/* This task's slot, claimed on first use when `create` is set: a free one, or
+ * failing that one whose task is gone, or failing that a new one at the end
+ * of the table. 0 only when the host would not give the page for it. */
 static struct pt_self *pt_self_get(int create) {
     long tid = sys_gettid();
-    unsigned h = (unsigned)((unsigned long)tid * 2654435761u) % PT_SELF_N;
-    for (unsigned k = 0; k < PT_SELF_N; k++) {
-        unsigned i = (h + k) % PT_SELF_N;
-        long t = __atomic_load_n(&g_self[i].tid, __ATOMIC_ACQUIRE);
-        if (t == tid)
-            return &g_self[i];
-        if (t == 0) {
-            if (!create)
-                return 0;
-            if (pt_claim_slot(&g_self[i].tid, tid)) {
-                struct pt_self *s = &g_self[i];
-                s->link = 0;
-                s->regs = 0;
-                s->uc = 0;
-                s->active = s->armed = s->step = 0;
-                s->entry_seen = s->skip_exit_stop = s->in_stop = 0;
-                s->traceall = s->tracer_armed = 0;
-                memset(&s->bkpt, 0, sizeof s->bkpt);
-                return s;
+    struct pt_self *s = pt_self_find(tid);
+    if (s || !create)
+        return s;
+    long pid = sys_getpid();
+    for (;;) {
+        unsigned long n = 0; /* slots the table has */
+        for (int pass = 0; pass < 2; pass++) {
+            struct cng_tab_iter it;
+            for (s = cng_tab_first(&g_self, &it); s;
+                 s = cng_tab_next(&g_self, &it)) {
+                if (!pass)
+                    n++;
+                long t = __atomic_load_n(&s->tid, __ATOMIC_ACQUIRE);
+                /* Free slots first; a dead task's only once there is none,
+                 * since telling one costs a syscall per slot. */
+                if (pass ? t == 0 || CNG_SYS(__NR_tgkill, pid, t, 0, 0, 0, 0) !=
+                                          -ESRCH
+                         : t != 0)
+                    continue;
+                if (!__atomic_compare_exchange_n(&s->tid, &t, tid, 0,
+                                                 __ATOMIC_ACQ_REL,
+                                                 __ATOMIC_RELAXED))
+                    continue; /* another claimant got there first */
+                /* Ours now. A step breakpoint the dead task left planted is
+                 * accounted for by this record alone: take it down as the
+                 * task's own next stop would have, before the record goes. */
+                if (pass)
+                    cng_pt_step_clear();
+                return pt_self_init(s);
             }
-            k--; /* lost the race for this slot; re-probe it */
         }
+        /* None to be had: the first slot of a chunk that did not exist. A
+         * claimant that maps the same chunk first takes that slot, and the
+         * rest of the chunk is free for the pass above to find. */
+        s = cng_tab_at(&g_self, n);
+        if (!s)
+            return 0;
+        long zero = 0;
+        if (__atomic_compare_exchange_n(&s->tid, &zero, tid, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            return pt_self_init(s);
     }
-    return 0;
+}
+
+/* The slot given back by its own task, at its exit. Nothing of it may be in
+ * use by then: the link is dropped and the step record is down. */
+static void pt_self_put(struct pt_self *s) {
+    __atomic_store_n(&s->tid, 0, __ATOMIC_RELEASE);
 }
 
 struct cng_pt_step *cng_pt_step_self(int create) {
@@ -392,11 +431,13 @@ struct cng_pt_step *cng_pt_step_self(int create) {
 
 int cng_pt_step_shared(u64 addr, u32 *orig) {
     long tid = sys_gettid(), pid = sys_getpid();
-    for (int i = 0; i < PT_SELF_N; i++) {
-        long t = __atomic_load_n(&g_self[i].tid, __ATOMIC_ACQUIRE);
+    struct cng_tab_iter it;
+    for (struct pt_self *s = cng_tab_first(&g_self, &it); s;
+         s = cng_tab_next(&g_self, &it)) {
+        long t = __atomic_load_n(&s->tid, __ATOMIC_ACQUIRE);
         if (!t || t == tid)
             continue;
-        struct cng_pt_step *st = &g_self[i].bkpt;
+        struct cng_pt_step *st = &s->bkpt;
         if (!__atomic_load_n(&st->live, __ATOMIC_ACQUIRE) || st->addr != addr)
             continue;
         if (CNG_SYS(__NR_tgkill, pid, t, 0, 0, 0, 0) == -ESRCH) {
@@ -417,12 +458,14 @@ int cng_pt_step_shared(u64 addr, u32 *orig) {
 }
 
 void cng_pt_step_mask(u64 addr, void *buf, unsigned long len) {
-    for (int i = 0; i < PT_SELF_N; i++) {
-        if (!__atomic_load_n(&g_self[i].tid, __ATOMIC_ACQUIRE) ||
-            !__atomic_load_n(&g_self[i].bkpt.live, __ATOMIC_ACQUIRE))
+    struct cng_tab_iter it;
+    for (struct pt_self *s = cng_tab_first(&g_self, &it); s;
+         s = cng_tab_next(&g_self, &it)) {
+        if (!__atomic_load_n(&s->tid, __ATOMIC_ACQUIRE) ||
+            !__atomic_load_n(&s->bkpt.live, __ATOMIC_ACQUIRE))
             continue;
-        u64 a = g_self[i].bkpt.addr;
-        u32 orig = g_self[i].bkpt.orig;
+        u64 a = s->bkpt.addr;
+        u32 orig = s->bkpt.orig;
         /* The four bytes of the word, wherever they fall in the window. */
         for (unsigned k = 0; k < 4; k++)
             if (a + k >= addr && a + k < addr + len)
@@ -431,9 +474,11 @@ void cng_pt_step_mask(u64 addr, void *buf, unsigned long len) {
 }
 
 void cng_pt_step_clear_all(void) {
-    for (int i = 0; i < PT_SELF_N; i++) {
-        struct cng_pt_step *st = &g_self[i].bkpt;
-        if (!g_self[i].tid || !st->live)
+    struct cng_tab_iter it;
+    for (struct pt_self *s = cng_tab_first(&g_self, &it); s;
+         s = cng_tab_next(&g_self, &it)) {
+        struct cng_pt_step *st = &s->bkpt;
+        if (!s->tid || !st->live)
             continue;
         st->live = 0;
         cng_pt_poke_text(st->addr, &st->orig, 4);
@@ -1231,7 +1276,12 @@ void cng_pt_fork_child(struct cng_uregs *r, int event) {
     /* The per-task table came across the fork describing the *parent's*
      * threads; only the forking thread exists here, and it has a new tid. Clear
      * it wholesale so a recycled tid can never match a stale entry. */
-    memset(g_self, 0, sizeof g_self);
+    {
+        struct cng_tab_iter it;
+        for (struct pt_self *s = cng_tab_first(&g_self, &it); s;
+             s = cng_tab_next(&g_self, &it))
+            memset(s, 0, sizeof *s);
+    }
     __atomic_store_n(&g_pt_traced, 0, __ATOMIC_SEQ_CST);
     s32 tracer = g_fork_inherit.tracer;
     u32 opts = g_fork_inherit.options;
@@ -1298,6 +1348,10 @@ void cng_pt_exit_report(int wstatus) {
         s->active = s->armed = s->step = s->skip_exit_stop = 0;
         if (was)
             pt_traced_dec(0); /* dying: no point putting dispositions back */
+        /* The slot goes back with the task. A step it still had planted goes
+         * first: nothing else accounts for the original word. */
+        cng_pt_step_clear();
+        pt_self_put(s);
     }
     if (!e) {
         cng_pt_wake_waiters();
@@ -1349,10 +1403,14 @@ void cng_pt_service_kick(struct cng_uregs *r) {
         if (!e || __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) <= 0 ||
             !__atomic_load_n(&e->attach_pending, __ATOMIC_ACQUIRE))
             return;
-        __atomic_store_n(&e->attach_pending, 0, __ATOMIC_RELEASE);
+        /* The state first, the flag after: the tracer was told its attach
+         * succeeded, so a slot that cannot be had (the host would not give
+         * the page) leaves the attach pending for the next stop point rather
+         * than consumed with nothing to show for it. */
         s = pt_self_get(1);
         if (!s)
             return;
+        __atomic_store_n(&e->attach_pending, 0, __ATOMIC_RELEASE);
         s->link = e;
         s->active = 1;
         g_pt_local = 1;
