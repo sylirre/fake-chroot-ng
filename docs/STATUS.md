@@ -834,8 +834,9 @@ vfork/`posix_spawn` child-stack handling.
     the in/out `addrlen`.
   - **Abstract names** have no filesystem node, so the rootfs prefix cannot scope
     them and an unprivileged process cannot be handed its own netns. A short
-    per-rootfs tag (`\x01cng<hash8>`, keyed by `cng_broker_key_hash` — the same
-    primitive broker.c already used for its own rendezvous) is spliced in after
+    per-rootfs tag (`\x01cng<hash16>` — 8 digits until M55 — keyed by
+    `cng_broker_key_hash`, the same primitive broker.c already used for its own
+    rendezvous) is spliced in after
     the leading NUL and stripped on readback. Without it, two invocations over
     different rootfs collide on one name (two guest X or D-Bus daemons fighting
     over `@/tmp/.X11-unix/X0`) and a guest can reach host abstract services.
@@ -2946,6 +2947,18 @@ vfork/`posix_spawn` child-stack handling.
   `attachmany` attaches to two hundred short-lived threads of one process in
   turn; the old binary hung at the 129th, and the leg is a kernel
   differential.
+
+- [x] **M54 — a rootfs that could not be entered ran the guest anyway**
+  With a real rootfs the guest starts at "/", and the real process is moved
+  into the rootfs so that a relative name the monitor never sees — anything
+  untrapped, and under `-R` every site the rewriter did not reach — resolves
+  inside it. `--work-dir` has treated that chdir's failure as fatal since
+  M17-17; the default path dropped it, so a rootfs that was not there, or
+  had no search permission, ran the guest (from a bind, say) told it was at
+  "/" with the real cwd still at the launch directory — the containment
+  fallback missing and nothing said. It is refused now like `-w` is, with
+  the errno, before the guest is entered; three `m17_workdir` legs, one with
+  the program reachable through a bind, where the old binary ran it.
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 

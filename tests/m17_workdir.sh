@@ -80,6 +80,30 @@ else
     chmod 0755 "$M17W/sealed"
 fi
 
+# The rootfs itself is the same story with no -w at all: the default cwd is
+# the rootfs, and the real process is moved there so that a relative name the
+# monitor never sees stays inside it. That chdir's failure was dropped too,
+# so a rootfs that was not there, or could not be entered, ran the guest —
+# from a bind, say — with the real cwd left at the launch directory and
+# nothing said about it. Refused now, like -w, before the guest is entered.
+run -R /no-such-rootfs -b "$M17W:/x" /x/no-such-program >/dev/null 2>&1
+check "a rootfs that is not there is refused" 1 $?
+out=$(run -R /no-such-rootfs -b "$M17W:/x" /x/no-such-program 2>&1)
+check_contains "the missing rootfs is diagnosed with its errno" \
+    "chroot-ng: rootfs '/no-such-rootfs': cannot enter (errno 2)" "$out"
+if [ "$(id -u)" = 0 ]; then
+    skip "a rootfs that cannot be entered is refused: running as root, mode 0000 is still enterable"
+else
+    mkdir -p "$M17W/sealed"
+    chmod 0000 "$M17W/sealed"
+    run -R -u 0:0 "$M17W/sealed" /no-such-program >/dev/null 2>&1
+    check "a rootfs that cannot be entered is refused" 1 $?
+    out=$(run -R -u 0:0 "$M17W/sealed" /no-such-program 2>&1)
+    check_contains "the unenterable rootfs is diagnosed with its errno" \
+        "chroot-ng: rootfs '$M17W/sealed': cannot enter (errno 13)" "$out"
+    chmod 0755 "$M17W/sealed"
+fi
+
 # --- the identity rootfs ----------------------------------------------------
 # Guest paths are host paths here, so these legs need no translation tier and
 # run on every host — including the cross host, where getcwd is answered by the
@@ -95,6 +119,12 @@ if guest_cc_report "$GDIR/cwdprobe" tests/guests/cwdprobe.c; then
     out=$(run / "$PROBE" 2>/dev/null)
     check_contains "identity rootfs: the default cwd is the launch directory" \
         "cwd=$(pwd -P)" "$out"
+
+    # ...and a rootfs that is not there, with the program reachable through
+    # a bind: used to run, told it was at "/" with the real cwd still here.
+    out=$(run -R -b "$M17W:/x" /no-such-rootfs /x/probe 2>/dev/null); rc=$?
+    check "a missing rootfs is refused before the guest is entered" 1 $rc
+    check_absent "...so the guest never reports a cwd" "cwd=" "$out"
 
     out=$(run -w "$M17W/a/b" / "$PROBE" marker 2>/dev/null)
     check_contains "-w sets the guest cwd" "cwd=$M17W/a/b" "$out"

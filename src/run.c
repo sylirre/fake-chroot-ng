@@ -291,12 +291,27 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
     /* Initial guest cwd. With a real rootfs, default to "/" (never leak the host
      * launch dir) and chdir the real process into the rootfs so untranslated
      * relative access stays contained. With an identity rootfs, the host cwd is
-     * the guest cwd. */
+     * the guest cwd.
+     *
+     * The chdir's failure is the whole answer, as it is for --work-dir: a
+     * relative name the monitor never sees — anything untrapped, and under
+     * -R every site the rewriter did not reach — resolves against the real
+     * cwd, and one left at the launch directory while the guest is told it
+     * is at "/" resolves those names outside the guest view entirely. It
+     * used to be ignored, so a rootfs that was not there, or not enterable,
+     * ran the guest (from a bind, say) with its containment fallback
+     * missing and not a word said. */
     if (strcmp(rootfs, "/") != 0) {
         cng_fs_set_cwd(&g_fs, "/");
         char rhost[CNG_PATH_MAX];
-        if (cng_fs_translate(&g_fs, "/", rhost, sizeof rhost) == 0)
-            sys_chdir(rhost);
+        long r = cng_fs_translate(&g_fs, "/", rhost, sizeof rhost) == 0
+                     ? sys_chdir(rhost)
+                     : -ENAMETOOLONG;
+        if (r != 0) {
+            cng_dprintf(2, "chroot-ng: rootfs '%s': cannot enter (errno %d)\n",
+                        rootfs, (int)-r);
+            return 1;
+        }
     } else {
         char cwd[CNG_PATH_MAX];
         if (sys_getcwd(cwd, sizeof cwd) > 0)
