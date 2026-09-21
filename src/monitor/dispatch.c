@@ -3207,39 +3207,147 @@ static unsigned long mmsg_take(struct cng_mmsghdr *dst,
     return got;
 }
 
-/* The descriptors a just-received message installed, put through
- * cng_fd_admit. `control`/`len` are the guest's control buffer and the length
- * the kernel wrote back for it: the SCM_RIGHTS records in there name the new
- * descriptors, and each is looked at where it lies — a header at a time and
- * the fd numbers in windows, since the buffer is the guest's and may be as
- * long as it likes. A record the walk cannot make sense of ends it, as the
- * kernel's own CMSG_NXTHDR would. A number closed here stays in the record:
- * the guest sees it and finds it not open, which is the whole of what an
- * import it may not have looks like. */
-static void scm_rights_admit(void *control, unsigned long len) {
+/* The SCM_RIGHTS records of a just-received message's control data, which is
+ * in a buffer of ours (recvmsg_bounced): each descriptor they name is handed
+ * to `fn`. A record the walk cannot make sense of ends it, as the kernel's
+ * own CMSG_NXTHDR would. */
+static void scm_rights_walk(const char *control, unsigned long len,
+                            void (*fn)(int)) {
     unsigned long off = 0;
-    while (control && off + sizeof(struct cng_cmsghdr) <= len) {
+    while (off + sizeof(struct cng_cmsghdr) <= len) {
         struct cng_cmsghdr ch;
-        if (cng_user_copyin(&ch, (char *)control + off, sizeof ch) < 0)
-            return;
+        memcpy(&ch, control + off, sizeof ch);
         if (ch.len < sizeof ch || ch.len > len - off)
             return;
         if (ch.level == CNG_SOL_SOCKET && ch.type == CNG_SCM_RIGHTS) {
             unsigned long nfd = (ch.len - sizeof ch) / sizeof(int);
-            const char *fds = (char *)control + off + sizeof ch;
-            while (nfd) {
-                int win[64];
-                unsigned long k = nfd > 64 ? 64 : nfd;
-                if (cng_user_copyin(win, fds, k * sizeof(int)) < 0)
-                    return;
-                for (unsigned long i = 0; i < k; i++)
-                    cng_fd_admit(win[i]);
-                fds += k * sizeof(int);
-                nfd -= k;
+            const char *fds = control + off + sizeof ch;
+            for (unsigned long i = 0; i < nfd; i++) {
+                int fd;
+                memcpy(&fd, fds + i * sizeof fd, sizeof fd);
+                fn(fd);
             }
         }
         off += (ch.len + 7) & ~7UL; /* CMSG_ALIGN */
     }
+}
+
+/* Put a received descriptor through cng_fd_admit. A number closed there stays
+ * in the record: the guest sees it and finds it not open, which is the whole
+ * of what an import it may not have looks like. */
+static void scm_rights_admit_one(int fd) { cng_fd_admit(fd); }
+
+/* ...and take one back that the guest never learned the number of. */
+static void scm_rights_close_one(int fd) {
+    if (fd >= 0)
+        sys_close(fd);
+}
+
+/* Does a recvmsg header ask for control data that could carry descriptors? A
+ * buffer shorter than one SCM_RIGHTS record with a single descriptor in it
+ * receives none: scm_detach_fds installs nothing into it and reports
+ * MSG_CTRUNC, whatever the message carried. */
+static int ctl_may_carry_fds(const struct cng_msghdr *h) {
+    return h->control &&
+           h->controllen >= sizeof(struct cng_cmsghdr) + sizeof(int);
+}
+
+/* One recvmsg with the header, and what it points at that this layer has to
+ * look at, taken out of the guest's memory: the header is always a copy of
+ * ours (the kernel writes msg_namelen, msg_controllen and msg_flags back into
+ * the one it is given, and those are carried over to the guest's afterwards);
+ * with `bname` the source address goes into a buffer of ours to be mapped
+ * back into the guest view (sun_deliver); with `bctl` the control data does,
+ * so the descriptors an SCM_RIGHTS record names are admitted (cng_fd_admit)
+ * out of the numbers the kernel wrote rather than out of the guest's buffer
+ * a syscall later, where another thread of the guest could have rewritten
+ * them into numbers of its choosing and kept the one that was to be closed.
+ * The records then go out to the guest in one copy.
+ *
+ * The control bounce is exact: a buffer up to CTL_BOUNCE is taken at its own
+ * size, so the kernel fills and truncates it exactly as it would have the
+ * guest's. Longer than that, the socket's family is asked (one getsockopt,
+ * and only then): AF_UNIX is the one family that can deliver descriptors,
+ * and it never produces more than an SCM_RIGHTS record of SCM_MAX_FD (253)
+ * descriptors, a credentials record and a security label — well under the
+ * bound — so its buffer is taken at CTL_BOUNCE with nothing lost; any other
+ * family's stays the guest's own, since nothing arriving on it needs
+ * admitting and a raw IPv6 socket's extension headers can run past the bound.
+ *
+ * A guest control buffer that will not take the records is answered as the
+ * kernel answers a control buffer it cannot write: no descriptor is left
+ * installed whose number the guest could not be told (receive_fd() installs
+ * nothing on a failed put), and the control data is reported truncated and
+ * empty. `flags_out` is the msg_flags the kernel
+ * wrote, for a caller that has to see MSG_OOB. A function of its own for the
+ * buffer it holds, which cng_dispatch's frame must not carry for every other
+ * syscall. */
+#define CTL_BOUNCE 8192
+static long sun_deliver(int own, char *ab, unsigned al, long aa, long alp);
+__attribute__((noinline)) static long
+recvmsg_bounced(long fd, struct cng_msghdr *g, const struct cng_msghdr *snap,
+                long flags, int bname, int bctl, unsigned *flags_out) {
+    char ab[CNG_SOCKADDR_MAX], cb[CTL_BOUNCE];
+    struct cng_msghdr mh = *snap;
+    if (bname) {
+        mh.name = ab;
+        mh.namelen = sizeof ab;
+    }
+    if (bctl) {
+        unsigned long cl = snap->controllen;
+        if (cl > sizeof cb) {
+            int dom = 0;
+            unsigned dlen = sizeof dom;
+            if (CNG_SYS(__NR_getsockopt, fd, CNG_SOL_SOCKET, CNG_SO_DOMAIN,
+                        &dom, &dlen, 0) == 0 &&
+                dom != CNG_AF_UNIX)
+                bctl = 0;
+            else
+                cl = sizeof cb;
+        }
+        if (bctl) {
+            mh.control = cb;
+            mh.controllen = cl;
+        }
+    }
+    long r = reissue(fd, (long)&mh, flags, 0, 0, 0, __NR_recvmsg);
+    if (r < 0)
+        return r;
+    if (bctl) {
+        unsigned long cl = mh.controllen;
+        if (cl > sizeof cb)
+            cl = sizeof cb; /* not a length the kernel reports; bounded anyway */
+        /* Handed over before it is judged: a record the guest could not be
+         * given is taken back whole, and every number in it is still the
+         * kernel's fresh install at that point — judged first, a number the
+         * judgement had closed would be closed here a second time, and by
+         * then it could be another thread's. */
+        if (cl && cng_user_copyout(snap->control, cb, cl) < 0) {
+            scm_rights_walk(cb, cl, scm_rights_close_one);
+            cl = 0;
+            mh.flags |= CNG_MSG_CTRUNC;
+        } else {
+            scm_rights_walk(cb, cl, scm_rights_admit_one);
+        }
+        mh.controllen = cl;
+    }
+    /* Written back whole rather than field by field: the guest's header is
+     * ours to restore in full, and the copy that carries it also validates
+     * it, so there is no zeroed remainder to worry about either. */
+    struct cng_msghdr back = *snap;
+    back.controllen = mh.controllen;
+    back.flags = mh.flags;
+    if (cng_user_copyout(g, &back, sizeof back) < 0)
+        return -EFAULT;
+    if (bname) {
+        long e = sun_deliver(-1, ab, mh.namelen, (long)snap->name,
+                             (long)&g->namelen);
+        if (e)
+            return e;
+    }
+    if (flags_out)
+        *flags_out = mh.flags;
+    return r;
 }
 
 /* Run the readback translation over an address the kernel just wrote into our
@@ -4762,45 +4870,18 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             return out;
         }
         /* msg_name is an output buffer of the guest's, so it gets the same
-         * bounce the single-address calls get. The header is copied to point at
-         * ours; the three fields the kernel writes back into the header it was
-         * given (msg_namelen, msg_controllen, msg_flags) then have to be carried
-         * over to the guest's own, or a caller loses MSG_TRUNC/MSG_CTRUNC and
-         * the length of the control data it is about to walk. */
+         * bounce the single-address calls get, and the control data one of
+         * its own where descriptors could arrive in it (recvmsg_bounced). A
+         * header asking for neither is the kernel's to fill as it stands. */
         struct cng_msghdr *g = (struct cng_msghdr *)a1;
         struct cng_msghdr snap; /* our copy of the guest's header, taken once */
         if (!a1 || cng_user_copyin(&snap, g, sizeof snap) < 0)
             return reissue(a0, a1, a2, a3, a4, a5, nr);
-        if (!snap.name || !snap.namelen) {
-            long r = reissue(a0, a1, a2, a3, a4, a5, nr);
-            /* The descriptors a message carried are in the table by now, and
-             * the kernel has written how much control data describes them
-             * into the guest's own header. */
-            struct cng_msghdr after;
-            if (r >= 0 && snap.control &&
-                cng_user_copyin(&after, g, sizeof after) == 0)
-                scm_rights_admit(snap.control, after.controllen);
-            return r;
-        }
-        char ab[CNG_SOCKADDR_MAX];
-        struct cng_msghdr mh = snap;
-        mh.name = ab;
-        mh.namelen = sizeof ab;
-        long r = reissue(a0, (long)&mh, a2, a3, a4, a5, nr);
-        if (r < 0)
-            return r;
-        scm_rights_admit(snap.control, mh.controllen);
-        /* Written back whole rather than field by field: the guest's header is
-         * ours to restore in full, and the copy that carries it also validates
-         * it, so there is no zeroed remainder to worry about either. */
-        struct cng_msghdr back = snap;
-        back.controllen = mh.controllen;
-        back.flags = mh.flags;
-        if (cng_user_copyout(g, &back, sizeof back) < 0)
-            return -EFAULT;
-        long e = sun_deliver(-1, ab, mh.namelen, (long)snap.name,
-                             (long)&g->namelen);
-        return e ? e : r;
+        int bname = snap.name && snap.namelen;
+        int bctl = ctl_may_carry_fds(&snap);
+        if (!bname && !bctl)
+            return reissue(a0, a1, a2, a3, a4, a5, nr);
+        return recvmsg_bounced(a0, g, &snap, a2, bname, bctl, 0);
     }
 
     /* recvmmsg: the readback side of the array forms. A source address cannot be
@@ -4899,49 +4980,33 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         long r = 0;
         while (got < vlen) {
             struct cng_mmsghdr *m = &v[got];
-            struct cng_mmsghdr h;
-            if (cng_user_copyin(&h, m, sizeof h) < 0) {
+            struct cng_msghdr snap;
+            if (cng_user_copyin(&snap, &m->hdr, sizeof snap) < 0) {
                 r = -EFAULT;
                 break;
-            }
-            char ab[CNG_SOCKADDR_MAX];
-            struct cng_msghdr snap = h.hdr; /* our copy, not the guest's live one */
-            struct cng_msghdr mh = snap;
-            if (snap.name) {
-                mh.name = ab;
-                mh.namelen = sizeof ab;
             }
             long fl = a3 & ~(long)CNG_MSG_WAITFORONE;
             if (got && first_only)
                 fl |= CNG_MSG_DONTWAIT;
-            long n = reissue(a0, (long)&mh, fl, 0, 0, 0, __NR_recvmsg);
+            unsigned mflags = 0;
+            long n = recvmsg_bounced(a0, &m->hdr, &snap, fl,
+                                     snap.name && snap.namelen,
+                                     ctl_may_carry_fds(&snap), &mflags);
             if (n < 0) {
-                r = n;
+                r = n; /* the message is consumed either way, as it is for
+                        * the single form */
                 break;
             }
-            scm_rights_admit(snap.control, mh.controllen);
-            h.hdr = snap;
-            h.hdr.controllen = mh.controllen;
-            h.hdr.flags = mh.flags;
-            h.len = (unsigned)n;
-            if (cng_user_copyout(m, &h, sizeof h) < 0) {
+            unsigned len = (unsigned)n;
+            if (cng_user_copyout(&m->len, &len, sizeof len) < 0) {
                 r = -EFAULT;
                 break;
-            }
-            if (snap.name) {
-                long e = sun_deliver(-1, ab, mh.namelen, (long)snap.name,
-                                     (long)&m->hdr.namelen);
-                if (e) {
-                    r = e; /* the message is consumed either way, as it is
-                            * for the single form */
-                    break;
-                }
             }
             got++;
             if (mmsg_deadline_hit(&dl))
                 break;
             /* Out-of-band data ends the batch where the kernel ends it. */
-            if (mh.flags & CNG_MSG_OOB)
+            if (mflags & CNG_MSG_OOB)
                 break;
         }
         long te2 = mmsg_deadline_report(&dl, a4, got);

@@ -97,6 +97,45 @@ elif guest_cc_report "$FVR/fdescape" tests/guests/fdescape.c; then
     check_contains "a directory of the view survives a trip over a socket" \
         "scm-view-dir=usable" "$out"
     check_contains "so does a file" "scm-view-file=usable" "$out"
+    # ...and what arrives from OUTSIDE the view, which only a host process can
+    # send: a directory the guest has no name for is closed on arrival, its
+    # number left in the record; a file and a directory of the view are let
+    # in. Judged out of the control data as the kernel wrote it into a buffer
+    # of the monitor's — the guest's own buffer, read back a syscall later,
+    # held whatever another of its threads had put there — and the records
+    # then handed to the guest, by recvmsg and by recvmmsg alike. Sent from a
+    # Python of the host's (send_fds, 3.9+); without one the leg sits out.
+    if guest_cc "$FVR/fdimport" tests/guests/fdimport.c &&
+        python3 -c 'import socket; socket.send_fds' 2>/dev/null; then
+        rm -f "$FVR/sock"
+        # shellcheck disable=SC2086
+        run_t 60 -R $GUEST_BINDS "$FVR" /fdimport /sock >"$FVO/import.out" \
+            2>/dev/null &
+        _bg=$!
+        _n=0
+        while [ ! -S "$FVR/sock" ] && [ $_n -lt 100 ]; do sleep 0.1; _n=$((_n + 1)); done
+        python3 tests/send_fds.py "$FVR/sock" "$FVO" "$FVO/file" "$FVR" \
+            2>/dev/null
+        wait $_bg 2>/dev/null
+        imp=$(cat "$FVO/import.out")
+        check_contains "an outside directory arriving over a socket is closed on arrival" \
+            "round=0 n=1 ctrunc=0 closed file dir" "$imp"
+        check_contains "...by recvmmsg as well" \
+            "round=1 n=1 ctrunc=0 closed file dir" "$imp"
+        # A control buffer longer than the monitor's own bound: an AF_UNIX
+        # socket's is taken at the bound (it can never fill it), so the records
+        # arrive whole and judged; an AF_INET socket's stays the guest's own,
+        # and the record the kernel wrote there arrives untouched.
+        check_contains "...and through a control buffer past the bounce bound" \
+            "round=2 n=1 ctrunc=0 closed file dir" "$imp"
+        case "$imp" in
+        *"inet: setup:"*) skip "no loopback for the AF_INET control leg" ;;
+        *) check_contains "a family that carries no descriptors keeps its own buffer" \
+            "inet: n=1 ctrunc=0 pktinfo=1" "$imp" ;;
+        esac
+    else
+        skip "descriptor import leg: no guest build or no python3 send_fds here"
+    fi
     # The hidden-process view by pid. /proc hides a host process by path, and
     # process_vm_readv/writev and pidfd_open were the routes to a process that
     # carry no path: with a ptrace policy that permits same-uid access a guest

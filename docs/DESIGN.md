@@ -39,6 +39,18 @@ What that does and does not buy:
 - A guest's *malice* is not. Hostile code sharing an address space with its own
   monitor is not confined by it; put a kernel boundary — a container, a VM, a
   separate uid — around the whole invocation instead.
+- The same holds one level down, for a guest racing itself. What the kernel
+  installs into the shared descriptor table it installs before anything of the
+  monitor's runs: a descriptor received over a socket, imported with
+  `pidfd_getfd` or opened by a scoped `openat2` that landed on a hidden
+  process exists in the table from the kernel's install until `cng_fd_admit`
+  closes it, and a thread that uses its number in that interval — a `dup()`,
+  a name resolved against it — keeps what the close was for. There is no
+  receiving into a table the guest does not share, so the interval is not the
+  monitor's to remove; what is the monitor's is the judgement, and that is
+  made from its own copy of the kernel's record (the control data of a
+  `recvmsg` is received into a buffer of the monitor's), so nothing a thread
+  writes into the guest's own buffers changes which descriptor is closed.
 
 One rule follows for the implementation: chroot-ng must never be the instrument.
 Wherever a **guest-chosen address** reaches a `MAP_FIXED` of ours — an `ET_EXEC`
@@ -145,8 +157,14 @@ or one of the two zones — and the walk from it is ours. A descriptor on a
 directory the guest cannot name is never let into its table: the launcher's
 are closed before the first program loads, and one arriving later over a
 socket or from `pidfd_getfd` is closed on arrival (`cng_fd_admit`,
-`src/monitor/dispatch.c`). Files are let in for the I/O they carry; a file is
-not a place to resolve a name from.
+`src/monitor/dispatch.c`). On arrival is as early as it can be — the kernel
+has installed the descriptor by then, and for the interval up to the close it
+is in the shared table for any thread of the guest to use; the threat model
+above says what that is worth. The numbers judged are the kernel's own: the
+control data of a `recvmsg` or `recvmmsg` is received into a buffer of the
+monitor's and handed to the guest afterwards, so a thread of the guest cannot
+rewrite the record between the kernel's write and the judgement. Files are let
+in for the I/O they carry; a file is not a place to resolve a name from.
 
 A file descriptor is the whole capability it is under `chroot(2)`, and
 deliberately so. What the launcher hands over by descriptor — a redirected

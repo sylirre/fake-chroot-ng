@@ -3050,6 +3050,38 @@ vfork/`posix_spawn` child-stack handling.
   (the remap and the length rules against a plain run), and a `faulttest`
   leg for the put-back stream.
 
+- [x] **M59 — a received descriptor was judged by the number the guest's buffer held**
+  A descriptor arriving over a socket is judged on arrival (`cng_fd_admit`:
+  a directory the guest has no name for is closed, its number left in the
+  record), and the numbers judged were read back out of the guest's own
+  control buffer after the kernel had written them — so another thread of
+  the guest could rewrite the record in between and have some other number
+  judged, keeping the descriptor the close was for; `recvmmsg` admitted the
+  same way. `recvmsg` and `recvmmsg` now receive the control data into a
+  buffer of the monitor's wherever the header asks for enough of it to
+  hold a descriptor (`recvmsg_bounced`, which also carries the
+  source-address bounce), judge the record there and hand it over in one
+  copy. The bounce is exact: a buffer up to 8 KiB is taken at its own size;
+  longer than that the socket's family is asked, and only then — AF_UNIX,
+  the one family that can deliver descriptors, never fills more than an
+  SCM_RIGHTS record of 253, a credentials record and a security label, so
+  its buffer is taken at the bound with nothing lost, and any other family's
+  stays the guest's own (a raw IPv6 socket's extension headers can run
+  past it). A guest buffer that will not take the records is answered as
+  the kernel answers one it cannot write: every descriptor of the record is
+  closed again (`receive_fd()` installs nothing on a failed put) and the
+  control data is reported truncated and empty; the copy-out comes before
+  the judgement so a number the judgement closed is never closed a second
+  time. What stays is the interval between the kernel's install and the
+  close, which no in-process design can remove — `recvmsg`, `pidfd_getfd`
+  and a scoped `openat2` landing on a hidden process all install first, and
+  the table is the guest's; `docs/DESIGN.md` states it in the threat model
+  and beside the fd-admission rule. `tests/guests/fdimport.c` receives from
+  a host Python (`tests/send_fds.py`) a directory outside the rootfs, a
+  file outside it and the rootfs itself — closed, file, dir — by `recvmsg`,
+  by `recvmmsg`, and through a 16 KiB buffer that takes the family check,
+  then an AF_INET `IP_PKTINFO` record through the same buffer (m25).
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes
