@@ -112,6 +112,18 @@ case "$out" in
     done
     check_contains "valid pointers still work" \
         "faulttest valid getresuid=0" "$out"
+    # getdents64 of a directory whose records are examined (/proc, for the
+    # hidden-process view) is answered out of a batch buffer of ours, so a bad
+    # guest buffer is EFAULT — and the stream is put back where it was, as the
+    # kernel leaves it at the record it could not copy: the next read starts
+    # the directory over.
+    for _o in "$out" "$memfd_out"; do
+        _d=$(printf '%s\n' "$_o" | grep "^faulttest getdents64 ")
+        check_contains "a failed getdents64 handover leaves the stream where it was" \
+            "faulttest getdents64 bad=-14 again=" "$_d"
+        check_contains "...and the next read is the first batch again" \
+            "first=1 -> OK" "$_d"
+    done
     # timer_create's id used to be read back out of the guest's buffer to be
     # recorded for the exec, so the record held whatever another thread had
     # put there by then. It is taken in a word of ours now and handed over

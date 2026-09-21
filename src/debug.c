@@ -2195,6 +2195,28 @@ int cng_cmd_faulttest(int argc, char **argv, char **envp, unsigned long *auxv) {
         fails += !ok;
     }
 
+    /* getdents64 of /proc is answered out of a batch buffer of ours (the
+     * hidden-process view has records to drop from it), so a bad buffer is
+     * -EFAULT from us — and the stream is put back where it was, the way the
+     * kernel leaves it at the record it could not copy: the read after it is
+     * the first batch again, "." at its head, rather than the second or the
+     * end of the directory. */
+    {
+        long dfd = sys_openat(CNG_AT_FDCWD, "/proc",
+                              CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
+        long rb = cng_dispatch(__NR_getdents64, dfd, (long)bad, 4096, 0, 0, 0, 1);
+        char db[4096];
+        long ra = cng_dispatch(__NR_getdents64, dfd, (long)db, sizeof db, 0, 0,
+                               0, 1);
+        int dot = ra > 20 && db[19] == '.' && db[20] == '\0';
+        int ok = dfd >= 0 && rb == -EFAULT && dot;
+        cng_dprintf(1, "faulttest getdents64 bad=%d again=%d first=%d -> %s\n",
+                    (int)rb, (int)ra, dot, ok ? "OK" : "FAIL");
+        fails += !ok;
+        if (dfd >= 0)
+            sys_close((int)dfd);
+    }
+
     /* The copy-in pair, which is how execve's second pass takes argv/envp now.
      * A probe followed by a memcpy is two acts with a gap, and another thread of
      * the exec'ing guest is free to unmap the strings inside it — the memcpy

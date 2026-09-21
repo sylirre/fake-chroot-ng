@@ -184,6 +184,40 @@ elif guest_cc_report "$AXD/auxprobe" tests/guests/auxprobe.c; then
 fi
 rm -rf "$AXD"
 
+# --- SO_PEERCRED under the fake identity --------------------------------------
+# The kernel names the peer by the real invoking ids; the emulation remaps the
+# pair to the fake identity so a daemon comparing them with its own getuid()
+# finds them equal. The answer is delivered out of a buffer of the monitor's —
+# it used to be corrected in the guest's own buffer a syscall after the kernel
+# filled it, which left the real uid readable there for the interval and took
+# whatever a racing thread had put there as the thing to remap — with
+# sock_getsockopt's own length rules applied to it: cut to the struct and
+# reported cut, that many bytes for a short one, nothing for zero, EINVAL for
+# a negative.
+PCD=$(mktemp -d)
+if ! guest_xlate_ready "SO_PEERCRED legs"; then
+    :
+elif guest_cc_report "$PCD/peercred" tests/guests/peercred.c; then
+    mkdir -p "$PCD/rootfs/bin"; cp "$PCD/peercred" "$PCD/rootfs/bin/"
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+    out=$(run_t 60 -R $GUEST_BINDS -u 0:0 "$PCD/rootfs" /bin/peercred 2>/dev/null)
+    check_contains "a peer's ids are remapped to the fake identity" \
+        "len=12 -> got=12 pid_ok=1 uid=0 gid=0 self=0:0" "$out"
+    check_contains "...a long length is cut to the struct and reported cut" \
+        "len=64 -> got=12 pid_ok=1 uid=0 gid=0 self=0:0" "$out"
+    check_contains "...a short one gets that many bytes" \
+        "len=8 -> got=8 pid_ok=1 uid=0 self=0:0" "$out"
+    check_contains "...zero gets nothing" "len=0 -> got=0 pid_ok=-1 self=0:0" "$out"
+    check_contains "...and a negative one is the kernel's EINVAL" \
+        "len=-1 -> errno=22" "$out"
+    # Without a fake identity nothing is trapped and the real ids come back.
+    out=$(run_t 60 -R $GUEST_BINDS "$PCD/rootfs" /bin/peercred 2>/dev/null)
+    check_contains "without a fake identity the real pair is reported" \
+        "len=12 -> got=12 pid_ok=1 uid=$(id -u) gid=$(id -g) self=$(id -u):$(id -g)" \
+        "$out"
+fi
+rm -rf "$PCD"
+
 # --- the initial program's own /proc/self/exe ------------------------------
 # Every program after the first gets its exe link from the emulated execve; the
 # first one is the one nothing republishes, and it used to report <program>
@@ -266,3 +300,42 @@ else
     skip "view-race legs: could not build tests/guests/viewrace.c with -pthread"
 fi
 rm -rf "$VRD"
+
+# --- host data passing through a guest buffer ---------------------------------
+# Three answers the monitor rewrites after the kernel has produced them: an fd
+# link's target (a host path), a /proc listing (the host's pids) and a peer's
+# credentials (the real uid). Each used to be produced by the kernel straight
+# into the guest's buffer and corrected there a syscall later, so for that
+# interval the host's answer sat in the guest's memory — readable by any other
+# thread of it, and rewritable into what the correction then worked from. Each
+# is produced into a buffer of the monitor's now and the guest's is written
+# once, with the guest's answer. The guest runs the call on one thread and
+# scans the buffer on another for what must never be there; before, it found
+# it hundreds of thousands of times a run.
+LKD=$(mktemp -d)
+if ! guest_xlate_ready "buffer-leak legs"; then
+    :
+elif guest_cc "$LKD/leakrace" tests/guests/leakrace.c -pthread; then
+    mkdir -p "$LKD/root/bin" "$LKD/root/d"; cp "$LKD/leakrace" "$LKD/root/bin/"
+    echo hi > "$LKD/root/d/f"
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+    lkrun() { run_t 120 -R $GUEST_BINDS "$@"; }
+    # The needle is the temp directory's own name: part of every host path
+    # under the rootfs, and no guest path.
+    out=$(lkrun "$LKD/root" /bin/leakrace readlink /d/f "$(basename "$LKD")" \
+        2>/dev/null)
+    check_contains "an fd link's host target never enters the guest's buffer" \
+        "leakrace readlink: iters=" "$out"
+    check_contains "...not once" " leaks=0" "$out"
+    out=$(lkrun "$LKD/root" /bin/leakrace dents 2>/dev/null)
+    check_contains "a hidden pid never enters the guest's listing buffer" \
+        "leakrace dents: iters=" "$out"
+    check_contains "...not once" " leaks=0" "$out"
+    out=$(lkrun -u 0:0 "$LKD/root" /bin/leakrace peercred "$(id -u)" 2>/dev/null)
+    check_contains "a peer's real uid never enters the guest's ucred" \
+        "leakrace peercred: iters=" "$out"
+    check_contains "...not once" " leaks=0" "$out"
+else
+    skip "buffer-leak legs: could not build tests/guests/leakrace.c with -pthread"
+fi
+rm -rf "$LKD"

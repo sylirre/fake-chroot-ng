@@ -3021,6 +3021,35 @@ vfork/`posix_spawn` child-stack handling.
   (a function now) go through it, and `viewrace` reads `getuid`/`geteuid`
   beside `getresuid` in its identity race.
 
+- [x] **M58 — the kernel wrote the host's answer into the guest's buffer first**
+  Three answers the monitor rewrites after the kernel has produced them were
+  produced straight into the guest's own buffer and corrected there a
+  syscall later: an fd or `map_files` link's target (`readlinkat` — a host
+  path, where the rootfs lives), a listing of `/proc` (`getdents64` — the
+  host's pids, and under `-l` the l2s store's names) and a peer's
+  credentials (`SO_PEERCRED` — the real invoking uid and gid). For the
+  interval the host's answer sat in the guest's memory, readable by any
+  other thread of it (a scanner thread finds it hundreds of thousands of
+  times in a few seconds), and the correction read the buffer back, so a
+  thread that rewrote it chose what was mapped, filtered or remapped. Each
+  now fills a buffer of the monitor's and the guest's is written once, with
+  the guest's answer — the rule the `uname` handler already stated.
+  `readlinkat` decides an fd link before the call and answers it out of a
+  `PATH_MAX` buffer (`rl_fdlink`), which also retires the second read for a
+  short buffer and the scrub of the host tail; `getdents64` fills the batch
+  buffer after the injected records and hands the final view over in one
+  copy (`dents_out`), putting the stream back where it was if the guest's
+  buffer will not take it, as the kernel leaves `f_pos` at the record it
+  could not copy, and takes the count as the `unsigned int` the kernel
+  does since the clamp now bounds a write into our buffer; `SO_PEERCRED`
+  fills a ucred and a length word of ours with `sock_getsockopt`'s own
+  length rules, so any length is remapped, not only a full one. Legs:
+  `tests/guests/leakrace.c` (one thread calls, another scans the buffer for
+  the host directory's name, a pid not its own, the real uid: 8k–5M
+  sightings on the previous build, none now), `tests/guests/peercred.c`
+  (the remap and the length rules against a plain run), and a `faulttest`
+  leg for the put-back stream.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

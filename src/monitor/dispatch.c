@@ -2213,6 +2213,49 @@ static int rl_may_fdlink(long dirfd, const char *p) {
     return 1;
 }
 
+/* readlinkat of an fd or map_files link, whose target is a host path. The
+ * kernel answers into a buffer of ours, long enough that its answer cannot
+ * truncate (it is at most PATH_MAX-1 bytes, or ENAMETOOLONG), the target is
+ * mapped back into the guest view, and the guest spelling goes out cut to
+ * bufsiz — exactly as the kernel cuts its own. What is not the view's (a
+ * pipe, a memfd, a host-only file) goes out as the kernel wrote it.
+ *
+ * It used to be the other way around: the kernel filled the guest's buffer
+ * with the host path and this layer read it back and corrected it there. The
+ * host path — where the rootfs lives on the device, the one thing the fixup
+ * exists to keep from the guest — then sat in the guest's memory for the
+ * interval, readable by any other thread of it; a buffer shorter than the
+ * value held a prefix of it that no mapping could recognize; and the readback
+ * itself was of memory the guest owns, which it can rewrite or unmap between
+ * the kernel's write and ours. Now nothing of the host's is ever written
+ * there: the guest's buffer receives the guest's answer, once. */
+static long rl_fdlink(long dirfd, const char *host, long ubuf, int bufsiz) {
+    char tgt[CNG_PATH_MAX], guest[CNG_PATH_MAX];
+    long tl = reissue(dirfd, (long)host, (long)tgt, sizeof tgt - 1, 0, 0,
+                      __NR_readlinkat);
+    if (tl <= 0)
+        return tl;
+    const char *out = tgt;
+    long ol = tl;
+    if ((size_t)tl < sizeof tgt && tgt[0] == '/') {
+        tgt[tl] = '\0';
+        /* A synthesized /proc file's fd is a memfd named after it: the link
+         * says so, not "memfd:... (deleted)". */
+        if (cng_fs_untranslate(cng_g_fs, tgt, guest, sizeof guest) == 0 ||
+            (!cng_g_no_proc && cng_procfs_link_name(tgt, guest, sizeof guest))) {
+            out = guest;
+            ol = (long)strlen(guest);
+        }
+    }
+    if (ol > bufsiz)
+        ol = bufsiz;
+    /* Our own copy_to_user: the kernel validated nothing of the guest's
+     * buffer here, so a bad one is -EFAULT from us. */
+    if (ol && cng_user_copyout((char *)ubuf, out, (unsigned long)ol) < 0)
+        return -EFAULT;
+    return ol;
+}
+
 /* The canonical GUEST path an (dirfd, path) pair names, for the /proc hooks.
  * Lexical, as the absolute form is: the name is joined onto the guest spelling
  * of the directory the dirfd names (host_dir_guest — a /proc dirfd's is its
@@ -2316,12 +2359,17 @@ static int fd_is_rootfs_root(long fd) {
  * that exist only as resolution overlays (bind mount points, /dev nodes) and so
  * have no physical dirent to return.
  *
- * All of that reads the records back and rewrites them, and the buffer they sit
- * in is the guest's. The kernel having just filled it says nothing about the
- * moment after: another thread of the guest can unmap it, and this runs with
- * SIGSEGV masked, where a fault is the death of the process rather than an
- * -EFAULT. So the records are examined in a batch buffer of our own and the
- * guest's is written only through cng_user_copyout.
+ * All of that examines the records and rewrites them, and the buffer the guest
+ * offered is the guest's. So whenever anything here is going to look at them,
+ * the kernel fills a batch buffer of ours and the guest's buffer is written
+ * once, with the final view, through cng_user_copyout. Filling the guest's
+ * buffer first and correcting it afterwards was wrong twice over: the guest
+ * owns that memory, so another of its threads can unmap it between the
+ * kernel's write and the readback (which runs with SIGSEGV masked, where a
+ * fault is the death of the process rather than an -EFAULT) — and for that
+ * interval the records the view exists to hide, the host's pids and the l2s
+ * store's names, sat in the guest's memory for any thread to read, and any
+ * thread could rewrite them into what got filtered.
  *
  * A function of its own because of that buffer: DENTS_BOUNCE is stack, and in
  * cng_dispatch's frame every other syscall would carry it — that frame already
@@ -2333,6 +2381,24 @@ static int fd_is_rootfs_root(long fd) {
  * the buffer offered is legal and simply read again — which is the same
  * contract the injection path below already relies on. */
 #define DENTS_BOUNCE 32768
+
+/* The final view goes out in one copy. A guest buffer that will not take it
+ * is -EFAULT — and the stream is put back where it was before the kernel was
+ * asked, since the records it moved past were never delivered: the kernel
+ * itself leaves f_pos at the record it could not copy. `pos` is that place
+ * (0 for the first read of a stream, which is also where the overlay records
+ * are injected, so a retried first read injects them again), or -1 where it
+ * could not be read, and then the stream stays where the kernel left it. */
+static long dents_out(long fd, long guest, const char *bnc, long n, long pos) {
+    if (n <= 0)
+        return n;
+    if (cng_user_copyout((char *)guest, bnc, (unsigned long)n) == 0)
+        return n;
+    if (pos >= 0)
+        sys_lseek((int)fd, pos, CNG_SEEK_SET);
+    return -EFAULT;
+}
+
 __attribute__((noinline)) static long do_getdents64(long a0, long a1, long a2,
                                                     long a3, long a4, long a5) {
     /* Injection belongs at the start of the stream and only there, so the
@@ -2349,29 +2415,34 @@ __attribute__((noinline)) static long do_getdents64(long a0, long a1, long a2,
      * so a bind mount point in a directory of any size was listed on a
      * Debian rootfs and invisible on an Alpine one. */
     char injdir[CNG_PATH_MAX], hdir[CNG_PATH_MAX];
-    int first = a1 && sys_lseek((int)a0, 0, CNG_SEEK_CUR) == 0;
+    long pos = a1 ? sys_lseek((int)a0, 0, CNG_SEEK_CUR) : -1;
+    int first = pos == 0;
     int named = first && dirfd_host((int)a0, hdir, sizeof hdir) == 0;
     int inject = named &&
                  cng_fs_untranslate(cng_g_fs, hdir, injdir, sizeof injdir) == 0;
     /* Whether anything here is going to look at the records at all. When
      * nothing is — no injection, no l2s, no hidden-process view — the call is
      * a plain pass-through and the guest's own buffer size is honored whole.
+     * A NULL buffer is one too: the kernel answers it (-EFAULT at the first
+     * record, 0 for an empty stream) with the stream where it was.
      *
      * The hidden-process view has records to drop from one directory only,
      * the host's real /proc (fd_is_host_proc), and whether this is that is
      * settled before the read rather than after it: with the zone on, every
-     * listing used to be bounced — copied back out of the guest's buffer and
-     * scanned for a numeric name — to find out, for all but `ls /proc`, that
-     * there was nothing to do. On the first read of a stream the readback
-     * above has already named the directory; a later read (a directory too
-     * big for one batch) asks for it again, which is one readlink against a
-     * copy of the whole batch. */
+     * listing used to be bounced — and scanned for a numeric name — to find
+     * out, for all but `ls /proc`, that there was nothing to do. On the first
+     * read of a stream the readback above has already named the directory; a
+     * later read (a directory too big for one batch) asks for it again, which
+     * is one readlink against a copy of the whole batch. */
     int at_proc = a1 && !cng_g_no_proc &&
                   (first ? named && strcmp(hdir, "/proc") == 0
                          : fd_is_host_proc(a0));
-    int bounce = inject || cng_g_l2s || at_proc;
+    int bounce = a1 && (inject || cng_g_l2s || at_proc);
     char bnc[DENTS_BOUNCE];
-    long ask = (long)a2;
+    /* The count as the kernel takes it, an unsigned int: the register's top
+     * half is not part of it, and with the kernel writing into a buffer of
+     * ours the clamp below has to be applied to the number it will use. */
+    long ask = (long)(unsigned)a2;
     if (bounce && ask > DENTS_BOUNCE)
         ask = DENTS_BOUNCE;
 
@@ -2403,37 +2474,31 @@ __attribute__((noinline)) static long do_getdents64(long a0, long a1, long a2,
      * 408 bytes the whole /dev overlay plus a kernel record fits and nothing
      * is dropped, and no real readdir asks for less.
      *
-     * The injected records are handed over before the kernel is asked, not
-     * after: a guest buffer that cannot take them is -EFAULT with the stream
-     * still where it was, which is what a plain getdents64 on the same buffer
-     * would have answered. */
+     * The injected records sit at the front of the batch buffer and the
+     * kernel's go in after them, so a refusal here has touched nothing of
+     * the guest's: it is answered with the stream still where it was, which
+     * is what a plain getdents64 on the same buffer would have answered. */
     long pre = 0, n, injcap = ask;
     for (;;) {
         pre = inject ? inject_dents(a0, injdir, bnc, 0, injcap) : 0;
-        if (pre && cng_user_copyout((char *)a1, bnc, (unsigned long)pre) < 0)
-            return -EFAULT;
-        n = reissue(a0, a1 + pre, ask - pre, a3, a4, a5, __NR_getdents64);
+        n = bounce ? reissue(a0, (long)(bnc + pre), ask - pre, a3, a4, a5,
+                             __NR_getdents64)
+                   : reissue(a0, a1, a2, a3, a4, a5, __NR_getdents64);
         if (n >= 0 || pre == 0)
             break;
         injcap = pre - 1;
     }
-    char *buf = (char *)a1 + pre;
-    long cap = ask - pre;
-
     /* A refusal is the guest's to see: the position did not move, so
      * answering with the spliced-in bytes would repeat them next time. */
-    if (n < 0)
+    if (n < 0 || !bounce)
         return n;
+    char *kb = bnc + pre;
+    long cap = ask - pre;
     /* End of stream on the very first read means a directory that emitted
      * neither "." nor "..", which no filesystem does; the overlay records
      * are the whole answer. */
-    if (n == 0 || !a1 || !bounce)
-        return pre ? pre : n;
-    /* The kernel wrote its records into the guest's buffer, so it has already
-     * answered for that pointer; taking them back out is ours to make safe. */
-    char *kb = bnc + pre;
-    if (cng_user_copyin(kb, buf, (unsigned long)n) < 0)
-        return -EFAULT;
+    if (n == 0)
+        return dents_out(a0, a1, bnc, pre, pos);
     /* Hidden-process view, listing side: the path layer makes a host
      * process's /proc entry unreachable, but `ls /proc` and `ps` read the
      * directory, so the numeric entries have to go as well (at_proc, decided
@@ -2441,14 +2506,13 @@ __attribute__((noinline)) static long do_getdents64(long a0, long a1, long a2,
     if (at_proc && !dents_have_pid(kb, n))
         at_proc = 0;
     if (!cng_g_l2s && !at_proc)
-        return pre + n;
+        return dents_out(a0, a1, bnc, pre + n, pos);
     int at_root = cng_g_l2s && fd_is_rootfs_root(a0);
     for (;;) {
         /* linux_dirent64: d_ino u64 @0, d_reclen u16 @16, d_type u8 @18,
          * d_name @19. d_off cookies are directory-stream positions, so
          * compaction is seek-safe. */
         long w = 0, o = 0;
-        int edited = 0;
         while (o + 19 <= n) {
             unsigned short reclen;
             memcpy(&reclen, kb + o + 16, 2);
@@ -2472,7 +2536,6 @@ __attribute__((noinline)) static long do_getdents64(long a0, long a1, long a2,
                     if (cng_l2s_dirent(a0, nm, &ino, &type)) {
                         memcpy(kb + o, &ino, sizeof ino);
                         kb[o + 18] = (char)type;
-                        edited = 1;
                     }
                 }
                 if (w != o)
@@ -2481,22 +2544,13 @@ __attribute__((noinline)) static long do_getdents64(long a0, long a1, long a2,
             }
             o += reclen;
         }
-        if (w > 0) {
-            /* Only a batch that lost or changed a record has to go back: what
-             * the filter left untouched is already exactly what the kernel
-             * wrote there. */
-            if ((w != n || edited) &&
-                cng_user_copyout(buf, kb, (unsigned long)w) < 0)
-                return -EFAULT;
-            return pre + w;
-        }
+        if (w > 0)
+            return dents_out(a0, a1, bnc, pre + w, pos);
         /* A whole batch of ours: re-read, so a filtered 0 is not mistaken
          * for end-of-directory. */
-        n = reissue(a0, (long)buf, cap, a3, a4, a5, __NR_getdents64);
+        n = reissue(a0, (long)kb, cap, a3, a4, a5, __NR_getdents64);
         if (n <= 0)
-            return pre ? pre : n;
-        if (cng_user_copyin(kb, buf, (unsigned long)n) < 0)
-            return -EFAULT;
+            return pre ? dents_out(a0, a1, bnc, pre, pos) : n;
     }
 }
 
@@ -4034,96 +4088,25 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 cng_l2s_resolve(hnf, data, sizeof data, 0) == 1)
                 return -EINVAL;
         }
-        long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_readlinkat);
         /* An fd link reports a HOST path (the kernel names the open file
          * description), and a map_files link the host path of the mapped file.
          * Map them back into the guest view so the guest never sees where its
          * rootfs really lives — `ls -l /proc/self/fd`, Alpine's /dev/fd, and
          * lsof's map_files walk all land here. Targets outside the view
          * (memfd:, pipe:[..], a host-only file) are left exactly as the kernel
-         * wrote them. */
-        if (r > 0 && rl_may_fdlink(a0, gp)) {
+         * wrote them. Decided before the call: the answer for one of these
+         * has to be produced into a buffer of ours (rl_fdlink), not into the
+         * guest's and corrected there. */
+        if (rl_may_fdlink(a0, gp)) {
             char canon[CNG_PATH_MAX];
             if (at_canon(a0, gp, canon, sizeof canon) == 0) {
                 size_t pl = proc_pid_prefix(canon, 0);
                 if (pl && (!strncmp(canon + pl, "fd/", 3) ||
-                           !strncmp(canon + pl, "map_files/", 10))) {
-                    char tgt[CNG_PATH_MAX], guest[CNG_PATH_MAX];
-                    long tl = -1;
-                    if (r < bufsiz) {
-                        /* The whole value fit, so the kernel's answer is
-                         * complete. It wrote this buffer, but that says nothing
-                         * about reading it back a syscall later: the guest owns
-                         * it and can unmap it in between, so it is taken like
-                         * any other guest range rather than dereferenced. */
-                        if ((size_t)r < sizeof tgt &&
-                            cng_user_copyin(tgt, (const char *)a2,
-                                            (size_t)r) == 0)
-                            tl = r;
-                    } else {
-                        /* r == bufsiz: readlink truncates to the buffer, so
-                         * what came back is a PREFIX of the value and there is
-                         * nothing here to map — "/rootfs/etc/hosts" cut to 12
-                         * bytes is not a path the untranslate can recognize,
-                         * and cutting the guest spelling out of it afterwards
-                         * would answer a different name than the one asked
-                         * about. Leaving it alone was worse still: it handed
-                         * the guest the head of the HOST path, which for any
-                         * buffer shorter than the rootfs prefix is nothing but
-                         * where the rootfs lives on the device — the one thing
-                         * this fixup exists to keep from it. So the link is
-                         * read again into a buffer that cannot truncate, and
-                         * the guest spelling of the whole value is what gets
-                         * cut to size below, exactly as the kernel cuts its
-                         * own. */
-                        tl = reissue(a0, (long)p, (long)tgt, sizeof tgt - 1, 0,
-                                     0, __NR_readlinkat);
-                    }
-                    if (tl > 0 && (size_t)tl < sizeof tgt && tgt[0] == '/') {
-                        tgt[tl] = '\0';
-                        /* A synthesized /proc file's fd is a memfd named after
-                         * it: the link says so, not "memfd:... (deleted)". */
-                        if (cng_fs_untranslate(cng_g_fs, tgt, guest,
-                                               sizeof guest) == 0 ||
-                            (!cng_g_no_proc &&
-                             cng_procfs_link_name(tgt, guest, sizeof guest))) {
-                            size_t gl = strlen(guest);
-                            if (gl > (size_t)bufsiz)
-                                gl = (size_t)bufsiz;
-                            /* A bind can make the guest spelling longer than
-                             * the host one, so this may write past what the
-                             * kernel validated — the copy asks as it goes. */
-                            if (cng_user_copyout((char *)a2, guest, gl) < 0)
-                                return -EFAULT;
-                            /* The kernel filled this buffer with the HOST path
-                             * before we got here, and the guest spelling is
-                             * usually the shorter of the two, so the bytes past
-                             * `gl` still hold its tail. readlink(2) does not
-                             * terminate its answer and a correct caller reads
-                             * only the returned length — but the bytes are in
-                             * the guest's memory either way, and what they
-                             * spell is the one thing this fixup exists to keep
-                             * from it. (Not academic: filling a buffer and
-                             * taking strlen of it is how much of the world
-                             * reads a link.) Scrub what the kernel wrote and
-                             * the mapped answer did not cover. */
-                            for (long z = (long)gl; z < r;) {
-                                static const char zeros[64] = {0};
-                                long k = r - z;
-                                if (k > (long)sizeof zeros)
-                                    k = (long)sizeof zeros;
-                                if (cng_user_copyout((char *)a2 + z, zeros,
-                                                     (unsigned long)k) < 0)
-                                    break;
-                                z += k;
-                            }
-                            r = (long)gl;
-                        }
-                    }
-                }
+                           !strncmp(canon + pl, "map_files/", 10)))
+                    return rl_fdlink(a0, p, a2, bufsiz);
             }
         }
-        return r;
+        return reissue(a0, (long)p, a2, a3, a4, a5, __NR_readlinkat);
     }
 
     /* symlinkat(target, newdirfd, linkpath): translate only the linkpath. */
@@ -4973,25 +4956,37 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * getuid(), which under --fake-id is the fake identity. Remap the pair
      * through the same rule stat uses. The pid is deliberately left alone: guest
      * pid == host pid here, so it is already correct. Trapped only under
-     * --fake-id. */
+     * --fake-id.
+     *
+     * The kernel fills a ucred of ours and the guest gets the remapped one in
+     * one copy. It used to fill the guest's own buffer and be corrected there
+     * a syscall later — which put the real uid in the guest's memory for the
+     * interval, where any other thread of the guest could read it — and the
+     * correction read the buffer back, so a thread that had rewritten it in
+     * the meantime chose what was remapped. The length word is ours as well,
+     * taken from the guest before the call as sock_getsockopt takes it: a
+     * negative one is its EINVAL, a short one gets that many bytes of the
+     * struct, and what was written is reported back, in that order. */
     case __NR_getsockopt: {
-        long r = reissue(a0, a1, a2, a3, a4, a5, nr);
-        if (r == 0 && cng_g_fake_id && a1 == CNG_SOL_SOCKET &&
-            a2 == CNG_SO_PEERCRED && a3 && a4) {
-            /* Read back and rewritten in a copy of ours: the kernel filled
-             * these twelve bytes, which says nothing about them still being
-             * there now (see uaccess.c). */
-            unsigned len, uc[3]; /* struct ucred: pid,uid,gid */
-            if (cng_user_copyin(&len, (void *)a4, sizeof len) == 0 &&
-                len >= sizeof uc &&
-                cng_user_copyin(uc, (void *)a3, sizeof uc) == 0) {
-                uc[1] = cng_remap_uid(uc[1]);
-                uc[2] = cng_remap_gid(uc[2]);
-                if (cng_user_copyout((void *)a3, uc, sizeof uc) < 0)
-                    return -EFAULT;
-            }
-        }
-        return r;
+        if (!(cng_g_fake_id && a1 == CNG_SOL_SOCKET && a2 == CNG_SO_PEERCRED &&
+              a3 && a4))
+            return reissue(a0, a1, a2, a3, a4, a5, nr);
+        int len;
+        if (cng_user_copyin(&len, (void *)a4, sizeof len) < 0)
+            return -EFAULT;
+        unsigned uc[3] = {0, 0, 0}; /* struct ucred: pid,uid,gid */
+        int got = len;
+        long r = reissue(a0, a1, a2, (long)uc, (long)&got, a5, nr);
+        if (r != 0)
+            return r;
+        if (got < 0 || (unsigned)got > sizeof uc)
+            got = sizeof uc; /* not a length the kernel reports; bounded anyway */
+        uc[1] = cng_remap_uid(uc[1]);
+        uc[2] = cng_remap_gid(uc[2]);
+        if ((got && cng_user_copyout((void *)a3, uc, (unsigned long)got) < 0) ||
+            cng_user_copyout((void *)a4, &got, sizeof got) < 0)
+            return -EFAULT;
+        return 0;
     }
 
     /* Extended attributes: the path is a0 and there is no dirfd, so this is a
