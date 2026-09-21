@@ -41,7 +41,14 @@ int cng_g_setgid_root = 0;
  * (commit_creds); this does the same thing the fs view does (path.c): two
  * buffers, the active one never written, a writer copies it into the other,
  * changes that and swaps the pointer, and a reader re-checks the sequence
- * after its read. cng_g_cred is the pointer. */
+ * after its read. cng_g_cred is the pointer.
+ *
+ * Every reader re-checks, a reader of a single field included. With two
+ * buffers, the one a pointer named a moment ago is the one the next writer
+ * fills: a getuid() that took cng_g_cred and then read ->ruid off it could
+ * find the writer's memcpy under way there — the struct is four-byte aligned,
+ * so a field can be mid-copy — or a setter's edits before their publication.
+ * cng_cred_ids is the one way to read the ids; cng_fake_root goes through it. */
 static struct cng_cred g_cred_buf[2];
 const struct cng_cred *cng_g_cred = &g_cred_buf[0];
 static unsigned g_cred_seq;
@@ -55,6 +62,31 @@ unsigned cng_cred_read_begin(const struct cng_cred **c) {
 
 int cng_cred_read_retry(unsigned s) {
     return __atomic_load_n(&g_cred_seq, __ATOMIC_ACQUIRE) != s;
+}
+
+void cng_cred_ids(struct cng_cred_ids *out) {
+    const struct cng_cred *c;
+    do {
+        unsigned s = cng_cred_read_begin(&c);
+        out->ruid = c->ruid;
+        out->euid = c->euid;
+        out->suid = c->suid;
+        out->fsuid = c->fsuid;
+        out->rgid = c->rgid;
+        out->egid = c->egid;
+        out->sgid = c->sgid;
+        out->fsgid = c->fsgid;
+        if (!cng_cred_read_retry(s))
+            break;
+    } while (1);
+}
+
+int cng_fake_root(void) {
+    if (!cng_g_fake_id)
+        return 0;
+    struct cng_cred_ids id;
+    cng_cred_ids(&id);
+    return id.euid == 0;
 }
 
 struct cng_cred *cng_cred_write_begin(struct cng_cred_write *w) {
@@ -473,8 +505,6 @@ static long reissue_cred(long nr, long a0, long a1, long a2, long a3, long a4,
 
 long cng_cred_handle(long nr, long a0, long a1, long a2, long a3, long a4,
                      long a5) {
-    const struct cng_cred *c = cng_g_cred;
-
     if (!cng_g_fake_id) {
         /* Reached only via an -R trampoline (these are trapped only under
          * --fake-id). Getters read the real ids; the setters sit on Android's
@@ -498,15 +528,22 @@ long cng_cred_handle(long nr, long a0, long a1, long a2, long a3, long a4,
         }
     }
 
+    /* The getters read the published ids (cng_cred_ids), never the pointer's
+     * buffer directly — see the top of this file. */
+    struct cng_cred_ids id;
     switch (nr) {
     case __NR_getuid:
-        return (long)c->ruid;
+        cng_cred_ids(&id);
+        return (long)id.ruid;
     case __NR_geteuid:
-        return (long)c->euid;
+        cng_cred_ids(&id);
+        return (long)id.euid;
     case __NR_getgid:
-        return (long)c->rgid;
+        cng_cred_ids(&id);
+        return (long)id.rgid;
     case __NR_getegid:
-        return (long)c->egid;
+        cng_cred_ids(&id);
+        return (long)id.egid;
     /* getres*id take three out pointers and the kernel fills them in order,
      * one put_user each, stopping at the first that will not take a store: a
      * bad second pointer leaves the real id in the first and still answers
@@ -519,15 +556,10 @@ long cng_cred_handle(long nr, long a0, long a1, long a2, long a3, long a4,
     case __NR_getresuid:
     case __NR_getresgid: {
         int u = (nr == __NR_getresuid);
-        unsigned r_, e_, s_;
-        do {
-            unsigned seq = cng_cred_read_begin(&c);
-            r_ = u ? c->ruid : c->rgid;
-            e_ = u ? c->euid : c->egid;
-            s_ = u ? c->suid : c->sgid;
-            if (!cng_cred_read_retry(seq))
-                break;
-        } while (1);
+        cng_cred_ids(&id);
+        unsigned r_ = u ? id.ruid : id.rgid;
+        unsigned e_ = u ? id.euid : id.egid;
+        unsigned s_ = u ? id.suid : id.sgid;
         if (cng_user_copyout((void *)a0, &r_, sizeof r_) < 0 ||
             cng_user_copyout((void *)a1, &e_, sizeof e_) < 0 ||
             cng_user_copyout((void *)a2, &s_, sizeof s_) < 0)

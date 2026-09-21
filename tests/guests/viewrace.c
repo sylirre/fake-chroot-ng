@@ -13,7 +13,8 @@
  *                   opening a relative name that exists in both
  *   viewrace groups (needs a fake identity) one thread alternating two group
  *                   lists of different lengths, one reading them back; and
- *                   setresuid/getresuid alternating two identities
+ *                   setresuid alternating two identities read back with
+ *                   getresuid, getuid and geteuid
  */
 #define _GNU_SOURCE
 #include <fcntl.h>
@@ -99,6 +100,12 @@ static int grp_reader(void) {
         uid_t r, e, s;
         if (getresuid(&r, &e, &s) != 0 || s != 0 || r != e ||
             (r != 0 && r != 1000))
+            bad++;
+        /* The one-field getters answer out of the same published set: one
+         * identity or the other, never a word of the copy a writer is
+         * filling (cred.c, cng_cred_ids). */
+        uid_t u = getuid(), eu = geteuid();
+        if ((u != 0 && u != 1000) || (eu != 0 && eu != 1000))
             bad++;
     }
     return bad;

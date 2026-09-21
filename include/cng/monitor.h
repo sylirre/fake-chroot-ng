@@ -77,13 +77,22 @@ extern unsigned cng_g_fake_gid;          /* (fixed; live ids live in cng_g_cred)
 extern unsigned cng_g_host_uid;          /* real invoking uid, captured at start */
 extern unsigned cng_g_host_gid;          /* real invoking gid */
 /* The live credential set, published as one object: cng_g_cred points at the
- * active copy, which is never written. A reader of more than one field takes
- * the sequence and the pointer and re-checks the sequence after (a setter on
- * another thread swapped the set meanwhile); a writer edits a copy and
- * publishes it. See cred.c. */
+ * active copy, which is never written. Every reader — of one field as much as
+ * of several — takes the sequence and the pointer and re-checks the sequence
+ * after (a setter on another thread swapped the set meanwhile); a writer
+ * edits a copy and publishes it. See cred.c, and cng_cred_ids for the ids. */
 extern const struct cng_cred *cng_g_cred;
 unsigned cng_cred_read_begin(const struct cng_cred **c);
 int cng_cred_read_retry(unsigned s);
+/* The eight ids of the published set, taken under the sequence. A reader
+ * wanting one of them goes through this too: the pointer alone names a
+ * buffer, and with two of them the buffer a stale pointer names is the one
+ * the next writer fills (cred.c). */
+struct cng_cred_ids {
+    unsigned ruid, euid, suid, fsuid;
+    unsigned rgid, egid, sgid, fsgid;
+};
+void cng_cred_ids(struct cng_cred_ids *out);
 struct cng_cred_write {
     struct cng_cred *dst;
     unsigned long mask;
@@ -150,10 +159,9 @@ long cng_cred_handle(long nr, long a0, long a1, long a2, long a3, long a4,
                      long a5);
 
 /* True when a fake identity is active AND its effective uid is 0: root's DAC
- * bypass applies (ownership/mode changes and denied access() checks are faked). */
-static inline int cng_fake_root(void) {
-    return cng_g_fake_id && cng_g_cred->euid == 0;
-}
+ * bypass applies (ownership/mode changes and denied access() checks are faked).
+ * Reads the published set (cred.c). */
+int cng_fake_root(void);
 
 /* Remap a host-side owner for stat results: a file owned by the real invoking
  * user is shown as owned by the fake id; every other owner passes through. A

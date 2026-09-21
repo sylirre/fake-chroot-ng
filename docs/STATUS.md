@@ -3006,6 +3006,21 @@ vfork/`posix_spawn` child-stack handling.
   that the guest knows nothing about. A `-t faulttest` leg: a bad pointer is
   `-EFAULT` and the count in `/proc/self/timers` does not move.
 
+- [x] **M57 — a one-field credential reader took the pointer and read the buffer it named**
+  The fake credential set is published as one object — two buffers, the
+  active one never written, a writer copying it into the other and swapping
+  the pointer, a reader re-checking the sequence after its read — and the
+  header exempted "a reader of one field": `getuid`, `geteuid`, `getgid`,
+  `getegid` and `cng_fake_root`, which every fake-root decision goes
+  through, read `cng_g_cred->field` directly. With two buffers the one a
+  pointer named a moment ago is the one the next writer fills, with a
+  `memcpy` of the active set and then its edits, and the struct is four-byte
+  aligned, so a uid could even come back torn — a value that was never any
+  identity of the guest. `cng_cred_ids` takes the eight ids under the
+  sequence and is the one way to read them; the getters and `cng_fake_root`
+  (a function now) go through it, and `viewrace` reads `getuid`/`geteuid`
+  beside `getresuid` in its identity race.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes
