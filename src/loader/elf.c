@@ -241,7 +241,19 @@ static int map_file(int fd, const Elf64_Ehdr *eh, const Elf64_Phdr *ph,
                 sys_munmap(base, span);
                 return CNG_LOAD_EMAP;
             }
-            /* Zero the BSS bytes sharing the last file page (writable segs). */
+            /* Zero the BSS bytes sharing the last file page (writable segs).
+             * A segment that is not writable keeps the file's bytes there,
+             * and that is the kernel's own answer, not a shortcut: its
+             * padzero() is a clear_user() of the same bytes, which fails on
+             * a page it cannot write, and elf_load() ignores the failure
+             * unless the segment has PROT_WRITE ("Zero the end of the last
+             * mapped page but ignore any errors if the segment isn't
+             * writable"). Measured on a 6.17 host with a read-only PT_LOAD
+             * whose p_memsz runs past p_filesz: the bytes past p_filesz read
+             * as the file's, where the same segment marked writable reads
+             * zeros. Nothing is exposed by it either way — the bytes are the
+             * guest's own executable, which it opened to load. No linker
+             * emits such a segment; a .bss lives in a writable one. */
             unsigned long pend = cng_page_up(fileend);
             if (ph[i].p_memsz > ph[i].p_filesz && (prot & CNG_PROT_WRITE) &&
                 pend > fileend)
