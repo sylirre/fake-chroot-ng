@@ -112,6 +112,20 @@ case "$out" in
     done
     check_contains "valid pointers still work" \
         "faulttest valid getresuid=0" "$out"
+    # timer_create's id used to be read back out of the guest's buffer to be
+    # recorded for the exec, so the record held whatever another thread had
+    # put there by then. It is taken in a word of ours now and handed over
+    # afterwards, and a bad pointer deletes the timer again the way the kernel
+    # does for its own failed put: EFAULT, and /proc/self/timers unchanged.
+    for _o in "$out" "$memfd_out"; do
+        _t=$(printf '%s\n' "$_o" | grep "^faulttest timer_create ")
+        check_contains "timer_create takes its id in a word of ours" \
+            "faulttest timer_create bad=-14 good=0 timers=" "$_t"
+        # The three counts are before, after the failed create, and with a
+        # good one live: the verdict on the line is before == after == with-1.
+        check_contains "...and a failed handover leaves no timer behind" \
+            "-> OK" "$_t"
+    done
     ;;
 esac
 

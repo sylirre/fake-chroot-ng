@@ -5493,13 +5493,28 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     /* POSIX timers do not survive an execve, and ours is emulated — the address
      * space stays, so a timer would go on firing into a program that never
      * armed it, through a handler that no longer exists. Nothing enumerates a
-     * process's timers, so the ids are recorded as they are handed out. */
+     * process's timers, so the ids are recorded as they are handed out.
+     *
+     * The kernel writes the id into a word of ours, and the guest gets a copy:
+     * read back out of the guest's buffer a syscall later, the record held
+     * whatever was there by then — another thread of the guest can rewrite or
+     * unmap that buffer in between, and where the record is all the exec has
+     * (qemu-user, whose ids are not the ones in /proc/self/timers) the timer
+     * it named wrongly outlived the program. A copy-out that fails deletes
+     * the timer, which is what do_timer_create() does when its own put_user
+     * fails: -EFAULT, and no timer left behind. */
     case __NR_timer_create: {
-        long r = reissue(a0, a1, a2, a3, a4, a5, nr);
-        int id;
-        if (r == 0 && a2 && cng_user_copyin(&id, (void *)a2, sizeof id) == 0)
-            cng_timer_note(id);
-        return r;
+        int id = 0;
+        long r = reissue(a0, a1, (long)&id, a3, a4, a5, nr);
+        if (r != 0)
+            return r;
+        cng_timer_note(id);
+        if (!a2 || cng_user_copyout((void *)a2, &id, sizeof id) < 0) {
+            reissue(id, 0, 0, 0, 0, 0, __NR_timer_delete);
+            cng_timer_forget(id);
+            return -EFAULT;
+        }
+        return 0;
     }
     case __NR_timer_delete: {
         long r = reissue(a0, a1, a2, a3, a4, a5, nr);

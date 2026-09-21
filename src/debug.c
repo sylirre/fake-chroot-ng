@@ -2040,6 +2040,30 @@ int cng_cmd_blocktest(int argc, char **argv, char **envp, unsigned long *auxv) {
  * fault there is unblockable and fatal. Every case below passes a wild (non-NULL,
  * unmapped) pointer through the dispatcher: a pass means the run survived AND the
  * errno is right, so the test failing to print at all is itself the diagnosis. */
+/* How many POSIX timers /proc/self/timers lists for this process ("ID: <n>"
+ * lines), or -1 where the file cannot be read. Under qemu-user the file is the
+ * emulator's own, listing the host timers it created for the guest's — which
+ * is the count that matters for the leg below, since those are the ones a
+ * failed create has to have deleted again. */
+static int dbg_count_timers(void) {
+    long fd = sys_openat(CNG_AT_FDCWD, "/proc/self/timers",
+                         CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    if (fd < 0)
+        return -1;
+    char buf[4096];
+    int n = 0, at_bol = 1;
+    long k;
+    while ((k = sys_read((int)fd, buf, sizeof buf)) > 0) {
+        for (long i = 0; i < k; i++) {
+            if (at_bol && i + 3 < k && !memcmp(buf + i, "ID: ", 4))
+                n++;
+            at_bol = buf[i] == '\n';
+        }
+    }
+    sys_close((int)fd);
+    return n;
+}
+
 int cng_cmd_faulttest(int argc, char **argv, char **envp, unsigned long *auxv) {
     (void)argc;
     (void)argv;
@@ -2144,6 +2168,30 @@ int cng_cmd_faulttest(int argc, char **argv, char **envp, unsigned long *auxv) {
         int ok = rd == -EFAULT;
         cng_dprintf(1, "faulttest execve path (CNG_DEBUG)=%d want=%d -> %s\n",
                     (int)rd, (int)-EFAULT, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* timer_create's id is taken in a word of ours and handed over afterwards,
+     * so a bad pointer is -EFAULT — and the timer the kernel had already
+     * created is deleted again, as do_timer_create() deletes its own when the
+     * put fails: the count in /proc/self/timers must not move. A good pointer
+     * still gets its id, and that one is deleted here to leave the count where
+     * it was. Where the file cannot be read (-1) only the errno is asserted. */
+    {
+        int before = dbg_count_timers();
+        long rt = cng_dispatch(__NR_timer_create, 0, 0, (long)bad, 0, 0, 0, 1);
+        int after = dbg_count_timers();
+        int id = -1;
+        long rg = cng_dispatch(__NR_timer_create, 0, 0, (long)&id, 0, 0, 0, 1);
+        int with = dbg_count_timers();
+        if (rg == 0)
+            cng_dispatch(__NR_timer_delete, id, 0, 0, 0, 0, 0, 1);
+        int ok = rt == -EFAULT && rg == 0 && id >= 0 &&
+                 (before < 0 || (after == before && with == before + 1));
+        cng_dprintf(1,
+                    "faulttest timer_create bad=%d good=%d timers=%d/%d/%d "
+                    "-> %s\n",
+                    (int)rt, (int)rg, before, after, with, ok ? "OK" : "FAIL");
         fails += !ok;
     }
 

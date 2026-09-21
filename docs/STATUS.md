@@ -2992,6 +2992,20 @@ vfork/`posix_spawn` child-stack handling.
   and joins an unplanted one twice; `m15` reads the sixteen digits back off
   the wire.
 
+- [x] **M56 — `timer_create` recorded whatever the guest's buffer held by then**
+  The emulated `execve` deletes every POSIX timer the guest created, from a
+  record of the ids as they were handed out (nothing enumerates them, and
+  under qemu-user the ids in `/proc/self/timers` are the emulator's own, so
+  the record is all the exec has there). The id was recorded by reading the
+  guest's buffer back after the kernel had written it: another thread of the
+  guest could rewrite or unmap the word in between, and the timer actually
+  created outlived the program. The id is taken in a word of the
+  dispatcher's now and handed to the guest afterwards; a copy-out that fails
+  deletes the timer again and answers `-EFAULT`, which is what
+  `do_timer_create()` does when its own put fails, so no timer is left behind
+  that the guest knows nothing about. A `-t faulttest` leg: a bad pointer is
+  `-EFAULT` and the count in `/proc/self/timers` does not move.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes
