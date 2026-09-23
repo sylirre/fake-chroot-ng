@@ -144,7 +144,7 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     }
     if (!op || !gpath) {
         cng_dprintf(2, "usage: _dtest -r ROOT [-b SRC:DST[:ro]] "
-                       "(open|access|dbgpath|robind|l2sro) GUESTPATH\n"
+                       "(open|access|dbgpath|robind|l2sro|rolink) GUESTPATH\n"
                        "       _dtest -r ROOT atrel GUESTDIR RELPATH\n"
                        "       _dtest -r ROOT outside HOSTDIR HOSTFILE\n");
         return 2;
@@ -1214,6 +1214,162 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
                     (int)rw, okw ? "OK" : "FAIL");
         fails += !okw;
         cng_dprintf(1, "l2sro: %d failures\n", fails);
+        return fails ? 1 : 0;
+    }
+    if (!strcmp(op, "rolink")) {
+        /* A link out of a :ro bind into the (writable) rootfs. A real one is
+         * EXDEV — a link cannot span mounts, and the bind is a mount — after
+         * the new name's own verdict; made anyway, the new name was a
+         * writable way into the :ro file, and under -l the fallback moved
+         * the file into the store. The rw bind is the control: every link
+         * there is the host's to make. */
+        int ro = fs.nbinds > 0 && fs.binds[0].ro;
+        const char *rs = ro ? "ro" : "rw";
+        char host[CNG_PATH_MAX], st0[144], st1[144];
+        if (cng_fs_translate(&fs, gpath, host, sizeof host) != 0 ||
+            CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, host, st0,
+                    CNG_AT_SYMLINK_NOFOLLOW, 0, 0) != 0) {
+            cng_dprintf(1, "rolink: %s is not there\n", gpath);
+            return 1;
+        }
+        long xdev = ro ? -EXDEV : 0;
+        cng_dispatch(__NR_symlinkat, (long)gpath, CNG_AT_FDCWD,
+                     (long)"/rolink.sym", 0, 0, 0, 0);
+        long tf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/rolink.taken",
+                               CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+        if (tf >= 0)
+            sys_close((int)tf);
+        long fd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
+                               CNG_O_RDONLY, 0, 0, 0, 0);
+        /* What the kernel says of this descriptor as a link source, asked the
+         * way dispatch asks it: "/" is a new name filename_create refuses
+         * with EEXIST once the source has passed, so nothing is created. */
+        long probe = fd >= 0 ? CNG_SYS(__NR_linkat, fd, (long)"", CNG_AT_FDCWD,
+                                       (long)"/", CNG_AT_EMPTY_PATH, 0)
+                             : -EBADF;
+        long byfd = probe == -EEXIST ? xdev : probe;
+        struct {
+            const char *name;
+            long want, r;
+        } t[] = {
+            {"name", xdev,
+             cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)gpath, CNG_AT_FDCWD,
+                          (long)"/rolink.a", 0, 0, 0)},
+            {"followed", xdev,
+             cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/rolink.sym",
+                          CNG_AT_FDCWD, (long)"/rolink.b",
+                          CNG_AT_SYMLINK_FOLLOW, 0, 0)},
+            {"dst-taken", -EEXIST,
+             cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)gpath, CNG_AT_FDCWD,
+                          (long)"/rolink.taken", 0, 0, 0)},
+            {"dst-nodir", -ENOENT,
+             cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)gpath, CNG_AT_FDCWD,
+                          (long)"/rolink.none/x", 0, 0, 0)},
+            {"by-fd", byfd,
+             cng_dispatch(__NR_linkat, fd, (long)"", CNG_AT_FDCWD,
+                          (long)"/rolink.e", CNG_AT_EMPTY_PATH, 0, 0)},
+        };
+        int fails = 0;
+        for (unsigned i = 0; i < sizeof t / sizeof *t; i++) {
+            int ok = t[i].r == t[i].want;
+            cng_dprintf(1, "rolink %s %s: rc=%d -> %s\n", rs, t[i].name,
+                        (int)t[i].r, ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+        /* Under -l, with the host's link refused so the fallback is what
+         * would answer: the refusal comes first, and the fallback never runs
+         * on a :ro source. (The rw control's fallback links for real, moving
+         * the bind's file into the store — last, since it changes the file.) */
+        if (ro) {
+            cng_g_l2s = 1;
+            cng_blocked[__NR_linkat] = 1;
+            long lf = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)gpath,
+                                   CNG_AT_FDCWD, (long)"/rolink.f", 0, 0, 0);
+            long lg = cng_dispatch(__NR_linkat, fd, (long)"", CNG_AT_FDCWD,
+                                   (long)"/rolink.g", CNG_AT_EMPTY_PATH, 0, 0);
+            cng_blocked[__NR_linkat] = 0;
+            cng_g_l2s = 0;
+            int ok = lf == -EXDEV && lg == -EXDEV;
+            cng_dprintf(1, "rolink ro l2s-fallback: rc=%d/%d -> %s\n", (int)lf,
+                        (int)lg, ok ? "OK" : "FAIL");
+            fails += !ok;
+            /* ...and the bind's file is as it was: the same regular file,
+             * with the one name it had. */
+            int kept = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, host, st1,
+                               CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0 &&
+                       ST_ISREG(st1) && ST_INO(st1) == ST_INO(st0) &&
+                       ST_NLINK(st1) == 1;
+            cng_dprintf(1, "rolink ro file-kept: %d -> %s\n", kept,
+                        kept ? "OK" : "FAIL");
+            fails += !kept;
+        }
+        if (fd >= 0)
+            sys_close((int)fd);
+
+        /* A group a link out of the bind already made: data under the bind,
+         * a writable name in the rootfs pointing at it. The file lives on the
+         * :ro mount, so it is read-only through that name too, the name's
+         * unlink leaves the count on the :ro mount alone, and a link from the
+         * name is a link out of the bind. Planted as the old fallback would
+         * have left it (a legacy group inside the bind, joined from outside
+         * by an absolute target). */
+        const char *bh = fs.binds[0].host;
+        char pd[CNG_PATH_MAX], pm[CNG_PATH_MAX], pn[CNG_PATH_MAX];
+        cng_snprintf(pd, sizeof pd, "%s/.l2s.4242", bh);
+        cng_snprintf(pm, sizeof pm, "%s/.l2s.4242.0002", bh);
+        cng_snprintf(pn, sizeof pn, "%s/rolink.pair", rootfs);
+        long pf = sys_openat(CNG_AT_FDCWD, pd, CNG_O_CREAT | CNG_O_WRONLY, 0644);
+        if (pf >= 0) {
+            sys_write((int)pf, "PAIR", 4);
+            sys_close((int)pf);
+        }
+        pf = sys_openat(CNG_AT_FDCWD, pm, CNG_O_CREAT | CNG_O_WRONLY, 0600);
+        if (pf >= 0)
+            sys_close((int)pf);
+        CNG_SYS(__NR_symlinkat, pd, CNG_AT_FDCWD, pn, 0, 0, 0);
+        cng_g_l2s = 1;
+        long rofs = ro ? -EROFS : 0;
+        long pt[4] = {1234, 0, 1234, 0};
+        long po = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/rolink.pair",
+                               CNG_O_WRONLY | CNG_O_NOFOLLOW, 0, 0, 0, 0);
+        struct {
+            const char *name;
+            long want, r;
+        } p[] = {
+            {"pair-utimensat", rofs,
+             cng_dispatch(__NR_utimensat, CNG_AT_FDCWD, (long)"/rolink.pair",
+                          (long)pt, CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0)},
+            {"pair-fchownat", rofs,
+             cng_dispatch(__NR_fchownat, CNG_AT_FDCWD, (long)"/rolink.pair",
+                          -1, -1, CNG_AT_SYMLINK_NOFOLLOW, 0, 0)},
+            {"pair-open-w", rofs, po >= 0 ? 0 : po},
+            {"pair-link", xdev,
+             cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/rolink.pair",
+                          CNG_AT_FDCWD, (long)"/rolink.pair2", 0, 0, 0)},
+            {"pair-unlink", 0,
+             cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/rolink.pair", 0,
+                          0, 0, 0, 0)},
+        };
+        if (po >= 0)
+            sys_close((int)po);
+        cng_g_l2s = 0;
+        for (unsigned i = 0; i < sizeof p / sizeof *p; i++) {
+            int ok = p[i].r == p[i].want;
+            cng_dprintf(1, "rolink %s %s: rc=%d -> %s\n", rs, p[i].name,
+                        (int)p[i].r, ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+        if (ro) {
+            int kept = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, pm, st1,
+                               CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0 &&
+                       CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, pd, st1,
+                               CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0 &&
+                       ST_MTIME(st1) != 1234;
+            cng_dprintf(1, "rolink ro pair-count-kept: %d -> %s\n", kept,
+                        kept ? "OK" : "FAIL");
+            fails += !kept;
+        }
+        cng_dprintf(1, "rolink: %d failures\n", fails);
         return fails ? 1 : 0;
     }
     cng_dprintf(2, "_dtest: unknown op %s\n", op);

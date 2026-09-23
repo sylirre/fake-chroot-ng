@@ -481,6 +481,42 @@ out=$(run -t dtest -r "$ROOT" -b "$LB":/rw l2sro /rw/f 2>&1); rc=$?
 check "a plain (rw) bind reports no EROFS on an l2s name" 0 "$rc"
 rm -rf "$LB"
 
+# A link out of a :ro bind. A real one is EXDEV — a link cannot span mounts,
+# and the bind is one — after the new name's own verdict (EEXIST, ENOENT).
+# Made anyway, on a host whose filesystem allowed it, the new name was a
+# writable way into the :ro file, and under -l the fallback moved the file
+# into the store and left a symlink in the bind. By name, through a followed
+# symlink, by descriptor (whose source verdict stays the kernel's), and
+# through the fallback; then a group such a link already made — data under
+# the bind, a writable name outside — which is read-only through that name,
+# is not decref'd on the :ro mount, and cannot be linked out again. The rw
+# bind is the control: there every link is the host's to make.
+LR=$(mktemp -d); LB=$(mktemp -d); printf 'RO-DATA' > "$LB/f"
+out=$(run -t dtest -r "$LR" -b "$LB":/ro:ro rolink /ro/f 2>&1); rc=$?
+check "a link out of a :ro bind is refused as a real one is" 0 "$rc"
+for _leg in name followed by-fd l2s-fallback; do
+    check_contains "a link out of a :ro bind ($_leg) is EXDEV" \
+        "rolink ro $_leg: rc=-18" "$out"
+done
+check_contains "...after the new name's EEXIST" "rolink ro dst-taken: rc=-17 -> OK" "$out"
+check_contains "...and its missing directory's ENOENT" \
+    "rolink ro dst-nodir: rc=-2 -> OK" "$out"
+check_contains "...and the bind's file is left as it was" \
+    "rolink ro file-kept: 1 -> OK" "$out"
+for _leg in pair-utimensat pair-fchownat pair-open-w; do
+    check_contains "a group with its data under a :ro bind refuses $_leg" \
+        "rolink ro $_leg: rc=-30 -> OK" "$out"
+done
+check_contains "...and its name cannot be linked out again" \
+    "rolink ro pair-link: rc=-18 -> OK" "$out"
+check_contains "...and its name's unlink leaves the count on the :ro mount" \
+    "rolink ro pair-count-kept: 1 -> OK" "$out"
+rm -rf "$LR" "$LB"
+LR=$(mktemp -d); LB=$(mktemp -d); printf 'RW-DATA' > "$LB/f"
+out=$(run -t dtest -r "$LR" -b "$LB":/rw rolink /rw/f 2>&1); rc=$?
+check "a link out of a plain (rw) bind is the host's to make" 0 "$rc"
+rm -rf "$LR" "$LB"
+
 run -t sigtest >/dev/null 2>&1
 check "signal round-trip + ucontext readable" 0 $?
 check_contains "sigtest handler ran" "handler ran" "$(run -t sigtest 2>&1)"

@@ -242,7 +242,8 @@ vfork/`posix_spawn` child-stack handling.
     non-rmdir'able, and per-dir-fallback links don't survive a rootfs move
     (store links self-heal); `/.l2s` stays reachable via dirfd `..`-walks;
     cross-dir + EXDEV still copies; an emulated cross-filesystem link (bind
-    mount) *succeeds* where a real one would report `EXDEV`.
+    mount) *succeeds* where a real one would report `EXDEV` — except out of
+    a `:ro` bind, which is `EXDEV` as it is natively (M65).
 
 - [x] **-R: signal-return svc sites left intact**
   The AoT rewriter used to turn the sa_restorer's `mov x8,#139; svc 0` into a
@@ -3213,6 +3214,37 @@ vfork/`posix_spawn` child-stack handling.
   whole range while batches of uptime files are opened into it; a rewind
   that reads an unmoved clock is a lost refresh — the previous build loses
   one in some runs, the window being a few instructions wide).
+
+- [x] **M65 — a link out of a :ro bind was a writable way into its file**
+  A link cannot span mounts: the kernel answers `EXDEV` for one whose
+  source is on another mount than the new name's directory, after the new
+  name's own verdict (`EEXIST`, a missing directory) and before anything
+  else about the source. A `:ro` bind is a mount of its own however the
+  host has it, and only a destination under one was refused, "linking
+  *from* a read-only mount is allowed, as on Linux" — which on Linux it is
+  only within that mount, where the new name is `EROFS`. So `ln /ro/f
+  /tmp/g`, the host's filesystem permitting (the bind and the rootfs on one
+  filesystem), made a real hardlink, and writing through `/tmp/g` changed
+  the `:ro` file; under `-l` the fallback went further and moved the file
+  into the store, leaving a symlink in the bind. A source under a `:ro`
+  bind is `EXDEV` now (`link_src_ro`): by name, through a followed name, by
+  descriptor (asked of the path the kernel reports for it — the file's
+  mount, not `fd_link_ro`'s reopen rule), and for an l2s name by where its
+  data is; after the new name's verdict (`link_dst_verdict`), and never
+  handed to the fallback. By descriptor the kernel's verdict on the source
+  stays the kernel's (the flag's capability rule before 6.10, `EBADF`): it
+  is asked with `/` for the new name, which `filename_create` answers
+  `EEXIST` once the source has passed (measured on 6.17), so nothing is
+  created. A group such a link already made — data under the bind, a
+  writable name outside — is read-only through that name too: the no-follow
+  mutators ask `:ro` of the data beside the name (`l2s_ro`), a link from it
+  is `EXDEV`, and its unlink leaves the count on the `:ro` mount alone.
+  `-t dtest rolink` in m5b, `:ro` and rw control: by name, followed, by
+  descriptor and through the forced fallback, the destination's verdicts
+  first, the bind's file untouched; and a planted pair refusing utimensat,
+  a no-follow chown, a no-follow write open and a link, with its count
+  kept (the previous build: ten failures, the bind's file turned into a
+  symlink into the store).
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 

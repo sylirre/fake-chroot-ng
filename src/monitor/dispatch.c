@@ -1876,16 +1876,73 @@ static long scope_canon(const char *gdir, const char *gp, int beneath,
  * so there is no second mount to argue for).
  *
  * Hence: where the guest's own name is an l2s link, the :ro question is asked
- * about the link, not about the data. The l2s hop is always the last component
- * — a link to a regular file has nothing under it — so the name's own path is
- * exactly the resolution with the final hop not taken. Asked only when -l and
- * a :ro bind are both in play, so the default path pays nothing for it. */
+ * about the link — and about where the data is, which a link out of a :ro bind
+ * used to put under it for a writable name (the linkat refusal below keeps any
+ * more from being made): the file lives on that mount, and every name of it
+ * is read-only there. The l2s hop is always the last component — a link to a
+ * regular file has nothing under it — so the name's own path is exactly the
+ * resolution with the final hop not taken. Asked only when -l and a :ro bind
+ * are both in play, so the default path pays nothing for it. */
+static int l2s_ro(const char *hnf, const char *data) {
+    return ro_denied(hnf) || cng_fs_host_ro(cng_g_fs, data);
+}
+
 static int ro_denied_l2s(long dirfd, const char *gp) {
     if (!cng_g_l2s || !gp || !gp[0] || !fs_has_ro())
         return 0;
     char hnf[CNG_PATH_MAX], data[CNG_PATH_MAX];
     return cng_resolve_at(dirfd, gp, 0, hnf, sizeof hnf) == 0 &&
-           cng_l2s_resolve(hnf, data, sizeof data, 0) == 1 && ro_denied(hnf);
+           cng_l2s_resolve(hnf, data, sizeof data, 0) == 1 && l2s_ro(hnf, data);
+}
+
+/* --- links out of a :ro bind ----------------------------------------------
+ *
+ * A link cannot span mounts: the kernel answers EXDEV for one whose source is
+ * on another mount than the new name's directory, after the new name's own
+ * verdict and before anything else about the source. A :ro bind is a mount
+ * of its own, however the host has it, so a source under one is on another
+ * mount than any writable destination (one in the bind itself is EROFS) —
+ * and linked anyway, the host's filesystem permitting, the new name was a
+ * writable way into the :ro file: written through it, the bind's file
+ * changed. Under -l the fallback went further and moved the file into the
+ * store, leaving a symlink in the bind. The file a link is made from is where
+ * its data is: the descriptor's own file for AT_EMPTY_PATH (asked of the path
+ * the kernel reports — not fd_link_ro's reopen rule, which is about the name
+ * a descriptor came through), and an l2s name's backing file. */
+static int link_src_ro(long fd, const char *srch, int by_fd, int followed) {
+    if (!cng_g_fs || !fs_has_ro())
+        return 0;
+    if (by_fd) {
+        char lk[40], real[CNG_PATH_MAX];
+        proc_fd_path(fd, lk);
+        long n = sys_readlinkat(CNG_AT_FDCWD, lk, real, sizeof real - 1);
+        if (n <= 0 || real[0] != '/')
+            return 0; /* anonymous: on no mount of ours */
+        real[n] = '\0';
+        return cng_fs_host_ro(cng_g_fs, real);
+    }
+    if (ro_denied(srch))
+        return 1;
+    char data[CNG_PATH_MAX];
+    return cng_g_l2s && !followed &&
+           cng_l2s_resolve(srch, data, sizeof data, 0) == 1 &&
+           cng_fs_host_ro(cng_g_fs, data);
+}
+
+/* What the kernel's filename_create says of a link's new name before the
+ * mount question is reached: the directory's own error (ENOENT, ENOTDIR),
+ * EEXIST for a name that is taken; 0 for a free one. */
+static long link_dst_verdict(const char *dsth) {
+    struct cng_pin p;
+    long e = cng_pin_at(CNG_AT_FDCWD, dsth, &p);
+    if (e == 0) {
+        char st[STAT_BUF_SIZE];
+        long r = CNG_SYS(__NR_newfstatat, p.dfd, (long)p.name, (long)st,
+                         CNG_AT_SYMLINK_NOFOLLOW, 0, 0);
+        e = r == 0 ? -EEXIST : r == -ENOENT ? 0 : r;
+    }
+    cng_unpin(&p);
+    return e;
 }
 
 /* --- no-follow calls on an l2s name -----------------------------------------
@@ -3948,7 +4005,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         char hnf[CNG_PATH_MAX], data[CNG_PATH_MAX];
         if (!deref && l2s_nofollow_data(a0, (const char *)a1, hnf, sizeof hnf,
                                         data, sizeof data)) {
-            if (ro_denied(hnf))
+            if (l2s_ro(hnf, data))
                 return -EROFS;
             return chattr_result(reissue(CNG_AT_FDCWD, (long)data, a2, a3, a4,
                                          a5, nr));
@@ -3981,7 +4038,10 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         if (ro_denied(p))
             return -EROFS;
         long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_unlinkat);
-        if (r == 0 && dec)
+        /* A group whose data is under a :ro bind (see ro_denied_l2s) loses a
+         * writable name, and keeps its count: the marker is on the :ro
+         * mount, and nothing is written there. */
+        if (r == 0 && dec && !cng_fs_host_ro(cng_g_fs, data))
             cng_l2s_decref(data, cnt);
         return r;
     }
@@ -4004,10 +4064,11 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             if (cng_resolve_at(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0 &&
                 cng_l2s_resolve(hnf, data, sizeof data, &cnt) == 1) {
                 /* The backing file is in the store, which no bind covers: the
-                 * mount that governs this call is the one the NAME sits under
-                 * (see ro_denied_l2s). Asked here, before the redirect, since
-                 * the check below never sees the guest's name again. */
-                if (ro_denied(hnf))
+                 * mount that governs this call is the one the NAME sits under,
+                 * or the data's where that is a :ro one (see ro_denied_l2s).
+                 * Asked here, before the redirect, since the check below never
+                 * sees the guest's name again. */
+                if (l2s_ro(hnf, data))
                     return -EROFS;
                 long r = reissue(CNG_AT_FDCWD, (long)data, a2, 0, 0, 0,
                                  __NR_utimensat);
@@ -4130,7 +4191,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             if (cng_resolve_at(a0, (const char *)a1, 0, hnf, sizeof hnf) ==
                     0 &&
                 cng_l2s_resolve(hnf, data, sizeof data, 0) == 1) {
-                if (ro_denied(hnf)) /* the name's mount, not the store's */
+                if (l2s_ro(hnf, data)) /* the name's mount, not the store's */
                     return -EROFS;
                 return chattr_result(reissue(CNG_AT_FDCWD, (long)data, a2, a3,
                                              0, a5, __NR_fchownat));
@@ -4435,8 +4496,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 fix = cng_l2s_rename_prep(hnf, absdata, sizeof absdata);
         }
         long r = reissue(a0, (long)op, a2, (long)np, a4, a5, nr);
-        if (r == 0 && dec)
-            cng_l2s_decref(data, cnt);
+        if (r == 0 && dec && !cng_fs_host_ro(cng_g_fs, data))
+            cng_l2s_decref(data, cnt); /* not on a :ro mount: see unlinkat */
         if (r == 0 && fix)
             cng_l2s_rename_fixup(dsth, absdata);
         return r;
@@ -4523,6 +4584,26 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 ddfd = CNG_AT_FDCWD;
                 dst = (long)dsth;
             }
+            /* A descriptor on a file under a :ro bind (see link_src_ro): the
+             * host would link it, its mount being the host's. What the kernel
+             * says of the source is still the kernel's to say — the flag's
+             * capability rule, EBADF — so it is asked, with "/" for the new
+             * name, which filename_create answers EEXIST once the source has
+             * passed (measured); nothing can be created by that. A host that
+             * does not let linkat be issued at all (ENOSYS) cannot be asked,
+             * and has nothing to refuse the source with either. The new
+             * name's own verdict follows, then EXDEV. */
+            if (dp && link_src_ro(a0, srch, (int)a0 != CNG_AT_FDCWD, 1)) {
+                r = reissue(a0, sp ? (long)"" : 0, CNG_AT_FDCWD, (long)"/", fl,
+                            0, __NR_linkat);
+                if (r == -EEXIST || r == -ENOSYS) {
+                    long e = link_dst_verdict(dsth);
+                    return e ? e : -EXDEV;
+                }
+                if (r == -ENOENT && cng_fake_root())
+                    goto by_link;
+                return r;
+            }
             r = reissue(a0, sp ? (long)"" : 0, ddfd, dst, fl, 0, __NR_linkat);
             /* Under fake root the capability is faked, as chroot's
              * CAP_SYS_CHROOT and the DAC bypass are. Root's AT_EMPTY_PATH
@@ -4570,11 +4651,18 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 cng_dprintf(2, "[cng] linkat: dst unresolved (%s)\n", dp);
             return -ENOENT;
         }
-        /* Only the new name is created, so only the destination end matters —
-         * linking *from* a read-only mount is allowed, as on Linux. Checked
-         * after both ends resolve so a bad source still reports ENOENT. */
+        /* The new name is created, so a destination under a :ro bind is
+         * EROFS. Checked after both ends resolve so a bad source still reports
+         * ENOENT. A source under one is a link across mounts (see
+         * link_src_ro), EXDEV once the new name has had its verdict — never a
+         * refusal for the fallback below to paper over. */
         if (ro_denied(dsth))
             return -EROFS;
+        if (link_src_ro(a0, srch, empty && (int)a0 != CNG_AT_FDCWD,
+                        follow || empty)) {
+            long e = link_dst_verdict(dsth);
+            return e ? e : -EXDEV;
+        }
         if (force)
             r = -EPERM;
         else
