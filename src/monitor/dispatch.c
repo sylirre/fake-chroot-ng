@@ -4219,12 +4219,35 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
 
     /* symlinkat(target, newdirfd, linkpath): translate only the linkpath. */
     case __NR_symlinkat: {
+        /* -l: the emulation recognizes its links by their target, so a guest
+         * link whose target's last component is in the ".l2s." grammar would
+         * be taken for one of them (see l2s.c) — counted into a group it was
+         * never counted into, and its unlink the decref that deletes the data
+         * under the group's other names. Such a target names the machinery,
+         * which does not exist for the guest; the link is refused as the
+         * names themselves are. Judged on a copy of ours, which is what the
+         * kernel is then handed: the guest's buffer could say otherwise by
+         * the time the kernel read it. */
+        long tgt = a0;
+        if (cng_g_l2s) {
+            long n = cng_user_strcopyin(b1, (const char *)a0, sizeof b1);
+            if (n < 0)
+                return n == -E2BIG ? -ENAMETOOLONG : n;
+            const char *tb = strrchr(b1, '/');
+            if (cng_l2s_hidden(tb ? tb + 1 : b1)) {
+                if (cng_g_debug)
+                    cng_dprintf(2, "[cng] l2s deny nr=%ld (target %s)\n", nr,
+                                b1);
+                return -ENOENT;
+            }
+            tgt = (long)b1;
+        }
         const char *lp = xlate(a1, (const char *)a2, b2, sizeof b2, 0);
         if (xlate_bad(lp))
             return xlate_errno(lp);
         if (ro_denied(lp))
             return -EROFS;
-        return reissue(a0, a1, (long)lp, a3, a4, a5, __NR_symlinkat);
+        return reissue(tgt, a1, (long)lp, a3, a4, a5, __NR_symlinkat);
     }
 
     /* fchown(fd,...): no path — try the real change, fake success under fake-root
@@ -4577,15 +4600,21 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             (r == -EPERM || r == -EMLINK || r == -EXDEV || r == -ENOSYS ||
              r == -EACCES || r == -EOPNOTSUPP)) {
             if (empty) {
-                /* If the fd names a live file, link its real path — an fd
-                 * onto a group's data file then bumps that group. Anonymous
-                 * or deleted files keep the /proc path: the fallback's
-                 * materialize copies the contents. */
-                char tgt[CNG_PATH_MAX], stt[144];
+                /* If the fd names a live file the guest has a name for, link
+                 * its real path — an fd onto a group's data file then bumps
+                 * that group, and a plain file becomes one. Anonymous or
+                 * deleted files keep the /proc path, and so does a file the
+                 * guest has no name for (a descriptor it was handed from
+                 * outside the view): the emulation would otherwise rename
+                 * it into the store and leave a symlink where it was, in a
+                 * directory no name of the guest's reaches. The fallback's
+                 * materialize copies the contents through the descriptor. */
+                char tgt[CNG_PATH_MAX], gtg[CNG_PATH_MAX], stt[144];
                 long tn = cng_pin_readlink(srch, tgt, sizeof tgt - 1);
                 if (tn > 0) {
                     tgt[tn] = '\0';
                     if (tgt[0] == '/' &&
+                        host_dir_guest(tgt, gtg, sizeof gtg) == 0 &&
                         cng_pin_fstatat(tgt, stt, CNG_AT_SYMLINK_NOFOLLOW) == 0)
                         cng_strlcpy(srch, tgt, sizeof srch);
                 }

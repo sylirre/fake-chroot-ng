@@ -146,6 +146,17 @@ check_contains "l2s unusable store falls back to the per-dir scheme" \
     "l2s-storefail: rc=0 reg=1 sameino=1 beside=1 -> OK" "$out"
 check_contains "dirfd args tolerate dirty upper halves (glibc w-registers)" \
     "l2s-dirtyfd: rc=0 nlink2=1 -> OK" "$out"
+# A link is the emulation's by its target, and the target is text: one naming
+# a data-shaped file outside the view is an ordinary symlink (it used to steer
+# lstat, utimensat, an O_NOFOLLOW open and unlink onto that host file), the
+# guest may not write such a target at all, and a descriptor on a file outside
+# the view is linked by copying through it, never by moving the file.
+check_contains "l2s link targets outside the view are not the emulation's" \
+    "l2s-spoof: lnk=1 follow=1 kept=1 guard=1 fdcopy=1 -> OK" "$out"
+check_contains "l2s links of a copied rootfs heal onto the copy's own store" \
+    "l2s-copied: own=1 reclaimed=1 orig_kept=1 -> OK" "$out"
+check_contains "l2s groups linked before a narrowing chroot stay recognized" \
+    "l2s-home: reg=1 decref=1 -> OK" "$out"
 check_contains "fchdir updates virtual cwd" "fchdir: cwd=/w -> OK" "$out"
 check_contains "chdir through a symlink records the directory it landed in" \
     "chdir-symlink: rc=0 cwd=/w -> OK" "$out"

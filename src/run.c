@@ -372,8 +372,12 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
 
     /* The view is complete: publish it. From here every reader sees it through
      * the sequence protocol and every chdir/chroot replaces it whole rather
-     * than editing it under them (path.c). g_fs itself is not looked at again. */
+     * than editing it under them (path.c). g_fs itself is not written again,
+     * which is what lets the l2s emulation keep it as the view the run was
+     * started with: a guest chroot narrows the published one, and a hardlink
+     * group made before it still has its data where this one put it. */
     cng_g_fs = cng_fs_publish(&g_fs);
+    cng_l2s_home(&g_fs);
 
     /* What the launcher handed down, judged against that view: a descriptor on
      * a directory the guest has no name for is closed here rather than left

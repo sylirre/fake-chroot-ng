@@ -172,6 +172,25 @@ static void put_u64(char **pp, char *end, unsigned long long v, int width) {
     *pp = p;
 }
 
+/* ".l2s.<ino>" exactly as build_name writes it: the digits of the number and
+ * nothing else — no leading zero, no run a parse would wrap. parse_data takes
+ * any digit run, which is the right grammar for the names that are hidden and
+ * refused, but not for the ones followed: ".l2s.07" is not ".l2s.7", and a
+ * link spelling one must not be taken for a link to the other. */
+static int parse_data_exact(const char *name, unsigned long long *ino) {
+    unsigned long long v;
+    if (!parse_data(name, &v))
+        return 0;
+    char tmp[24], *p = tmp;
+    put_u64(&p, tmp + sizeof tmp - 1, v, 1);
+    *p = '\0';
+    if (strcmp(tmp, name + L2S_PREFIX_LEN) != 0)
+        return 0;
+    if (ino)
+        *ino = v;
+    return 1;
+}
+
 /* "<dir>/.l2s.<ino>" (count < 0) or "<dir>/.l2s.<ino>.<count>" into out.
  * Returns 0 or -ENAMETOOLONG. */
 static int build_name(char *out, size_t sz, const char *dir,
@@ -343,17 +362,145 @@ int cng_l2s_deny(long dirfd, const char *gp) {
     return 0;
 }
 
-int cng_l2s_untranslate_target(const char *tgt, char *out, size_t sz) {
-    if (tgt[0] != '/' || !parse_data(l2s_basename(tgt), 0))
-        return 0;
-    if (cng_g_fs && cng_fs_untranslate(cng_g_fs, tgt, out, sz) == 0)
+/* ---- which links are ours ------------------------------------------------
+ *
+ * A link is recognized by its target, and a target is text: the kernel keeps
+ * whatever symlinkat was given, and the guest calls symlinkat too. Taken on
+ * its word — any target whose last component parsed as ".l2s.<digits>" —
+ * that text named the file every no-follow call was then redirected to: a
+ * guest's `ln -s /elsewhere/on/the/host/.l2s.1 x` made lstat of x describe a
+ * host file outside the rootfs, chown and utimensat change it, an O_NOFOLLOW
+ * open read and write it, and unlink delete it — another rootfs's store is
+ * exactly such a place. So a target is only ours where it names a data file
+ * the emulation could have written, which is one of:
+ *
+ *  - a bare ".l2s.<ino>": the legacy same-directory link, its data beside it;
+ *  - an absolute path, in canonical form, to a data file in a place of the
+ *    guest's own (l2s_owned): this rootfs's store, a legacy group joined from
+ *    another directory, a group in a bind;
+ *  - an absolute path into some other "<dir>/.l2s" store, which is what a
+ *    link carries after its rootfs tree was moved or copied: it self-heals
+ *    onto this rootfs's store under the same name, and the file it named is
+ *    never looked at.
+ *
+ * and the data file has to be there, a regular file. Everything else is an
+ * ordinary symlink, whatever its last component says. The guest can no longer
+ * write such a target at all (the symlinkat refusal in dispatch.c); this is
+ * what keeps a tree that already holds one — from before that refusal, from
+ * the host, from another tool — from being read the old way. */
+
+/* The view chroot-ng was started with: run.c's, never written after it is
+ * published. A guest chroot narrows the view, and a group linked before it
+ * keeps its data where the wider view put it. 0 in the unit harness. */
+static const struct cng_fs *g_home;
+
+void cng_l2s_home(const struct cng_fs *fs) { g_home = fs; }
+
+/* A place of the guest's own: somewhere the view names (the rootfs, a bind,
+ * the /dev/shm stand-in — cng_host_dir_guest), or somewhere the view it was
+ * started with named. `p` is canonical, so a prefix is a containment. */
+static int l2s_owned(const char *p) {
+    if (!cng_g_fs)
+        return 1; /* no view at all: the host root is the rootfs */
+    char g[CNG_PATH_MAX];
+    if (cng_host_dir_guest(p, g, sizeof g) == 0)
         return 1;
-    /* Stale prefix (the rootfs tree was moved): the store sits at a fixed
-     * guest location, so the basename alone reconstructs it. */
+    return g_home && cng_fs_untranslate(g_home, p, g, sizeof g) == 0;
+}
+
+/* Absolute, and no empty, "." or ".." component, no trailing slash: the form
+ * of every target this file writes (the store path and the walk's host paths
+ * both are), and the only one whose prefix says where it leads. */
+static int l2s_canonical(const char *p) {
+    if (p[0] != '/')
+        return 0;
+    for (const char *c = p + 1;;) {
+        const char *e = c;
+        while (*e && *e != '/')
+            e++;
+        size_t n = (size_t)(e - c);
+        if (n == 0 || (n == 1 && c[0] == '.') ||
+            (n == 2 && c[0] == '.' && c[1] == '.'))
+            return 0;
+        if (!*e)
+            return 1;
+        c = e + 1;
+    }
+}
+
+/* "<dir>/.l2s/.l2s.<ino>": a data file in some rootfs's store. */
+static int l2s_store_shaped(const char *p) {
+    const char *b = l2s_basename(p);
+    return b - p >= 6 && !strncmp(b - 6, "/.l2s/", 6);
+}
+
+/* The data file the link at `host` names by `tgt`, into `data`: 1 (ours), 0
+ * (an ordinary symlink), or -ENAMETOOLONG. *heal is set when the target is a
+ * stale store path and `data` is where this rootfs's store has it: the link
+ * should be repointed. */
+static int l2s_locate(const char *host, const char *tgt, char *data,
+                      size_t dsz, int *heal) {
+    char st[ST_SIZE];
+    const char *b = l2s_basename(tgt);
+    *heal = 0;
+    if (!parse_data_exact(b, 0))
+        return 0;
+    if (tgt[0] != '/') {
+        if (b != tgt)
+            return 0; /* a relative target of ours is the bare name */
+        char dir[CNG_PATH_MAX];
+        l2s_dirname(host, dir, sizeof dir);
+        size_t dl = strlen(dir);
+        int sep = !(dl && dir[dl - 1] == '/');
+        if (dl + (size_t)sep + strlen(b) >= dsz)
+            return -ENAMETOOLONG;
+        memcpy(data, dir, dl);
+        if (sep)
+            data[dl++] = '/';
+        cng_strlcpy(data + dl, b, dsz - dl);
+        return l2s_lstat(data, st) == 0 && is_reg(st);
+    }
+    if (!l2s_canonical(tgt))
+        return 0;
+    if (l2s_owned(tgt)) {
+        if (cng_strlcpy(data, tgt, dsz) >= dsz)
+            return -ENAMETOOLONG;
+        if (l2s_lstat(data, st) == 0 && is_reg(st))
+            return 1;
+    }
+    if (!l2s_store_shaped(tgt))
+        return 0;
+    char store[CNG_PATH_MAX];
+    if (l2s_store_dir(store, sizeof store) != 0)
+        return 0;
+    size_t sl = strlen(store);
+    if (sl + 1 + strlen(b) >= dsz)
+        return -ENAMETOOLONG;
+    memcpy(data, store, sl);
+    data[sl] = '/';
+    cng_strlcpy(data + sl + 1, b, dsz - sl - 1);
+    if (!strcmp(data, tgt) || l2s_lstat(data, st) != 0 || !is_reg(st))
+        return 0; /* dangling: just an ordinary symlink */
+    *heal = 1;
+    return 1;
+}
+
+int cng_l2s_untranslate_target(const char *tgt, char *out, size_t sz) {
+    const char *b = l2s_basename(tgt);
+    if (tgt[0] != '/' || !parse_data_exact(b, 0) || !l2s_canonical(tgt))
+        return 0;
+    if (cng_g_fs && cng_host_dir_guest(tgt, out, sz) == 0)
+        return 1;
+    /* A stale store path (the rootfs tree was moved or copied): the store
+     * sits at a fixed guest location, so the basename alone reconstructs it,
+     * as l2s_locate's self-heal does. Anything else is re-rooted like the
+     * absolute target of any other symlink. */
+    if (!l2s_store_shaped(tgt))
+        return 0;
     size_t n = cng_strlcpy(out, "/.l2s/", sz);
     if (n >= sz)
         return 0;
-    cng_strlcpy(out + n, l2s_basename(tgt), sz - n);
+    cng_strlcpy(out + n, b, sz - n);
     return 1;
 }
 
@@ -375,36 +522,20 @@ int cng_l2s_resolve(const char *host, char *data, size_t dsz,
         return (int)n;
     tgt[n] = '\0';
 
-    unsigned long long ino;
-    if (!parse_data(l2s_basename(tgt), &ino))
-        return 0; /* an ordinary symlink */
-
-    char dir[CNG_PATH_MAX];
-    if (tgt[0] == '/') {
-        /* Absolute host target: the central store, or a legacy group joined
-         * from another directory. */
-        l2s_dirname(tgt, dir, sizeof dir);
-        if (build_name(data, dsz, dir, ino, -1) < 0)
-            return -ENAMETOOLONG;
-        if (l2s_lstat(data, st) < 0) {
-            /* Stale target (the rootfs tree was moved): self-heal via the
-             * current rootfs' store, and repoint the link (best effort). */
-            char store[CNG_PATH_MAX];
-            if (l2s_store_dir(store, sizeof store) != 0 ||
-                build_name(data, dsz, store, ino, -1) < 0 ||
-                l2s_lstat(data, st) < 0)
-                return 0; /* dangling: just an ordinary symlink */
-            l2s_unlink(host);
-            l2s_symlink(data, host);
-            cng_strlcpy(dir, store, sizeof dir);
-        }
-    } else {
-        l2s_dirname(host, dir, sizeof dir); /* relative: beside the link */
-        if (build_name(data, dsz, dir, ino, -1) < 0)
-            return -ENAMETOOLONG;
+    int heal;
+    int k = l2s_locate(host, tgt, data, dsz, &heal);
+    if (k != 1)
+        return k;
+    if (heal) { /* repoint the stale link at its data (best effort) */
+        l2s_unlink(host);
+        l2s_symlink(data, host);
     }
-    unsigned long c = 0;
     if (count) {
+        unsigned long long ino;
+        unsigned long c = 0;
+        char dir[CNG_PATH_MAX];
+        parse_data(l2s_basename(data), &ino);
+        l2s_dirname(data, dir, sizeof dir);
         if (find_marker(dir, ino, &c) != 0)
             c = 0;
         *count = c;
@@ -420,7 +551,8 @@ static int l2s_target(const char *host, char *data, size_t dsz,
     if (isl != 0)
         return isl;
     unsigned long long ino;
-    if (parse_data(l2s_basename(host), &ino)) {
+    if (parse_data_exact(l2s_basename(host), &ino) && l2s_canonical(host) &&
+        l2s_owned(host)) {
         char dir[CNG_PATH_MAX];
         l2s_dirname(host, dir, sizeof dir);
         if (build_name(data, dsz, dir, ino, -1) < 0)
@@ -504,9 +636,15 @@ int cng_l2s_link(const char *src, const char *dst) {
         L2S_LOG("[cng] l2s: src probe %s -> %d\n", src, isl);
         return isl;
     }
+    /* A source outside every place of the guest's own — the file behind a
+     * descriptor it was handed, linked by AT_EMPTY_PATH — is never renamed
+     * into the store or given a marker beside it: that would move a file,
+     * and write a directory, that no name of the guest's reaches. Its
+     * contents are copied instead, as for a file with no name at all. */
+    int own = l2s_canonical(src) && l2s_owned(src);
     /* AT_SYMLINK_FOLLOW may have resolved src straight onto the data file. */
-    if (isl == 0 && l2s_lstat(src, st) == 0 && is_reg(st) &&
-        parse_data(l2s_basename(src), &ino)) {
+    if (isl == 0 && own && l2s_lstat(src, st) == 0 && is_reg(st) &&
+        parse_data_exact(l2s_basename(src), &ino)) {
         cng_strlcpy(data, src, sizeof data);
         l2s_dirname(src, sdir, sizeof sdir);
         if (find_marker(sdir, ino, &count) != 0)
@@ -556,7 +694,7 @@ int cng_l2s_link(const char *src, const char *dst) {
         L2S_LOG("[cng] l2s: src %s missing\n", src);
         return -ENOENT;
     }
-    if (!is_reg(st)) /* e.g. /proc/self/fd/N O_TMPFILE: copy contents */
+    if (!is_reg(st) || !own) /* e.g. /proc/self/fd/N O_TMPFILE: copy contents */
         return l2s_materialize(src, dst);
     ino = *(unsigned long long *)((char *)st + ST_INO_OFF);
 
@@ -641,17 +779,10 @@ int cng_l2s_rename_prep(const char *srch, char *absdata, size_t sz) {
     if (n < 0)
         return 0;
     tgt[n] = '\0';
-    if (tgt[0] == '/' || !parse_data(l2s_basename(tgt), 0))
-        return 0; /* absolute targets survive any move; others aren't ours */
-    char dir[CNG_PATH_MAX];
-    l2s_dirname(srch, dir, sizeof dir);
-    size_t k = cng_strlcpy(absdata, dir, sz);
-    if (k && absdata[k - 1] != '/' && k + 1 < sz) {
-        absdata[k++] = '/';
-        absdata[k] = '\0';
-    }
-    cng_strlcpy(absdata + k, tgt, sz > k ? sz - k : 0);
-    return 1;
+    if (tgt[0] == '/')
+        return 0; /* absolute targets survive any move */
+    int heal;
+    return l2s_locate(srch, tgt, absdata, sz, &heal) == 1;
 }
 
 void cng_l2s_rename_fixup(const char *dsth, const char *absdata) {
@@ -734,8 +865,11 @@ static int l2s_fd_count(long fd, unsigned long *count) {
     if (n < 0)
         return 0;
     path[n] = '\0';
+    /* Where the kernel says the file is, which is only a data file of ours
+     * in a place of the guest's own (see l2s_locate). */
     unsigned long long ino;
-    if (!parse_data(l2s_basename(path), &ino))
+    if (!parse_data_exact(l2s_basename(path), &ino) || !l2s_canonical(path) ||
+        !l2s_owned(path))
         return 0;
     char dir[CNG_PATH_MAX];
     unsigned long c = 0;
@@ -773,21 +907,29 @@ int cng_l2s_dirent(long dirfd, const char *name, unsigned long long *ino,
     if (n <= 0)
         return 0;
     tgt[n] = '\0';
-    if (!parse_data(l2s_basename(tgt), 0))
+    const char *b = l2s_basename(tgt);
+    if (!parse_data_exact(b, 0) || (tgt[0] != '/' && b != tgt))
         return 0;
     /* What stat(2) of the name answers is the data file — a follow lands on
      * it — so the record carries that inode and type. The target is asked
      * about directly rather than followed by the kernel: a data file is never
-     * a symlink, and the link is the guest's to have pointed anywhere. */
+     * a symlink, and the link is the guest's to have pointed anywhere — which
+     * is why an absolute one is asked about only where l2s_locate would take
+     * it as it stands, in a place of the guest's own. */
     char st[ST_SIZE];
-    long sr = tgt[0] == '/'
-                  ? cng_pin_fstatat(tgt, st, CNG_AT_SYMLINK_NOFOLLOW)
-                  : CNG_SYS(__NR_newfstatat, (int)dirfd, tgt, st,
-                            CNG_AT_SYMLINK_NOFOLLOW, 0, 0);
-    if (sr < 0) {
-        /* Dangling: the rootfs tree was moved and the absolute target went
-         * stale. cng_l2s_stat self-heals that onto the current store, and a
-         * listing must say what the stat after it will. */
+    long sr = -1;
+    if (tgt[0] != '/')
+        sr = CNG_SYS(__NR_newfstatat, (int)dirfd, tgt, st,
+                     CNG_AT_SYMLINK_NOFOLLOW, 0, 0);
+    else if (l2s_canonical(tgt) && l2s_owned(tgt))
+        sr = cng_pin_fstatat(tgt, st, CNG_AT_SYMLINK_NOFOLLOW);
+    if (sr < 0 || !is_reg(st)) {
+        if (tgt[0] != '/')
+            return 0; /* a bare name with no data beside it: not ours */
+        /* Not a data file where it says: an absolute target whose rootfs tree
+         * was moved or copied, which cng_l2s_stat self-heals onto the current
+         * store, or no link of ours at all — and a listing must say what the
+         * stat after it will. */
         char host[CNG_PATH_MAX];
         size_t dl;
         if (l2s_fd_dir(dirfd, host, sizeof host) < 0 ||

@@ -145,6 +145,41 @@ if [ "$m10_ready" -eq 1 ]; then
         echo "    chroot: [$e1|$e2] rc=$rc_e"
     fi
     rm -rf "$RO" "$REM"
+
+    # A rootfs copied with `cp -a` is a tree of its own: real hardlinks come
+    # out of the copy as groups of the copy's. The emulated ones keep their
+    # text, which names the ORIGINAL's store, and a link was taken for what
+    # its text named — so the copy's `rm` of both names deleted the
+    # original's data, and the original's names were left dangling. A tree
+    # of busybox and its loader is enough, and saves copying the whole image
+    # four times.
+    RO=$(mktemp -d); REM=$(mktemp -d)
+    for _r in "$RO/r" "$REM/r"; do
+        mkdir -p "$_r/bin" "$_r/lib" "$_r/tmp"
+        cp "$M10_ALPINE/bin/busybox" "$_r/bin/busybox"
+        ln -s busybox "$_r/bin/sh"
+        cp "$M10_ALPINE/lib/ld-musl-aarch64.so.1" "$_r/lib/"
+    done
+    s1='cd /tmp; echo orig > a; busybox ln a b; busybox stat -c %h a'
+    s2='cd /tmp; echo copy >> a; busybox cat b; busybox stat -c %h a b;
+        busybox rm a b; busybox ls -a'
+    s3='cd /tmp; busybox cat a; busybox stat -c %h a b'
+    o1=$("$M10_ORACLE" "$RO/r" /bin/sh -c "$s1" 2>/dev/null)
+    e1=$(run -R -l "$REM/r" /bin/sh -c "$s1" 2>/dev/null)
+    cp -a "$RO/r" "$RO/c"; cp -a "$REM/r" "$REM/c"
+    o2=$("$M10_ORACLE" "$RO/c" /bin/sh -c "$s2" 2>/dev/null)
+    e2=$(run -R -l "$REM/c" /bin/sh -c "$s2" 2>/dev/null)
+    o3=$("$M10_ORACLE" "$RO/r" /bin/sh -c "$s3" 2>/dev/null); rc_o=$?
+    e3=$(run -R -l "$REM/r" /bin/sh -c "$s3" 2>/dev/null); rc_e=$?
+    if [ "$o1|$o2|$o3" = "$e1|$e2|$e3" ] && [ "$rc_o" = "$rc_e" ] &&
+        [ -n "$o3" ]; then
+        pass=$((pass + 1)); echo "  ok   m10 a copied rootfs leaves the original's groups alone"
+    else
+        fail=$((fail + 1)); echo "  FAIL m10 a copied rootfs leaves the original's groups alone"
+        echo "    oracle: [$o1|$o2|$o3] rc=$rc_o"
+        echo "    chroot: [$e1|$e2|$e3] rc=$rc_e"
+    fi
+    rm -rf "$RO" "$REM"
 fi
 
 # The dirents themselves. Every leg above goes through busybox, which stats

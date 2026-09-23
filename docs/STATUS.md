@@ -234,7 +234,8 @@ vfork/`posix_spawn` child-stack handling.
     when the guest has a live `/proc`; `ln -P` of a symlink copies the
     target's contents instead of linking the symlink itself; the marker
     read-modify-write is not atomic under concurrent link/unlink; a guest
-    cannot create files matching the `.l2s.` name grammar (denied `ENOENT`);
+    cannot create files matching the `.l2s.` name grammar, nor (M60) a
+    symlink whose target's last component matches it (denied `ENOENT`);
     the rootfs root's own `st_nlink` is +1 once the store exists;
     `openat2(RESOLVE_NO_SYMLINKS)` fails on emulated links; a legacy per-dir
     group whose surviving names were all mv'ed away leaves its old dir
@@ -3081,6 +3082,41 @@ vfork/`posix_spawn` child-stack handling.
   file outside it and the rootfs itself — closed, file, dir — by `recvmsg`,
   by `recvmmsg`, and through a 16 KiB buffer that takes the family check,
   then an AF_INET `IP_PKTINFO` record through the same buffer (m25).
+
+- [x] **M60 — an l2s link was whatever its target's text said it was**
+  The emulation recognizes its links by their target, and took any target
+  whose last component parsed as `.l2s.<digits>` at its word: an absolute one
+  named the data file as it stood, wherever that was. A target is text the
+  guest writes — `symlinkat` checked only the link's own name — so
+  `ln -s /elsewhere/on/the/host/.l2s.1 x` made `lstat` of `x` describe a host
+  file outside the rootfs, `chown -h`/`utimensat`/an `O_NOFOLLOW` open reach
+  it, and `rm x` decref and delete it; another rootfs's store is exactly such
+  a place. The same reading made a rootfs copied with `cp -a` operate on the
+  original's store (its links still name it, and it is there), so the copy's
+  `rm` deleted the original's data under names the copy never had. A link
+  is the emulation's now only where its target is one the emulation could
+  have written (`l2s_locate`, used by every recognition site — resolve,
+  listing, rename fix-up, fd link count, the resolver's untranslation): a
+  bare `.l2s.<ino>` with its data beside it, or a canonical absolute path to
+  a data file in a place of the guest's own (the view, or the view the run
+  started with, which a guest chroot narrows — `cng_l2s_home`), or a path
+  into some other `…/.l2s` store, which self-heals onto this rootfs's store
+  without the named file being looked at; the digits must be exactly the
+  number's, and the data a regular file. Everything else is an ordinary
+  symlink. The guest may no longer write such a target at all: `symlinkat`
+  refuses one whose last component is in the grammar (data or marker) with
+  `ENOENT`, as the names themselves are, judged on a copy of the target that
+  is then the one the kernel gets. The `linkat(fd, "", …, AT_EMPTY_PATH)`
+  fallback used to substitute the descriptor's real path for its `/proc`
+  link whenever the file was live, and the first-link path then renamed a
+  file outside the view into the store and left a symlink in its place; the
+  substitution now needs a path the guest has a name for, and
+  `cng_l2s_link` copies (materialize) rather than move a source that is not
+  in a place of the guest's own. Legs: `-t l2stest` `l2s-spoof` (a planted
+  outside target is a symlink to every call, the outside file untouched;
+  the refusals; an outside descriptor linked by copy), `l2s-copied`,
+  `l2s-home`; m10 differential "a copied rootfs leaves the original's groups
+  alone" (fails on the previous build: the original's names dangle).
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 

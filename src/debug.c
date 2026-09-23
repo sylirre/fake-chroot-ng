@@ -3812,6 +3812,217 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
     fails += !dirty_ok;
     cng_dispatch(__NR_chdir, (long)"/", 0, 0, 0, 0, 0, 0);
 
+    /* A link is the emulation's by its target, and a target is text. One
+     * naming a data-shaped file outside the view — planted here with raw
+     * syscalls, as the host or a tool could have, since the guest itself
+     * may no longer write one — is an ordinary symlink: lstat says so, a
+     * no-follow call lands on the link, and unlink removes the link and
+     * nothing else. The guest's own attempt at such a link, or at one
+     * naming a marker, is refused with ENOENT, as the names are. */
+    char spr[CNG_PATH_MAX], spin[CNG_PATH_MAX], spw[CNG_PATH_MAX],
+        spout[CNG_PATH_MAX], spf[CNG_PATH_MAX], spx[CNG_PATH_MAX],
+        spp[CNG_PATH_MAX];
+    dbg_mkpath(spr, sizeof spr, rootfs, "/sp", 0, 0);
+    dbg_mkpath(spin, sizeof spin, rootfs, "/sp/in", 0, 0);
+    dbg_mkpath(spw, sizeof spw, rootfs, "/sp/in/w", 0, 0);
+    dbg_mkpath(spout, sizeof spout, rootfs, "/sp/out", 0, 0);
+    dbg_mkpath(spf, sizeof spf, rootfs, "/sp/out/.l2s.77", 0, 0);
+    dbg_mkpath(spx, sizeof spx, rootfs, "/sp/in/w/x", 0, 0);
+    dbg_mkpath(spp, sizeof spp, rootfs, "/sp/out/plain", 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, spr, 0755, 0, 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, spin, 0755, 0, 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, spw, 0755, 0, 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, spout, 0755, 0, 0, 0);
+    odf = sys_openat(CNG_AT_FDCWD, spf, CNG_O_CREAT | CNG_O_WRONLY, 0600);
+    if (odf >= 0) {
+        sys_write((int)odf, "zz", 2);
+        sys_close((int)odf);
+    }
+    CNG_SYS(__NR_symlinkat, spf, CNG_AT_FDCWD, spx, 0, 0, 0);
+    static struct cng_fs fs3;
+    cng_fs_init(&fs3, spin);
+    cng_g_fs = &fs3;
+    char ssx[144];
+    long rsx = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/x",
+                            (long)ssx, CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0);
+    int sp_lnk = (rsx == 0 && (ST_MODE(ssx) & 0170000) == 0120000);
+    int sp_follow = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/x",
+                                 (long)ssx, 0, 0, 0, 0) == -ENOENT;
+    long spt[4] = {1234, 0, 1234, 0};
+    long sut = cng_dispatch(__NR_utimensat, CNG_AT_FDCWD, (long)"/w/x",
+                            (long)spt, CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0);
+    long sop = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/x",
+                            CNG_O_RDONLY | CNG_O_NOFOLLOW, 0, 0, 0, 0);
+    if (sop >= 0)
+        sys_close((int)sop);
+    long sul = cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/x", 0, 0,
+                            0, 0, 0);
+    char ssf[144];
+    long rsf = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, spf, ssf,
+                       CNG_AT_SYMLINK_NOFOLLOW, 0, 0);
+    int sp_kept = (sut == 0 && sop == -ELOOP && sul == 0 && rsf == 0 &&
+                   ST_ISREG(ssf) && ST_MTIME(ssf) != 1234);
+    long sg1 = cng_dispatch(__NR_symlinkat, (long)spf, CNG_AT_FDCWD,
+                            (long)"/w/y", 0, 0, 0, 0);
+    long sg2 = cng_dispatch(__NR_symlinkat, (long)".l2s.5.0002", CNG_AT_FDCWD,
+                            (long)"/w/y", 0, 0, 0, 0);
+    long sg3 = cng_dispatch(__NR_symlinkat, (long)".l2s", CNG_AT_FDCWD,
+                            (long)"/w/y", 0, 0, 0, 0);
+    cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/y", 0, 0, 0, 0, 0);
+    int sp_guard = (sg1 == -ENOENT && sg2 == -ENOENT && sg3 == 0);
+
+    /* A descriptor on a file outside the view, linked by AT_EMPTY_PATH: the
+     * contents are copied through it, and the file stays where it is — the
+     * emulation used to rename it into the store and leave a symlink in a
+     * directory no name of the guest's reaches. */
+    odf = sys_openat(CNG_AT_FDCWD, spp, CNG_O_CREAT | CNG_O_WRONLY, 0644);
+    if (odf >= 0) {
+        sys_write((int)odf, "pp", 2);
+        sys_close((int)odf);
+    }
+    long spd = sys_openat(CNG_AT_FDCWD, spp, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    long spl = -1;
+    if (spd >= 0) {
+        spl = cng_dispatch(__NR_linkat, spd, (long)"", CNG_AT_FDCWD,
+                           (long)"/w/pl", CNG_AT_EMPTY_PATH, 0, 0);
+        sys_close((int)spd);
+    }
+    char spb[4] = {0};
+    long spo = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/pl",
+                            CNG_O_RDONLY, 0, 0, 0, 0);
+    if (spo >= 0) {
+        sys_read((int)spo, spb, 2);
+        sys_close((int)spo);
+    }
+    char ssp[144];
+    long rsp = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, spp, ssp,
+                       CNG_AT_SYMLINK_NOFOLLOW, 0, 0);
+    int sp_fd = (spl == 0 && spb[0] == 'p' && spb[1] == 'p' && rsp == 0 &&
+                 ST_ISREG(ssp));
+    cng_g_fs = &fs;
+    int ok_sp = (sp_lnk && sp_follow && sp_kept && sp_guard && sp_fd);
+    cng_dprintf(1,
+                "l2s-spoof: lnk=%d follow=%d kept=%d guard=%d fdcopy=%d "
+                "-> %s\n",
+                sp_lnk, sp_follow, sp_kept, sp_guard, sp_fd,
+                ok_sp ? "OK" : "FAIL");
+    fails += !ok_sp;
+
+    /* A rootfs copied with its links (cp -a) keeps their text, which names
+     * the ORIGINAL's store — present, so it was taken as it stood, and the
+     * copy's unlinks decref'd and deleted the original's data under names
+     * the copy never had. Planted as the copy would be: the names carry the
+     * original's store path, the copy's store its own data under the same
+     * name. The copy answers from its own data and reclaims it; the original
+     * keeps its group whole. */
+    long cgf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/cg1",
+                            CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (cgf >= 0) {
+        sys_write((int)cgf, "og", 2);
+        sys_close((int)cgf);
+    }
+    long cgl = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/cg1",
+                            CNG_AT_FDCWD, (long)"/w/cg2", 0, 0, 0);
+    char scg[144];
+    long rcg = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/cg1",
+                            (long)scg, 0, 0, 0, 0);
+    char cgt[CNG_PATH_MAX], cph[CNG_PATH_MAX], cpw[CNG_PATH_MAX],
+        cps[CNG_PATH_MAX], cpd[CNG_PATH_MAX], cpm[CNG_PATH_MAX],
+        cpn[CNG_PATH_MAX];
+    dbg_mkpath(cgt, sizeof cgt, rootfs, "/.l2s/.l2s.", ST_INO(scg), 1);
+    dbg_mkpath(cph, sizeof cph, rootfs, "/cp", 0, 0);
+    dbg_mkpath(cpw, sizeof cpw, rootfs, "/cp/w", 0, 0);
+    dbg_mkpath(cps, sizeof cps, rootfs, "/cp/.l2s", 0, 0);
+    dbg_mkpath(cpd, sizeof cpd, rootfs, "/cp/.l2s/.l2s.", ST_INO(scg), 1);
+    dbg_mkpath(cpm, sizeof cpm, cpd, ".0002", 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, cph, 0755, 0, 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, cpw, 0755, 0, 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, cps, 0700, 0, 0, 0);
+    odf = sys_openat(CNG_AT_FDCWD, cpd, CNG_O_CREAT | CNG_O_WRONLY, 0644);
+    if (odf >= 0) {
+        sys_write((int)odf, "cp", 2);
+        sys_close((int)odf);
+    }
+    odf = sys_openat(CNG_AT_FDCWD, cpm, CNG_O_CREAT | CNG_O_WRONLY, 0600);
+    if (odf >= 0)
+        sys_close((int)odf);
+    dbg_mkpath(cpn, sizeof cpn, rootfs, "/cp/w/cg1", 0, 0);
+    CNG_SYS(__NR_symlinkat, cgt, CNG_AT_FDCWD, cpn, 0, 0, 0);
+    dbg_mkpath(cpn, sizeof cpn, rootfs, "/cp/w/cg2", 0, 0);
+    CNG_SYS(__NR_symlinkat, cgt, CNG_AT_FDCWD, cpn, 0, 0, 0);
+    char scd[144];
+    long rcd = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, cpd, scd,
+                       CNG_AT_SYMLINK_NOFOLLOW, 0, 0);
+    static struct cng_fs fs4;
+    cng_fs_init(&fs4, cph);
+    cng_g_fs = &fs4;
+    char scc[144];
+    long rcc = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/cg1",
+                            (long)scc, CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0);
+    int cp_own = (rcc == 0 && rcd == 0 && ST_ISREG(scc) &&
+                  ST_INO(scc) == ST_INO(scd) && ST_NLINK(scc) == 2);
+    long cu1 = cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/cg1", 0, 0,
+                            0, 0, 0);
+    long cu2 = cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/cg2", 0, 0,
+                            0, 0, 0);
+    int cp_gone = (cu1 == 0 && cu2 == 0 && dbg_has_l2s(cps) == 0);
+    cng_g_fs = &fs;
+    rcg = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/cg2", (long)scg,
+                       0, 0, 0, 0);
+    char cgb[4] = {0};
+    long cgo = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/cg2",
+                            CNG_O_RDONLY, 0, 0, 0, 0);
+    if (cgo >= 0) {
+        sys_read((int)cgo, cgb, 2);
+        sys_close((int)cgo);
+    }
+    int cp_orig = (cgl == 0 && rcg == 0 && ST_NLINK(scg) == 2 &&
+                   cgb[0] == 'o' && cgb[1] == 'g');
+    int ok_cp = (cp_own && cp_gone && cp_orig);
+    cng_dprintf(1, "l2s-copied: own=%d reclaimed=%d orig_kept=%d -> %s\n",
+                cp_own, cp_gone, cp_orig, ok_cp ? "OK" : "FAIL");
+    fails += !ok_cp;
+
+    /* A guest chroot narrows the view, and the store with it; a group linked
+     * before it keeps its data in the store of the view the run started
+     * with. Those links are still the emulation's (cng_l2s_home), as they
+     * were before the recognition was confined to the guest's own places. */
+    long hgf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/hs",
+                            CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+    if (hgf < 0)
+        cng_dispatch(__NR_mkdirat, CNG_AT_FDCWD, (long)"/w/hs", 0755, 0, 0, 0,
+                     0);
+    else
+        sys_close((int)hgf);
+    hgf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/hs/h1",
+                       CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (hgf >= 0)
+        sys_close((int)hgf);
+    long hgl = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/hs/h1",
+                            CNG_AT_FDCWD, (long)"/w/hs/h2", 0, 0, 0);
+    char hsr[CNG_PATH_MAX];
+    dbg_mkpath(hsr, sizeof hsr, rootfs, "/w/hs", 0, 0);
+    static struct cng_fs fs5;
+    cng_fs_init(&fs5, hsr);
+    cng_l2s_home(&fs);
+    cng_g_fs = &fs5;
+    char sh1[144];
+    long rh1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/h1",
+                            (long)sh1, CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0);
+    int home_reg = (hgl == 0 && rh1 == 0 && ST_ISREG(sh1) &&
+                    ST_NLINK(sh1) == 2);
+    long hu2 = cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/h2", 0, 0, 0,
+                            0, 0);
+    rh1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/h1", (long)sh1,
+                       0, 0, 0, 0);
+    int home_dec = (hu2 == 0 && rh1 == 0 && ST_NLINK(sh1) == 1);
+    cng_g_fs = &fs;
+    cng_l2s_home(0);
+    int ok_home = (home_reg && home_dec);
+    cng_dprintf(1, "l2s-home: reg=%d decref=%d -> %s\n", home_reg, home_dec,
+                ok_home ? "OK" : "FAIL");
+    fails += !ok_home;
+
     cng_blocked[__NR_linkat] = 0;
     cng_g_l2s = 0;
 

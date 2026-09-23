@@ -20,7 +20,10 @@
  * data + marker in the first-linked name's own directory, names as same-
  * directory *relative* symlinks. That legacy format (also what arm64chroot
  * writes) is still recognized everywhere; absolute targets whose rootfs prefix
- * went stale (the tree was moved) self-heal onto the current store.
+ * went stale (the tree was moved or copied) self-heal onto the current store.
+ * A link is ours only where its target names a data file the emulation could
+ * have written — in a place of the guest's own, or a stale store path — and
+ * the guest cannot write a target in the ".l2s." grammar itself (l2s.c).
  *
  * stat/statx on any of the names is redirected to the data file, with st_nlink
  * overridden to the marker count, so the group presents as ordinary regular
@@ -84,7 +87,9 @@ void cng_l2s_fix_fd(long fd, void *statbuf);
 void cng_l2s_fix_fd_statx(long fd, void *statxbuf);
 
 /* True for any hidden l2s file (data or marker) basename — used to hide them
- * from the guest's directory listings. */
+ * from the guest's directory listings, and to refuse a guest symlink whose
+ * target's last component is one (such a link would be taken for one of the
+ * emulation's own). */
 int cng_l2s_hidden(const char *name);
 
 /* Listing side of the emulation: is the entry `name` of the directory open
@@ -99,8 +104,17 @@ int cng_l2s_dirent(long dirfd, const char *name, unsigned long long *ino,
 /* If `tgt` (a symlink target) is an absolute host path naming an l2s data
  * file, fill `out` with its guest-view path — for the guest-level resolver,
  * which must not re-root such targets as guest paths. Self-heals store paths
- * whose rootfs prefix went stale. Returns 1 (filled) or 0 (not ours). */
+ * whose rootfs prefix went stale. Returns 1 (filled) or 0 (not ours: the
+ * target is re-rooted as any other). */
 int cng_l2s_untranslate_target(const char *tgt, char *out, size_t sz);
+
+/* Record the view chroot-ng was started with (run.c's, never written after
+ * it is published). A guest chroot narrows the view; a group linked before
+ * it keeps its data where the wider view put it, and is still recognized
+ * there. Only a link's target can name such a place — see l2s.c for which
+ * targets are the emulation's own. */
+struct cng_fs;
+void cng_l2s_home(const struct cng_fs *fs);
 
 /* 1 if the guest-supplied (dirfd, path) names l2s machinery — a data/marker
  * basename anywhere, or the "/.l2s" store dir — which must appear not to
