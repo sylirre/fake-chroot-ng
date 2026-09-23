@@ -3264,6 +3264,24 @@ vfork/`posix_spawn` child-stack handling.
   by name, followed and by descriptor, each joins the group (nlink, inode),
   and the data outlives the removal of the other names.
 
+- [x] **M67 — a segment whose end rounded up to nothing reserved nothing**
+  The header pass refused a `PT_LOAD` whose `p_vaddr + p_memsz` wrapped,
+  and one whose page-rounded end came out below its start. A sum within a
+  page of the top of the address space is neither: it does not wrap, and
+  `cng_page_up` turns it into 0 — which is not below a start of 0. So
+  `p_vaddr` 0 with `p_memsz` a page short of 2^64 passed with a span of 0.
+  Without `-R` that was an mmap of length 0 and an `EMAP`; with it, the
+  trampoline pool on top of the span made the reservation a pool-sized
+  mapping that succeeded, and the segment's whole file part was read into
+  it — past the pool, into whatever the kernel had placed after it (an exec
+  of such a file from a shell died "with the new image already mapped over
+  the old one"). `cng_page_end` (loader.h) now answers both ways an end can
+  fail to be an address, and the header pass refuses either with
+  `CNG_LOAD_EFORMAT` (ENOEXEC, the caller alive); `execmap.c`'s span
+  arithmetic, which had the same gap but only placed a pool with it, asks
+  the same helper. `-t elfspan` `roundwrap` in m3, with `-R` off and on
+  (the previous build: `plain=-4 rewrite=0`).
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

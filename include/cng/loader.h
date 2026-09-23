@@ -21,6 +21,19 @@ static inline unsigned long cng_page_down(unsigned long a) {
 static inline unsigned long cng_page_up(unsigned long a) {
     return (a + cng_page_size - 1) & ~(cng_page_size - 1);
 }
+/* The page-rounded end of [a, a+n) into *end: 0, or -1 when that end is not an
+ * address. There are two ways for it not to be one, and a guest-controlled
+ * pair (a segment's p_vaddr and p_memsz) can take either: the sum wraps, or it
+ * lands within a page of the top and cng_page_up wraps it to 0 — a sum that
+ * "did not overflow" and still rounds to nothing. */
+static inline int cng_page_end(unsigned long a, unsigned long n,
+                               unsigned long *end) {
+    unsigned long e = a + n;
+    if (e < a || e > ~0UL - (cng_page_size - 1))
+        return -1;
+    *end = cng_page_up(e);
+    return 0;
+}
 
 struct cng_loaded {
     unsigned long entry;   /* absolute entry point (bias + e_entry) */

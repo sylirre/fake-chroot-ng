@@ -148,6 +148,12 @@ esac
 # takes, and each passes the per-segment wrap check on its own.
 check_contains "a PT_LOAD span that cannot carry the trampoline pool is refused" \
     "elfspan wrap: plain=-2 rewrite=-2 -> OK" "$(run -t elfspan 2>&1)"
+# ...and an end that does not wrap as a sum but rounds up to 0: p_vaddr 0 and a
+# p_memsz a page short of 2^64. The span came out 0, which without -R was an
+# mmap that failed, and with it a pool-sized mapping that succeeded, with the
+# segment's whole file part then read into it.
+check_contains "a PT_LOAD whose page-rounded end wraps is refused" \
+    "elfspan roundwrap: plain=-2 rewrite=-2 -> OK" "$(run -t elfspan 2>&1)"
 
 # A PT_INTERP the loader cannot honor has to be refused, not dropped. Ignoring
 # one — because the path did not fit the buffer, or the file was too short to

@@ -392,15 +392,19 @@ static int elf_read_headers(int fd, struct cng_elf_plan *plan,
                 return CNG_LOAD_EINVAL;
         }
         /* Overflow, which is the span question one step out: p_vaddr and
-         * p_memsz are attacker-chosen 64-bit values, and a sum that wraps
-         * yields an `e` below `lo` and a span that is not the range we then
-         * write into. */
-        if (ph[i].p_vaddr + ph[i].p_memsz < ph[i].p_vaddr)
+         * p_memsz are attacker-chosen 64-bit values, and an end that is not an
+         * address yields a span that is not the range we then write into.
+         * The sum wrapping is one way; the other is a sum within a page of the
+         * top, which does not wrap but rounds up to 0 (cng_page_end). That one
+         * used to be caught only as `e < s`, which a segment starting in the
+         * first page never is — s was 0 as well, the span came out 0, and
+         * under -R the trampoline pool on top of it made the reservation a
+         * mapping that succeeded, a pool's size long, into which the
+         * segment's whole file part was then read. */
+        unsigned long e;
+        if (cng_page_end(ph[i].p_vaddr, ph[i].p_memsz, &e) != 0)
             return CNG_LOAD_EFORMAT;
         unsigned long s = cng_page_down(ph[i].p_vaddr);
-        unsigned long e = cng_page_up(ph[i].p_vaddr + ph[i].p_memsz);
-        if (e < s) /* cng_page_up wrapped at the top of the address space */
-            return CNG_LOAD_EFORMAT;
         if (s < lo)
             lo = s;
         if (e > hi)

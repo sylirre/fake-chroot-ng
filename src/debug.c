@@ -5224,6 +5224,31 @@ int cng_cmd_elfspan(int argc, char **argv, char **envp, unsigned long *auxv) {
     cng_dprintf(1, "elfspan wrap: plain=%d rewrite=%d -> %s\n", wrc[0], wrc[1],
                 wok ? "OK" : "FAIL");
 
+    /* ...and the end that does not wrap but rounds up to nothing. p_vaddr 0
+     * and p_memsz a page's worth short of 2^64 sum to an address within the
+     * last page, which cng_page_up turns into 0: the same 0 as the segment's
+     * start, so the old `e < s` let it through with a span of 0. Without -R
+     * that was an mmap of length 0 (EMAP); with it, the pool on top made a
+     * mapping that succeeded and the load was reported done — a pool's size
+     * of memory for a segment claiming the address space, with the file part
+     * read into it however long it was. One page short of 2^64 rounds to 0 on
+     * a 4, 16 or 64 KiB kernel alike. */
+    struct synth_seg rwrap = {0, SYNTH_ELF_HDRSZ, ~0UL - 0xFFE, 6 /*PF_R|PF_W*/,
+                              0};
+    int rrc[2];
+    for (int i = 0; i < 2; i++) {
+        cng_g_rewrite = i;
+        long rfd = synth_elf_memfd(3 /*ET_DYN*/, &rwrap, 1);
+        rrc[i] = rfd < 0 ? (int)rfd : cng_load_elf_fd((int)rfd, 0, &prog);
+        if (rfd >= 0)
+            sys_close((int)rfd);
+    }
+    cng_g_rewrite = saved;
+    int rok = rrc[0] == CNG_LOAD_EFORMAT && rrc[1] == CNG_LOAD_EFORMAT;
+    cng_dprintf(1, "elfspan roundwrap: plain=%d rewrite=%d -> %s\n", rrc[0],
+                rrc[1], rok ? "OK" : "FAIL");
+    wok = wok && rok;
+
     /* The real route, with the denial that produces it. PR_SET_MDWE refuses an
      * mprotect that adds PROT_EXEC — the same EACCES Android's execmem
      * revocation gives — so map_anon reports CNG_LOAD_EEXEC and the fall back

@@ -89,12 +89,12 @@ static int rewrite_text(int fd, unsigned long map, unsigned long off,
             return 0;
         if (ph.p_type != PT_LOAD)
             continue;
-        if (ph.p_vaddr + ph.p_memsz < ph.p_vaddr)
-            return 0; /* a header that wraps describes nothing */
-        unsigned long s = cng_page_down(ph.p_vaddr);
-        unsigned long e = cng_page_up(ph.p_vaddr + ph.p_memsz);
-        if (e < s)
+        /* A header whose end is not an address describes nothing — the sum
+         * wrapping, or rounding up to 0 from within a page of the top. */
+        unsigned long e;
+        if (cng_page_end(ph.p_vaddr, ph.p_memsz, &e) != 0)
             return 0;
+        unsigned long s = cng_page_down(ph.p_vaddr);
         if (s < vlo)
             vlo = s;
         if (e > vhi)
