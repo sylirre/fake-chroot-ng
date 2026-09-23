@@ -351,6 +351,23 @@ else
     else
         skip "many-socket leg: could not build tests/guests/nlmany.c with -pthread"
     fi
+    # ...and the table's own churn. A slot whose fd the guest closed is
+    # retired by whoever finds it, and found, judged and claimed were three
+    # steps: judged from one occupant, it could be claimed from the next, and
+    # the new socket in it was released under its owner — whose next call then
+    # went to the host as an AF_UNIX socket's (bind EINVAL; the four-thread leg
+    # above lost a dump to that now and then). A lookup that retired a stale
+    # slot with its number also stopped there. Eight threads open, bind, name
+    # and close sockets in a loop: every one must stay the emulation's. The
+    # previous build had about twenty go wrong a run.
+    if guest_cc "$M16D/nlchurn" tests/guests/nlchurn.c -pthread; then
+        cp "$M16D/nlchurn" "$R/bin/nlchurn"
+        st=$(CNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nlchurn 2>/dev/null)
+        check_contains "m16 sockets opened and closed by eight threads stay emulated" \
+            "nlchurn: sockets=3600 bad=0" "$st"
+    else
+        skip "slot-churn leg: could not build tests/guests/nlchurn.c with -pthread"
+    fi
 
     # --- 5. the hidden descriptors and the guest's own -----------------------
     # An emulated socket is three descriptors, and the guest knows one. A

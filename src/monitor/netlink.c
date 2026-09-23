@@ -159,28 +159,71 @@ struct sockaddr_nl_ {
  * SOCK_CLOEXEC — and its pair peer, which carries the guest's own flags —
  * survives into the next program.
  *
- * `state` is the slot's claim: NL_FREE is a slot nobody holds (a fresh table
- * element is all zero, so this is also the state an fd of 0 must never be
- * mistaken for), NL_CLAIMED one a socket() call is filling or emptying, and
- * NL_LIVE one whose fds are published. The table grows a page at a time
- * (cng_tab) and there is no limit on the sockets it holds: there was one, at
- * four, and the fifth concurrent emulated socket was handed the host's own
- * refusal — a resolver with one per thread reaches that on a device where
- * rtnetlink is denied. Two threads opening sockets at once used to pick the
- * same free slot; the claim is a compare-and-swap now. */
+ * `state` is the slot's claim, in its low two bits: NL_FREE is a slot nobody
+ * holds (a fresh table element is all zero, so this is also the state an fd
+ * of 0 must never be mistaken for), NL_CLAIMED one a thread is filling or
+ * emptying, and NL_LIVE one whose fds are published. The table grows a page
+ * at a time (cng_tab) and there is no limit on the sockets it holds: there
+ * was one, at four, and the fifth concurrent emulated socket was handed the
+ * host's own refusal — a resolver with one per thread reaches that on a
+ * device where rtnetlink is denied. Two threads opening sockets at once used
+ * to pick the same free slot; the claim is a compare-and-swap now.
+ *
+ * The bits above the claim count the claims made on the slot. A live slot
+ * whose fd no longer names its socket is retired by whoever finds it — close
+ * is not trapped — and finding, judging and claiming were three steps with
+ * nothing tying them to one occupant: another thread could retire the slot
+ * and put a new socket in it between a judgement and a claim, and the claim,
+ * from the "live" it had read, went through and released that new, live
+ * socket — closed its pair peer, and gave the slot to a third. So a live
+ * slot is judged on a snapshot of its fd and identity taken between two
+ * reads of an unchanged state (slot_snap), and claimed by a compare-and-swap
+ * from that very state (slot_claim), which every claim has since changed. */
 enum { NL_FREE = 0, NL_CLAIMED = 1, NL_LIVE = 2 };
+#define NL_KIND(st) ((st) & 3u)
 
 struct nl_slot {
-    int state;
+    unsigned state; /* claim | claims made << 2 */
     int fd, monfd, hostfd;
     struct cng_fdid id, monid, hostid;
 };
 
 static struct cng_tab g_slots = CNG_TAB_INIT(struct nl_slot);
 
-/* Is this live slot's fd still the socket it was handed out as? */
-static int slot_current(const struct nl_slot *s) {
-    return cng_fd_is(s->fd, &s->id);
+/* Claim the slot if its state is still `st`: 1 with *mine the claimed state.
+ * The fence orders the claim before the field stores that follow it, so a
+ * snapshot that reads one of them also reads the state move (slot_snap). */
+static int slot_claim(struct nl_slot *s, unsigned st, unsigned *mine) {
+    unsigned want = ((st & ~3u) + 4u) | NL_CLAIMED;
+    if (!__atomic_compare_exchange_n(&s->state, &st, want, 0, __ATOMIC_ACQ_REL,
+                                     __ATOMIC_RELAXED))
+        return 0;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    *mine = want;
+    return 1;
+}
+
+/* Settle a claimed slot as `kind` (NL_LIVE or NL_FREE), its fields written. */
+static void slot_settle(struct nl_slot *s, unsigned mine, unsigned kind) {
+    __atomic_store_n(&s->state, (mine & ~3u) | kind, __ATOMIC_RELEASE);
+}
+
+/* A live slot's fd and identity as one occupant published them, and the
+ * state they were read at; 0 for a slot that is not live, or changed while it
+ * was being read. */
+static int slot_snap(struct nl_slot *s, unsigned *st, int *fd,
+                     struct cng_fdid *id) {
+    unsigned a = __atomic_load_n(&s->state, __ATOMIC_ACQUIRE);
+    if (NL_KIND(a) != NL_LIVE)
+        return 0;
+    *fd = __atomic_load_n(&s->fd, __ATOMIC_RELAXED);
+    id->dev = __atomic_load_n(&s->id.dev, __ATOMIC_RELAXED);
+    id->ino = __atomic_load_n(&s->id.ino, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    if (__atomic_load_n(&s->state, __ATOMIC_RELAXED) != a)
+        return 0;
+    *st = a;
+    return 1;
 }
 
 /* Our end of the pair, or -1 once the number no longer names it. Abandoned,
@@ -223,15 +266,30 @@ static int slot_hostfd(struct nl_slot *s) {
     }
 }
 
-/* Give a slot back: its pair peer and relay socket are ours to close — where
- * the numbers still name them. The caller holds the claim. */
-static void slot_release(struct nl_slot *s) {
+/* Empty a slot: its pair peer and relay socket are ours to close — where the
+ * numbers still name them. The caller holds the claim, and settles it. */
+static void slot_empty(struct nl_slot *s) {
     if (s->monfd >= 0 && cng_fd_is(s->monfd, &s->monid))
         sys_close(s->monfd);
     if (s->hostfd >= 0 && cng_fd_is(s->hostfd, &s->hostid))
         sys_close(s->hostfd);
-    s->fd = s->monfd = s->hostfd = -1;
-    __atomic_store_n(&s->state, NL_FREE, __ATOMIC_RELEASE);
+    __atomic_store_n(&s->fd, -1, __ATOMIC_RELAXED);
+    s->monfd = s->hostfd = -1;
+}
+
+/* Retire a live slot judged stale on a snapshot taken at `st`: 1 with the
+ * slot emptied and claimed (*mine), for the caller to fill or give back; 0
+ * when it is not ours to retire — claimed or refilled since, or its fd put
+ * back meanwhile (asked again under the claim, and published as it was). */
+static int slot_retire(struct nl_slot *s, unsigned st, unsigned *mine) {
+    if (!slot_claim(s, st, mine))
+        return 0;
+    if (cng_fd_is(s->fd, &s->id)) {
+        slot_settle(s, *mine, NL_LIVE);
+        return 0;
+    }
+    slot_empty(s);
+    return 1;
 }
 
 static struct nl_slot *slot_of(int fd) {
@@ -240,18 +298,18 @@ static struct nl_slot *slot_of(int fd) {
     struct cng_tab_iter it;
     for (struct nl_slot *s = cng_tab_first(&g_slots, &it); s;
          s = cng_tab_next(&g_slots, &it)) {
-        if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) != NL_LIVE ||
-            s->fd != fd)
+        unsigned st, mine;
+        int sfd;
+        struct cng_fdid id;
+        if (!slot_snap(s, &st, &sfd, &id) || sfd != fd)
             continue;
-        if (slot_current(s))
+        if (cng_fd_is(fd, &id))
             return s;
-        /* Recycled behind our back: not ours. Whoever claims it first gives
-         * it back; a claim that fails is a socket() call already doing so. */
-        int live = NL_LIVE;
-        if (__atomic_compare_exchange_n(&s->state, &live, NL_CLAIMED, 0,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
-            slot_release(s);
-        return 0;
+        /* Recycled behind our back: this slot is not the number's socket.
+         * Retired by whoever claims it first — and the search goes on, for
+         * the slot a new socket given the number sits in. */
+        if (slot_retire(s, st, &mine))
+            slot_settle(s, mine, NL_FREE);
     }
     return 0;
 }
@@ -943,25 +1001,20 @@ long cng_nl_socket(long domain, long type, long protocol) {
      * or a new one at the end of the table. Each is taken with a CAS, so two
      * threads opening sockets at once cannot share one. */
     struct nl_slot *s = 0;
+    unsigned mine = 0;
     for (unsigned long i = 0; !s; i++) {
         struct nl_slot *c = cng_tab_at(&g_slots, i);
         if (!c)
             return -1; /* no page for the record: the host's own refusal */
-        int st = __atomic_load_n(&c->state, __ATOMIC_ACQUIRE);
-        if (st == NL_FREE) {
-            if (__atomic_compare_exchange_n(&c->state, &st, NL_CLAIMED, 0,
-                                            __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+        unsigned st = __atomic_load_n(&c->state, __ATOMIC_ACQUIRE);
+        int sfd;
+        struct cng_fdid id;
+        if (NL_KIND(st) == NL_FREE) {
+            if (slot_claim(c, st, &mine))
                 s = c;
-        } else if (st == NL_LIVE && !slot_current(c)) {
-            if (__atomic_compare_exchange_n(&c->state, &st, NL_CLAIMED, 0,
-                                            __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
-                slot_release(c);
-                st = NL_FREE;
-                if (__atomic_compare_exchange_n(&c->state, &st, NL_CLAIMED, 0,
-                                                __ATOMIC_ACQ_REL,
-                                                __ATOMIC_RELAXED))
-                    s = c;
-            }
+        } else if (slot_snap(c, &st, &sfd, &id) && !cng_fd_is(sfd, &id)) {
+            if (slot_retire(c, st, &mine)) /* emptied, and still claimed */
+                s = c;
         }
     }
     /* A connected AF_UNIX datagram socketpair stands in: the guest gets one
@@ -972,22 +1025,27 @@ long cng_nl_socket(long domain, long type, long protocol) {
     if (CNG_SYS(__NR_socketpair, CNG_AF_UNIX,
                 SOCK_DGRAM_ | (type & ~(long)SOCK_TYPE_MASK), 0, (long)sv, 0,
                 0) < 0) {
-        s->fd = s->monfd = s->hostfd = -1;
-        __atomic_store_n(&s->state, NL_FREE, __ATOMIC_RELEASE);
+        __atomic_store_n(&s->fd, -1, __ATOMIC_RELAXED);
+        s->monfd = s->hostfd = -1;
+        slot_settle(s, mine, NL_FREE);
         return -1;
     }
-    if (cng_fdid_of(sv[0], &s->id) != 0 || cng_fdid_of(sv[1], &s->monid) != 0) {
+    struct cng_fdid gid;
+    if (cng_fdid_of(sv[0], &gid) != 0 || cng_fdid_of(sv[1], &s->monid) != 0) {
         sys_close(sv[0]);
         sys_close(sv[1]);
-        s->fd = s->monfd = s->hostfd = -1;
-        __atomic_store_n(&s->state, NL_FREE, __ATOMIC_RELEASE);
+        __atomic_store_n(&s->fd, -1, __ATOMIC_RELAXED);
+        s->monfd = s->hostfd = -1;
+        slot_settle(s, mine, NL_FREE);
         return -1;
     }
-    s->fd = sv[0];
+    __atomic_store_n(&s->id.dev, gid.dev, __ATOMIC_RELAXED);
+    __atomic_store_n(&s->id.ino, gid.ino, __ATOMIC_RELAXED);
+    __atomic_store_n(&s->fd, sv[0], __ATOMIC_RELAXED);
     s->monfd = sv[1];
     s->hostfd = -1;
     slot_hostfd(s); /* the relay socket, where the host gives one */
-    __atomic_store_n(&s->state, NL_LIVE, __ATOMIC_RELEASE);
+    slot_settle(s, mine, NL_LIVE);
     if (cng_g_debug)
         cng_dprintf(2,
                     "[cng] netlink: emulating fd %d (host denies rtnetlink), "

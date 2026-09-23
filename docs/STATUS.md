@@ -3141,6 +3141,29 @@ vfork/`posix_spawn` child-stack handling.
   candidate are each passed over for the next candidate (all three were
   adopted by the previous build).
 
+- [x] **M62 — an emulated netlink slot judged stale was claimed from its next occupant**
+  The table of emulated `NETLINK_ROUTE` sockets retires a slot lazily — close
+  is not trapped — whenever a thread finds one whose fd no longer names its
+  socket, and finding, judging and claiming were three steps with nothing
+  tying them to one occupant. Another thread could retire the slot and open
+  a new socket in it between a judgement and the claim, and the claim, a
+  compare-and-swap from the same "live" it had read, went through: the new,
+  live socket was released under its owner, its pair peer closed and the
+  slot handed to a third. The owner's next call reached the host as an
+  AF_UNIX socket's — `bind` `EINVAL` — which is the four-thread leg of
+  `nlmany` failing now and then under load (1–2 in 80 loaded runs, on the
+  build before M60 too). A lookup that retired a stale slot holding the
+  number it was asked about also stopped there, so a live socket a new
+  owner had been given that number in another slot was taken for one that
+  was not emulated. The state word counts the claims made on the slot above
+  its two claim bits now; a live slot is judged on a snapshot of its fd and
+  identity taken between two reads of one state (`slot_snap`) and claimed
+  from exactly that state (`slot_claim`), the verdict asked once more under
+  the claim (`slot_retire`); a slot retired for reuse stays claimed rather
+  than passing through FREE, and a lookup goes on past a retired slot. m16
+  leg: `tests/guests/nlchurn.c`, eight threads opening, binding, naming and
+  closing 3600 sockets — about twenty went wrong a run, none now.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes
