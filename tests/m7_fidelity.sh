@@ -157,6 +157,12 @@ check_contains "l2s links of a copied rootfs heal onto the copy's own store" \
     "l2s-copied: own=1 reclaimed=1 orig_kept=1 -> OK" "$out"
 check_contains "l2s groups linked before a narrowing chroot stay recognized" \
     "l2s-home: reg=1 decref=1 -> OK" "$out"
+# Where the host permits hardlinks, a link of the emulation's own file used to
+# be the host's: of the symlink by name (a name the count never had, whose
+# group's last counted unlink deleted the data under it), of the backing file
+# followed or by descriptor. It joins the group now.
+check_contains "l2s links of the emulation's own file join the group" \
+    "l2s-hostlink: joined=1 kept=1 -> OK" "$out"
 check_contains "fchdir updates virtual cwd" "fchdir: cwd=/w -> OK" "$out"
 check_contains "chdir through a symlink records the directory it landed in" \
     "chdir-symlink: rc=0 cwd=/w -> OK" "$out"

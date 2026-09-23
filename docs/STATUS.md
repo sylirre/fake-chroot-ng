@@ -3246,6 +3246,24 @@ vfork/`posix_spawn` child-stack handling.
   kept (the previous build: ten failures, the bind's file turned into a
   symlink into the store).
 
+- [x] **M66 — a hardlink of the emulation's own file was the host's to make**
+  Where the host permits hardlinks, a `linkat` of an l2s name went to the
+  host like any other: without `AT_SYMLINK_FOLLOW` it linked the
+  emulation's *symlink* — a second name with the same target that the
+  group's marker never counted, so after the counted names were removed
+  the decref deleted the data under it (`ln a b` in a group `{a, c}`, then
+  `rm a c`: `b` dangles). Followed, or by a descriptor opened through a
+  name, it linked the backing file, which then counted its links apart
+  from the group's. Groups meet such a host whenever a rootfs made on one
+  that refuses links is used on one that does. The emulation's own file —
+  one of its links named without following, its backing file however
+  reached (`link_src_l2s`, i.e. `cng_l2s_stat` answering for it) — is now
+  linked by the emulation whatever the host would allow, which joins the
+  group; by descriptor, after the kernel's verdict on the source, asked as
+  M65 asks it. `-t l2stest` `l2s-hostlink` with the host's link unblocked:
+  by name, followed and by descriptor, each joins the group (nlink, inode),
+  and the data outlives the removal of the other names.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

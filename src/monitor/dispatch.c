@@ -1929,6 +1929,19 @@ static int link_src_ro(long fd, const char *srch, int by_fd, int followed) {
            cng_fs_host_ro(cng_g_fs, data);
 }
 
+/* Is the file a link is made from the l2s emulation's own: one of its links,
+ * named without following it, or its backing file — reached by following
+ * one, or through a descriptor opened by one? To the guest that file is a
+ * hardlinked regular file, and a new link of it has to join the group. The
+ * host, where it permits hardlinks at all, linked the emulation's symlink
+ * itself instead — a name the group's count never had, so the last counted
+ * unlink deleted the data under it — or the backing file, which then counted
+ * its links apart from the group's. */
+static int link_src_l2s(const char *srch) {
+    char st[STAT_BUF_SIZE];
+    return cng_g_l2s && cng_l2s_stat(srch, st) == 1;
+}
+
 /* What the kernel's filename_create says of a link's new name before the
  * mount question is reached: the directory's own error (ENOENT, ENOTDIR),
  * EEXIST for a name that is taken; 0 for a free one. */
@@ -4604,6 +4617,20 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                     goto by_link;
                 return r;
             }
+            /* A descriptor on an l2s backing file (see link_src_l2s): the
+             * same probe for the kernel's verdict on the source, and then the
+             * emulation makes the link, whatever the host would allow. */
+            if (dp && (int)a0 != CNG_AT_FDCWD && link_src_l2s(srch)) {
+                r = reissue(a0, sp ? (long)"" : 0, CNG_AT_FDCWD, (long)"/", fl,
+                            0, __NR_linkat);
+                if (r == -EEXIST || r == -ENOSYS) {
+                    r = -EPERM;
+                    goto fallback;
+                }
+                if (r == -ENOENT && cng_fake_root())
+                    goto by_link;
+                return r;
+            }
             r = reissue(a0, sp ? (long)"" : 0, ddfd, dst, fl, 0, __NR_linkat);
             /* Under fake root the capability is faked, as chroot's
              * CAP_SYS_CHROOT and the DAC bypass are. Root's AT_EMPTY_PATH
@@ -4663,7 +4690,9 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             long e = link_dst_verdict(dsth);
             return e ? e : -EXDEV;
         }
-        if (force)
+        /* The emulation's own file is linked by the emulation, whatever the
+         * host would allow (see link_src_l2s); -EPERM sends it there. */
+        if (force || link_src_l2s(srch))
             r = -EPERM;
         else
             r = reissue(CNG_AT_FDCWD, (long)srch, CNG_AT_FDCWD, (long)dsth,

@@ -4179,6 +4179,73 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
                 ok_home ? "OK" : "FAIL");
     fails += !ok_home;
 
+    /* A link of the emulation's own file where the host permits hardlinks
+     * (linkat unblocked: the harness's tmpfs does). By name, the host linked
+     * the emulation's symlink — a name the count never had, whose group's
+     * last counted unlink deleted the data under it; followed, or through a
+     * descriptor opened by the name, it linked the backing file, which then
+     * counted apart from the group. Each has to join the group. A descriptor
+     * is a link source only as far as the kernel says (before 6.10 the flag
+     * takes CAP_DAC_READ_SEARCH), so that leg expects the kernel's answer. */
+    long qf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/q1",
+                           CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (qf >= 0) {
+        sys_write((int)qf, "qq", 2);
+        sys_close((int)qf);
+    }
+    long ql2 = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/q1",
+                            CNG_AT_FDCWD, (long)"/w/q2", 0, 0, 0);
+    cng_blocked[__NR_linkat] = 0;
+    long ql3 = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/q1",
+                            CNG_AT_FDCWD, (long)"/w/q3", 0, 0, 0);
+    long ql4 = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/q1",
+                            CNG_AT_FDCWD, (long)"/w/q4", CNG_AT_SYMLINK_FOLLOW,
+                            0, 0);
+    long qd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/q1",
+                           CNG_O_RDONLY, 0, 0, 0, 0);
+    long qprobe = qd >= 0 ? CNG_SYS(__NR_linkat, qd, (long)"", CNG_AT_FDCWD,
+                                    (long)"/", CNG_AT_EMPTY_PATH, 0)
+                          : -EBADF;
+    long ql5 = qd >= 0 ? cng_dispatch(__NR_linkat, qd, (long)"", CNG_AT_FDCWD,
+                                      (long)"/w/q5", CNG_AT_EMPTY_PATH, 0, 0)
+                       : -EBADF;
+    if (qd >= 0)
+        sys_close((int)qd);
+    cng_blocked[__NR_linkat] = 1;
+    int q5_made = qprobe == -EEXIST;
+    char sq1[144], sqx[144];
+    long rq1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/q1",
+                            (long)sq1, 0, 0, 0, 0);
+    int q_join = (ql2 == 0 && ql3 == 0 && ql4 == 0 &&
+                  ql5 == (q5_made ? 0 : qprobe) && rq1 == 0 &&
+                  ST_NLINK(sq1) == (unsigned)(q5_made ? 5 : 4));
+    const char *qn[] = {"/w/q3", "/w/q4", "/w/q5"};
+    for (int i = 0; i < 2 + q5_made; i++) {
+        long rx = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)qn[i],
+                               (long)sqx, 0, 0, 0, 0);
+        q_join &= rx == 0 && ST_ISREG(sqx) && ST_INO(sqx) == ST_INO(sq1);
+    }
+    const char *qu[] = {"/w/q1", "/w/q2", "/w/q3"};
+    for (int i = 0; i < 3; i++)
+        cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)qu[i], 0, 0, 0, 0, 0);
+    char qb[4] = {0};
+    long qo = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/q4",
+                           CNG_O_RDONLY, 0, 0, 0, 0);
+    if (qo >= 0) {
+        sys_read((int)qo, qb, 2);
+        sys_close((int)qo);
+    }
+    rq1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/q4", (long)sq1,
+                       0, 0, 0, 0);
+    int q_kept = (qb[0] == 'q' && qb[1] == 'q' && rq1 == 0 &&
+                  ST_NLINK(sq1) == (unsigned)(q5_made ? 2 : 1));
+    cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/q4", 0, 0, 0, 0, 0);
+    cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/q5", 0, 0, 0, 0, 0);
+    int ok_q = (q_join && q_kept);
+    cng_dprintf(1, "l2s-hostlink: joined=%d kept=%d -> %s\n", q_join, q_kept,
+                ok_q ? "OK" : "FAIL");
+    fails += !ok_q;
+
     cng_blocked[__NR_linkat] = 0;
     cng_g_l2s = 0;
 
