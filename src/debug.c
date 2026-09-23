@@ -6561,6 +6561,46 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
             sys_close((int)fd);
         }
 
+        /* A refreshable file opened onto the number another one just had:
+         * the entry that number carried describes the file before, and it
+         * is the one taken for the new file's (pf_track), not left beside
+         * it for the first read to find, retire, and skip the refresh on.
+         * The rewind must regenerate, as uptime's advancing clock shows,
+         * and as uptime rather than as the loadavg the number had. */
+        {
+            long la = pt_open("/proc/loadavg");
+            if (la >= 0)
+                sys_close((int)la);
+            long up = pt_open("/proc/uptime");
+            char u1[128], u2[128];
+            long n1 = up >= 0 ? cng_dispatch(__NR_read, up, (long)u1,
+                                             sizeof u1 - 1, 0, 0, 0, 0)
+                              : -1;
+            struct {
+                long s, ns;
+            } nap = {0, 30000000};
+            CNG_SYS(__NR_nanosleep, (long)&nap, 0, 0, 0, 0, 0);
+            long n2 = -1;
+            if (up >= 0) {
+                sys_lseek((int)up, 0, CNG_SEEK_SET);
+                n2 = cng_dispatch(__NR_read, up, (long)u2, sizeof u2 - 1, 0,
+                                  0, 0, 0);
+            }
+            int spaces = 0;
+            for (long i = 0; i < n2; i++)
+                spaces += u2[i] == ' ';
+            int moved = n1 > 0 && n2 > 0 && (n1 != n2 || memcmp(u1, u2, (size_t)n1));
+            int ok = la >= 0 && up == la && spaces == 1 && moved;
+            cng_dprintf(1,
+                        "proctest synth fd reused by another kind: same=%d "
+                        "uptime=%d refreshed=%d -> %s\n",
+                        la >= 0 && up == la, spaces == 1, moved,
+                        ok ? "OK" : "FAIL");
+            fails += !ok;
+            if (up >= 0)
+                sys_close((int)up);
+        }
+
         fd = pt_open("/proc/uptime");
         n = pt_slurp(fd, buf, sizeof buf);
         ok = n > 0 && buf[0] >= '0' && buf[0] <= '9' && pt_has(buf, ".");

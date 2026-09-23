@@ -690,31 +690,103 @@ static int put_maps(int fd, const char *host) {
  * memfd's old descriptor number, passed as the memfd and was truncated and
  * rewritten with /proc/stat, through a description of our own opened for
  * writing on a file the guest may only have been able to read. */
+/*
+ * An entry is three facts about one descriptor — its number, the kind of file
+ * it regenerates as, and the identity that proves the number still names it —
+ * and a reader needs all three from the same moment. The number used to be
+ * published by a compare-and-swap with the other two written after it, so a
+ * sibling thread reading the new descriptor in that interval (the synthesized
+ * range is small, and its numbers easy to guess) judged it against the
+ * identity of whatever the slot held before: a mismatch that retired the
+ * entry, or with a matching identity, the previous kind — a /proc/uptime
+ * rewritten as /proc/loadavg. A stale verdict was retired with a plain store,
+ * too, which could clear an entry another thread had just made in that slot.
+ *
+ * So each entry carries a sequence: even when it is settled, odd while one
+ * thread rewrites it. A reader takes the three facts between two reads of an
+ * even, unchanged sequence (pf_snap), and a writer — tracking a new
+ * descriptor, reclaiming a stale entry, retiring one — claims the entry with
+ * a compare-and-swap from the very sequence its snapshot was taken at, so
+ * that what it judged is what it replaces. Nobody waits for a claim: a
+ * reader that meets one skips the entry, which leaves one read with its
+ * open-time snapshot, and a writer tries the next entry.
+ */
 static struct {
-    int fd1; /* fd + 1, so a zeroed table means "all free"; claimed by CAS */
+    unsigned seq; /* even: settled; odd: being rewritten by its claimant */
+    int fd1;      /* fd + 1, so a zeroed table means "all free" */
     int kind;
     struct cng_fdid id;
 } g_pf[CNG_SYNTH_FD_SLOTS];
 
+/* A settled copy of entry i, and the sequence it was taken at; 0 while a
+ * claimant is rewriting it. */
+static int pf_snap(int i, unsigned *seq, int *fd1, int *kind,
+                   struct cng_fdid *id) {
+    unsigned s = __atomic_load_n(&g_pf[i].seq, __ATOMIC_ACQUIRE);
+    if (s & 1)
+        return 0;
+    *fd1 = __atomic_load_n(&g_pf[i].fd1, __ATOMIC_RELAXED);
+    *kind = __atomic_load_n(&g_pf[i].kind, __ATOMIC_RELAXED);
+    id->dev = __atomic_load_n(&g_pf[i].id.dev, __ATOMIC_RELAXED);
+    id->ino = __atomic_load_n(&g_pf[i].id.ino, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    if (__atomic_load_n(&g_pf[i].seq, __ATOMIC_RELAXED) != s)
+        return 0;
+    *seq = s;
+    return 1;
+}
+
+/* Claim entry i if it still holds what was read at `seq`. The fence orders
+ * the odd sequence before every field store that follows, so a reader that
+ * sees one of those stores also sees the sequence move (the seqlock
+ * writer's half of pf_snap's acquire fence). */
+static int pf_claim(int i, unsigned seq) {
+    if (!__atomic_compare_exchange_n(&g_pf[i].seq, &seq, seq + 1, 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+        return 0;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    return 1;
+}
+
+/* Settle a claimed entry: its facts, then the sequence that publishes them. */
+static void pf_settle(int i, unsigned seq, int fd1, int kind,
+                      const struct cng_fdid *id) {
+    __atomic_store_n(&g_pf[i].fd1, fd1, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_pf[i].kind, kind, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_pf[i].id.dev, id->dev, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_pf[i].id.ino, id->ino, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_pf[i].seq, seq + 2, __ATOMIC_RELEASE);
+}
+
 static void pf_track(int fd, int kind) {
-    struct cng_fdid id;
-    if (cng_fdid_of(fd, &id) != 0)
+    struct cng_fdid nid;
+    if (cng_fdid_of(fd, &nid) != 0)
         return;
-    for (int i = 0; i < CNG_SYNTH_FD_SLOTS; i++) {
-        int expect = 0; /* free */
-        if (__atomic_compare_exchange_n(&g_pf[i].fd1, &expect, fd + 1, 0,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
-            g_pf[i].kind = kind;
-            g_pf[i].id = id;
-            return;
-        }
-        /* Reclaim a slot whose fd is gone or now names a different file (we do
-         * not trap close, so entries are only ever retired lazily). */
-        if (expect > 0 && !cng_fd_is(expect - 1, &g_pf[i].id) &&
-            __atomic_compare_exchange_n(&g_pf[i].fd1, &expect, fd + 1, 0,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
-            g_pf[i].kind = kind;
-            g_pf[i].id = id;
+    /* The entry this very number had, first: it described the file the
+     * number named before this one, so it is stale by the new file's
+     * identity, and left beside the new entry it would be the one a read
+     * finds and retires, with the refresh skipped. Then a free entry, then
+     * one whose fd is gone or now names a different file (we do not trap
+     * close, so entries are only ever retired lazily). A stale verdict is
+     * asked again under the claim — a dup2 can have put the file back — and
+     * an entry that is not stale after all is given back as it was. */
+    for (int pass = 0; pass < 3; pass++) {
+        for (int i = 0; i < CNG_SYNTH_FD_SLOTS; i++) {
+            unsigned s;
+            int f1, k;
+            struct cng_fdid id;
+            if (!pf_snap(i, &s, &f1, &k, &id))
+                continue;
+            int take = pass == 0   ? f1 == fd + 1
+                       : pass == 1 ? f1 == 0
+                                   : f1 > 0 && !cng_fd_is(f1 - 1, &id);
+            if (!take || !pf_claim(i, s))
+                continue;
+            if (f1 > 0 && cng_fd_is(f1 - 1, &id)) {
+                pf_settle(i, s, f1, k, &id);
+                continue;
+            }
+            pf_settle(i, s, fd + 1, kind, &nid);
             return;
         }
     }
@@ -774,18 +846,31 @@ void cng_procfs_pre_read(int fd, long off) {
     if (fd < 0)
         return;
     for (int i = 0; i < CNG_SYNTH_FD_SLOTS; i++) {
-        if (__atomic_load_n(&g_pf[i].fd1, __ATOMIC_ACQUIRE) != fd + 1)
+        unsigned s;
+        int f1, kind;
+        struct cng_fdid id;
+        if (!pf_snap(i, &s, &f1, &kind, &id) || f1 != fd + 1)
             continue;
-        if (!cng_fd_is(fd, &g_pf[i].id)) { /* stale: the fd was reused */
-            __atomic_store_n(&g_pf[i].fd1, 0, __ATOMIC_RELEASE);
-            return;
+        if (!cng_fd_is(fd, &id)) {
+            /* Stale: the fd was reused. Retired only as it was judged — an
+             * entry another thread has made here since is not this one —
+             * and the scan goes on, for the entry the number's current
+             * file may have. */
+            if (pf_claim(i, s)) {
+                struct cng_fdid none = {0, 0};
+                if (cng_fd_is(fd, &id)) /* put back meanwhile (see pf_track) */
+                    pf_settle(i, s, f1, kind, &id);
+                else
+                    pf_settle(i, s, 0, 0, &none);
+            }
+            continue;
         }
         long cur = sys_lseek(fd, 0, CNG_SEEK_CUR);
         if (off < 0)
             off = cur;
         if (off != 0)
             return; /* mid-file: keep the current snapshot */
-        regen(fd, g_pf[i].kind, &g_pf[i].id);
+        regen(fd, kind, &id);
         /* pread(2) is defined never to move the file offset. The rewrite goes
          * through a description of its own and leaves the guest's where it
          * was — unless it had to write through the guest's own, which it then

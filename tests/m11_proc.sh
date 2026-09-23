@@ -97,6 +97,11 @@ check_contains "the refresh is keyed on device and inode, and a reused number is
     "proctest synth fd identity: dev+ino=1 reused number left alone=1 -> OK" "$out"
 check_contains "a pread that triggers the refresh leaves the offset alone" \
     "proctest pread keeps the offset: 8 then 8 -> OK" "$out"
+# The entry a number carried is the one taken when another refreshable file is
+# opened onto it; left beside the new one, it was what the first read found
+# and retired, skipping that read's refresh.
+check_contains "a number reused by another refreshable file refreshes as it" \
+    "proctest synth fd reused by another kind: same=1 uptime=1 refreshed=1 -> OK" "$out"
 check_contains "uptime is synthesized" "proctest uptime:" "$out"
 # The description handed over is what the real file gives. memfd_create only
 # makes O_RDWR files, and that was what the guest got: a /proc file it could
@@ -228,6 +233,26 @@ if guest_xlate_ready "maps over-long-line legs" &&
     fi
 fi
 rm -rf "$ML_DIR"
+
+# A refreshable file's tracking entry used to publish the descriptor before
+# its kind and identity, so a sibling thread reading the new number in that
+# interval judged it against the entry's previous identity, retired it, and
+# the file never refreshed again. Reader threads pread the whole reserved range
+# from offset 0 while the main thread opens batches of /proc/uptime into it and
+# checks that each rewind reads a clock that has moved. The window is a few
+# instructions wide, so the previous build loses a refresh in only some runs;
+# a lost one is never right.
+PR_ROOT=$(mktemp -d)
+if guest_xlate_ready "refresh-tracking race leg" &&
+    guest_cc "$PR_ROOT/procrace" tests/guests/procrace.c -pthread; then
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
+    out=$(run_t 120 -R $GUEST_BINDS "$PR_ROOT" /procrace 2>&1)
+    check_contains "a rewind refreshes however readers race the open" \
+        "procrace: samples>0=1 lost=0" "$out"
+else
+    skip "refresh-tracking race leg: could not build tests/guests/procrace.c with -pthread"
+fi
+rm -rf "$PR_ROOT"
 
 # --- guest-shell scenarios -------------------------------------------------
 m11_ready=0

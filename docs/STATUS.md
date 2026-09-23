@@ -3186,6 +3186,34 @@ vfork/`posix_spawn` child-stack handling.
   state to publish, and none to share. About three syscalls more per
   relayed request. m16 leg: `nlrace` (rounds=60 left=0 leaked=0).
 
+- [x] **M64 — a refreshable /proc descriptor was published before its facts**
+  A refreshable synthesized file (`/proc/uptime`, `loadavg`, `stat`) is a
+  memfd in a small reserved descriptor range, tracked by an entry of three
+  facts — the number, the kind of file it regenerates as, and the memfd's
+  identity — so a read from offset 0 can regenerate it. The number was
+  published by a compare-and-swap and the other two written after it, so
+  a sibling thread reading the new descriptor in between (the range is
+  small, its numbers easy to hit) judged it against the identity the entry
+  had before: a mismatch that retired the entry, and the file never
+  refreshed again — or, with ARM's ordering, a matching identity beside the
+  previous kind. A stale verdict was retired with a plain store too, which
+  could clear an entry another thread had just made there. Each entry
+  carries a sequence now (even settled, odd being rewritten): readers take
+  the three facts between two reads of an unchanged even sequence
+  (`pf_snap`), and every writer — tracking, reclaiming, retiring — claims
+  the entry by a compare-and-swap from the very sequence it judged
+  (`pf_claim`), so what it replaces is what it looked at; nobody waits on a
+  claim, which the `-R` tier's same-thread re-entry would make a deadlock.
+  Tracking takes the entry the number itself had first (stale by the new
+  file's identity; left beside the new entry it was what the next read
+  retired, skipping that refresh), and a read that retires a stale entry
+  goes on looking for the live one. Legs: `-t proctest` "synth fd reused
+  by another kind" (a number moved from loadavg to uptime refreshes, as
+  uptime), and `tests/guests/procrace.c` in m11 (reader threads pread the
+  whole range while batches of uptime files are opened into it; a rewind
+  that reads an unmoved clock is a lost refresh — the previous build loses
+  one in some runs, the window being a few instructions wide).
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes
