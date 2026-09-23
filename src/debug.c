@@ -9632,15 +9632,170 @@ int cng_cmd_tabtest(int argc, char **argv, char **envp, unsigned long *auxv) {
  * patched through the entry point the SIGSYS body calls with the site the
  * CPU trapped from; then every patched site is called, so the trampoline it
  * branches to is proven to run the syscall. */
+/* The permission column /proc/self/maps shows for the mapping holding `addr`
+ * ("r-xp"), into perm[5]; "" when no line covers it. */
+static void lz_perms(unsigned long addr, char perm[5]) {
+    static char mb[65536];
+    perm[0] = '\0';
+    long fd = sys_openat(CNG_AT_FDCWD, "/proc/self/maps",
+                         CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    long n = pt_slurp(fd, mb, sizeof mb);
+    if (fd >= 0)
+        sys_close((int)fd);
+    for (char *l = mb; n > 0 && *l;) {
+        char *e = strchr(l, '\n');
+        unsigned long lo = 0, hi = 0;
+        char *q = l;
+        for (; *q && *q != '-'; q++)
+            lo = lo * 16 + (unsigned long)(*q <= '9' ? *q - '0' : *q - 'a' + 10);
+        for (q++; *q && *q != ' '; q++)
+            hi = hi * 16 + (unsigned long)(*q <= '9' ? *q - '0' : *q - 'a' + 10);
+        if (*q == ' ' && addr >= lo && addr < hi) {
+            memcpy(perm, q + 1, 4);
+            perm[4] = '\0';
+            return;
+        }
+        if (!e)
+            break;
+        l = e + 1;
+    }
+}
+
+/* Write `nblk` getpid-and-return blocks of four words (the svc at +4 of
+ * each) into [p, p+len) and give the range protection `prot`. */
+static int lz_fill(unsigned long p, unsigned long len, int nblk, int prot) {
+    if (sys_mprotect((void *)p, len, CNG_PROT_READ | CNG_PROT_WRITE) != 0)
+        return 0;
+    uint32_t *code = (uint32_t *)p;
+    for (int i = 0; i < nblk; i++) {
+        code[4 * i + 0] = 0xD2801588u; /* mov x8, #172 (getpid) */
+        code[4 * i + 1] = 0xD4000001u; /* svc #0 */
+        code[4 * i + 2] = 0xD65F03C0u; /* ret */
+        code[4 * i + 3] = 0xD503201Fu; /* nop */
+    }
+    if (sys_mprotect((void *)p, len, prot) != 0)
+        return 0;
+    cng_flush_icache((void *)p, (void *)(p + 16 * (unsigned long)nblk));
+    return 1;
+}
+
+/* _lazytest stale [gone|shared|prot|full] — a record of the lazy rewriter
+ * says where a mapping was when a site in it first trapped, and the guest
+ * moves its own text without a word to us. Each leg makes the record, changes
+ * the mapping under it the way a guest can, then hands the patcher a site the
+ * record covers:
+ *
+ *  gone    the page is unmapped: what a sibling thread's munmap between the
+ *          trap and the patch leaves. The word was a load of ours, which
+ *          faulted in a handler with every signal masked.
+ *  shared  a MAP_SHARED memfd mapped over the same address: the record said
+ *          private, and the branch went into the memfd — into every other
+ *          mapping of it, a JIT's writable view included.
+ *  prot    the text made writable since (a JIT): the protection the record
+ *          was made with was put back after the store, taking write away.
+ *  full    more sites than a pool holds: the one that found it full unmapped
+ *          the pool, and every site already patched branched into nothing.
+ *
+ * Each leg is in its own pages of one reservation, PROT_NONE between them,
+ * so no two share a mapping or an address a record could outlive into. */
+static int lazy_stale(const char *only) {
+    unsigned long pg = cng_page_size, tsz = cng_tramp_size();
+    /* More blocks than a pool (128 KiB of trampolines) takes, and pages for
+     * them: sixteen bytes a block. */
+    int nfull = (int)(0x20000UL / tsz) + 16;
+    unsigned long flen = cng_page_up(16 * (unsigned long)nfull);
+    unsigned long span = 8 * pg + flen + pg;
+    void *res = sys_mmap(0, span, CNG_PROT_NONE,
+                         CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (res == CNG_MAP_FAILED || cng_is_err((long)res)) {
+        cng_dprintf(1, "lazytest stale: mmap failed -> FAIL\n");
+        return 1;
+    }
+    unsigned long base = (unsigned long)res;
+    long pid = sys_getpid();
+    int rx = CNG_PROT_READ | CNG_PROT_EXEC;
+    /* A pool is written while it stays executable, so a host that grants no
+     * writable executable memory (PR_SET_MDWE, a revoked execmem) has no lazy
+     * tier to test. */
+    if (sys_mprotect(res, pg, rx | CNG_PROT_WRITE) != 0) {
+        sys_munmap(res, span);
+        cng_dprintf(1, "lazytest stale: no writable executable memory -> SKIP\n");
+        return 0;
+    }
+    sys_mprotect(res, pg, CNG_PROT_NONE);
+    int gone = -1, shared = -1, prot = -1, full = -1;
+
+    if (!only || !strcmp(only, "gone")) {
+        unsigned long p = base + pg;
+        int a = lz_fill(p, pg, 2, rx) ? cng_rewrite_site(p + 4) : -1;
+        sys_munmap((void *)p, pg);
+        int b = cng_rewrite_site(p + 20);
+        gone = a == 1 && b == 0;
+    }
+    if (!only || !strcmp(only, "shared")) {
+        unsigned long p = base + 3 * pg;
+        int a = lz_fill(p, pg, 1, rx) ? cng_rewrite_site(p + 4) : -1;
+        long mfd = sys_memfd_create("cng-lazy-shared", CNG_MFD_CLOEXEC);
+        uint32_t blk[4] = {0xD2801588u, 0xD4000001u, 0xD65F03C0u, 0xD503201Fu};
+        int b = -1;
+        uint32_t w = 0;
+        if (mfd >= 0 && sys_ftruncate((int)mfd, (long)pg) == 0 &&
+            cng_write_all((int)mfd, blk, sizeof blk) == (long)sizeof blk) {
+            void *m = sys_mmap((void *)p, pg, rx, CNG_MAP_SHARED | CNG_MAP_FIXED,
+                               (int)mfd, 0);
+            if (!cng_is_err((long)m) && (unsigned long)m == p) {
+                b = cng_rewrite_site(p + 4);
+                sys_pread64((int)mfd, &w, sizeof w, 4);
+            }
+        }
+        if (mfd >= 0)
+            sys_close((int)mfd);
+        shared = a == 1 && b == 0 && w == 0xD4000001u;
+    }
+    if (!only || !strcmp(only, "prot")) {
+        unsigned long p = base + 5 * pg;
+        int a = lz_fill(p, pg, 2, rx) ? cng_rewrite_site(p + 4) : -1;
+        char perm[5] = "";
+        int b = -1;
+        if (sys_mprotect((void *)p, pg, rx | CNG_PROT_WRITE) == 0) {
+            b = cng_rewrite_site(p + 20);
+            lz_perms(p, perm);
+        }
+        long (*fn)(void) = (long (*)(void))(p + 16);
+        prot = a == 1 && b == 1 && !strcmp(perm, "rwxp") && fn() == pid;
+    }
+    if (!only || !strcmp(only, "full")) {
+        unsigned long p = base + 7 * pg;
+        int patched = 0, ran = 0;
+        if (lz_fill(p, flen, nfull, rx)) {
+            for (int i = 0; i < nfull; i++)
+                patched += cng_rewrite_site(p + 16 * (unsigned long)i + 4) == 1;
+            /* The first site patched and the last: both branch into the pool
+             * the site that found it full stopped at. */
+            long (*f0)(void) = (long (*)(void))p;
+            long (*fl)(void) = (long (*)(void))(p + 16 * (unsigned long)(patched - 1));
+            if (patched > 0)
+                ran = (f0() == pid) + (fl() == pid);
+        }
+        full = patched > 0 && patched < nfull && ran == 2;
+    }
+    sys_munmap(res, span);
+    int ok = gone != 0 && shared != 0 && prot != 0 && full != 0;
+    cng_dprintf(1,
+                "lazytest stale: gone=%d shared=%d prot=%d full=%d -> %s\n",
+                gone, shared, prot, full, ok ? "OK" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 int cng_cmd_lazytest(int argc, char **argv, char **envp, unsigned long *auxv) {
-    (void)argc;
-    (void)argv;
     (void)envp;
     (void)auxv;
     static struct cng_fs fs;
     cng_fs_init(&fs, "/");
     cng_g_fs = &fs;
     cng_g_rewrite = 1;
+    if (argc > 1 && !strcmp(argv[1], "stale"))
+        return lazy_stale(argc > 2 ? argv[2] : 0);
 
     enum { N = 60 };
     unsigned long pg = cng_page_size;

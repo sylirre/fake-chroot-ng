@@ -3341,6 +3341,46 @@ vfork/`posix_spawn` child-stack handling.
   marker gone, bumped, and the group removed, the strays untouched
   throughout (the previous build: `two=0 lost=0`).
 
+- [x] **M71 — the lazy patch trusted what a mapping was when it first trapped**
+  M34's patcher read `/proc/self/maps` once per mapping and then, for every
+  later site in it, loaded the word, `mprotect`ed the page writable, stored
+  the branch, flushed the icache by address and put back the protection it
+  had recorded — all on the guest's own page. Four ways that went wrong.
+  A sibling thread's `munmap` between the trap and the patch made the load,
+  the store or the flush a fault in a handler with every signal masked: the
+  process died. A record outlives its mapping, so a library closed and a
+  shared mapping put at the same addresses (a JIT's memfd view) was written
+  as if private — the branch went into the memfd, and into its writable
+  view. A guest that made its text writable since (a JIT) had the recorded
+  read-only protection put back after the store. And "retire", on the site
+  that found the pool full or its page unwritable, unmapped the pool — which
+  every site already patched branched into.
+  Now (the owner's choice among three): the word is read and the branch
+  written through `/proc/self/mem`, opened per patch (a descriptor is bound
+  to the address space it was opened in, so one kept across a fork writes
+  the parent), so the kernel does the access with the mapping held still,
+  answers EIO for a page that is gone, and does the icache maintenance for
+  an executable one (`copy_to_user_page`, what a debugger's breakpoint
+  relies on). What the page is — private, readable and executable, its
+  protection to put back — is read from `/proc/self/maps` at each patch:
+  one read per site patched rather than per mapping, never per trap. The
+  `mprotect` stays as the policy's say (an execmod or MDWE refusal means
+  "not ours to patch"), so nothing here writes text the host would not let
+  it. A record only keeps a pool and a verdict: one the page contradicts is
+  closed, and a closed record keeps its pool while any trampoline is in it
+  (handed back at the exec). What remains is a sibling thread changing that
+  very page within the patch's few syscalls, whose change the restore can
+  overwrite — in-process-inherent, stated in the threat model in
+  `docs/DESIGN.md`. `-t lazytest stale` in m8: gone, shared, prot and full,
+  one leg each (the previous build dies on gone and full, writes the memfd,
+  and leaves the text read-only). The same four through real traps, where
+  a filter is live: `tests/guests/lazystale.c` writes its own code, as a
+  JIT does, and moves the mapping under the record — the race leg a thread
+  unmapping and replacing the page while sites in it trap. On the native
+  VM (6.8) the previous build fails the first three and dies in the race,
+  six runs in six, with SIGSEGV at the `svc` word itself: the patcher's
+  load, not the guest's fetch.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

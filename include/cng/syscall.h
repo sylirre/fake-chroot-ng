@@ -59,6 +59,9 @@ static inline long sys_lseek(int fd, long off, int whence) {
 static inline long sys_pread64(int fd, void *b, size_t n, long off) {
     return CNG_SYS(__NR_pread64, fd, b, n, off, 0, 0);
 }
+static inline long sys_pwrite64(int fd, const void *b, size_t n, long off) {
+    return CNG_SYS(__NR_pwrite64, fd, b, n, off, 0, 0);
+}
 static inline void *sys_mmap(void *a, size_t l, int prot, int fl, int fd,
                              long off) {
     return (void *)CNG_SYS(__NR_mmap, a, l, prot, fl, fd, off);

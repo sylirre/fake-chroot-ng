@@ -74,8 +74,48 @@ case "$rwout" in
     check "the lazy rewriter remembers more than 32 mappings" 0 $rc
     check_contains "...every one patched and running through its pool" \
         "60 mappings: 60 patched, 60 ran through their trampolines -> OK" "$out"
+    # A record says where a mapping was when a site in it first trapped, and
+    # the guest moves its own text without a word to us. Each leg changes the
+    # mapping under a record and hands the patcher a site the record covers:
+    # the page unmapped (the word was a load of ours, which faulted with every
+    # signal masked), a shared memfd mapped over it (the branch went into the
+    # memfd), made writable since (the record's protection was put back after
+    # the store), and more sites than a pool holds (the one that found it full
+    # unmapped the pool every patched site branched into). The previous build
+    # dies on two of the four and fails the other two.
+    out=$(run_t 60 -t lazytest stale 2>&1); rc=$?
+    case "$out" in
+    *"lazytest stale: no writable executable memory"*)
+        skip "lazy patching of stale records: no writable executable memory here"
+        ;;
+    *)
+        check "the lazy rewriter judges the page at the patch, not the record" 0 $rc
+        check_contains "...gone, replaced by a shared one, reprotected, a full pool" \
+            "lazytest stale: gone=1 shared=1 prot=1 full=1 -> OK" "$out"
+        ;;
+    esac
     ;;
 esac
+
+# The same four through real traps, which only a live filter delivers: a guest
+# that writes its own code (a JIT's shape) and changes the mapping under it —
+# made writable, a shared memfd view put over it, more sites than a pool, and
+# a thread unmapping and replacing the page while sites in it trap. The
+# previous build fails the first three and dies in the race (SIGSEGV at the
+# svc word: the patcher's own load, in a handler with every signal masked).
+LZ=$(mktemp -d)
+if [ "$CNG_SECCOMP_LIVE" != 1 ]; then
+    skip "lazy patching through real traps: the seccomp tier is inert here"
+elif [ "$CNG_EXECMEM" != 1 ]; then
+    skip "lazy patching through real traps: no anonymous executable memory"
+elif guest_cc_report "$LZ/lazystale" tests/guests/lazystale.c -pthread; then
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
+    out=$(run_t 120 -R $GUEST_BINDS "$LZ" /lazystale 2>&1); rc=$?
+    check "a guest that moves its own text under the lazy patcher survives" 0 $rc
+    check_contains "...and every site behaves as the kernel's would" \
+        "lazystale: jit=1 shared=1 full=1 race=1 patched>0=1" "$out"
+fi
+rm -rf "$LZ"
 
 ROOT=$(mktemp -d)
 mkdir -p "$ROOT/bin" "$ROOT/etc"

@@ -299,11 +299,18 @@ int cng_rewrite_seg(unsigned long lo, unsigned long hi, unsigned long foff,
 
 #define LAZY_POOL 0x20000UL /* 128 KiB: ~800 trampolines per mapping */
 
+/* What a record knows is where a mapping WAS, and the pool placed within reach
+ * of it — never what the page is now. A guest unmaps, remaps and reprotects
+ * its own text without a word to us (dlclose and a new library at the same
+ * address; a JIT flipping W^X), so everything a patch depends on — whether the
+ * page is private, what it goes back to, whether it is there at all — is asked
+ * again at the patch (cng_rewrite_site). The record is the cache that keeps a
+ * mapping that cannot be patched from costing anything per trap. */
 struct lazy_region {
     unsigned long lo, hi;  /* the mapping, as /proc/self/maps had it */
-    unsigned long pool;    /* 0: this mapping is not one we can patch */
+    unsigned long pool;    /* 0: none was placed; else ours until the exec */
     unsigned long used;
-    int prot;              /* what the page goes back to after the store */
+    int live;              /* sites here may still be patched */
 };
 
 /* One entry per executable mapping a trap has come out of, on a table that
@@ -317,7 +324,7 @@ struct lazy_region {
 static struct cng_tab g_lazy = CNG_TAB_INIT(struct lazy_region);
 static unsigned long g_lazy_n;
 static struct lazy_region *g_lazy_last; /* the entry the last lookup found */
-static int g_lazy_nomaps; /* no /proc to read: stop asking */
+static int g_lazy_off; /* no /proc/self/maps or /proc/self/mem: stop asking */
 /* Not a lock to wait on: a thread that finds the table busy leaves this site to
  * the floor, which is what would have answered it anyway. That also keeps a
  * nested trap (one of our own syscalls refused by Android, answered by the
@@ -367,7 +374,7 @@ static int lazy_vma(unsigned long addr, unsigned long *lo_out,
     long fd = sys_openat(CNG_AT_FDCWD, "/proc/self/maps",
                          CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
     if (fd < 0) {
-        g_lazy_nomaps = 1;
+        g_lazy_off = 1;
         return 0;
     }
     /* Small on purpose: this can run on a guest thread's own stack. A line
@@ -486,13 +493,14 @@ static unsigned long lazy_pool(unsigned long lo, unsigned long hi,
     return p;
 }
 
-/* The table entry for the mapping holding `site`, or nothing. An entry with no
- * pool is a mapping we know we cannot patch, kept precisely so the next trap
- * out of it costs nothing — not even the read of /proc/self/maps, which is the
- * whole reason the table exists. The entry found last is tried first: the
- * sites that keep arriving are the ones a mapping that cannot be patched
- * traps out of, and they arrive in runs. Read and written under the busy
- * flag, like the table. */
+/* The table entry for the mapping holding `site`, or nothing. An entry that
+ * is not live is a mapping we know we cannot patch (or have stopped patching),
+ * kept precisely so the next trap out of it costs nothing — not even the read
+ * of /proc/self/maps, which is the whole reason the table exists. A live one
+ * is only a pool to use: the patch asks what the page is now (see struct
+ * lazy_region). The entry found last is tried first: the sites that keep
+ * arriving are the ones a mapping that cannot be patched traps out of, and
+ * they arrive in runs. Read and written under the busy flag, like the table. */
 static struct lazy_region *lazy_known(unsigned long site) {
     struct lazy_region *last = g_lazy_last;
     if (last && site >= last->lo && site < last->hi)
@@ -512,7 +520,7 @@ static struct lazy_region *lazy_known(unsigned long site) {
  * will branch into — or with none, when the mapping is one we must not write,
  * which is remembered just as carefully so the next trap out of it is answered
  * from this table and costs nothing. */
-static struct lazy_region *lazy_add(unsigned long lo, unsigned long hi, int prot,
+static struct lazy_region *lazy_add(unsigned long lo, unsigned long hi,
                                     int usable, unsigned long hole) {
     struct lazy_region *r = cng_tab_at(&g_lazy, g_lazy_n);
     if (!r)
@@ -520,10 +528,58 @@ static struct lazy_region *lazy_add(unsigned long lo, unsigned long hi, int prot
     g_lazy_n++;
     r->lo = lo;
     r->hi = hi;
-    r->prot = prot;
     r->used = 0;
     r->pool = usable ? lazy_pool(lo, hi, hole) : 0;
+    r->live = r->pool != 0;
     return r;
+}
+
+/* Patchable at all: a private mapping we may read and that executes. A store
+ * into a shared one would not patch our copy but edit the object behind it —
+ * the file on disk, or a memfd another mapping (a JIT's writable view) reads. */
+static int lazy_usable(int prot, int shared) {
+    return !shared && (prot & (CNG_PROT_READ | CNG_PROT_EXEC)) ==
+                          (CNG_PROT_READ | CNG_PROT_EXEC);
+}
+
+/* Stop patching in a mapping. Its pool goes back only while nothing branches
+ * into it: a trampoline already in use is the only way back for every site
+ * patched to reach it, and unmapping it — which this used to do whenever a
+ * later site failed, the pool filling up after hundreds of good ones — sent
+ * all of those sites into unmapped memory. A pool kept is handed back with
+ * the rest at the exec (cng_rewrite_lazy_reset). */
+static void lazy_close(struct lazy_region *r) {
+    r->live = 0;
+    if (r->pool && !r->used) {
+        sys_munmap((void *)r->pool, LAZY_POOL);
+        r->pool = 0;
+    }
+}
+
+/* /proc/self/mem, for the one read and the one write a patch makes of guest
+ * text. Neither may be a load or a store of ours: the page is the guest's, and
+ * a sibling thread may unmap or reprotect it at any moment, where a fault of
+ * ours — in a handler running with every signal masked — kills the process.
+ * Through the file the kernel does the access with the mapping held still,
+ * and answers EIO for a page that is not there; a write also gets the
+ * instruction-cache maintenance for an executable one (copy_to_user_page on
+ * arm64: what makes a debugger's breakpoint visible), which a flush of our
+ * own by address would have faulted on too.
+ *
+ * Opened for each patch rather than kept: the file is bound to the address
+ * space it was opened in, so a descriptor inherited across a fork writes into
+ * the parent's text, and the guest can close a number of ours and have it
+ * handed back for a file of its own. A patch happens once per site. Returns
+ * the descriptor, or -1 — having turned the tier off where the file cannot be
+ * had at all, so that is not asked again on every trap. */
+static int lazy_mem_open(void) {
+    long fd = sys_openat(CNG_AT_FDCWD, "/proc/self/mem",
+                         CNG_O_RDWR | CNG_O_CLOEXEC, 0);
+    if (fd >= 0)
+        return (int)fd;
+    if (fd != -EMFILE && fd != -ENFILE && fd != -ENOMEM && fd != -EINTR)
+        g_lazy_off = 1;
+    return -1;
 }
 
 /* One trampoline, into a pool that stays executable while it is written. */
@@ -549,69 +605,90 @@ static char *lazy_emit(struct lazy_region *r, unsigned long site) {
 }
 
 int cng_rewrite_site(unsigned long site) {
-    if (!cng_g_rewrite || (site & 3) || g_lazy_nomaps)
+    if (!cng_g_rewrite || (site & 3) || g_lazy_off)
         return 0;
     int idle = 0;
     if (!__atomic_compare_exchange_n(&g_lazy_busy, &idle, 1, 0,
                                      __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
         return 0;
 
-    int done = 0;
+    int done = 0, mfd = -1, fresh = 0;
+    unsigned long lo, hi, hole;
+    int prot = 0, shared = 1;
     struct lazy_region *r = lazy_known(site);
     if (!r) {
-        /* The first site to trap out of a mapping is the only one that pays for
-         * reading /proc/self/maps. What that answers is whether the word may be
-         * loaded at all — an execute-only mapping would fault on the load, in a
-         * handler running with SIGSEGV masked — whether the store would land in
-         * our copy or in a file on disk (a shared mapping is not ours to
-         * write), and what to put the page back to afterwards.
-         *
-         * That last one is remembered rather than re-read, so a guest that
-         * changes its own text protections after a site there is patched gets
-         * back what the mapping had when we first saw it. The alternative costs
-         * a read of /proc per trap, which is what this tier exists to avoid. */
-        unsigned long lo, hi, hole;
-        int prot, shared;
+        /* The first site to trap out of a mapping reads /proc/self/maps to
+         * make the record: the mapping's bounds and a pool within a branch's
+         * reach of all of it — or the verdict that it cannot be patched,
+         * which every later trap out of it is answered from without a
+         * syscall. That verdict is the whole reason the table exists. */
         if (!lazy_vma(site, &lo, &hi, &prot, &shared, &hole))
             goto out;
-        int usable = !shared && (prot & (CNG_PROT_READ | CNG_PROT_EXEC)) ==
-                                    (CNG_PROT_READ | CNG_PROT_EXEC);
-        r = lazy_add(lo, hi, prot, usable, hole);
+        r = lazy_add(lo, hi, lazy_usable(prot, shared), hole);
+        fresh = 1;
     }
-    if (!r || !r->pool)
+    if (!r || !r->live)
         goto out; /* known to be none of ours: answered without a syscall */
 
     /* Not a `svc` any more is the ordinary outcome of two threads trapping the
      * same site at once: the first patched it, and this one is finishing the
-     * syscall it was already in the middle of. */
-    if (*(uint32_t *)site != SVC0_INSN)
+     * syscall it was already in the middle of. A word that cannot be read is
+     * a page that went away since the trap, or one no longer readable: the
+     * mapping is not what the record says, so stop asking it. */
+    mfd = lazy_mem_open();
+    if (mfd < 0)
         goto out;
+    uint32_t w = 0;
+    if (sys_pread64(mfd, &w, sizeof w, (long)site) != (long)sizeof w)
+        goto close;
+    if (w != SVC0_INSN)
+        goto out;
+
+    /* What the page is now, asked at the patch: once per site patched rather
+     * than once per mapping. The protection put back after the store used to
+     * be the one the record was made with, so a guest that had reprotected its
+     * text since — a JIT making its code writable — had it taken away again;
+     * and a record outlives its mapping, so a library closed and another
+     * mapped over the same addresses, shared perhaps, was written as if it
+     * were the first. What is left is a sibling thread changing this very
+     * page in the few syscalls from here to the restore, which the in-process
+     * design cannot close (see the threat model in docs/DESIGN.md). */
+    if (!fresh && !lazy_vma(site, &lo, &hi, &prot, &shared, &hole))
+        goto close;
+    if (!lazy_usable(prot, shared))
+        goto close;
 
     char *slot = lazy_emit(r, site);
     uint32_t br = slot ? b_insn(site, (unsigned long)slot) : 0;
     if (!br)
-        goto retire; /* the pool is full: this mapping has had its share */
+        goto close; /* the pool is full: this mapping has had its share */
 
+    /* The page gains write for the store, which is also the policy's say on
+     * it: an SELinux execmod denial or PR_SET_MDWE refuses exactly this, and
+     * a refusal means the mapping is not ours to patch. X is held throughout,
+     * so a thread executing this page while the store lands neither faults
+     * nor has to be stopped — and `svc` to `b` is one of the substitutions the
+     * architecture allows under exactly that condition. The store itself goes
+     * through the kernel (lazy_mem_open), which also makes it visible to
+     * instruction fetch. */
     unsigned long p0 = cng_page_down(site), p1 = cng_page_up(site + 4);
-    int add_w = !(r->prot & CNG_PROT_WRITE);
-    if (add_w && sys_mprotect((void *)p0, p1 - p0, r->prot | CNG_PROT_WRITE) < 0)
-        goto retire; /* the mapping cannot be written at all: stop asking */
-    /* X is held throughout, so a thread executing this page while the store
-     * lands neither faults nor has to be stopped — and `svc` to `b` is one of
-     * the substitutions the architecture allows under exactly that condition. */
-    *(uint32_t *)site = br;
-    cng_flush_icache((void *)site, (void *)(site + 4));
+    int add_w = !(prot & CNG_PROT_WRITE);
+    if (add_w && sys_mprotect((void *)p0, p1 - p0, prot | CNG_PROT_WRITE) < 0)
+        goto close; /* the mapping cannot be written at all: stop asking */
+    long wr = sys_pwrite64(mfd, &br, sizeof br, (long)site);
     if (add_w)
-        sys_mprotect((void *)p0, p1 - p0, r->prot);
+        sys_mprotect((void *)p0, p1 - p0, prot);
+    if (wr != (long)sizeof br)
+        goto close;
     done = 1;
     goto out;
 
-retire:
-    /* Whatever stopped this site stops every other site in the mapping too, so
-     * the pool goes back and the entry stays as the record that it did. */
-    sys_munmap((void *)r->pool, LAZY_POOL);
-    r->pool = 0;
+close:
+    /* Whatever stopped this site stops every other site in the mapping too. */
+    lazy_close(r);
 out:
+    if (mfd >= 0)
+        sys_close(mfd);
     __atomic_store_n(&g_lazy_busy, 0, __ATOMIC_RELEASE);
     if (done && cng_g_debug)
         cng_dprintf(2, "[cng] lazy: patched the svc site at %lx\n", site);
@@ -619,8 +696,9 @@ out:
 }
 
 void cng_rewrite_lazy_reset(void) {
-    /* An emulated execve is the one place the mappings these describe go away,
-     * and by now it is single-threaded: the exec's de_thread has killed every
+    /* An emulated execve is where every mapping these describe goes away at
+     * once — pools kept for a closed entry included — and by now it is
+     * single-threaded: the exec's de_thread has killed every
      * other thread (execve.c), so nothing is running in a pool, and nothing is
      * inside this table — a thread killed while it held the busy flag left it
      * set, which is why it is cleared here rather than trusted. Handing the

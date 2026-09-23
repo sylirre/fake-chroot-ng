@@ -51,6 +51,15 @@ What that does and does not buy:
   made from its own copy of the kernel's record (the control data of a
   `recvmsg` is received into a buffer of the monitor's), so nothing a thread
   writes into the guest's own buffers changes which descriptor is closed.
+  The `-R` tier's lazy patch — a site rewritten on its first trap — has the
+  same shape over the guest's text. The page gains write for the store and
+  gets back the protection `/proc/self/maps` gave it at that patch, so a
+  sibling thread that reprotects or remaps that very page in the few syscalls
+  between that read and the restore can have its change overwritten, or the
+  branch land in what it mapped there. What the monitor does own is that no
+  such race can fault it: the word is read and the branch written through
+  `/proc/self/mem`, and a page that went away is an `EIO` there, not a
+  `SIGSEGV` in a handler that has every signal masked.
 
 One rule follows for the implementation: chroot-ng must never be the instrument.
 Wherever a **guest-chosen address** reaches a `MAP_FIXED` of ours — an `ET_EXEC`

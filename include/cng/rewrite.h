@@ -67,9 +67,12 @@ unsigned long cng_pool_at(unsigned long want, unsigned long size);
 /* Rewrite one site the SIGSYS floor just trapped from — `si_call_addr - 4`,
  * a word the CPU executed as `svc #0`, which is the one thing a scan of the
  * bytes cannot establish. Everything about it is best-effort: an unreadable
- * mapping, a shared one, no pool in reach, a denied mprotect all mean the site
- * keeps trapping, which is what it did before. Returns 1 if the site is now a
- * branch. No-op unless cng_g_rewrite is set. */
+ * mapping, a shared one, no pool in reach, a denied mprotect, a page gone by
+ * the time it is looked at all mean the site keeps trapping, which is what it
+ * did before. The guest's text is read and written through /proc/self/mem,
+ * never loaded or stored by the monitor, and what the page is is asked at the
+ * patch, not remembered from the mapping's first trap. Returns 1 if the site
+ * is now a branch. No-op unless cng_g_rewrite is set. */
 int cng_rewrite_site(unsigned long site);
 
 /* Hand back the lazy pools. For the emulated execve, whose images (and the
