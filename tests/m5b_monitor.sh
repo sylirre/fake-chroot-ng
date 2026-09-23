@@ -494,10 +494,16 @@ rm -rf "$LB"
 LR=$(mktemp -d); LB=$(mktemp -d); printf 'RO-DATA' > "$LB/f"
 out=$(run -t dtest -r "$LR" -b "$LB":/ro:ro rolink /ro/f 2>&1); rc=$?
 check "a link out of a :ro bind is refused as a real one is" 0 "$rc"
-for _leg in name followed by-fd l2s-fallback; do
+for _leg in name followed l2s-fallback; do
     check_contains "a link out of a :ro bind ($_leg) is EXDEV" \
         "rolink ro $_leg: rc=-18" "$out"
 done
+# By descriptor the source is the kernel's to judge first, and before 6.10 it
+# refuses AT_EMPTY_PATH without CAP_DAC_READ_SEARCH (ENOENT, measured on 6.8).
+# The op asks the kernel and expects EXDEV where it takes the descriptor, its
+# own errno where it does not; its verdict is the needle, not a fixed errno.
+check_contains "a link out of a :ro bind (by-fd) is EXDEV where the kernel takes the descriptor" \
+    "-> OK" "$(printf '%s\n' "$out" | grep '^rolink ro by-fd: ')"
 check_contains "...after the new name's EEXIST" "rolink ro dst-taken: rc=-17 -> OK" "$out"
 check_contains "...and its missing directory's ENOENT" \
     "rolink ro dst-nodir: rc=-2 -> OK" "$out"
