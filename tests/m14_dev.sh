@@ -222,6 +222,47 @@ else
     else
         skip "stand-in containment leg: this host has no /dev/shm to keep clear"
     fi
+
+    # The stand-in's name is predictable and its last candidate is a directory
+    # every user shares, so what is already on the name is not ours for being
+    # there: a directory other users can enter, a symlink to somewhere else, a
+    # parent anyone may rename entries out of. Each used to be adopted as the
+    # guest's /dev/shm (mkdirat's EEXIST was the end of the question). Each is
+    # passed over now for the next candidate — $XDG_RUNTIME_DIR here, set to a
+    # private directory of the test's own so the object has somewhere to go.
+    m14_uid=$(id -u)
+    m14_squat() { # desc, TMPDIR to use, dir the object must not reach
+        M14X=$(mktemp -d)
+        got=$(TMPDIR="$2" XDG_RUNTIME_DIR="$M14X" CNG_DEVSHM_FORCE_TMP=1 \
+            run -R "$M14_ALPINE" /bin/busybox sh -c \
+            'echo SQUAT > /dev/shm/m14squat && cat /dev/shm/m14squat' \
+            2>/dev/null)
+        if [ "$got" = "SQUAT" ] && [ ! -e "$3/m14squat" ] &&
+            [ -f "$M14X/chroot-ng-shm.v1.$m14_uid/m14squat" ]; then
+            pass=$((pass + 1))
+            echo "  ok   m14 the stand-in passes over $1"
+        else
+            fail=$((fail + 1))
+            echo "  FAIL m14 the stand-in passes over $1 (got '$got')"
+            find "$2" "$3" "$M14X" 2>/dev/null | sed 's/^/    /' | head -8
+        fi
+        rm -rf "$M14X"
+    }
+    M14T=$(mktemp -d)
+    mkdir -m 0777 "$M14T/chroot-ng-shm.v1.$m14_uid"
+    chmod 0777 "$M14T/chroot-ng-shm.v1.$m14_uid" # past the umask
+    m14_squat "a directory on its name others can enter" "$M14T" \
+        "$M14T/chroot-ng-shm.v1.$m14_uid"
+    rm -rf "$M14T"
+    M14T=$(mktemp -d); M14E=$(mktemp -d)
+    ln -s "$M14E" "$M14T/chroot-ng-shm.v1.$m14_uid"
+    m14_squat "a symlink on its name" "$M14T" "$M14E"
+    rm -rf "$M14T" "$M14E"
+    M14T=$(mktemp -d)
+    chmod 0777 "$M14T"
+    m14_squat "a parent anyone may rename entries out of" "$M14T" \
+        "$M14T/chroot-ng-shm.v1.$m14_uid"
+    rm -rf "$M14T"
 fi
 
 # --- reaching an overlay entry through a dirfd ------------------------------

@@ -3118,6 +3118,29 @@ vfork/`posix_spawn` child-stack handling.
   `l2s-home`; m10 differential "a copied rootfs leaves the original's groups
   alone" (fails on the previous build: the original's names dangle).
 
+- [x] **M61 — the /dev/shm stand-in adopted whatever sat on its name**
+  Where the host has no `/dev/shm` (Android), or `CNG_DEVSHM_FORCE_TMP=1` is
+  set, the guest's `/dev/shm` is a per-uid directory of ours,
+  `<candidate>/chroot-ng-shm.v1.<uid>`, with `/tmp` the last candidate — a
+  name anyone can predict in a directory every user shares. `mkdirat`'s
+  `EEXIST` was the end of the question and the check after it followed
+  symlinks, so another user's directory made ahead of us, or a symlink to
+  one where the host follows it, became the guest's `/dev/shm`: its POSIX
+  shm objects and semaphores stored where that user could read, replace or
+  delete them, or refused outright. One is adopted now only as procreg
+  adopts its shared file: opened `O_PATH|O_DIRECTORY|O_NOFOLLOW`, a
+  directory, owned by our uid and with no group or other bits
+  (`shm_dir_ours`), in a candidate owned by us or root that nobody else can
+  rename an entry out of — not writable by others, or sticky
+  (`shm_parent_safe`). Anything else moves the search to the next
+  candidate; a name squatted in every candidate leaves the guest without a
+  `/dev/shm`, the degraded answer the stand-in already had, since nothing
+  keeps a name in a shared directory from being taken first and a private
+  name would split the directory every invocation shares. m14 legs: a
+  0777 directory on the name, a symlink on it, and a 0777 non-sticky
+  candidate are each passed over for the next candidate (all three were
+  adopted by the previous build).
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

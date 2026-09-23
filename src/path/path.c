@@ -94,8 +94,59 @@ int cng_dev_shm_ok(void) { return !cng_g_no_dev && is_dir(g_shm_host); }
  * Best effort throughout: a host with no writable temp directory anywhere keeps
  * the old behaviour, which is that /dev/shm resolves to a name that is not
  * there, is left out of the listing, and — now — is left out of the mount
- * tables too. */
+ * tables too.
+ *
+ * The name is predictable, and the last candidate is a directory every user
+ * shares, so what is found under it is not ours by being there. mkdirat's
+ * EEXIST used to be the end of the question, and any directory — another
+ * user's, made ahead of us, or a symlink to one where the host follows it —
+ * became the guest's /dev/shm: its shm objects and semaphores stored where
+ * that user could read, replace or delete them, or refused them outright.
+ * One is adopted now only as procreg adopts its shared file: reached without
+ * a symlink at the name, a directory, ours, and private (shm_dir_ours) — in a
+ * parent nobody else can rename it out of (shm_parent_safe). Anything else on
+ * the name moves the search to the next candidate. Squatting every candidate
+ * still leaves the guest without a /dev/shm, which is the degraded answer
+ * above; nothing can keep a name in a shared directory from being taken
+ * first, and taking a different one would split the one directory every
+ * invocation shares. */
 static int canon_host_root(char *dst, size_t dstsz, const char *src);
+
+/* A directory nobody but us — and root — can take an entry of away: owned by
+ * one of the two, and writable by anyone else only with the sticky bit, which
+ * leaves an entry to its own owner (/tmp's 1777). Followed: it is the
+ * directory the candidate names that holds ours. */
+static int shm_parent_safe(const char *dir) {
+    char st[144]; /* struct stat: st_mode at 16, st_uid at 24 */
+    if (CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, (long)dir, (long)st, 0, 0, 0) !=
+        0)
+        return 0;
+    unsigned mode = *(unsigned *)(st + 16), uid = *(unsigned *)(st + 24);
+    if (uid != 0 && uid != (unsigned)sys_getuid())
+        return 0;
+    return !(mode & 022) || (mode & 01000);
+}
+
+/* The stand-in directory at `path` is ours to adopt: the name itself not a
+ * symlink, a directory, owned by us, and nobody else's to enter — what the
+ * mkdirat below creates, and what procreg's file_ours asks of its file. */
+static int shm_dir_ours(const char *path) {
+    long fd = sys_openat(CNG_AT_FDCWD, path,
+                         CNG_O_PATH | CNG_O_DIRECTORY | CNG_O_NOFOLLOW |
+                             CNG_O_CLOEXEC,
+                         0);
+    if (fd < 0)
+        return 0;
+    char st[144];
+    int ok = 0;
+    if (sys_fstat((int)fd, st) == 0) {
+        unsigned mode = *(unsigned *)(st + 16), uid = *(unsigned *)(st + 24);
+        ok = (mode & 0170000) == 0040000 && (mode & 077) == 0 &&
+             uid == (unsigned)sys_getuid();
+    }
+    sys_close((int)fd);
+    return ok;
+}
 
 /* The directory node's host path, as the kernel spells it (see g_shm_host):
  * a symlink-free spelling that the readback of a descriptor on it, or below
@@ -123,7 +174,7 @@ void cng_dev_shm_init(void) {
                           cng_broker_env("XDG_RUNTIME_DIR"), "/data/local/tmp",
                           "/tmp"};
     for (unsigned i = 0; i < sizeof cand / sizeof cand[0]; i++) {
-        if (!cand[i] || !is_dir(cand[i]))
+        if (!cand[i] || !is_dir(cand[i]) || !shm_parent_safe(cand[i]))
             continue;
         char path[CNG_PATH_MAX];
         /* Same shape as the broker's own files: named, versioned, per-uid. */
@@ -133,7 +184,7 @@ void cng_dev_shm_init(void) {
         long r = CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, (long)path, 0700, 0, 0, 0);
         if (r != 0 && r != -EEXIST)
             continue;
-        if (!is_dir(path))
+        if (!shm_dir_ours(path))
             continue; /* something else is sitting on the name */
         cng_strlcpy(g_shm_host, path, sizeof g_shm_host);
         canon_dev_dir(g_shm_host, sizeof g_shm_host);
