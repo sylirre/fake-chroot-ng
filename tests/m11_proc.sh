@@ -254,6 +254,38 @@ else
 fi
 rm -rf "$PR_ROOT"
 
+# A /proc number spelled with a leading zero is no name at all to procfs
+# (name_to_int), so "/proc/self/fd/05" and "/proc/0<pid>/exe" are ENOENT
+# whatever descriptor 5 and process <pid> are. Where the monitor answers such a
+# name itself — an exec through an fd link, exe/cwd, a synthesized cmdline — it
+# read the digits as the number, and the previous build ran the program and
+# read the files. Differential against the same guest with nothing in the way.
+PN_ROOT=$(mktemp -d)
+if guest_xlate_ready "leading-zero /proc name leg" &&
+    guest_cc_report "$PN_ROOT/procnum" tests/guests/procnum.c; then
+    pn_base=$(emu_t 60 "$PN_ROOT/procnum" 2>/dev/null)
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
+    pn_got=$(run_t 60 -R $GUEST_BINDS "$PN_ROOT" /procnum 2>/dev/null)
+    case "$pn_base" in
+    *"fd plain open: ok"*"exec pid-zero-exe: errno=2"*)
+        if [ "$pn_got" = "$pn_base" ]; then
+            pass=$((pass + 1))
+            echo "  ok   a /proc number with a leading zero names what the kernel's does"
+        else
+            fail=$((fail + 1))
+            echo "  FAIL a /proc number with a leading zero names what the kernel's does"
+            printf '%s\n' "$pn_base" >"$CNG_TMP/pn.want"
+            printf '%s\n' "$pn_got" >"$CNG_TMP/pn.got"
+            diff "$CNG_TMP/pn.want" "$CNG_TMP/pn.got" | sed 's/^/    /'
+        fi
+        ;;
+    *)
+        skip "leading-zero /proc name leg: the unemulated guest did not run cleanly"
+        ;;
+    esac
+fi
+rm -rf "$PN_ROOT"
+
 # --- guest-shell scenarios -------------------------------------------------
 m11_ready=0
 if [ -n "$M11_ALPINE" ] && [ -x "$M11_ALPINE/bin/busybox" ]; then

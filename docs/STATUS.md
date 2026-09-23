@@ -3302,6 +3302,25 @@ vfork/`posix_spawn` child-stack handling.
   m5 pins both sides of the boundary through the resolver with the cwd in
   `/dev/fd` (the previous build resolves the longer name to the shorter).
 
+- [x] **M69 — a /proc number with a leading zero was the number to us**
+  procfs looks its numbered entries up with `name_to_int()`, which refuses
+  a leading zero: `/proc/self/fd/05` and `/proc/0<pid>/exe` do not exist,
+  whatever descriptor 5 and process `<pid>` are (measured: ENOENT). Where
+  the monitor answers such a name itself it read the digits as the number
+  — `parse_int_run` for the fd links, exe/cwd/root, the fd shortcut an
+  exec takes (`cng_proc_self_fd`), and procfs's `pid_tail` for the files it
+  synthesizes — so an exec of `/proc/self/fd/0<n>` ran descriptor `<n>`, a
+  readlink of `/proc/0<pid>/exe` reported the program, and
+  `/proc/0<pid>/cmdline` opened. Found while fixing M68, where the zero run
+  a truncation left behind was what made the wrong descriptor executable.
+  Both parsers now take a number the way procfs names it (`0` itself, or
+  no leading zero), and `proc_magic` asks `parse_int_run` too, so a digit
+  run procfs has no entry for is an ordinary lookup rather than an fd link
+  `RESOLVE_NO_MAGICLINKS` would refuse. `tests/guests/procnum.c` in m11,
+  differential against the same guest with nothing in the way (the previous
+  build reads the cmdline, exe and cwd of `/proc/0<pid>` and runs the
+  program from `/proc/self/fd/0<n>`).
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

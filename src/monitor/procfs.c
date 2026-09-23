@@ -988,7 +988,9 @@ static const char *pid_tail(const char *canon, int *pid) {
         *pid = (int)sys_getpid();
         return q + 12;
     }
-    if (*q < '0' || *q > '9')
+    /* A pid as procfs names it: name_to_int() refuses a leading zero, so
+     * "/proc/0<pid>/status" is ENOENT to the kernel and no file of ours. */
+    if (*q < '1' || *q > '9')
         return 0;
     long n = 0;
     for (; *q >= '0' && *q <= '9'; q++) {

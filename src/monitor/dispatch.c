@@ -638,13 +638,19 @@ static long proc_self_fixup(const char *canon, char *buf, unsigned long bufsz);
  * and is refused rather than accumulated: the multiply-add is signed, and the
  * digit string is the guest's to make as long as it likes, so letting it run
  * is undefined behaviour that can wrap into a small valid number — a
- * "/proc/self/fd/<20 digits>" that came out as one of OUR descriptors. Returns
- * the value and advances *p past the run, or -1 for no digits or out of range.
- */
+ * "/proc/self/fd/<20 digits>" that came out as one of OUR descriptors.
+ *
+ * Nor is every spelling of a number a name: procfs looks its entries up with
+ * name_to_int(), which refuses a leading zero, so "/proc/self/fd/05" and
+ * "/proc/0<pid>/exe" are ENOENT to the kernel (measured) — only "0" itself is
+ * the number zero. Read as 5 and <pid>, they were names the monitor answered
+ * for itself: an exec of the first ran descriptor 5, and a readlink of the
+ * second reported the program. Returns the value and advances *p past the
+ * run, or -1 for no digits, a leading zero, or out of range. */
 static long parse_int_run(const char **p) {
     const char *q = *p;
     long v = 0;
-    if (*q < '0' || *q > '9')
+    if (*q < '0' || *q > '9' || (q[0] == '0' && q[1] >= '0' && q[1] <= '9'))
         return -1;
     for (; *q >= '0' && *q <= '9'; q++) {
         v = v * 10 + (*q - '0');
@@ -732,10 +738,12 @@ static int proc_magic(char *cur, size_t sz) {
     if (strncmp(rest, "fd", 2) == 0 && (rest[2] == '\0' || rest[2] == '/')) {
         if (rest[2] == '\0')
             return PROC_MAGIC_HOST;
+        /* A number procfs has a name for (parse_int_run): "05" is no link,
+         * and neither is a run past any descriptor — an ordinary lookup that
+         * the kernel answers ENOENT, which RESOLVE_NO_MAGICLINKS has no link
+         * to refuse. */
         const char *d = rest + 3;
-        while (*d >= '0' && *d <= '9')
-            d++;
-        if (d > rest + 3 && (*d == '\0' || *d == '/'))
+        if (parse_int_run(&d) >= 0 && (*d == '\0' || *d == '/'))
             return PROC_MAGIC_HOST;
         return PROC_MAGIC_NONE;
     }
