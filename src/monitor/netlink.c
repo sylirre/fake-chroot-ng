@@ -1153,47 +1153,67 @@ int cng_nl_recv(int fd, void *buf, long len, long flags, long *out) {
     return 1;
 }
 
-/* Write a sockaddr_nl into a guest buffer. `pid` distinguishes the two callers,
- * and getting it wrong is not cosmetic: a netlink client discards any reply whose
- * *source* address is not nl_pid == 0, because that is what "came from the
- * kernel" means. Filling the source with our own port id made glibc skip every
- * message and wait for an NLMSG_DONE it would never accept. getsockname, by
- * contrast, must report our own port id, which is what the client then matches
- * each reply's nlmsg_pid against (see fix_pid). */
-/* Both pointers are the guest's, and this address is synthesized rather than
+/* Hand a sockaddr_nl back to the guest by the kernel's rules for handing back
+ * any address (move_addr_to_user): the caller's length is read first, and is
+ * EINVAL when negative; as much of the address as fits is copied — a prefix,
+ * into a buffer shorter than the address — and the length written back is the
+ * address's own, not what was copied ("fromlen shall refer to the value before
+ * truncation", 1003.1g) — for a recvmsg whose msg_namelen was 0 as well, since
+ * the kernel fills its own copy of the address whatever the caller's room. A
+ * NULL buffer with a length to copy is EFAULT, and so is a NULL length — the
+ * kernel reads it before anything else.
+ *
+ * This used to answer success and write nothing whenever the buffer was
+ * shorter than a sockaddr_nl, or either pointer was NULL, and to copy the whole
+ * address whatever the (negative) length said: a caller checking the length it
+ * got back saw its own, and one probing with a zero length learned nothing.
+ *
+ * Both pointers are the guest's, and this address is synthesized rather than
  * fetched — so the kernel never validates either, and a bad one has to answer
  * -EFAULT instead of faulting inside the handler, where SIGSEGV is masked and
- * fatal. The caller's length is read out before anything is probed for
- * writing, since the write probe validates a range by zeroing it. */
-static long write_nladdr(void *addr, unsigned *alen, unsigned pid) {
-    if (!addr || !alen)
-        return 0;
-    unsigned want;
-    if (cng_user_copyin(&want, alen, sizeof want) < 0)
-        return -EFAULT;
-    if (want < sizeof(struct sockaddr_nl_))
-        return 0;
+ * fatal. */
+static long put_nladdr(unsigned pid, void *addr, void *alen) {
+    int klen = (int)sizeof(struct sockaddr_nl_);
     struct sockaddr_nl_ sa;
     memset(&sa, 0, sizeof sa);
     sa.family = AF_NETLINK_;
     sa.pid = pid;
-    if (cng_user_copyout(addr, &sa, sizeof sa) < 0)
+    int len;
+    if (cng_user_copyin(&len, alen, sizeof len) < 0)
         return -EFAULT;
-    unsigned back = (unsigned)sizeof sa;
-    if (cng_user_copyout(alen, &back, sizeof back) < 0)
+    if (len > klen)
+        len = klen;
+    if (len < 0)
+        return -EINVAL;
+    if (len && cng_user_copyout(addr, &sa, (unsigned long)len) < 0)
+        return -EFAULT;
+    if (cng_user_copyout(alen, &klen, sizeof klen) < 0)
         return -EFAULT;
     return 0;
 }
 
-long cng_nl_getname(int fd, void *addr, unsigned *alen) {
+/* `peer` distinguishes the two, and getting either wrong is not cosmetic.
+ * getsockname must report our own port id, which is what a client then
+ * matches each reply's nlmsg_pid against (see fix_pid). getpeername reports
+ * the socket's destination, and an emulated socket's only peer is the kernel:
+ * port id 0, which is also what the kernel answers for a netlink socket that
+ * never connected. */
+long cng_nl_getname(int fd, void *addr, unsigned *alen, int peer) {
     /* The real AF_UNIX answer is an unnamed 2-byte sockaddr, and iproute2
      * rejects that with "Wrong address length 2". Report the sockaddr_nl it
-     * expects, carrying our own port id. */
-    return write_nladdr(addr, alen, (unsigned)sys_getpid());
+     * expects. */
+    return put_nladdr(peer ? 0 : (unsigned)sys_getpid(), addr, alen);
 }
 
+/* A netlink client discards any reply whose *source* address is not
+ * nl_pid == 0, because that is what "came from the kernel" means: filling it
+ * with our own port id made glibc skip every message and wait for an
+ * NLMSG_DONE it would never accept. Nothing is written for a NULL buffer —
+ * the kernel does not hand an address back where none was asked for. */
 long cng_nl_srcaddr(int fd, void *addr, unsigned *alen) {
-    return write_nladdr(addr, alen, 0); /* 0 == from the kernel */
+    if (!addr)
+        return 0;
+    return put_nladdr(0, addr, alen);
 }
 
 int cng_nl_bind(int fd) { return slot_of(fd) != 0; }

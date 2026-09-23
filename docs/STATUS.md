@@ -3381,6 +3381,30 @@ vfork/`posix_spawn` child-stack handling.
   six runs in six, with SIGSEGV at the `svc` word itself: the patcher's
   load, not the guest's fetch.
 
+- [x] **M72 — an emulated netlink socket's address was all or nothing**
+  The kernel hands every address back the same way (`move_addr_to_user`):
+  the caller's length is read first and a negative one is EINVAL, as much of
+  the address as fits is copied, and the length written back is the
+  address's own — "the value before truncation". The emulated socket's
+  writer copied the whole `sockaddr_nl` or, for a buffer shorter than one,
+  nothing at all and left the caller's length alone; a NULL buffer or NULL
+  length was success, and a negative length a full copy. getpeername gave
+  our own port id where the kernel gives the peer's (0, for a socket that
+  never connected — and the kernel is the only peer the stand-in has).
+  recvfrom wrote the source address after a receive that failed, and
+  answered EFAULT over the EAGAIN when that write failed; recvmsg and
+  recvmmsg took a negative `msg_namelen` without the EINVAL the kernel
+  gives before it receives anything. All measured against the kernel, which
+  also settled the one case a reading of the source got wrong: a
+  `msg_namelen` of 0 gets the length back as 12, since `____sys_recvmsg`
+  points the protocol at its own copy of the address whatever room the
+  caller left. `put_nladdr` is
+  `move_addr_to_user` for the synthesized address, getpeername asks it for
+  port id 0, and the three receives hand the source back only after a
+  receive that worked. `tests/guests/nladdr.c` in m16, compared on every
+  host with the kernel's text and, where rtnetlink works, with the kernel
+  itself (the previous build: all thirteen lines differ).
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

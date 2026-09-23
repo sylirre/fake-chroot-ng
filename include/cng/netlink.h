@@ -68,15 +68,19 @@ int cng_nl_send(int fd, const void *buf, long len, long *out);
  * getifaddrs(3) sizes its buffer before reading. */
 int cng_nl_recv(int fd, void *buf, long len, long flags, long *out);
 
-/* getsockname/getpeername: report a sockaddr_nl carrying our own port id, since
- * the real AF_UNIX answer is 2 bytes and iproute2 rejects that. Call only for a
- * stand-in fd (cng_nl_is_fake). Returns 0, or -EFAULT for a guest buffer we
- * cannot write — this address is synthesized, so the kernel never checks it. */
-long cng_nl_getname(int fd, void *addr, unsigned *alen);
+/* getsockname (`peer` 0) / getpeername (`peer` 1): report a sockaddr_nl — our
+ * own port id, or the kernel's (0) for the peer — since the real AF_UNIX answer
+ * is 2 bytes and iproute2 rejects that. Call only for a stand-in fd
+ * (cng_nl_is_fake). The address goes out by the kernel's rules for a short or
+ * absent buffer (move_addr_to_user): 0, -EINVAL for a negative length, or
+ * -EFAULT for a guest buffer we cannot read or write — this address is
+ * synthesized, so the kernel never checks it. */
+long cng_nl_getname(int fd, void *addr, unsigned *alen, int peer);
 
 /* The *source* address of a received reply, which must be nl_pid == 0: that is
  * how a netlink client knows a message came from the kernel, and glibc discards
- * anything else. Same contract as cng_nl_getname. */
+ * anything else. For a successful receive only, and nothing for a NULL `addr`.
+ * Same contract as cng_nl_getname otherwise. */
 long cng_nl_srcaddr(int fd, void *addr, unsigned *alen);
 
 /* bind(2) on an emulated socket is a silent success. Returns 1 if handled. */

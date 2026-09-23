@@ -414,6 +414,51 @@ else
         skip "concurrent-relay leg: could not build tests/guests/nlrace.c with -pthread"
     fi
 
+    # --- 7. the address an emulated socket hands back ----------------------
+    # getsockname, getpeername and the source address of the three receives
+    # go out by the kernel's rules for any address (move_addr_to_user): a
+    # prefix into a short buffer, the address's own length written back, EINVAL
+    # for a negative length (before anything is received, for recvmsg), EFAULT
+    # for no buffer or no length, and nothing at all after a failed receive.
+    # The previous build wrote nothing into a short buffer and kept its length,
+    # answered success for every bad pointer and length, gave getpeername our
+    # own port id, and wrote the source into the buffer of a receive that
+    # failed. The text is the kernel's, measured; where rtnetlink works here
+    # the kernel is asked again.
+    nladdr_want='getsockname 4: r=0 l=12 b=10000000aa
+getsockname 0: r=0 l=12 b=aa
+getsockname -1: r=-1 e=22 l=-1
+getsockname nobuf: r=-1 e=14 l=12
+getsockname nobuf 0: r=0 e=0 l=12
+getsockname nolen: r=-1 e=14
+getpeername: r=0 l=12 family=16 pid=0 groups=0
+recvfrom 6: got=1 l=12 b=100000000000aa
+recvfrom again: r=-1 e=11 l=12 b=aa
+recvmsg 5: got=1 namelen=12 b=1000000000
+recvmsg 0: got=1 namelen=12 b=aa
+recvmsg -1: r=-1 e=22 then=1
+recvmmsg: r=2 namelen=12 family=16 pid=0 namelen0=12 b=aa'
+    if guest_cc "$M16D/nladdr" tests/guests/nladdr.c; then
+        cp "$M16D/nladdr" "$R/bin/nladdr"
+        st=$(CNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nladdr 2>/dev/null)
+        if [ "$st" = "$nladdr_want" ]; then
+            pass=$((pass + 1))
+            echo "  ok   m16 an emulated socket hands its address back as the kernel does"
+        else
+            fail=$((fail + 1))
+            echo "  FAIL m16 an emulated socket hands its address back as the kernel does"
+            printf '%s\n' "$nladdr_want" >"$M16D/nladdr.want"
+            printf '%s\n' "$st" >"$M16D/nladdr.got"
+            diff "$M16D/nladdr.want" "$M16D/nladdr.got" | sed 's/^/    /'
+        fi
+        if [ "$m16_raw" = 1 ]; then
+            kst=$(emu_t 60 "$M16D/nladdr" 2>/dev/null)
+            check "m16 ...and the kernel here says the same" "$nladdr_want" "$kst"
+        fi
+    else
+        skip "address writeback leg: could not build tests/guests/nladdr.c"
+    fi
+
     rm -rf "$R"
 fi
 rm -rf "$M16D"

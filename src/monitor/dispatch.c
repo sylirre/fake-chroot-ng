@@ -4988,8 +4988,14 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         long alp = is_recv ? a5 : a2;
         if (cng_nl_is_fake((int)a0)) {
             if (is_recv) {
+                /* The source address is handed back only for a receive that
+                 * worked, as the kernel's recvfrom does: a failed one (EAGAIN)
+                 * left it written, and answered EFAULT over the EAGAIN when
+                 * the write failed. */
                 long out = 0;
                 cng_nl_recv((int)a0, (void *)a1, a2, a3, &out);
+                if (out < 0)
+                    return out;
                 long e = cng_nl_srcaddr((int)a0, (void *)aa, (unsigned *)alp);
                 return e ? e : out;
             }
@@ -5002,7 +5008,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 return -EOPNOTSUPP;
             /* getsockname/getpeername must report a sockaddr_nl: the real
              * AF_UNIX answer is 2 bytes and iproute2 refuses it. */
-            return cng_nl_getname((int)a0, (void *)aa, (unsigned *)alp);
+            return cng_nl_getname((int)a0, (void *)aa, (unsigned *)alp,
+                                  nr == __NR_getpeername);
         }
         if (!aa || !alp) /* no address wanted: nothing to translate */
             return reissue(a0, a1, a2, a3, a4, a5, nr);
@@ -5035,12 +5042,19 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 struct cng_msghdr h;
                 if (cng_user_copyin(&h, m, sizeof h) < 0)
                     return -EFAULT;
+                /* The header's name length is judged before anything is
+                 * received (__copy_msghdr): negative is EINVAL, with the reply
+                 * still queued. */
+                if (h.name && (int)h.namelen < 0)
+                    return -EINVAL;
                 if (h.iov && h.iovlen > 0) {
                     struct cng_iovec io0;
                     if (cng_user_copyin(&io0, h.iov, sizeof io0) < 0)
                         return -EFAULT;
                     cng_nl_recv((int)a0, io0.base, (long)io0.len, a2, &out);
                 }
+                if (out < 0)
+                    return out;
                 long e = cng_nl_srcaddr((int)a0, h.name, &m->namelen);
                 if (e)
                     return e;
@@ -5096,6 +5110,10 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 struct cng_mmsghdr h;
                 if (cng_user_copyin(&h, m, sizeof h) < 0) {
                     r = -EFAULT;
+                    break;
+                }
+                if (h.hdr.name && (int)h.hdr.namelen < 0) {
+                    r = -EINVAL; /* __copy_msghdr, as for recvmsg */
                     break;
                 }
                 struct cng_iovec io0;
