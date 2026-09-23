@@ -67,6 +67,10 @@ int cng_nl_send(int fd, const void *buf, long len, long *out);
  * MSG_TRUNC must report the whole pending length, which is how glibc's
  * getifaddrs(3) sizes its buffer before reading. */
 int cng_nl_recv(int fd, void *buf, long len, long flags, long *out);
+/* The same for recvmsg: `msg` is a struct cng_msghdr of the caller's, handed
+ * to the kernel's recvmsg on the stand-in whole — its iovecs are received
+ * into, and its msg_flags and msg_controllen written, by the kernel. */
+int cng_nl_recvmsg(int fd, void *msg, long flags, long *out);
 
 /* getsockname (`peer` 0) / getpeername (`peer` 1): report a sockaddr_nl — our
  * own port id, or the kernel's (0) for the peer — since the real AF_UNIX answer

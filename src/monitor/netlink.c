@@ -1153,6 +1153,24 @@ int cng_nl_recv(int fd, void *buf, long len, long flags, long *out) {
     return 1;
 }
 
+/* recvmsg's form of cng_nl_recv: the same drain, then the kernel's own recvmsg
+ * on the guest's end of the pair with the header the caller built — the
+ * guest's iovecs, scattered into, truncated and flagged by the kernel, which
+ * also reads and validates the iovec array itself. */
+int cng_nl_recvmsg(int fd, void *msg, long flags, long *out) {
+    struct nl_slot *s = slot_of(fd);
+    if (!s)
+        return 0;
+    unsigned char scratch[NL_REPLY_MAX];
+    drain_requests(s, scratch);
+    long n = CNG_SYS(__NR_recvmsg, fd, (long)msg, flags, 0, 0, 0);
+    if (cng_g_debug)
+        cng_dprintf(2, "[cng] nl recvmsg fd=%d flags=%lx -> %ld\n", fd, flags,
+                    n);
+    *out = n;
+    return 1;
+}
+
 /* Hand a sockaddr_nl back to the guest by the kernel's rules for handing back
  * any address (move_addr_to_user): the caller's length is read first, and is
  * EINVAL when negative; as much of the address as fits is copied — a prefix,

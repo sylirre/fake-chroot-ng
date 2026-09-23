@@ -3464,6 +3464,50 @@ static long sun_deliver(int own, char *ab, unsigned al, long aa, long alp) {
     return addr_out(ab, got, aa, alp);
 }
 
+/* One recvmsg on an emulated netlink socket (cng_nl_is_fake). The payload is
+ * the kernel's own recvmsg on the socketpair end the guest holds, into the
+ * guest's own iovecs — every one of them, scattered into, truncated and
+ * flagged as the kernel does for a datagram, an empty set consuming the
+ * reply with MSG_TRUNC — while the header handed to it is ours: no name, since
+ * the stand-in's peer has an AF_UNIX address and the guest must be told the
+ * kernel's (cng_nl_srcaddr), and no control buffer, since the stand-in
+ * carries no ancillary data (a netlink socket has none to give unless asked
+ * with a socket option the emulation does not model).
+ *
+ * The guest's header gets what ___sys_recvmsg writes, in its order: the
+ * source address, then msg_flags, then msg_controllen — nothing received
+ * into the control buffer, so 0, and never MSG_CTRUNC for data it was not
+ * offered. It used to get only the address: the first iovec alone was
+ * received into, msg_flags and msg_controllen kept whatever the guest had
+ * put there (so MSG_TRUNC never reached a client sizing its buffer by it, and
+ * CMSG_FIRSTHDR walked a buffer nothing had written), a header with no iovec
+ * left the reply queued and answered 0, and a NULL header answered 0 too.
+ * `snap` is our copy of the header, taken once. */
+static long nl_recvmsg(long fd, struct cng_msghdr *g,
+                       const struct cng_msghdr *snap, long flags) {
+    /* Judged before anything is received (__copy_msghdr): a negative name
+     * length is EINVAL with the reply still queued. */
+    if (snap->name && (int)snap->namelen < 0)
+        return -EINVAL;
+    struct cng_msghdr mh;
+    memset(&mh, 0, sizeof mh);
+    mh.iov = snap->iov;
+    mh.iovlen = snap->iovlen;
+    long r = 0;
+    cng_nl_recvmsg((int)fd, &mh, flags, &r);
+    if (r < 0)
+        return r;
+    long e = cng_nl_srcaddr((int)fd, snap->name, &g->namelen);
+    if (e)
+        return e;
+    unsigned fl = mh.flags & ~(unsigned)CNG_MSG_CTRUNC;
+    unsigned long cl = 0;
+    if (cng_user_copyout(&g->flags, &fl, sizeof fl) < 0 ||
+        cng_user_copyout(&g->controllen, &cl, sizeof cl) < 0)
+        return -EFAULT;
+    return r;
+}
+
 /* ---- recvmmsg's timeout ------------------------------------------------- */
 
 /* It is not a bound on the wait, and a decomposed batch must not treat it as
@@ -5036,30 +5080,10 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
 
     case __NR_recvmsg: {
         if (cng_nl_is_fake((int)a0)) {
-            long out = 0;
-            struct cng_msghdr *m = (struct cng_msghdr *)a1;
-            if (m) {
-                struct cng_msghdr h;
-                if (cng_user_copyin(&h, m, sizeof h) < 0)
-                    return -EFAULT;
-                /* The header's name length is judged before anything is
-                 * received (__copy_msghdr): negative is EINVAL, with the reply
-                 * still queued. */
-                if (h.name && (int)h.namelen < 0)
-                    return -EINVAL;
-                if (h.iov && h.iovlen > 0) {
-                    struct cng_iovec io0;
-                    if (cng_user_copyin(&io0, h.iov, sizeof io0) < 0)
-                        return -EFAULT;
-                    cng_nl_recv((int)a0, io0.base, (long)io0.len, a2, &out);
-                }
-                if (out < 0)
-                    return out;
-                long e = cng_nl_srcaddr((int)a0, h.name, &m->namelen);
-                if (e)
-                    return e;
-            }
-            return out;
+            struct cng_msghdr h;
+            if (cng_user_copyin(&h, (void *)a1, sizeof h) < 0)
+                return -EFAULT; /* a NULL header too, as the kernel says */
+            return nl_recvmsg(a0, (struct cng_msghdr *)a1, &h, a2);
         }
         /* msg_name is an output buffer of the guest's, so it gets the same
          * bounce the single-address calls get, and the control data one of
@@ -5088,8 +5112,9 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         if (vlen > CNG_UIO_MAXIOV)
             vlen = CNG_UIO_MAXIOV;
 
-        /* An emulated netlink socket has to be taken apart per message instead:
-         * its replies are built on demand, and a client discards any whose
+        /* An emulated netlink socket has to be taken apart per message instead,
+         * each received as recvmsg receives one (nl_recvmsg): its replies are
+         * built on demand, and a client discards any whose
          * source address is not the kernel's — which means msg_name must be
          * filled by cng_nl_srcaddr from the guest's own buffer length, not
          * overwritten by the socketpair's AF_UNIX answer first. The
@@ -5112,21 +5137,12 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                     r = -EFAULT;
                     break;
                 }
-                if (h.hdr.name && (int)h.hdr.namelen < 0) {
-                    r = -EINVAL; /* __copy_msghdr, as for recvmsg */
-                    break;
-                }
-                struct cng_iovec io0;
-                if (!h.hdr.iov || !h.hdr.iovlen ||
-                    cng_user_copyin(&io0, h.hdr.iov, sizeof io0) < 0) {
-                    r = -EFAULT;
-                    break;
-                }
                 long fl = a3 & ~(long)CNG_MSG_WAITFORONE;
                 if (got && (a3 & CNG_MSG_WAITFORONE))
                     fl |= CNG_MSG_DONTWAIT;
-                long out = 0;
-                cng_nl_recv((int)a0, io0.base, (long)io0.len, fl, &out);
+                /* Each message as recvmsg receives one, and its length after
+                 * its header, which is do_recvmmsg's order. */
+                long out = nl_recvmsg(a0, &m->hdr, &h.hdr, fl);
                 if (out < 0) {
                     r = out;
                     break;
@@ -5134,11 +5150,6 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 unsigned wlen = (unsigned)out;
                 if (cng_user_copyout(&m->len, &wlen, sizeof wlen) < 0) {
                     r = -EFAULT;
-                    break;
-                }
-                long e = cng_nl_srcaddr((int)a0, h.hdr.name, &m->hdr.namelen);
-                if (e) {
-                    r = e;
                     break;
                 }
                 got++;

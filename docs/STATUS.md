@@ -3405,6 +3405,28 @@ vfork/`posix_spawn` child-stack handling.
   host with the kernel's text and, where rtnetlink works, with the kernel
   itself (the previous build: all thirteen lines differ).
 
+- [x] **M73 — an emulated recvmsg filled one iovec and wrote no header**
+  Found while fixing M72. The emulated socket's recvmsg received into the
+  header's first iovec only, through a recvfrom, and wrote nothing back but
+  the address: `msg_flags` and `msg_controllen` kept whatever the caller
+  had put there, so MSG_TRUNC never reached a client that sizes its buffer
+  by it (libnl's growth loop) and `CMSG_FIRSTHDR` walked a control buffer
+  nothing had written; a header with no iovec left the reply queued; a
+  NULL header answered 0 and 1025 iovecs a successful receive. recvmmsg
+  had the same body per message. Now the payload is the kernel's own
+  recvmsg on the stand-in (`cng_nl_recvmsg`), handed the guest's iovec
+  array with a header of ours that asks for no name and no control data —
+  the kernel scatters, truncates, flags, consumes and refuses (EFAULT,
+  EMSGSIZE) exactly as it does for a datagram — and `nl_recvmsg` writes
+  what `___sys_recvmsg` writes, in its order: the source address, then
+  `msg_flags` (never MSG_CTRUNC for data the guest was not offered), then
+  `msg_controllen` 0, the stand-in carrying no ancillary data. recvmmsg
+  receives each message through it and writes `msg_len` after its header,
+  as `do_recvmmsg` does. `tests/guests/nlhdr.c` in m16, the kernel's text
+  and the kernel (the previous build differs on six of seven lines; a
+  header with no iovec at all is left out, since qemu-user answers it
+  without asking the kernel).
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

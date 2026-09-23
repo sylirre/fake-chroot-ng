@@ -459,6 +459,42 @@ recvmmsg: r=2 namelen=12 family=16 pid=0 namelen0=12 b=aa'
         skip "address writeback leg: could not build tests/guests/nladdr.c"
     fi
 
+    # --- 8. the rest of a recvmsg header -----------------------------------
+    # The datagram scattered over every iovec, MSG_TRUNC for a cut one in
+    # msg_flags, msg_controllen written back (0: the stand-in carries no
+    # ancillary data), a datagram offered no room consumed all the same, and a
+    # header the kernel cannot read refused with the reply left queued. The
+    # previous build received into the first iovec only, left msg_flags and
+    # msg_controllen as the caller had them, and answered 0 for a NULL header
+    # and success for 1025 iovecs. Kernel text, and the kernel where it works.
+    nlhdr_want='scatter: r=32 second=1 flags=0x20 controllen=0
+whole: got=1 flags=0 controllen=0
+empty: r=0 flags=0x20 controllen=0 consumed=1
+nullhdr: r=-1 e=14
+bigiov: r=-1 e=90
+badiov: r=-1 e=14 then=1
+recvmmsg: r=1 len=32 second=1 flags=0x20 controllen=0'
+    if guest_cc "$M16D/nlhdr" tests/guests/nlhdr.c; then
+        cp "$M16D/nlhdr" "$R/bin/nlhdr"
+        st=$(CNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nlhdr 2>/dev/null)
+        if [ "$st" = "$nlhdr_want" ]; then
+            pass=$((pass + 1))
+            echo "  ok   m16 an emulated recvmsg writes its header as the kernel does"
+        else
+            fail=$((fail + 1))
+            echo "  FAIL m16 an emulated recvmsg writes its header as the kernel does"
+            printf '%s\n' "$nlhdr_want" >"$M16D/nlhdr.want"
+            printf '%s\n' "$st" >"$M16D/nlhdr.got"
+            diff "$M16D/nlhdr.want" "$M16D/nlhdr.got" | sed 's/^/    /'
+        fi
+        if [ "$m16_raw" = 1 ]; then
+            kst=$(emu_t 60 "$M16D/nlhdr" 2>/dev/null)
+            check "m16 ...and the kernel here writes the same" "$nlhdr_want" "$kst"
+        fi
+    else
+        skip "recvmsg header leg: could not build tests/guests/nlhdr.c"
+    fi
+
     rm -rf "$R"
 fi
 rm -rf "$M16D"
