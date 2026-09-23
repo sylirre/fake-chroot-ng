@@ -629,6 +629,7 @@ static long reissue(long a0, long a1, long a2, long a3, long a4, long a5,
 #define PROC_MAGIC_NONE  0 /* not a magic link */
 #define PROC_MAGIC_GUEST 1 /* rewritten to a guest path; keep resolving */
 #define PROC_MAGIC_HOST  2 /* already a host path; resolution is done */
+#define PROC_MAGIC_LONG  3 /* exe/cwd/root, whose expansion does not fit */
 
 static long proc_self_fixup(const char *canon, char *buf, unsigned long bufsz);
 
@@ -753,19 +754,29 @@ static int proc_magic(char *cur, size_t sz) {
     if (!vl || (rest[vl] != '\0' && rest[vl] != '/'))
         return PROC_MAGIC_NONE;
 
-    /* The link component alone, for the fixup; the rest rides along after. */
+    /* The link component alone, for the fixup; the rest rides along after.
+     *
+     * The target plus that rest is a longer name than the link, and one that
+     * does not fit is not cut to fit: a truncated expansion names some other
+     * path, which the walk would then go on to resolve (and a failed
+     * canonicalization leaves `cur` half-written). PROC_MAGIC_LONG is the
+     * verdict, and the walk answers it -ENAMETOOLONG — the XLATE_TOOLONG
+     * rule, for a name the view cannot express. The fixup is handed the whole
+     * buffer, so a target that fills it is told apart from one that fits. */
     char link[CNG_PATH_MAX], tmp[CNG_PATH_MAX];
     if (pl + vl >= sizeof link)
         return PROC_MAGIC_NONE;
     memcpy(link, cur, pl + vl);
     link[pl + vl] = '\0';
-    long n = proc_self_fixup(link, tmp, sizeof tmp - 1);
+    long n = proc_self_fixup(link, tmp, sizeof tmp);
     if (n < 0)
         return PROC_MAGIC_NONE;
-    tmp[n] = '\0';
-    cng_strlcpy(tmp + n, rest + vl, sizeof tmp - (size_t)n);
+    if ((size_t)n >= sizeof tmp ||
+        cng_strlcpy(tmp + n, rest + vl, sizeof tmp - (size_t)n) >=
+            sizeof tmp - (size_t)n)
+        return PROC_MAGIC_LONG;
     return cng_path_canon(tmp, cur, sz) == 0 ? PROC_MAGIC_GUEST
-                                             : PROC_MAGIC_NONE;
+                                             : PROC_MAGIC_LONG;
 }
 
 /* If `host` names one of *this* process's own open fds — "/proc/self/fd/<n>",
@@ -793,7 +804,13 @@ int cng_proc_self_fd(const char *host) {
 /* Rewrite the /dev aliases of the /proc fd links in place — /dev/fd[/...] to
  * /proc/self/fd[/...], /dev/std{in,out,err} to /proc/self/fd/{0,1,2} — so the
  * resolver's existing magic-link handling covers them. Returns 1 if `cur` was
- * rewritten (the caller re-runs the round), 0 otherwise. */
+ * rewritten, 0 if it is none of these, and -1 if the /proc spelling does not
+ * fit, with `cur` left as it was.
+ *
+ * That spelling is six bytes longer than /dev/fd's, and what follows it can
+ * be as long as the name: a guest whose cwd is /dev/fd names "/dev/fd/<its
+ * whole relative path>" here. Cut to fit, the rewrite used to drop the tail
+ * of that name, and a different, shorter one was resolved in its place. */
 static int dev_magic(char *cur, size_t sz) {
     if (cng_g_no_dev || strncmp(cur, "/dev/", 5) != 0)
         return 0;
@@ -817,8 +834,10 @@ static int dev_magic(char *cur, size_t sz) {
     }
     char tmp[CNG_PATH_MAX];
     size_t n = cng_strlcpy(tmp, base, sizeof tmp);
-    cng_strlcpy(tmp + n, rest, sizeof tmp > n ? sizeof tmp - n : 0);
-    cng_strlcpy(cur, tmp, sz);
+    size_t r = cng_strlcpy(tmp + n, rest, sizeof tmp - n);
+    if (r >= sizeof tmp - n || n + r >= sz)
+        return -1;
+    memcpy(cur, tmp, n + r + 1);
     return 1;
 }
 
@@ -1164,17 +1183,20 @@ int cng_resolve_lim(const char *path, int deref_final, char *out, size_t outsz,
          * /proc spelling, so rewrite them to it and let the checks below treat
          * them as such — readlink-ing an fd link like an ordinary symlink would
          * try to re-root whatever it names, which for a pipe or a memfd is not a
-         * path at all ("pipe:[12345]"). */
-        dev_magic(canon, sizeof canon);
+         * path at all ("pipe:[12345]"). A rewrite that does not fit is the
+         * name the view cannot express (see dev_magic). */
+        if (dev_magic(canon, sizeof canon) < 0)
+            return -ENAMETOOLONG;
         int magic = proc_magic(canon, sizeof canon);
         /* A magic link is a link: RESOLVE_NO_MAGICLINKS refuses it, and
          * RESOLVE_NO_SYMLINKS implies NO_MAGICLINKS. Both are ELOOP, which is
          * what the kernel answers for a constraint it cannot satisfy by
          * resolving. Whether a link was actually traversed: exe/cwd/root
          * always (they are rewritten in place, so the test has to be the
-         * verdict rather than the path), an fd link when it is one rather than
-         * the directory they live in. */
-        int magic_link = magic == PROC_MAGIC_GUEST ||
+         * verdict rather than the path — and an expansion too long to make is
+         * still that link, refused as one before its length is the answer),
+         * an fd link when it is one rather than the directory they live in. */
+        int magic_link = magic == PROC_MAGIC_GUEST || magic == PROC_MAGIC_LONG ||
                          (magic == PROC_MAGIC_HOST && !proc_fd_dir(canon));
         if (magic_link && lim) {
             if (lim->no_magiclinks || lim->no_symlinks) {
@@ -1190,6 +1212,8 @@ int cng_resolve_lim(const char *path, int deref_final, char *out, size_t outsz,
                 return -EXDEV;
             }
         }
+        if (magic == PROC_MAGIC_LONG)
+            return -ENAMETOOLONG;
         if (magic == PROC_MAGIC_HOST) {
             /* The magic path IS the host path: the kernel takes it straight to
              * the open file description, anonymous and deleted files included.

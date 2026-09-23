@@ -3282,6 +3282,26 @@ vfork/`posix_spawn` child-stack handling.
   the same helper. `-t elfspan` `roundwrap` in m3, with `-R` off and on
   (the previous build: `plain=-4 rewrite=0`).
 
+- [x] **M68 — a magic link's expansion was cut to fit, and named another path**
+  The walk rewrites `/dev/fd[/…]` and `/dev/std*` to their `/proc/self/fd`
+  spelling in place, and `/proc/<pid>/{exe,cwd,root}` to the guest-visible
+  target plus whatever follows the link — both longer than what they
+  replace, and both built with `cng_strlcpy` whose truncation nobody asked
+  about. The `/dev/fd` one is reachable: a guest whose cwd is `/dev/fd`
+  (chdir records it by that name) names `/dev/fd/<its whole relative
+  path>` there, so a 4082-byte name lost its last byte and resolved as the
+  4081-byte one — a run of zeros and the descriptor digit after it came
+  out as descriptor 0, and a trailing tail of junk was dropped to leave a
+  real descriptor number, which an exec then ran (measured: the host says
+  ENOENT). `dev_magic` now answers -1 when the rewrite does not fit and
+  `proc_magic` `PROC_MAGIC_LONG` — which also covers a canonicalization that
+  overflowed, which used to fall through to an ordinary lookup with the
+  walk's prefix half-overwritten — and the walk answers `-ENAMETOOLONG`, the
+  `XLATE_TOOLONG` rule. A too-long exe/cwd/root is still a magic link to
+  `RESOLVE_NO_MAGICLINKS` and to a scoped lookup, which refuse it first.
+  m5 pins both sides of the boundary through the resolver with the cwd in
+  `/dev/fd` (the previous build resolves the longer name to the shorter).
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

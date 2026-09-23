@@ -232,3 +232,19 @@ check_contains "a relative name with no room left in the cwd is refused" \
 check_absent "...and the longest cwd that still has room is not" \
     "<overflow>" \
     "$(run_t 20 -t xlate -r / -C "$_cwd/$(printf '%.72s' "$_a")" x 2>&1)"
+
+# ...and for the /dev fd aliases, whose /proc spelling is six bytes longer than
+# the name the guest gave. A guest standing in /dev/fd names "/dev/fd/<its whole
+# relative path>", and the rewrite cut that to fit: a 4082-byte name lost its
+# last byte and resolved as the 4081-byte one — here the run of zeros without
+# the 7 after it, which is descriptor 0. Both sides of the boundary are pinned.
+_fd81=$(printf '%04081d' 7)
+_fd82=$(printf '%04082d' 7)
+XD=$(mktemp -d)
+check_contains "an fd alias whose /proc spelling just fits resolves whole" \
+    "$_fd81 -> /proc/self/fd/$_fd81" \
+    "$(run_t 20 -t xlate -R -r "$XD" -C /dev/fd "$_fd81" 2>&1)"
+check_contains "...and one byte more is refused, not cut to a shorter name" \
+    "$_fd82 -> <errno 36>" \
+    "$(run_t 20 -t xlate -R -r "$XD" -C /dev/fd "$_fd82" 2>&1)"
+rm -rf "$XD"
