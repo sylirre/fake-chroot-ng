@@ -135,29 +135,37 @@ struct sockaddr_nl_ {
  * `fd` is the guest's end of the stand-in socketpair and `monfd` is ours:
  * replies are sent into `monfd` and appear as datagrams on `fd`, and requests
  * the guest wrote with untrapped write(2)/send(2) queue on `monfd` until a
- * trapped call drains them. `hostfd` is a real, deliberately UNBOUND netlink
- * socket used to relay dumps.
+ * trapped call drains them. A dump is relayed through a real, deliberately
+ * UNBOUND netlink socket of its own (relay_open), opened for the request and
+ * closed after it.
  *
- * All three are numbers in the one descriptor table the guest and the monitor
- * share, and close(2) is not trapped: the guest can close any of them and be
- * handed the number back for a file of its own — a close-all loop before an
- * exec does exactly that to the two it never knew about. So each carries the
- * identity of the file it was opened as (cng_fdid: device and inode, the
- * discipline procfs.c and uaccess.c apply to their own descriptors), and no
- * number is used, or closed, without that identity checked first. For `fd`
- * the check is what makes the slot the guest's at all: without it a guest
- * that closed this fd and opened something else on the number would have its
- * I/O quietly diverted here. For `monfd` and `hostfd` it is what keeps the
- * monitor from acting on a number that has become the guest's — the pair
- * peer used to be closed on that evidence alone when a slot was reclaimed,
- * which closed two descriptors of the program that had reused the numbers.
- * A stale `monfd` is abandoned (the pair is broken, which is what the guest
- * did to it); a stale or closed `hostfd` is opened again on the next relay,
- * because the ordinary way to lose it is not the guest at all: it is opened
- * close-on-exec, as every descriptor of ours is, and the emulated execve's
- * sweep closes it while a netlink socket the guest holds without
- * SOCK_CLOEXEC — and its pair peer, which carries the guest's own flags —
- * survives into the next program.
+ * The relay used to be a third descriptor of the slot's, kept for its life,
+ * and replaced when it went stale — which two threads relaying on the same
+ * socket could both find at once: each opened one and wrote its identity
+ * into the slot, and the loser of the publishing compare-and-swap had by
+ * then overwritten the winner's, so the socket that won no longer matched
+ * its record, was taken for stale by the next call, and was replaced without
+ * being closed — a monitor descriptor lost per race. Shared, it was also
+ * shared by their dumps: the kernel runs one dump per socket (a second is
+ * EBUSY), each thread's reads took the other's replies, and a dump that
+ * timed out left its tail for the next request to read. One socket per
+ * request has no state to publish and nobody to share it with.
+ *
+ * Every one of these is a number in the one descriptor table the guest and
+ * the monitor share, and close(2) is not trapped: the guest can close any of
+ * them and be handed the number back for a file of its own — a close-all
+ * loop before an exec does exactly that to the ones it never knew about. So
+ * each carries the identity of the file it was opened as (cng_fdid: device
+ * and inode, the discipline procfs.c and uaccess.c apply to their own
+ * descriptors), and no number is used, or closed, without that identity
+ * checked first. For `fd` the check is what makes the slot the guest's at
+ * all: without it a guest that closed this fd and opened something else on
+ * the number would have its I/O quietly diverted here. For `monfd` and a
+ * relay socket it is what keeps the monitor from acting on a number that has
+ * become the guest's — the pair peer used to be closed on that evidence alone
+ * when a slot was reclaimed, which closed two descriptors of the program that
+ * had reused the numbers. A stale `monfd` is abandoned (the pair is broken,
+ * which is what the guest did to it).
  *
  * `state` is the slot's claim, in its low two bits: NL_FREE is a slot nobody
  * holds (a fresh table element is all zero, so this is also the state an fd
@@ -184,8 +192,8 @@ enum { NL_FREE = 0, NL_CLAIMED = 1, NL_LIVE = 2 };
 
 struct nl_slot {
     unsigned state; /* claim | claims made << 2 */
-    int fd, monfd, hostfd;
-    struct cng_fdid id, monid, hostid;
+    int fd, monfd;
+    struct cng_fdid id, monid;
 };
 
 static struct cng_tab g_slots = CNG_TAB_INIT(struct nl_slot);
@@ -240,41 +248,33 @@ static int slot_monfd(struct nl_slot *s) {
 
 static long open_hostfd(void);
 
-/* The relay socket, opened again if the number was closed (the exec sweep) or
- * has become the guest's (abandoned, never closed). Two threads finding it
- * gone at once each open one and the compare-and-swap decides whose is
- * published; the other closes its own, which nobody has seen. -1 when the
- * host will not give one, or the relay is switched off. */
-static int slot_hostfd(struct nl_slot *s) {
-    for (;;) {
-        int cur = __atomic_load_n(&s->hostfd, __ATOMIC_ACQUIRE);
-        if (cur >= 0 && cng_fd_is(cur, &s->hostid))
-            return cur;
-        long nfd = open_hostfd();
-        if (nfd < 0)
-            return -1;
-        struct cng_fdid id;
-        if (cng_fdid_of((int)nfd, &id) != 0) {
-            sys_close((int)nfd);
-            return -1;
-        }
-        s->hostid = id;
-        if (__atomic_compare_exchange_n(&s->hostfd, &cur, (int)nfd, 0,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
-            return (int)nfd;
-        sys_close((int)nfd);
+/* A relay socket for one request, and the identity it is closed by. -1 when
+ * the host will not give one, or the relay is switched off. */
+static int relay_open(struct cng_fdid *id) {
+    long fd = open_hostfd();
+    if (fd < 0)
+        return -1;
+    if (cng_fdid_of((int)fd, id) != 0) {
+        sys_close((int)fd);
+        return -1;
     }
+    return (int)fd;
 }
 
-/* Empty a slot: its pair peer and relay socket are ours to close — where the
- * numbers still name them. The caller holds the claim, and settles it. */
+/* ...closed where the number still names it: a guest thread may have closed
+ * it under us and been handed the number back for a file of its own. */
+static void relay_close(int fd, const struct cng_fdid *id) {
+    if (fd >= 0 && cng_fd_is(fd, id))
+        sys_close(fd);
+}
+
+/* Empty a slot: its pair peer is ours to close — where the number still
+ * names it. The caller holds the claim, and settles it. */
 static void slot_empty(struct nl_slot *s) {
     if (s->monfd >= 0 && cng_fd_is(s->monfd, &s->monid))
         sys_close(s->monfd);
-    if (s->hostfd >= 0 && cng_fd_is(s->hostfd, &s->hostid))
-        sys_close(s->hostfd);
     __atomic_store_n(&s->fd, -1, __ATOMIC_RELAXED);
-    s->monfd = s->hostfd = -1;
+    s->monfd = -1;
 }
 
 /* Retire a live slot judged stale on a snapshot taken at `st`: 1 with the
@@ -600,7 +600,8 @@ static long put_error(unsigned char *buf, long off, long max, unsigned seq,
 static int addr_dump_indices(int *idx, unsigned *v4, unsigned char *plen,
                              int cap, unsigned char *scratch,
                              long scratch_len) {
-    long fd = open_hostfd();
+    struct cng_fdid rid;
+    int fd = relay_open(&rid);
     int n = 0;
     if (fd < 0)
         return 0;
@@ -674,7 +675,7 @@ static int addr_dump_indices(int *idx, unsigned *v4, unsigned char *plen,
         }
     }
 out:
-    sys_close((int)fd);
+    relay_close(fd, &rid);
     return n;
 }
 
@@ -891,7 +892,8 @@ static void process_request(struct nl_slot *s, const unsigned char *req,
 
     if (type == RTM_GETLINK_ || type == RTM_GETADDR_ || type == RTM_GETROUTE_) {
         long sr = -1;
-        int hostfd = slot_hostfd(s);
+        struct cng_fdid rid;
+        int hostfd = relay_open(&rid);
         if (hostfd >= 0)
             sr = (cng_nl_deny_getlink && type == RTM_GETLINK_)
                      ? -EACCES /* test aid: Android's nlmsg_readpriv refusal */
@@ -901,8 +903,10 @@ static void process_request(struct nl_slot *s, const unsigned char *req,
                 cng_dprintf(2, "[cng] nl send fd=%d type=%u -> relayed\n",
                             s->fd, type);
             pump(s, hostfd, seq, pid, is_dump, scratch);
+            relay_close(hostfd, &rid);
             return;
         }
+        relay_close(hostfd, &rid);
         /* The host refuses to answer this query — on Android RTM_GETLINK is
          * denied outright (nlmsg_readpriv), in any request form, while the
          * other dumps relay fine. Synthesize what the oracle synthesizes
@@ -922,8 +926,9 @@ static void process_request(struct nl_slot *s, const unsigned char *req,
             if (cng_g_debug)
                 cng_dprintf(2,
                             "[cng] nl send fd=%d type=%u -> synthesized %ld "
-                            "bytes (relay fd=%d sendto=%ld)\n",
-                            s->fd, type, off, hostfd, sr);
+                            "bytes (relay %s, sendto=%ld)\n",
+                            s->fd, type, off, hostfd >= 0 ? "open" : "none",
+                            sr);
             push_msgs(s, scratch, off);
             return;
         }
@@ -1026,7 +1031,7 @@ long cng_nl_socket(long domain, long type, long protocol) {
                 SOCK_DGRAM_ | (type & ~(long)SOCK_TYPE_MASK), 0, (long)sv, 0,
                 0) < 0) {
         __atomic_store_n(&s->fd, -1, __ATOMIC_RELAXED);
-        s->monfd = s->hostfd = -1;
+        s->monfd = -1;
         slot_settle(s, mine, NL_FREE);
         return -1;
     }
@@ -1035,7 +1040,7 @@ long cng_nl_socket(long domain, long type, long protocol) {
         sys_close(sv[0]);
         sys_close(sv[1]);
         __atomic_store_n(&s->fd, -1, __ATOMIC_RELAXED);
-        s->monfd = s->hostfd = -1;
+        s->monfd = -1;
         slot_settle(s, mine, NL_FREE);
         return -1;
     }
@@ -1043,14 +1048,12 @@ long cng_nl_socket(long domain, long type, long protocol) {
     __atomic_store_n(&s->id.ino, gid.ino, __ATOMIC_RELAXED);
     __atomic_store_n(&s->fd, sv[0], __ATOMIC_RELAXED);
     s->monfd = sv[1];
-    s->hostfd = -1;
-    slot_hostfd(s); /* the relay socket, where the host gives one */
     slot_settle(s, mine, NL_LIVE);
     if (cng_g_debug)
         cng_dprintf(2,
                     "[cng] netlink: emulating fd %d (host denies rtnetlink), "
-                    "pair peer %d, relay fd %d\n",
-                    s->fd, s->monfd, s->hostfd);
+                    "pair peer %d\n",
+                    sv[0], sv[1]);
     return sv[0];
 }
 

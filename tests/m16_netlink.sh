@@ -370,13 +370,14 @@ else
     fi
 
     # --- 5. the hidden descriptors and the guest's own -----------------------
-    # An emulated socket is three descriptors, and the guest knows one. A
-    # close-all loop closes the other two too and the next opens get the
+    # An emulated socket was three descriptors, and the guest knows one. A
+    # close-all loop closes the others too and the next opens get the
     # numbers back; the slot's reclaim used to close them again, on the
     # evidence of the guest's fd alone — two files of the program's. And the
-    # relay socket is close-on-exec while a netlink socket without SOCK_CLOEXEC
+    # relay socket was close-on-exec while a netlink socket without SOCK_CLOEXEC
     # is not: after an exec the inherited socket's dump went through, and read
-    # from, whatever the new program had opened on the relay's number.
+    # from, whatever the new program had opened on the relay's number. (The
+    # relay is a socket per request now; the legs stand for what they check.)
     if guest_cc "$M16D/nlstale" tests/guests/nlstale.c; then
         cp "$M16D/nlstale" "$R/bin/nlstale"
         st=$(CNG_DEBUG=1 CNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nlstale \
@@ -386,14 +387,31 @@ else
         check_contains "m16 a netlink socket without SOCK_CLOEXEC works after an exec" \
             "exec: inherited_open=1 dump=1 files=16 kept=16" "$st"
         if [ "$m16_raw" = 1 ]; then
-            # The relay the sweep closed is opened again: the dump after the
-            # exec is relayed like the two before it, not synthesized through
-            # the guest's file on the old number.
+            # The dump after the exec is relayed like the two before it, not
+            # synthesized through the guest's file on an old number.
             check "m16 ...and its dump is still relayed, on a relay socket of ours" \
                 3 "$(grep -c -- '-> relayed' "$M16D/nlstale.err")"
         fi
     else
         skip "hidden-descriptor leg: could not build tests/guests/nlstale.c"
+    fi
+
+    # --- 6. concurrent relays on one socket ---------------------------------
+    # The relay was a descriptor the socket kept, re-opened when it went stale,
+    # and two threads finding it gone at once could leave the published one
+    # recorded under the loser's identity: taken for stale by the next call and
+    # replaced without a close, a descriptor lost per race. Each round closes
+    # the monitor's netlink sockets (what a close-all loop does), and eight
+    # threads relay on the one socket at the same moment; a relay belongs to
+    # its request now, so none may be left once they are done. The previous
+    # build leaves its one relay behind every round, and more when it races.
+    if guest_cc "$M16D/nlrace" tests/guests/nlrace.c -pthread; then
+        cp "$M16D/nlrace" "$R/bin/nlrace"
+        st=$(CNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nlrace 2>/dev/null)
+        check_contains "m16 concurrent relays leave no relay socket behind" \
+            "nlrace: rounds=60 left=0 leaked=0" "$st"
+    else
+        skip "concurrent-relay leg: could not build tests/guests/nlrace.c with -pthread"
     fi
 
     rm -rf "$R"

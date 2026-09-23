@@ -3164,6 +3164,28 @@ vfork/`posix_spawn` child-stack handling.
   leg: `tests/guests/nlchurn.c`, eight threads opening, binding, naming and
   closing 3600 sockets — about twenty went wrong a run, none now.
 
+- [x] **M63 — two threads relaying on one netlink socket lost a descriptor**
+  An emulated `NETLINK_ROUTE` socket relayed its dumps through a host
+  netlink socket it kept for its life, replaced when the number stopped
+  naming it (the exec sweep closes it; so does a guest's close-all loop).
+  Two threads finding it gone at once each opened one and wrote its
+  identity into the slot *before* the compare-and-swap that published it,
+  so the loser could overwrite the winner's record: the published socket
+  then failed its own identity check, was taken for stale by the next call
+  and replaced without a close — a monitor descriptor lost per race, in the
+  guest's table (`tests/guests/nlrace.c` measures ~270 over 60 rounds of
+  eight threads on the previous build). Shared, the socket was also shared
+  by the threads' dumps: the kernel runs one dump per socket (a second is
+  `EBUSY`), each thread's reads took the other's replies, and a dump that
+  timed out left its tail for the next request. The owner chose a socket
+  per request over a guarded shared one: `relay_open`/`relay_close` give
+  each relayed GET its own unbound socket, closed after the request where
+  the number still names it (the identity discipline of M47; the address
+  enumeration's throwaway socket closes the same way now), and the slot
+  keeps only the guest's end and the pair peer — so there is no relay
+  state to publish, and none to share. About three syscalls more per
+  relayed request. m16 leg: `nlrace` (rounds=60 left=0 leaked=0).
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

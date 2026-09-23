@@ -1,9 +1,9 @@
 /* The emulated netlink socket's hidden descriptors and the guest's own (M16
  * regression).
  *
- * An emulated NETLINK_ROUTE socket is three descriptors in the guest's table:
+ * An emulated NETLINK_ROUTE socket was three descriptors in the guest's table:
  * the guest's end of a socketpair, the monitor's end, and an unbound relay
- * socket — and the guest knows only the first. A program that closes every
+ * socket (one per request now) — and the guest knows only the first. A program that closes every
  * descriptor it did not open (a daemon's close-all loop, closefrom(3) before an
  * exec) closes the other two as well, and its next opens are handed the same
  * numbers back. The monitor used to reclaim the slot on the evidence of the
