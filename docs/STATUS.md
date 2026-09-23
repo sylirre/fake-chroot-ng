@@ -3321,6 +3321,26 @@ vfork/`posix_spawn` child-stack handling.
   build reads the cmdline, exe and cwd of `/proc/0<pid>` and runs the
   program from `/proc/self/fd/0<n>`).
 
+- [x] **M70 — an l2s marker was any name whose number came out right**
+  `find_marker` took the first directory entry of the marker grammar
+  (`.l2s.<digits>.<digits>`) whose inode field equalled the group's, and
+  `parse_u64` accumulated modulo 2^64 — so `.l2s.<ino + 2^64>.<n>` was
+  that group's marker, and so were `.l2s.<ino>.9` and `.l2s.0<ino>.0009`,
+  spellings `build_name` never writes. The guest cannot create such a
+  name (the grammar is hidden and refused), but a tree from elsewhere can
+  carry one, and then the count was whichever the listing gave first (a
+  tmpfs lists the newest first): `st_nlink` from the stray, and the next
+  link or unlink renaming a canonical name that was not there — or, with
+  the real marker gone, the stray's count taken as the group's, which a
+  decref could act on. `parse_u64` now tells a run whose value does not fit
+  apart (it no longer wraps; the hide/refuse grammar still takes any run,
+  a value is only had where there is one), and `find_marker` accepts
+  exactly the name `build_name` writes (`parse_marker_exact`: the inode
+  unpadded, the count four digits wide). `-t l2stest` `l2s-marker` in m7:
+  three strays beside a live group — its count read, read with the real
+  marker gone, bumped, and the group removed, the strays untouched
+  throughout (the previous build: `two=0 lost=0`).
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

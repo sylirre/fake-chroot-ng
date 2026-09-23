@@ -78,21 +78,40 @@ static int is_dir(const void *st) { return (st_mode(st) & S_IFMT_) == S_IFDIR_; 
 
 /* ---- name parsing / formatting ------------------------------------------ */
 
-/* Parse a run of decimal digits: 1 (+ value, +end) if >=1 digit, else 0. */
+/* Parse a run of decimal digits, setting *end past it: 0 for no digits, 1 for
+ * a run whose value is in *out, 2 for one whose value does not fit in 64 bits
+ * (*out untouched). The value used to be accumulated modulo 2^64, so a name
+ * spelling ino + 2^64 parsed as ino. */
 static int parse_u64(const char *p, unsigned long long *out, const char **end) {
     unsigned long long v = 0;
     const char *s = p;
+    int wide = 0;
     while (*p >= '0' && *p <= '9') {
-        v = v * 10 + (unsigned)(*p - '0');
+        unsigned d = (unsigned)(*p - '0');
+        if (v > (~0ULL - d) / 10)
+            wide = 1;
+        else
+            v = v * 10 + d;
         p++;
     }
     if (p == s)
         return 0;
-    if (out)
-        *out = v;
     if (end)
         *end = p;
+    if (wide)
+        return 2;
+    if (out)
+        *out = v;
     return 1;
+}
+
+/* A number field of the names below. The grammar — what cng_l2s_hidden hides
+ * and refuses — is any digit run, however long, and a caller asking only that
+ * passes no `out`; one that wants the number gets it only if there is one. */
+static int parse_field(const char *p, unsigned long long *out,
+                       const char **end) {
+    int r = parse_u64(p, out, end);
+    return r == 1 || (r == 2 && !out);
 }
 
 /* ".l2s.<ino>" exactly (data backing file). */
@@ -100,7 +119,7 @@ static int parse_data(const char *name, unsigned long long *ino) {
     if (strncmp(name, L2S_PREFIX, L2S_PREFIX_LEN))
         return 0;
     const char *end;
-    if (!parse_u64(name + L2S_PREFIX_LEN, ino, &end))
+    if (!parse_field(name + L2S_PREFIX_LEN, ino, &end))
         return 0;
     return *end == '\0';
 }
@@ -111,11 +130,12 @@ static int parse_marker(const char *name, unsigned long long *ino,
     if (strncmp(name, L2S_PREFIX, L2S_PREFIX_LEN))
         return 0;
     const char *end;
-    unsigned long long v;
-    if (!parse_u64(name + L2S_PREFIX_LEN, &v, &end) || *end != '.')
+    unsigned long long v, c;
+    int want = ino || count;
+    if (!parse_field(name + L2S_PREFIX_LEN, want ? &v : 0, &end) ||
+        *end != '.')
         return 0;
-    unsigned long long c;
-    if (!parse_u64(end + 1, &c, &end) || *end != '\0')
+    if (!parse_field(end + 1, want ? &c : 0, &end) || *end != '\0')
         return 0;
     if (ino)
         *ino = v;
@@ -191,6 +211,39 @@ static int parse_data_exact(const char *name, unsigned long long *ino) {
     return 1;
 }
 
+/* ".l2s.<ino>.<count>" exactly as build_name writes it: the inode with no
+ * leading zero, the count zero-padded to four digits and no wider — the one
+ * marker name a group has. find_marker used to take any name of the grammar
+ * whose number came out equal, and the numbers came out equal for spellings
+ * no marker of ours ever had: ".l2s.<ino + 2^64>.<n>" (the parse wrapped),
+ * ".l2s.<ino>.5" or ".l2s.0<ino>.0005". A tree carrying one — a rootfs from
+ * elsewhere; the guest cannot make such a name — had its count read from the
+ * stray, which the next update then failed to rename (it renames the
+ * canonical name), or which outvoted the real marker, whichever the directory
+ * listed first. */
+static int parse_marker_exact(const char *name, unsigned long long *ino,
+                              unsigned long *count) {
+    unsigned long long v;
+    unsigned long c;
+    if (!parse_marker(name, &v, &c))
+        return 0;
+    char tmp[48], *p = tmp, *end = tmp + sizeof tmp - 1;
+    put_u64(&p, end, v, 1);
+    if (p < end)
+        *p++ = '.';
+    put_u64(&p, end, (unsigned long long)c, 4);
+    if (p > end)
+        return 0;
+    *p = '\0';
+    if (strcmp(tmp, name + L2S_PREFIX_LEN) != 0)
+        return 0;
+    if (ino)
+        *ino = v;
+    if (count)
+        *count = c;
+    return 1;
+}
+
 /* "<dir>/.l2s.<ino>" (count < 0) or "<dir>/.l2s.<ino>.<count>" into out.
  * Returns 0 or -ENAMETOOLONG. */
 static int build_name(char *out, size_t sz, const char *dir,
@@ -242,7 +295,7 @@ static int find_marker(const char *dir, unsigned long long ino,
             const char *nm = buf + o + 19;
             unsigned long long dino;
             unsigned long dc;
-            if (parse_marker(nm, &dino, &dc) && dino == ino) {
+            if (parse_marker_exact(nm, &dino, &dc) && dino == ino) {
                 *count = dc;
                 found = 0;
                 break;

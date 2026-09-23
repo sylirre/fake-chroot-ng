@@ -4246,6 +4246,101 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
                 ok_q ? "OK" : "FAIL");
     fails += !ok_q;
 
+    /* A group's count is its one marker, spelled as build_name spells it.
+     * Names of the same grammar that no marker of ours ever had — the inode
+     * plus 2^64 (the parse wrapped it back onto the inode), an unpadded
+     * count, a leading-zero inode — were read as that marker whenever the
+     * directory listed them first, which a tmpfs does for the newest entries:
+     * planted after the group's marker, as a tree from elsewhere could carry
+     * them. With the real marker gone every one of them is all there is,
+     * which settles the order whatever the filesystem: the count they claim
+     * (9) must not become the group's, and nothing done to the group may
+     * touch them. */
+    long mgf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/m1",
+                           CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (mgf >= 0) {
+        sys_write((int)mgf, "mm", 2);
+        sys_close((int)mgf);
+    }
+    char smf[144];
+    unsigned long long mino = 0;
+    if (cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/m1", (long)smf,
+                     0, 0, 0, 0) == 0)
+        mino = ST_INO(smf);
+    /* ino + 2^64 in decimal, added digit by digit onto 2^64's digits. */
+    char wide[32] = "18446744073709551616";
+    unsigned long long carry = mino;
+    for (int k = 19; k >= 0; k--) {
+        carry += (unsigned long long)(wide[k] - '0');
+        wide[k] = (char)('0' + carry % 10);
+        carry /= 10;
+    }
+    char mstray[3][CNG_PATH_MAX], mcanon[CNG_PATH_MAX], mlost[CNG_PATH_MAX],
+        mdata[CNG_PATH_MAX], mdir[CNG_PATH_MAX];
+    dbg_mkpath(mdir, sizeof mdir, rootfs, "/.l2s", 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, mdir, 0700, 0, 0, 0);
+    dbg_mkpath(mstray[0], CNG_PATH_MAX, rootfs, "/.l2s/.l2s.", 0, 0);
+    cng_strlcpy(mstray[0] + strlen(mstray[0]), wide,
+                CNG_PATH_MAX - strlen(mstray[0]));
+    cng_strlcpy(mstray[0] + strlen(mstray[0]), ".0009",
+                CNG_PATH_MAX - strlen(mstray[0]));
+    dbg_mkpath(mstray[1], CNG_PATH_MAX, rootfs, "/.l2s/.l2s.", mino, 1);
+    cng_strlcpy(mstray[1] + strlen(mstray[1]), ".9",
+                CNG_PATH_MAX - strlen(mstray[1]));
+    dbg_mkpath(mstray[2], CNG_PATH_MAX, rootfs, "/.l2s/.l2s.0", mino, 1);
+    cng_strlcpy(mstray[2] + strlen(mstray[2]), ".0009",
+                CNG_PATH_MAX - strlen(mstray[2]));
+    dbg_mkpath(mdata, sizeof mdata, rootfs, "/.l2s/.l2s.", mino, 1);
+    dbg_mkpath(mcanon, sizeof mcanon, rootfs, "/.l2s/.l2s.", mino, 1);
+    size_t mcl = strlen(mcanon);
+    dbg_mkpath(mlost, sizeof mlost, rootfs, "/.l2s/lost-marker", 0, 0);
+    long ml2 = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/m1",
+                            CNG_AT_FDCWD, (long)"/w/m2", 0, 0, 0);
+    for (int k = 0; k < 3; k++) {
+        long sf = sys_openat(CNG_AT_FDCWD, mstray[k],
+                             CNG_O_CREAT | CNG_O_WRONLY | CNG_O_CLOEXEC, 0600);
+        if (sf >= 0)
+            sys_close((int)sf);
+    }
+    long rm1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/m1",
+                            (long)smf, 0, 0, 0, 0);
+    int m_two = ml2 == 0 && rm1 == 0 && ST_NLINK(smf) == 2;
+    /* The real marker gone, as a crash between two renames could leave it:
+     * the count is unknown (1), not the strays' 9. */
+    cng_strlcpy(mcanon + mcl, ".0002", sizeof mcanon - mcl);
+    CNG_SYS(__NR_renameat, CNG_AT_FDCWD, mcanon, CNG_AT_FDCWD, mlost, 0, 0);
+    rm1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/m1", (long)smf,
+                       0, 0, 0, 0);
+    int m_lost = rm1 == 0 && ST_NLINK(smf) == 1;
+    CNG_SYS(__NR_renameat, CNG_AT_FDCWD, mlost, CNG_AT_FDCWD, mcanon, 0, 0);
+    long ml3 = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/m1",
+                            CNG_AT_FDCWD, (long)"/w/m3", 0, 0, 0);
+    rm1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/m3", (long)smf,
+                       0, 0, 0, 0);
+    cng_strlcpy(mcanon + mcl, ".0003", sizeof mcanon - mcl);
+    char msk[144];
+    int m_three = ml3 == 0 && rm1 == 0 && ST_NLINK(smf) == 3 &&
+                  CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, mcanon, msk,
+                          CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0;
+    const char *mu[] = {"/w/m1", "/w/m2", "/w/m3"};
+    for (int k = 0; k < 3; k++)
+        cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)mu[k], 0, 0, 0, 0, 0);
+    int m_gone = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, mdata, msk,
+                         CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == -ENOENT &&
+                 CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, mcanon, msk,
+                         CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == -ENOENT;
+    int m_strays = 1;
+    for (int k = 0; k < 3; k++) {
+        m_strays &= CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, mstray[k], msk,
+                            CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0;
+        CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, mstray[k], 0, 0, 0, 0);
+    }
+    int ok_m = mino && m_two && m_lost && m_three && m_gone && m_strays;
+    cng_dprintf(1,
+                "l2s-marker: two=%d lost=%d three=%d gone=%d strays=%d -> %s\n",
+                m_two, m_lost, m_three, m_gone, m_strays, ok_m ? "OK" : "FAIL");
+    fails += !ok_m;
+
     cng_blocked[__NR_linkat] = 0;
     cng_g_l2s = 0;
 

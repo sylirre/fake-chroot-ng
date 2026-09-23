@@ -163,6 +163,12 @@ check_contains "l2s groups linked before a narrowing chroot stay recognized" \
 # followed or by descriptor. It joins the group now.
 check_contains "l2s links of the emulation's own file join the group" \
     "l2s-hostlink: joined=1 kept=1 -> OK" "$out"
+# A group's count is its one marker as the emulation spells it. Stray names of
+# the same grammar — the inode plus 2^64, which the parse wrapped back onto the
+# inode, an unpadded count, a leading-zero inode — were taken for it whenever
+# listed first, and were all there was once the real marker was gone.
+check_contains "l2s reads a group's count from its own marker only" \
+    "l2s-marker: two=1 lost=1 three=1 gone=1 strays=1 -> OK" "$out"
 check_contains "fchdir updates virtual cwd" "fchdir: cwd=/w -> OK" "$out"
 check_contains "chdir through a symlink records the directory it landed in" \
     "chdir-symlink: rc=0 cwd=/w -> OK" "$out"
