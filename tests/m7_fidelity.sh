@@ -19,6 +19,8 @@ check_contains "fake-root reopens a file it may execute but not read" \
     "fakeroot_reopen: opened=1 mode_kept=1 -> OK" "$out"
 check_contains "a refused reopen is served from the fd we hold, rewound" \
     "fd_reopen: dup=1 content=1 -> OK" "$out"
+check_contains "fake-root passes fchmodat2's ENOSYS on for the fallback" \
+    "fchmodat2_enosys=-38 want=-38 -> OK" "$out"
 check_contains "supplementary groups empty" "ngroups=0"           "$out"
 # The set has to hold a realistic list. initgroups(3) against a directory
 # service hands over more than a handful, and a ceiling it trips is an EINVAL
