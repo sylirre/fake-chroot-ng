@@ -1610,6 +1610,20 @@ int cng_cmd_faketest(int argc, char **argv, char **envp, unsigned long *auxv) {
                     (dup_ok && content) ? "OK" : "FAIL");
     }
 
+    /* fchmodat2 answered ENOSYS — by a kernel predating it (Linux < 6.6), or by
+     * Android's filter, which reissue answers the same way — is what glibc's
+     * fchmodat and systemd fall back on. Fake-root is for denials, and faking
+     * this one to 0 left the mode silently unchanged. The blocked form gives
+     * the same ENOSYS on any host, so it stands in for the old kernel. */
+    {
+        cng_blocked[__NR_fchmodat2] = 1;
+        long r = cng_dispatch(__NR_fchmodat2, CNG_AT_FDCWD, (long)file, 0640,
+                              0, 0, 0, /*trapped=*/1);
+        cng_blocked[__NR_fchmodat2] = 0;
+        cng_dprintf(1, "fchmodat2_enosys=%d want=%d -> %s\n", (int)r,
+                    (int)-ENOSYS, r == -ENOSYS ? "OK" : "FAIL");
+    }
+
     /* Full credential model. Supplementary groups start empty; capabilities are
      * the full set while fake-root (euid still 0 at this point). */
     cng_dprintf(1, "ngroups=%d\n",

@@ -72,7 +72,8 @@ static void statx_remap(void *st) {
  * real process is unprivileged, but the guest believes it is root. Denied
  * (EPERM/EACCES/EINVAL) and Android-blocked (ENOSYS) results are faked; genuine
  * errors (ENOENT, EROFS, ...) still propagate, as do all results when the
- * identity is unprivileged or inactive. */
+ * identity is unprivileged or inactive. fchmodat2 goes through
+ * fchmodat2_result instead, whose ENOSYS asks for a fallback. */
 static long chattr_result(long r) {
     if (r == 0)
         return 0;
@@ -80,6 +81,15 @@ static long chattr_result(long r) {
         (r == -EPERM || r == -EACCES || r == -EINVAL || r == -ENOSYS))
         return 0;
     return r;
+}
+
+/* fchmodat2's ENOSYS is not a refusal to fake: it is a kernel predating the
+ * call (Linux < 6.6), or Android's filter, answered as such a kernel would.
+ * glibc and systemd fall back to fchmodat (or a chmod of /proc/self/fd/N) on
+ * exactly that answer. Faked to success, the guest believes the mode changed
+ * and it silently stays as it was. */
+static long fchmodat2_result(long r) {
+    return r == -ENOSYS ? r : chattr_result(r);
 }
 
 static int fs_has_ro(void);
@@ -4148,8 +4158,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                                         data, sizeof data)) {
             if (l2s_ro(hnf, data))
                 return -EROFS;
-            return chattr_result(reissue(CNG_AT_FDCWD, (long)data, a2, a3, a4,
-                                         a5, nr));
+            return fchmodat2_result(reissue(CNG_AT_FDCWD, (long)data, a2, a3,
+                                            a4, a5, nr));
         }
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
         if (xlate_bad(p))
@@ -4158,7 +4168,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                                   deref ? 0 : CNG_AT_SYMLINK_NOFOLLOW);
         if (ro)
             return ro;
-        return chattr_result(reissue(a0, (long)p, a2, a3, a4, a5, nr));
+        return fchmodat2_result(reissue(a0, (long)p, a2, a3, a4, a5, nr));
     }
 
     /* unlinkat: on removing one of our link2symlink names, drop the group's
