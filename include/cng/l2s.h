@@ -4,7 +4,9 @@
  * hosts that refuse link(2) (Android/SELinux returns EACCES/EXDEV, some EPERM).
  *
  * A guest hardlink group lives in the per-rootfs object store "<rootfs>/.l2s":
- *   data   ".l2s.<ino>"          holds the real contents; every "hardlink" name
+ *   data   ".l2s.<ino>"          the linked file itself, moved here — a regular
+ *                                file, or the FIFO, socket or device node that
+ *                                was linked; every "hardlink" name
  *                                is a symlink carrying the data file's absolute
  *                                *host* path, so links span directories and
  *                                survive renames of names or parent dirs. <ino>
@@ -26,8 +28,8 @@
  * the guest cannot write a target in the ".l2s." grammar itself (l2s.c).
  *
  * stat/statx on any of the names is redirected to the data file, with st_nlink
- * overridden to the marker count, so the group presents as ordinary regular
- * files sharing one inode (matching st_ino, shared contents) — which is what
+ * overridden to the marker count, so the group presents as ordinary files
+ * sharing one inode (matching st_ino, shared contents) — which is what
  * lets programs that set+verify metadata (e.g. apk preserving mtime) succeed.
  * A directory listing says the same: the names' dirents carry the data file's
  * d_type/d_ino rather than the symlinks' own (cng_l2s_dirent).

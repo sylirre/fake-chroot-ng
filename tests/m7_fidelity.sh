@@ -199,6 +199,10 @@ check_contains "l2s link of a symlink makes a symlink with its text" \
 # legacy bare-target link that lands in another directory is repointed.
 check_contains "l2s rename between two names of one file does nothing" \
     "l2s-samefile: mv=0 exch=0 noreplace=1 kept=1 legacy_exch=1 -> OK" "$out"
+# A FIFO or a socket is a group's data as a regular file is: both names are one
+# pipe, one socket. The copy path opened the FIFO and hung until a writer came.
+check_contains "l2s links of a FIFO and a socket share the node" \
+    "l2s-node: fifo=1 pipe=1 socket=1 -> OK" "$out"
 check_contains "fchdir updates virtual cwd" "fchdir: cwd=/w -> OK" "$out"
 check_contains "chdir through a symlink records the directory it landed in" \
     "chdir-symlink: rc=0 cwd=/w -> OK" "$out"

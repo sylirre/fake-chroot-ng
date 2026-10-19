@@ -84,6 +84,10 @@ static unsigned st_mode(const void *st) {
 static int is_lnk(const void *st) { return (st_mode(st) & S_IFMT_) == S_IFLNK_; }
 static int is_reg(const void *st) { return (st_mode(st) & S_IFMT_) == S_IFREG_; }
 static int is_dir(const void *st) { return (st_mode(st) & S_IFMT_) == S_IFDIR_; }
+/* What a group's data file can be: anything a link(2) can name — a regular
+ * file, a FIFO, a socket, a device node — which is everything but a directory
+ * (EPERM) and a symlink (linked as itself, l2s_copy_symlink). */
+static int is_data(const void *st) { return !is_dir(st) && !is_lnk(st); }
 
 /* ---- name parsing / formatting ------------------------------------------ */
 
@@ -450,11 +454,13 @@ int cng_l2s_deny(long dirfd, const char *gp) {
  *    onto this rootfs's store under the same name, and the file it named is
  *    never looked at.
  *
- * and the data file has to be there, a regular file. Everything else is an
- * ordinary symlink, whatever its last component says. The guest can no longer
- * write such a target at all (the symlinkat refusal in dispatch.c); this is
- * what keeps a tree that already holds one — from before that refusal, from
- * the host, from another tool — from being read the old way. */
+ * and the data file has to be there: a regular file, a FIFO, a socket or a
+ * device node (is_data) — whatever was linked, never a directory or a
+ * symlink. Everything else is an ordinary symlink, whatever its last
+ * component says. The guest can no longer write such a target at all (the
+ * symlinkat refusal in dispatch.c); this is what keeps a tree that already
+ * holds one — from before that refusal, from the host, from another tool —
+ * from being read the old way. */
 
 /* The view chroot-ng was started with: run.c's, never written after it is
  * published. A guest chroot narrows the view, and a group linked before it
@@ -525,14 +531,14 @@ static int l2s_locate(const char *host, const char *tgt, char *data,
         if (sep)
             data[dl++] = '/';
         cng_strlcpy(data + dl, b, dsz - dl);
-        return l2s_lstat(data, st) == 0 && is_reg(st);
+        return l2s_lstat(data, st) == 0 && is_data(st);
     }
     if (!l2s_canonical(tgt))
         return 0;
     if (l2s_owned(tgt)) {
         if (cng_strlcpy(data, tgt, dsz) >= dsz)
             return -ENAMETOOLONG;
-        if (l2s_lstat(data, st) == 0 && is_reg(st))
+        if (l2s_lstat(data, st) == 0 && is_data(st))
             return 1;
     }
     if (!l2s_store_shaped(tgt))
@@ -546,7 +552,7 @@ static int l2s_locate(const char *host, const char *tgt, char *data,
     memcpy(data, store, sl);
     data[sl] = '/';
     cng_strlcpy(data + sl + 1, b, dsz - sl - 1);
-    if (!strcmp(data, tgt) || l2s_lstat(data, st) != 0 || !is_reg(st))
+    if (!strcmp(data, tgt) || l2s_lstat(data, st) != 0 || !is_data(st))
         return 0; /* dangling: just an ordinary symlink */
     *heal = 1;
     return 1;
@@ -637,14 +643,26 @@ static int l2s_target(const char *host, char *data, size_t dsz,
 
 /* Copy the contents of `src` (opened, follows /proc/self/fd/N) into a new
  * regular file `dst`. Used when src has no named regular inode to symlink to
- * (e.g. /proc/self/fd/N naming an O_TMPFILE), or the link spans directories. */
+ * (e.g. /proc/self/fd/N naming an O_TMPFILE), or the link spans directories.
+ * Only a regular file has contents to copy, and only one is opened: opening a
+ * FIFO blocked the linker until a writer came (`ln fifo fifo2` hung), and
+ * opening a device acts on it. The type is asked first, and the open is
+ * non-blocking and takes no terminal, for a file swapped in between. */
 static int l2s_materialize(const char *src, const char *dst) {
-    long in = cng_pin_open(src, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    char st[ST_SIZE];
+    long sr = l2s_statf(src, st);
+    if (sr < 0)
+        return (int)sr;
+    if (!is_reg(st))
+        return -EPERM; /* link(2) on a directory; a node it cannot group */
+    long in = cng_pin_open(src,
+                           CNG_O_RDONLY | CNG_O_NONBLOCK | CNG_O_NOCTTY |
+                               CNG_O_CLOEXEC,
+                           0);
     if (in < 0)
         return (int)in;
     /* A real hardlink shares the source's mode; the copy must too (apk
      * publishes its database files this way — 0644, not 0755). */
-    char st[ST_SIZE];
     unsigned mode = 0644;
     if (CNG_SYS(__NR_fstat, (int)in, st, 0, 0, 0, 0) == 0) {
         if (!is_reg(st)) {
@@ -740,7 +758,7 @@ static int l2s_link_source(const char *src, int own, char *data, size_t dsz,
     /* AT_SYMLINK_FOLLOW may have resolved src straight onto the data file. */
     char st[ST_SIZE], sdir[CNG_PATH_MAX];
     unsigned long long ino;
-    if (isl == 0 && own && l2s_lstat(src, st) == 0 && is_reg(st) &&
+    if (isl == 0 && own && l2s_lstat(src, st) == 0 && is_data(st) &&
         parse_data_exact(l2s_basename(src), &ino)) {
         cng_strlcpy(data, src, dsz);
         l2s_dirname(src, sdir, sizeof sdir);
@@ -807,7 +825,10 @@ static int l2s_first_link(const char *src, const char *dst, const char *ddir,
      * itself. */
     if (is_lnk(st) && !l2s_under_proc(src))
         return l2s_copy_symlink(src, dst, st);
-    if (!is_reg(st) || !own) /* e.g. /proc/self/fd/N O_TMPFILE: copy contents */
+    /* A FIFO, a socket or a device node becomes a group as a regular file
+     * does: the node itself moves into the store, so every name opens the one
+     * pipe, connects to the one socket. A copy cannot stand in for those. */
+    if (!is_data(st) || !own) /* e.g. /proc/self/fd/N O_TMPFILE: copy contents */
         return 1;
     ino = *(unsigned long long *)((char *)st + ST_INO_OFF);
 
@@ -1102,7 +1123,7 @@ int cng_l2s_dirent(long dirfd, const char *name, unsigned long long *ino,
                      CNG_AT_SYMLINK_NOFOLLOW, 0, 0);
     else if (l2s_canonical(tgt) && l2s_owned(tgt))
         sr = cng_pin_fstatat(tgt, st, CNG_AT_SYMLINK_NOFOLLOW);
-    if (sr < 0 || !is_reg(st)) {
+    if (sr < 0 || !is_data(st)) {
         if (tgt[0] != '/')
             return 0; /* a bare name with no data beside it: not ours */
         /* Not a data file where it says: an absolute target whose rootfs tree

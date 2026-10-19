@@ -4593,6 +4593,61 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
                 sm_ok ? "OK" : "FAIL");
     fails += !sm_ok;
 
+    /* A FIFO and a socket join a group as a regular file does: the node moves
+     * into the store, so both names are one pipe and one socket — a write
+     * end opened by one name finds the reader opened by the other (O_NONBLOCK
+     * opens of a FIFO with no reader are ENXIO), and a connect through the
+     * new name reaches the listener bound at the old one. The copy path
+     * opened the FIFO to read it and blocked until a writer came. */
+    char snd1[144], snd2[144], nb = 0;
+    long nmk = cng_dispatch(__NR_mknodat, CNG_AT_FDCWD, (long)"/w/nfifo",
+                            0010644, 0, 0, 0, 0);
+    long nfl = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/nfifo",
+                            CNG_AT_FDCWD, (long)"/w/nfifo2", 0, 0, 0);
+    long ns1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/nfifo",
+                            (long)snd1, CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0);
+    long ns2 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/nfifo2",
+                            (long)snd2, CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0);
+    int nd_fifo = nmk == 0 && nfl == 0 && ns1 == 0 && ns2 == 0 &&
+                  (ST_MODE(snd2) & 0170000) == 0010000 &&
+                  ST_NLINK(snd1) == 2 && ST_NLINK(snd2) == 2 &&
+                  ST_INO(snd1) == ST_INO(snd2);
+    long nrd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/nfifo2",
+                            CNG_O_RDONLY | CNG_O_NONBLOCK, 0, 0, 0, 0);
+    long nwr = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/nfifo",
+                            CNG_O_WRONLY | CNG_O_NONBLOCK, 0, 0, 0, 0);
+    int nd_pipe = nrd >= 0 && nwr >= 0 && sys_write((int)nwr, "p", 1) == 1 &&
+                  sys_read((int)nrd, &nb, 1) == 1 && nb == 'p';
+    if (nrd >= 0)
+        sys_close((int)nrd);
+    if (nwr >= 0)
+        sys_close((int)nwr);
+    struct cng_sockaddr_un nsa;
+    memset(&nsa, 0, sizeof nsa);
+    nsa.family = CNG_AF_UNIX;
+    cng_strlcpy(nsa.path, "/w/nsock", sizeof nsa.path);
+    unsigned nal = 2 + (unsigned)strlen(nsa.path) + 1;
+    long nls = CNG_SYS(__NR_socket, CNG_AF_UNIX, CNG_SOCK_STREAM, 0, 0, 0, 0);
+    long ncs = CNG_SYS(__NR_socket, CNG_AF_UNIX, CNG_SOCK_STREAM, 0, 0, 0, 0);
+    int nd_sock = nls >= 0 && ncs >= 0 &&
+                  cng_dispatch(__NR_bind, nls, (long)&nsa, nal, 0, 0, 0, 0) ==
+                      0 &&
+                  CNG_SYS(__NR_listen, nls, 1, 0, 0, 0, 0) == 0 &&
+                  cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/nsock",
+                               CNG_AT_FDCWD, (long)"/w/nsock2", 0, 0, 0) == 0;
+    cng_strlcpy(nsa.path, "/w/nsock2", sizeof nsa.path);
+    nal = 2 + (unsigned)strlen(nsa.path) + 1;
+    nd_sock = nd_sock && cng_dispatch(__NR_connect, ncs, (long)&nsa, nal, 0, 0,
+                                      0, 0) == 0;
+    if (nls >= 0)
+        sys_close((int)nls);
+    if (ncs >= 0)
+        sys_close((int)ncs);
+    int nd_ok = nd_fifo && nd_pipe && nd_sock;
+    cng_dprintf(1, "l2s-node: fifo=%d pipe=%d socket=%d -> %s\n", nd_fifo,
+                nd_pipe, nd_sock, nd_ok ? "OK" : "FAIL");
+    fails += !nd_ok;
+
     cng_blocked[__NR_linkat] = 0;
     cng_g_l2s = 0;
 

@@ -108,6 +108,14 @@ if [ "$m10_ready" -eq 1 ]; then
          mkdir d; ln n d/o; mv d/o m; echo mv=$?; ls m n d; stat -c %h m n d/o;
          echo y>p; mv p n; echo mv=$?; stat -c %h m n d/o; cat n d/o'
 
+    # A FIFO's names are one pipe: what is written to one is read from the
+    # other. The fallback opened the FIFO to copy it and hung.
+    l2s_diff "ln of a FIFO: both names are one pipe" \
+        'cd /tmp; mkfifo f; ln f g; echo rc=$?; stat -c "%h %F" f g;
+         [ "$(stat -c %i f)" = "$(stat -c %i g)" ] && echo same-ino;
+         (echo hi > f &); cat g; mkdir d; ln g d/h; stat -c %h f;
+         rm f; stat -c "%h %F" g d/h; rm g d/h; ls -a'
+
     l2s_diff "double ln refuses with EEXIST" \
         'cd /tmp; echo hi>a; ln a b; ln a b 2>&1; echo rc=$?'
 

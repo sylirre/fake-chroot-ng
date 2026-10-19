@@ -244,7 +244,9 @@ vfork/`posix_spawn` child-stack handling.
     group whose surviving names were all mv'ed away leaves its old dir
     non-rmdir'able, and per-dir-fallback links don't survive a rootfs move
     (store links self-heal); `/.l2s` stays reachable via dirfd `..`-walks;
-    cross-dir + EXDEV still copies; an emulated cross-filesystem link (bind
+    cross-dir + EXDEV still copies a regular file (a FIFO, socket or device
+    node, which is otherwise grouped like one, is refused `EPERM` there,
+    never opened); an emulated cross-filesystem link (bind
     mount) *succeeds* where a real one would report `EXDEV` — except out of
     a `:ro` bind, which is `EXDEV` as it is natively (M65).
 
