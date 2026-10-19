@@ -3761,6 +3761,31 @@ vfork/`posix_spawn` child-stack handling.
     bytes — including busybox run through a member — and the store must then
     hold what proot itself would leave. The previous build fails both.
 
+- [x] **M83 — the l2s store lock waited on itself**
+  Every change of a group's count is made under one exclusive flock per
+  rootfs (`.l2s/.lock`), held across the several syscalls the change takes.
+  Two ways it could never be had again, both found while M82 added callers:
+  - A signal. On the `-R` tier the dispatcher runs on the guest's own mask, so
+    a handler was delivered on the way out of any syscall a change makes, and a
+    handler that linked or unlinked a name of a group opened the lock file
+    again and waited for the lock its own thread held — forever, since an
+    flock belongs to the open file and the second open is another one (the
+    guest thread sat in `locks_lock_inode_wait`). The lock is now held with
+    every signal blocked, as the view's, the credentials' and M81's mount
+    snapshot already are; a signal that arrives meanwhile is taken once the
+    change is done.
+  - A fork. A fork by another thread while the lock was held handed the child
+    a duplicate of the locked open file, and the close that gave the lock back
+    left it held by the child's copy: every later change, by any process,
+    waited until that child exec'd or exited. The lock is given back with
+    `LOCK_UN` before the close.
+  - Tests: `tests/guests/l2ssig.c` (M10, `-R -l`) links and unlinks a name in a
+    loop under a one-shot timer, swept as `mntsig.c` sweeps its own, whose
+    handler does the same; the previous build hangs. `tests/guests/l2sfork.c`
+    (M10) forks children that do not exec beside a loop of links; the previous
+    build held a link up for the child's whole life (8 s against 38 ms with
+    real hardlinks).
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

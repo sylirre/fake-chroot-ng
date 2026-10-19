@@ -328,7 +328,8 @@ static int l2s_store_dir(char *out, size_t sz);
 
 /* Serialize the marker's read-modify-write (find + rename/unlink) across
  * processes sharing the rootfs, and across threads of one: an exclusive flock,
- * held for the update. Returns the locked fd, or -1.
+ * held for the update. Fills *h, which l2s_unlock gives back whatever the
+ * answer, and returns the locked fd, or -1.
  *
  * The lock used to be taken on the data file, opened for reading, and a data
  * file that could not be opened that way — mode 0200, mode 0000, both of which
@@ -345,10 +346,30 @@ static int l2s_store_dir(char *out, size_t sz);
  *
  * A first link asks by its source, the file that is to become the data file,
  * and that can be a FIFO or a device: only a regular file is opened to stand
- * in, since opening one of those blocks or acts. */
-static long l2s_lock(const char *data) {
+ * in, since opening one of those blocks or acts.
+ *
+ * Every signal is blocked from before the lock is asked for until it is given
+ * back, as the view's and the credentials' writers hold theirs (path.c,
+ * cred.c). On the -R tier the dispatcher runs on the guest's own mask, and a
+ * signal is delivered on the way out of any syscall an update makes: a
+ * handler that linked or unlinked a name itself opened the lock file again
+ * and waited for the lock its own thread held, forever — an flock belongs to
+ * the open file, and the second open is another one. A signal that arrives
+ * meanwhile is taken once the update is done. And the lock is given back
+ * with LOCK_UN before the close: a fork by another thread meanwhile hands the
+ * child a duplicate of the locked open file, and the close of ours alone left
+ * the lock held until the child exec'd or exited. */
+struct l2s_held {
+    long fd;            /* the locked descriptor, or -1: no lock to be had */
+    unsigned long mask; /* the signal mask to restore */
+};
+
+static long l2s_lock(const char *data, struct l2s_held *h) {
     char lk[CNG_PATH_MAX], st[ST_SIZE];
     long fd = -1;
+    unsigned long all = ~0UL;
+    CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, &all, &h->mask, 8, 0, 0);
+    h->fd = -1;
     if (l2s_store_dir(lk, sizeof lk) == 0) {
         size_t n = strlen(lk);
         if (n + 7 < sizeof lk) {
@@ -382,12 +403,15 @@ static long l2s_lock(const char *data) {
         sys_close((int)fd);
         return -1;
     }
-    return fd;
+    return h->fd = fd;
 }
 
-static void l2s_unlock(long fd) {
-    if (fd >= 0)
-        sys_close((int)fd); /* closing drops the flock */
+static void l2s_unlock(const struct l2s_held *h) {
+    if (h->fd >= 0) {
+        CNG_SYS(__NR_flock, (int)h->fd, 8 /* LOCK_UN */, 0, 0, 0, 0);
+        sys_close((int)h->fd);
+    }
+    CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, &h->mask, 0, 8, 0, 0);
 }
 
 /* ---- central store ------------------------------------------------------ */
@@ -908,12 +932,13 @@ static int pr_link(const char *data, const char *dst) {
     struct pr_group g;
     if (pr_from_data(data, &g) != 0)
         return -ENAMETOOLONG;
-    long lk = l2s_lock(data);
+    struct l2s_held lk;
+    l2s_lock(data, &lk);
     int k = pr_settle(&g);
     long r = k == 1 ? pr_adjust(&g, 1) : k < 0 ? k : -ENOENT;
     if (r == 0 && (r = l2s_symlink(g.ind, dst)) < 0)
         pr_adjust(&g, -1);
-    l2s_unlock(lk);
+    l2s_unlock(&lk);
     return (int)r;
 }
 
@@ -923,10 +948,11 @@ static void pr_drop(const char *data) {
     struct pr_group g;
     if (pr_from_data(data, &g) != 0)
         return;
-    long lk = l2s_lock(data);
+    struct l2s_held lk;
+    l2s_lock(data, &lk);
     if (pr_settle(&g) == 1)
         pr_adjust(&g, -1);
-    l2s_unlock(lk);
+    l2s_unlock(&lk);
 }
 
 int cng_l2s_untranslate_target(const char *tgt, char *out, size_t sz) {
@@ -1332,14 +1358,15 @@ int cng_l2s_link(const char *src, const char *dst) {
      * where the store cannot be had, that is what the group's own updates
      * lock (l2s_lock). */
     if (isl <= 0) {
-        long lk = l2s_lock(src);
+        struct l2s_held lk;
+        l2s_lock(src, &lk);
         isl = l2s_link_source(src, own, data, sizeof data, &count);
         if (isl == 0) {
             int r = l2s_first_link(src, dst, ddir, own);
-            l2s_unlock(lk);
+            l2s_unlock(&lk);
             return r == 1 ? l2s_materialize(src, dst) : r;
         }
-        l2s_unlock(lk);
+        l2s_unlock(&lk);
     }
     if (isl < 0)
         return isl;
@@ -1353,13 +1380,14 @@ int cng_l2s_link(const char *src, const char *dst) {
      * (how names in other directories join a group). */
     parse_data(l2s_basename(data), &ino);
     l2s_dirname(data, sdir, sizeof sdir);
-    long lk = l2s_lock(data);
-    if (lk >= 0 && find_marker(sdir, ino, &count) != 0)
+    struct l2s_held lk;
+    l2s_lock(data, &lk);
+    if (lk.fd >= 0 && find_marker(sdir, ino, &count) != 0)
         count = 0; /* re-read under the lock */
     char newm[CNG_PATH_MAX], oldm[CNG_PATH_MAX];
     unsigned long nc = (count ? count : 1) + 1;
     if (build_name(newm, sizeof newm, sdir, ino, (long)nc) < 0) {
-        l2s_unlock(lk);
+        l2s_unlock(&lk);
         return -ENAMETOOLONG;
     }
     int bumped = 0;
@@ -1376,10 +1404,10 @@ int cng_l2s_link(const char *src, const char *dst) {
             l2s_rename(newm, oldm);
         else
             l2s_unlink(newm);
-        l2s_unlock(lk);
+        l2s_unlock(&lk);
         return (int)sr;
     }
-    l2s_unlock(lk);
+    l2s_unlock(&lk);
     return 0;
 }
 
@@ -1418,8 +1446,9 @@ void cng_l2s_decref(const char *data, unsigned long count) {
         return;
     char dir[CNG_PATH_MAX], m[CNG_PATH_MAX], newm[CNG_PATH_MAX];
     l2s_dirname(data, dir, sizeof dir);
-    long lk = l2s_lock(data);
-    if (lk >= 0) {
+    struct l2s_held lk;
+    l2s_lock(data, &lk);
+    if (lk.fd >= 0) {
         unsigned long c;
         if (find_marker(dir, ino, &c) == 0)
             count = c; /* fresher than the caller's pre-unlink read */
@@ -1428,13 +1457,13 @@ void cng_l2s_decref(const char *data, unsigned long count) {
         l2s_unlink(data);
         if (build_name(m, sizeof m, dir, ino, (long)(count ? count : 1)) == 0)
             l2s_unlink(m);
-        l2s_unlock(lk);
+        l2s_unlock(&lk);
         return;
     }
     if (build_name(m, sizeof m, dir, ino, (long)count) == 0 &&
         build_name(newm, sizeof newm, dir, ino, (long)(count - 1)) == 0)
         l2s_rename(m, newm);
-    l2s_unlock(lk);
+    l2s_unlock(&lk);
 }
 
 int cng_l2s_stat(const char *host, void *statbuf) {

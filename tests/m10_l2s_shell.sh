@@ -321,6 +321,43 @@ if guest_xlate_ready "l2s first-link race leg" &&
     rm -rf "$R"
 fi
 
+# A link and an unlink from a signal handler that interrupted another. Every
+# count change holds the store lock (an flock) across several syscalls, and on
+# the -R tier the dispatcher runs on the guest's own signal mask: a handler
+# delivered inside one that linked or unlinked a name itself waited for the
+# lock its own thread held, forever. The timer's delay is swept across the time
+# one link+unlink takes; with real hardlinks every call succeeds and the group
+# ends with its two names, so no oracle is needed. A hang is the bug.
+if guest_xlate_ready "l2s link from a signal handler leg" &&
+    guest_cc_report "$CNG_TMP/l2ssig" tests/guests/l2ssig.c; then
+    R=$(mktemp -d)
+    mkdir -p "$R/bin" "$R/w"
+    cp "$CNG_TMP/l2ssig" "$R/bin/l2ssig"
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+    out=$(run_t 120 $GUEST_BINDS -R -l "$R" /bin/l2ssig /w 2>/dev/null)
+    check_contains "m10 a link from a handler that interrupted another" \
+        "l2ssig: handled>0=1 bad=0 nlink=2" "$out"
+    rm -rf "$R"
+fi
+
+# A fork by another thread while one links. The lock is an flock, which belongs
+# to the open file: a child forked while it was held kept a duplicate of that
+# file, and the close that gave the lock back left it held until the child
+# exec'd or exited, so the next change of any group waited out the child.
+# Children that wait without exec'ing are forked under a loop of links; with
+# real hardlinks no pair is held up.
+if guest_xlate_ready "l2s link beside a fork leg" &&
+    guest_cc_report "$CNG_TMP/l2sfork" tests/guests/l2sfork.c -pthread; then
+    R=$(mktemp -d)
+    mkdir -p "$R/bin" "$R/w"
+    cp "$CNG_TMP/l2sfork" "$R/bin/l2sfork"
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+    out=$(run_t 120 $GUEST_BINDS -R -l "$R" /bin/l2sfork /w 2>/dev/null)
+    check_contains "m10 a fork while the lock is held does not keep it" \
+        "l2sfork: stalled=0 bad=0" "$out"
+    rm -rf "$R"
+fi
+
 # Debian leg: glibc + GNU coreutils/findutils (`find -samefile`, GNU stat).
 # Gated on a smoke test proving translation is live — a dynamic-glibc guest
 # under -R + qemu can silently run untranslated (ld.so-loaded libc.so has no
