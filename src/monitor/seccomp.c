@@ -10,6 +10,7 @@
 #include "cng/l2s.h"
 #include "cng/monitor.h"
 #include "cng/procfs.h"
+#include "cng/procreg.h"
 #include "cng/rt.h"
 #include "cng/seccomp.h"
 #include "cng/syscall.h"
@@ -357,7 +358,7 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
 
     /* Build the trapped syscall list (path set + SysV IPC set, plus the id set
      * when faking, plus the conditional entries below). */
-    int nr[NPATH + NIPC + NID + NROFD + 6];
+    int nr[NPATH + NIPC + NID + NROFD + 11];
     int nsys = 0;
     for (int i = 0; i < NPATH; i++)
         nr[nsys++] = path_syscalls[i];
@@ -403,6 +404,17 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
         nr[nsys++] = __NR_process_vm_readv;
         nr[nsys++] = __NR_process_vm_writev;
         nr[nsys++] = __NR_pidfd_open;
+    }
+    /* The signal family names a process by pid too, and its group and
+     * broadcast forms name every process at once (dispatch.c). The view tells
+     * a guest from a host process only through the registry, so without one
+     * these run native rather than refuse every other pid. */
+    if (!cng_g_no_proc && cng_g_procreg_backing != CNG_PROCREG_B_NONE) {
+        nr[nsys++] = __NR_kill;
+        nr[nsys++] = __NR_tkill;
+        nr[nsys++] = __NR_tgkill;
+        nr[nsys++] = __NR_rt_sigqueueinfo;
+        nr[nsys++] = __NR_rt_tgsigqueueinfo;
     }
     /* getdents64 does three jobs, and it has to be trapped for any one of them:
      * it hides the l2s backing files, it filters host processes out of a /proc

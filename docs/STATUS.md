@@ -3817,6 +3817,53 @@ vfork/`posix_spawn` child-stack handling.
     blocked syscall, which never reached that branch; it uses
     `get_robust_list` now.
 
+- [x] **M85 — a signal reached a process the view hides**
+  M46 left the signal family native on purpose (a real chroot lets a
+  same-uid process be signalled, and trapping `kill` costs every guest). By
+  the owner's decision it is now part of the view. `/proc` hid a host process
+  by path, but `kill` named it by pid and reached it all the same. The group
+  and broadcast forms named host processes the guest never saw:
+  - a guest's `kill(0)` (`trap 'kill 0' EXIT`) signalled the shell or
+    pipeline that started chroot-ng, because they share its process group;
+  - `kill(-1)` (a shutdown script, `killall5`) signalled every process of the
+    user, which on a device includes the terminal app the guest runs in.
+  - `kill`, `tkill`, `tgkill`, `rt_sigqueueinfo` and `rt_tgsigqueueinfo` are
+    trapped for every guest while there is a view and a registry. A hidden
+    target is ESRCH, as `/proc/<pid>` is. The call is re-issued at a pid
+    above `PID_MAX_LIMIT`, so whatever the kernel checks before its lookup
+    keeps its own answer: a forged `si_code` is EPERM and a zero tid is
+    EINVAL. The thread-directed calls are judged by the thread group they
+    name, since the kernel delivers only within it, so `raise` and
+    `pthread_kill` cost no lookup. The registry now also checks one of the
+    guest's own threads with a single `tgkill` probe instead of reading its
+    status file.
+  - The group and broadcast forms signal each process the view shows in
+    turn, and combine the results the way the kernel's
+    `kill_something_info` does: 0 if any member took the signal, ESRCH for
+    an empty group, and for `kill(-1)` every process except pid 1 and the
+    caller. The caller goes last, because its own SIGKILL or SIGSTOP would
+    stop the rest from being sent. A tracee's stop signal is routed per
+    member, as for a single pid.
+  - Divergence: the kernel's group kill is atomic and catches a child that
+    is still being forked; this one passes over the registry again until a
+    pass finds nobody new. A child whose parent has not yet published it
+    when the last pass ends is missed.
+  - The parent of the first guest process is a host process and is hidden
+    like any other (owner's choice). A guest can no longer signal a host
+    launcher, as in Xorg's SIGUSR1 to xinit.
+  - The family runs native under `--no-proc` and without a registry
+    (`CNG_PROCREG_NONE`). Without one, every other pid would look hidden and
+    a shell could not signal its own jobs. `pidfd_send_signal` stays native,
+    because `pidfd_open` only gives a pidfd for a process the view shows.
+  - Tests: `-t bpftest`'s `hidden-pid signals` row. In M25,
+    `tests/guests/sigview.c` runs against two host `sigholder` processes,
+    one in the guest's group and one leading its own; each counts the
+    SIGURGs that reach it. Every call, the parent, and the group and
+    broadcast forms are checked on each tier the host has. A `--no-proc`
+    control shows the holders do see a signal that reaches them, and a
+    no-registry run shows the guest still signals its own processes. The
+    previous build delivers 6 and 2 SIGURGs to the holders.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

@@ -12,7 +12,8 @@
  * that process's /proc entries from it. Membership doubles as the visibility
  * rule: a numeric
  * /proc/<pid> that is not registered is not a guest process, so the path layer
- * hides it (see cng_procreg_has).
+ * hides it (see cng_procreg_has), and the calls that name a process by pid —
+ * process_vm_*, pidfd_open, the signal family — answer ESRCH for it.
  *
  * Ported from arm64chroot's proctab.c. By default the backing is one
  * MAP_SHARED|MAP_ANONYMOUS region inherited across fork() — a guest process
@@ -107,8 +108,17 @@ int cng_procreg_has(int pid);
  * threads? The kernel finds a task by any tid it has (kill, ptrace, capget all
  * do), so the questions those answer about "a guest" have to as well; the
  * registry itself is keyed by thread-group leader. A secondary thread costs a
- * read of its status file. */
+ * probe when it is one of ours, and a read of its status file otherwise. */
 int cng_procreg_has_task(int tid);
+
+/* A walk over every guest process: slots 0 .. cng_procreg_slots()-1, and the
+ * pid of the process in slot `i` — 0 for a free slot, one whose process is gone
+ * or whose pid the host has reused (cng_procreg_has's guard), and for the later
+ * of two slots that hold one pid, so a walk visits exactly the processes the
+ * view shows, each once. Our own pid counts like any other. For the calls that
+ * name every process at once: kill(2)'s group and broadcast forms. */
+int cng_procreg_slots(void);
+int cng_procreg_pid_at(int i);
 
 /* Snapshot `pid`'s payload. Returns 1 on a fresh hit, 0 on miss or when the
  * entry is stale (the pid was recycled by the host — detected by comparing the

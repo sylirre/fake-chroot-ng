@@ -134,7 +134,11 @@ gets the attributes of a `/proc` regular file). Because
 we run the guest in this process and never `execve`, those files are the kernel's
 record of *our* invocation, so this is a correctness requirement, not polish.
 See `src/monitor/procfs.c` (synthesis) and `src/monitor/procreg.c` (the
-fork-inherited registry that tells a guest pid from a host one).
+fork-inherited registry that tells a guest pid from a host one). The calls that
+name a process by pid rather than by path follow the same rule: a hidden pid
+is ESRCH to `process_vm_readv`/`writev`, `pidfd_open` (M46) and the signal
+family, and `kill`'s group and broadcast forms reach only the guest processes
+in them (M85).
 
 The walk produces a host path; the syscall is not made on it. A string handed
 to the kernel is resolved again from scratch, following whatever is there by

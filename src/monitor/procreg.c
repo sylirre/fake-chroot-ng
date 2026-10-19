@@ -57,17 +57,10 @@ typedef u64 __attribute__((__may_alias__)) pid_pair;
 static int g_hint_slot = -1;
 static int g_hint_pid;
 
-static int slot_of(int pid) {
-    if (!g_tab || pid <= 0)
-        return -1;
+/* The scan itself: the first slot holding `pid`, past the remembered one. */
+static int scan_for(int pid) {
     const s32 *tab = g_tab->pid;
     int n = g_tab_n;
-    int h = __atomic_load_n(&g_hint_slot, __ATOMIC_RELAXED);
-    if (h >= 0 && h < n && __atomic_load_n(&g_hint_pid, __ATOMIC_RELAXED) == pid &&
-        __atomic_load_n(&tab[h], __ATOMIC_RELAXED) == pid) {
-        __atomic_thread_fence(__ATOMIC_ACQUIRE);
-        return h;
-    }
     int i = 0, found = -1;
     for (; i + 1 < n; i += 2) {
         u64 w = __atomic_load_n((const pid_pair *)&tab[i], __ATOMIC_RELAXED);
@@ -82,6 +75,20 @@ static int slot_of(int pid) {
     }
     if (found < 0 && i < n && __atomic_load_n(&tab[i], __ATOMIC_RELAXED) == pid)
         found = i; /* an odd slot count: the last one on its own */
+    return found;
+}
+
+static int slot_of(int pid) {
+    if (!g_tab || pid <= 0)
+        return -1;
+    int h = __atomic_load_n(&g_hint_slot, __ATOMIC_RELAXED);
+    if (h >= 0 && h < g_tab_n &&
+        __atomic_load_n(&g_hint_pid, __ATOMIC_RELAXED) == pid &&
+        __atomic_load_n(&g_tab->pid[h], __ATOMIC_RELAXED) == pid) {
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        return h;
+    }
+    int found = scan_for(pid);
     if (found < 0)
         return -1;
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
@@ -222,6 +229,10 @@ int cng_proc_tgid(int tid) {
 
 int cng_procreg_has_task(int tid) {
     if (cng_procreg_has(tid))
+        return 1;
+    /* A thread of our own costs one probe rather than a status read: raise(3)
+     * and pthread_kill(3) under musl name one with every tkill. */
+    if (tid > 0 && CNG_SYS(__NR_tgkill, sys_getpid(), tid, 0, 0, 0, 0) == 0)
         return 1;
     int tgid = cng_proc_tgid(tid);
     return tgid > 0 && tgid != tid && cng_procreg_has(tgid);
@@ -684,6 +695,22 @@ int cng_procreg_has(int pid) {
         return 0;
     }
     return 1;
+}
+
+int cng_procreg_slots(void) {
+    return g_tab ? g_tab_n : 0;
+}
+
+int cng_procreg_pid_at(int i) {
+    if (!g_tab || i < 0 || i >= g_tab_n)
+        return 0;
+    s32 pid = __atomic_load_n(&g_tab->pid[i], __ATOMIC_ACQUIRE);
+    /* Two slots can hold one pid — a forking parent and its exec'ing child
+     * each claim one when neither sees the other's yet — and a walk is to
+     * visit a process once: at the first of them. */
+    if (pid <= 0 || scan_for(pid) != i)
+        return 0;
+    return cng_procreg_has(pid) ? pid : 0;
 }
 
 int cng_procreg_get(int pid, struct cng_procsnap *out) {

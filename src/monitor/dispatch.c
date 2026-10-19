@@ -3252,6 +3252,99 @@ static int pid_hidden(long pid) {
     return !cng_g_no_proc && p > 0 && !cng_procreg_has_task(p);
 }
 
+/* The signal family under the view (see the kill case). The registry is what
+ * tells a guest from a host process, so with none (CNG_PROCREG_NONE, a host
+ * that could map nothing) every other pid would read as hidden — a shell could
+ * not signal its own job — and they run native there, untrapped. */
+static int sig_view(void) {
+    return !cng_g_no_proc && cng_g_procreg_backing != CNG_PROCREG_B_NONE;
+}
+
+/* A pid nobody holds: above PID_MAX_LIMIT (4M), which /proc/sys/kernel/pid_max
+ * cannot exceed. A call aimed at a hidden process is re-issued at this one, so
+ * the kernel gives the ESRCH it gives for a pid that does not exist, from the
+ * same place — after whatever it checks first (a bad siginfo pointer, a forged
+ * si_code, a tid of zero), which then keeps its own answer. */
+#define PID_NONE 0x7fffffffL
+
+static long sig_target(long pid) {
+    return sig_view() && pid_hidden(pid) ? PID_NONE : pid;
+}
+
+/* One process of a group or broadcast kill: as kill(pid, sig) would, a
+ * tracee's stop signal included. */
+static long kill_one(int pid, int sig) {
+    if (cng_pt_signal_route(pid, sig))
+        return 0;
+    return reissue(pid, sig, 0, 0, 0, 0, __NR_kill);
+}
+
+/* kill(0), kill(-pgrp) and kill(-1) name processes by group or all at once,
+ * and the kernel would signal host processes among them: the host shell or
+ * pipeline the guest was started from shares its group (`trap 'kill 0' EXIT`
+ * reached the script that ran chroot-ng), and kill(-1) — a shutdown script,
+ * killall5 — reached every process of the user. So each one the view shows is
+ * signalled in turn instead, and the answer is put together the way the kernel
+ * puts it together (kill_something_info, __kill_pgrp_info):
+ *   - a group: 0 if any member took the signal, else the last refusal, and
+ *     ESRCH for a group with no member in the view;
+ *   - kill(-1): every process but pid 1 and the caller's own, 0 unless one
+ *     refused for a reason other than EPERM, and ESRCH when there is none.
+ * The caller, when it is a member, goes last: its own SIGKILL or SIGSTOP would
+ * take effect on the way out of the first kill and leave the rest unsent.
+ *
+ * Not atomic, which the kernel's is: it signals the whole group under one
+ * lock, and a fork that races it either restarts or hands the signal to the
+ * child as well. Here a member forked during the pass is caught by passing
+ * again until a pass finds no one new (each process once, by its slot); one
+ * whose parent has not yet published it when the last pass ends is missed. */
+static long kill_some(int pid, int sig) {
+    int me = (int)sys_getpid();
+    long pgrp = 0;
+    if (pid == 0)
+        pgrp = CNG_SYS(__NR_getpgid, 0, 0, 0, 0, 0, 0);
+    else if (pid != -1)
+        pgrp = -(long)pid;
+    int n = cng_procreg_slots();
+    u64 seen[(CNG_PROCREG_MAX + 63) / 64];
+    memset(seen, 0, sizeof seen);
+    int count = 0, success = 0, self = 0;
+    long ret = -ESRCH, retval = 0;
+    for (int fresh = 1; fresh;) {
+        fresh = 0;
+        for (int i = 0; i < n; i++) {
+            if (seen[i / 64] & (1ULL << (i % 64)))
+                continue;
+            int p = cng_procreg_pid_at(i);
+            if (p <= 0)
+                continue;
+            if (pid == -1 ? p <= 1 || p == me
+                          : CNG_SYS(__NR_getpgid, p, 0, 0, 0, 0, 0) != pgrp)
+                continue;
+            seen[i / 64] |= 1ULL << (i % 64);
+            fresh = 1;
+            if (p == me) {
+                self = 1;
+                continue;
+            }
+            long err = kill_one(p, sig);
+            count++;
+            success |= err == 0;
+            ret = err;
+            if (err != -EPERM)
+                retval = err;
+        }
+    }
+    if (self) {
+        long err = kill_one(me, sig);
+        success |= err == 0;
+        ret = err;
+    }
+    if (pid == -1)
+        return count ? retval : -ESRCH;
+    return success ? 0 : ret;
+}
+
 /* FIDEDUPERANGE: the descriptor is the source, and the destinations are the
  * dest_fd fields of the argument — each of which the kernel takes write
  * access on the mount for (vfs_dedupe_file_range_one), answering per
@@ -5679,19 +5772,37 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * SIGSTOP would freeze it inside its ptrace service loop, and every later
      * tracer request would deadlock (strace sends exactly that on ^C). SIGCONT
      * ends a PTRACE_LISTEN group-stop the same way. Everything else, and every
-     * target that is not a tracee, is sent for real. */
+     * target that is not a tracee, is sent for real.
+     *
+     * The family is also trapped for every guest while there is a view (with
+     * a registry: sig_view), because a signal names a process by pid and /proc
+     * hides host processes by path only — a guest killed a process its /proc
+     * said did not exist, and kill(-1) reached every process of the user. A
+     * hidden target is ESRCH (sig_target), and the group and broadcast forms
+     * reach the processes the view shows (kill_some). The thread-directed
+     * calls are judged by the thread group they name: the kernel delivers only
+     * to a task of that group, so a guest's own (raise, pthread_kill) needs no
+     * lookup. rt_sigqueueinfo has no group form — the kernel answers ESRCH for
+     * a pid of zero or below — and pidfd_send_signal needs a pidfd, which
+     * pidfd_open hands out only for a process the view shows. */
     case __NR_kill:
         if (cng_pt_signal_route(a0, (int)a1))
             return 0;
-        return reissue(a0, a1, a2, a3, a4, a5, nr);
+        /* INT_MIN negates to no group; the kernel answers it with ESRCH. */
+        if (sig_view() && (int)a0 <= 0 && (int)a0 != -0x7fffffff - 1)
+            return kill_some((int)a0, (int)a1);
+        return reissue(sig_target(a0), a1, a2, a3, a4, a5, nr);
     case __NR_tkill:
         if (cng_pt_signal_route(a0, (int)a1))
             return 0;
-        return reissue(a0, a1, a2, a3, a4, a5, nr);
+        return reissue(sig_target(a0), a1, a2, a3, a4, a5, nr);
     case __NR_tgkill:
         if (cng_pt_signal_route(a1, (int)a2))
             return 0;
-        return reissue(a0, a1, a2, a3, a4, a5, nr);
+        return reissue(sig_target(a0), a1, a2, a3, a4, a5, nr);
+    case __NR_rt_sigqueueinfo:
+    case __NR_rt_tgsigqueueinfo:
+        return reissue(sig_target(a0), a1, a2, a3, a4, a5, nr);
 
     /* strace reads tracee memory with these before falling back to PEEKDATA.
      * When the peer is one of our stopped tracees they are served from the

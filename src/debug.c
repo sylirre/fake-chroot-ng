@@ -8783,6 +8783,35 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
                     ok3 ? "OK" : "FAIL");
         fails += !ok3;
 
+        /* ...and the signal family, by pid and by group: trapped while there
+         * is a view and a registry to tell a guest by, native under --no-proc
+         * and without a registry, where every other pid would read hidden. */
+        static const int sigs[] = {__NR_kill, __NR_tkill, __NR_tgkill,
+                                   __NR_rt_sigqueueinfo,
+                                   __NR_rt_tgsigqueueinfo};
+        int was_rb = cng_g_procreg_backing;
+        int sig_on = 1, sig_np = 1, sig_noreg = 1;
+        for (int pass = 0; pass < 3; pass++) {
+            cng_g_no_proc = pass == 1;
+            cng_g_procreg_backing =
+                pass == 2 ? CNG_PROCREG_B_NONE : CNG_PROCREG_B_ANON;
+            int ns = cng_build_seccomp(f, CNG_SECCOMP_MAX_INSNS);
+            u32 want = pass ? CNG_SECCOMP_RET_ALLOW : CNG_SECCOMP_RET_TRAP;
+            int *ok = pass == 0 ? &sig_on : pass == 1 ? &sig_np : &sig_noreg;
+            for (unsigned k = 0; k < sizeof sigs / sizeof sigs[0]; k++) {
+                bpf_data(d, sigs[k], 0x1000, 10);
+                *ok &= ns > 0 && bpf_run(f, ns, d, &bad) == want;
+            }
+        }
+        cng_g_no_proc = was_np;
+        cng_g_procreg_backing = was_rb;
+        int ok4 = !bad && sig_on && sig_np && sig_noreg;
+        cng_dprintf(1,
+                    "bpftest hidden-pid signals: trap_view=%d native_noproc=%d "
+                    "native_noreg=%d -> %s\n",
+                    sig_on, sig_np, sig_noreg, ok4 ? "OK" : "FAIL");
+        fails += !ok4;
+
         /* The descriptor side of a :ro bind (M45): with one in the view,
          * fchmod, fchown and the fd xattr setters trap, and so does every
          * ioctl request that writes the mount — one JEQ each in the ioctl
@@ -8890,11 +8919,13 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
         cng_g_no_proc = 0;
         cng_g_l2s = 1;
         cng_g_no_dev = 0;
+        cng_g_procreg_backing = CNG_PROCREG_B_ANON;
         int nmax = cng_build_seccomp(f, CNG_SECCOMP_MAX_INSNS);
         cng_g_fake_id = was;
         cng_g_no_proc = was_np;
         cng_g_l2s = was_l2s;
         cng_g_no_dev = was_nd;
+        cng_g_procreg_backing = was_rb;
         cng_g_fs = was_fs;
         int fits = nmax > 0 && nmax <= CNG_SECCOMP_MAX_INSNS - 8;
         cng_dprintf(1, "bpftest largest filter: %d of %d insns -> %s\n", nmax,

@@ -176,3 +176,128 @@ elif guest_cc_report "$FVR/fdescape" tests/guests/fdescape.c; then
     esac
 fi
 rm -rf "$FVR" "$FVO"
+
+# The hidden-process view by pid, for signals (M85). kill, tkill, tgkill and
+# the two sigqueue calls name a process by pid as well, and the group and
+# broadcast forms of kill name every process at once: a guest's kill(0)
+# reached the host shell it was started from, and kill(-1) every process of
+# the user. Two host processes stand in for them (sigholder: one in the
+# guest's process group, one leading a group of its own) and count the SIGURGs
+# that reach them, while the guest prints what each call answered and what
+# its own processes received. A --no-proc control, under which nothing is
+# hidden, shows the holders do see a signal that reaches them. The guest is
+# started untimed and bounds itself with alarm(), because timeout(1) would
+# move it into a process group the holder is not in.
+SVD=$(mktemp -d)
+SV_WANT="kill-hidden-0=-1 errno=3
+kill-hidden=-1 errno=3
+tkill-hidden=-1 errno=3
+tgkill-hidden=-1 errno=3
+tgkill-hidden-tid0=-1 errno=22
+sigqueue-hidden=-1 errno=3
+tgsigqueue-hidden=-1 errno=3
+sigqueue-hidden-forged=-1 errno=1
+kill-parent=-1 errno=3
+kill-hidden-group-0=-1 errno=3
+kill-hidden-group=-1 errno=3
+kill-intmin=-1 errno=3
+kill-child=0
+tgkill-self=0
+tkill-thread=0
+tgkill-thread=0
+kill-group-own=0
+kill-group-child=0
+kill-all=0
+kill-group-child-0=0
+counts us=1 c1=2 c2=2 c3=2
+done"
+
+# Start both holders and wait until their handlers are in; SVA and SVB are
+# their pids, SVJA and SVJB the shell's jobs for them.
+sv_start() {
+    rm -f "$SVD/a" "$SVD/b"
+    emu "$SVD/sigholder" "$SVD/a" &
+    SVJA=$!
+    emu "$SVD/sigholder" "$SVD/b" own &
+    SVJB=$!
+    _n=0
+    until grep -q '^ready' "$SVD/a" 2>/dev/null &&
+        grep -q '^ready' "$SVD/b" 2>/dev/null; do
+        [ $_n -ge 300 ] && break
+        sleep 0.1
+        _n=$((_n + 1))
+    done
+    SVA=$(sed -n 's/^ready pid=//p' "$SVD/a")
+    SVB=$(sed -n 's/^ready pid=//p' "$SVD/b")
+}
+# Stop them; each leaves its count in its file.
+sv_stop() {
+    kill -TERM "$SVA" "$SVB" 2>/dev/null
+    wait "$SVJA" "$SVJB" 2>/dev/null
+}
+
+if guest_xlate_ready "signals to hidden processes" &&
+    guest_cc_report "$SVD/sigholder" tests/guests/sigholder.c &&
+    guest_cc_report "$SVD/sigview" tests/guests/sigview.c -pthread; then
+    for _tier in -R plain; do
+        if [ "$_tier" = plain ] && [ "$CNG_SECCOMP_LIVE" != 1 ]; then
+            skip "signals to hidden processes, seccomp tier: the filter is inert here"
+            continue
+        fi
+        _opt=""
+        [ "$_tier" = -R ] && _opt=-R
+        sv_start
+        if [ -z "$SVA" ] || [ -z "$SVB" ]; then
+            check "signals to hidden processes ($_tier): the holders start" \
+                started "a=$SVA b=$SVB"
+            sv_stop
+            continue
+        fi
+        # shellcheck disable=SC2086  # $_opt and $GUEST_BINDS are split on purpose
+        _got=$(run $_opt $GUEST_BINDS "$SVD" /sigview "$SVA" "$SVB" 2>/dev/null)
+        sv_stop
+        _label="a signal reaches no process the view hides, alone or by group ($_tier)"
+        if [ "$(printf '%s\n' "$_got" | sed 1d)" = "$SV_WANT" ]; then
+            pass=$((pass + 1))
+            echo "  ok   $_label"
+        else
+            fail=$((fail + 1))
+            echo "  FAIL $_label"
+            printf '%s\n' "$_got" | sed 's/^/    /' | head -30
+        fi
+        check "the hidden process in the guest's group got nothing ($_tier)" \
+            "urg=0" "$(grep '^urg=' "$SVD/a")"
+        check "the hidden group got nothing ($_tier)" \
+            "urg=0" "$(grep '^urg=' "$SVD/b")"
+        case "$_got" in
+        "holder-shares-group=1"*) ;;
+        *) skip "kill(0) past a hidden member ($_tier): the shell put the guest in a group of its own" ;;
+        esac
+    done
+    # The control: with --no-proc nothing is hidden, and the same calls reach
+    # both holders -- so the zeros above are the view's doing. kill(-1) is
+    # left out of it, since there it would reach every process of the user.
+    sv_start
+    # shellcheck disable=SC2086
+    _got=$(run -R --no-proc $GUEST_BINDS "$SVD" /sigview "$SVA" "$SVB" control 2>/dev/null)
+    sv_stop
+    check_contains "--no-proc: a host process is signalled as on the host" \
+        "kill-hidden=0" "$_got"
+    for _h in a b; do
+        _u=$(sed -n 's/^urg=//p' "$SVD/$_h")
+        [ -n "$_u" ] && [ "$_u" != 0 ] && _u=some
+        check "--no-proc: holder $_h sees the signals that reach it" some "$_u"
+    done
+    # Without a registry (CNG_PROCREG_NONE: a host that could map none) the
+    # view cannot tell a guest from a host process, and the signal family runs
+    # native rather than refuse every pid but the caller's.
+    sv_start
+    # shellcheck disable=SC2086
+    _got=$(CNG_PROCREG_NONE=1 run -R $GUEST_BINDS "$SVD" /sigview "$SVA" "$SVB" control 2>/dev/null)
+    sv_stop
+    check_contains "no registry: a guest still signals its own child" \
+        "kill-child=0" "$_got"
+    check_contains "no registry: ...and its own process groups" \
+        "counts us=1 c1=1 c2=1 c3=1" "$_got"
+fi
+rm -rf "$SVD"
