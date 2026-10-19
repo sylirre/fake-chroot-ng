@@ -4500,6 +4500,99 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
                 sy_ok ? "OK" : "FAIL");
     fails += !sy_ok;
 
+    /* A rename between two names of one group does nothing and answers 0,
+     * as the kernel's does for two names of one inode — under EXCHANGE too.
+     * The host moved one symlink over the other: the source name was gone
+     * and the count one short. NOREPLACE is still EEXIST. And under
+     * EXCHANGE both names move, so a legacy (bare-target) link that lands in
+     * another directory is repointed at its data like a renamed one is. */
+    char ssm[144];
+    long smfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/sma",
+                            CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (smfd >= 0)
+        sys_close((int)smfd);
+    cng_dispatch(__NR_mkdirat, CNG_AT_FDCWD, (long)"/w/smd", 0755, 0, 0, 0, 0);
+    cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/sma", CNG_AT_FDCWD,
+                 (long)"/w/smb", 0, 0, 0);
+    cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/sma", CNG_AT_FDCWD,
+                 (long)"/w/smd/smc", 0, 0, 0);
+    static const char *const smn[3] = {"/w/sma", "/w/smb", "/w/smd/smc"};
+    long smr = cng_dispatch(__NR_renameat, CNG_AT_FDCWD, (long)smn[0],
+                            CNG_AT_FDCWD, (long)smn[1], 0, 0, 0);
+    long smxr = cng_dispatch(__NR_renameat2, CNG_AT_FDCWD, (long)smn[1],
+                            CNG_AT_FDCWD, (long)smn[2], CNG_RENAME_EXCHANGE, 0,
+                            0);
+    long smo = cng_dispatch(__NR_renameat2, CNG_AT_FDCWD, (long)smn[0],
+                            CNG_AT_FDCWD, (long)smn[1], CNG_RENAME_NOREPLACE,
+                            0, 0);
+    int sm_kept = 1;
+    for (int k = 0; k < 3; k++)
+        sm_kept &= cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)smn[k],
+                                (long)ssm, 0, 0, 0, 0) == 0 &&
+                   ST_ISREG(ssm) && ST_NLINK(ssm) == 3;
+    char lgd[CNG_PATH_MAX], lgf[CNG_PATH_MAX];
+    dbg_mkpath(lgd, sizeof lgd, rootfs, "/w/lg", 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, lgd, 0755, 0, 0, 0);
+    dbg_mkpath(lgf, sizeof lgf, rootfs, "/w/lg/.l2s.21", 0, 0);
+    long lgo = sys_openat(CNG_AT_FDCWD, lgf, CNG_O_CREAT | CNG_O_WRONLY, 0644);
+    if (lgo >= 0) {
+        sys_write((int)lgo, "lg", 2);
+        sys_close((int)lgo);
+    }
+    dbg_mkpath(lgf, sizeof lgf, rootfs, "/w/lg/.l2s.21.0002", 0, 0);
+    lgo = sys_openat(CNG_AT_FDCWD, lgf, CNG_O_CREAT | CNG_O_WRONLY, 0600);
+    if (lgo >= 0)
+        sys_close((int)lgo);
+    dbg_mkpath(lgf, sizeof lgf, rootfs, "/w/lg/u", 0, 0);
+    CNG_SYS(__NR_symlinkat, ".l2s.21", CNG_AT_FDCWD, lgf, 0, 0, 0);
+    dbg_mkpath(lgf, sizeof lgf, rootfs, "/w/lg/v", 0, 0);
+    CNG_SYS(__NR_symlinkat, ".l2s.21", CNG_AT_FDCWD, lgf, 0, 0, 0);
+    lgo = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/lq",
+                       CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (lgo >= 0)
+        sys_close((int)lgo);
+    long lgx = cng_dispatch(__NR_renameat2, CNG_AT_FDCWD, (long)"/w/lg/u",
+                            CNG_AT_FDCWD, (long)"/w/lq", CNG_RENAME_EXCHANGE,
+                            0, 0);
+    char lgb[4];
+    long lgr = -1;
+    lgo = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/lq", CNG_O_RDONLY,
+                       0, 0, 0, 0);
+    if (lgo >= 0) {
+        lgr = sys_read((int)lgo, lgb, sizeof lgb);
+        sys_close((int)lgo);
+    }
+    int lg_ok = lgx == 0 && lgr == 2 && lgb[0] == 'l' &&
+                cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/lq",
+                             (long)ssm, 0, 0, 0, 0) == 0 &&
+                ST_NLINK(ssm) == 2;
+    /* ...and the other way round: the legacy link is the destination. */
+    lgo = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/lr",
+                       CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (lgo >= 0)
+        sys_close((int)lgo);
+    lgx = cng_dispatch(__NR_renameat2, CNG_AT_FDCWD, (long)"/w/lr",
+                       CNG_AT_FDCWD, (long)"/w/lg/v", CNG_RENAME_EXCHANGE, 0,
+                       0);
+    lgr = -1;
+    lgo = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/lr", CNG_O_RDONLY,
+                       0, 0, 0, 0);
+    if (lgo >= 0) {
+        lgr = sys_read((int)lgo, lgb, sizeof lgb);
+        sys_close((int)lgo);
+    }
+    lg_ok = lg_ok && lgx == 0 && lgr == 2 && lgb[0] == 'l' &&
+            cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/lr",
+                         (long)ssm, 0, 0, 0, 0) == 0 &&
+            ST_NLINK(ssm) == 2;
+    int sm_ok = smr == 0 && smxr == 0 && smo == -EEXIST && sm_kept && lg_ok;
+    cng_dprintf(1,
+                "l2s-samefile: mv=%d exch=%d noreplace=%d kept=%d "
+                "legacy_exch=%d -> %s\n",
+                (int)smr, (int)smxr, smo == -EEXIST, sm_kept, lg_ok,
+                sm_ok ? "OK" : "FAIL");
+    fails += !sm_ok;
+
     cng_blocked[__NR_linkat] = 0;
     cng_g_l2s = 0;
 

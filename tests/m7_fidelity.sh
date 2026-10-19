@@ -193,6 +193,12 @@ check_contains "l2s first link moves the file by exchange, or in two steps" \
 # is not copied.
 check_contains "l2s link of a symlink makes a symlink with its text" \
     "l2s-symlink: rc=0 lnk=1 text=1 times=1 guard=1 -> OK" "$out"
+# Two names of one group are two names of one file: a rename between them does
+# nothing and answers 0 (the host moved one symlink over the other, so the
+# source was gone and the count a link short), and under RENAME_EXCHANGE a
+# legacy bare-target link that lands in another directory is repointed.
+check_contains "l2s rename between two names of one file does nothing" \
+    "l2s-samefile: mv=0 exch=0 noreplace=1 kept=1 legacy_exch=1 -> OK" "$out"
 check_contains "fchdir updates virtual cwd" "fchdir: cwd=/w -> OK" "$out"
 check_contains "chdir through a symlink records the directory it landed in" \
     "chdir-symlink: rc=0 cwd=/w -> OK" "$out"

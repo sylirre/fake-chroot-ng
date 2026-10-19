@@ -4644,8 +4644,18 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * link2symlink names, it is replaced by the rename, so drop its group's
      * refcount (apk installs by renaming a temp file over the final name) —
      * except under RENAME_EXCHANGE, where both names live on. A legacy-format
-     * source (bare-basename target) moving to another directory is repointed
-     * at its (unmoved) data file afterwards. */
+     * name (bare-basename target) moving to another directory is repointed
+     * at its (unmoved) data file afterwards — under EXCHANGE either name can
+     * be one, and both move.
+     *
+     * Two names of one group are two names of one file to the guest, and
+     * the kernel's vfs_rename does nothing for those and answers 0 — the
+     * first thing it asks, after the flags, the lookups, NOREPLACE's EEXIST
+     * and the mount's EROFS, before any permission of the directories. The
+     * host saw two symlinks and moved one over the other: the source name
+     * was gone and the group a link short (`mv a b` of `ln a b`). So such a
+     * pair is answered here, for no flags and for EXCHANGE; any other flag
+     * goes to the host for its own verdict. */
     case __NR_renameat:
     case __NR_renameat2: {
         const char *op = xlate(a0, (const char *)a1, b1, sizeof b1, 0);
@@ -4658,23 +4668,37 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * under a :ro bind is EROFS. */
         if (ro_denied(op) || ro_denied(np))
             return -EROFS;
-        int exch = (nr == __NR_renameat2 && ((int)a4 & CNG_RENAME_EXCHANGE));
+        unsigned rfl = nr == __NR_renameat2 ? (unsigned)a4 : 0;
+        int exch = (rfl & CNG_RENAME_EXCHANGE) != 0;
         char data[CNG_PATH_MAX], absdata[CNG_PATH_MAX], dsth[CNG_PATH_MAX];
+        char hnf[CNG_PATH_MAX], sdata[CNG_PATH_MAX];
         unsigned long cnt;
-        int dec = 0, fix = 0;
-        if (cng_g_l2s && !exch && strcmp(op, np) != 0 &&
+        int dec = 0, fix = 0, fix_back = 0;
+        if (cng_g_l2s && strcmp(op, np) != 0 &&
             cng_resolve_at(a2, (const char *)a3, 0, dsth, sizeof dsth) == 0) {
-            if (cng_l2s_resolve(dsth, data, sizeof data, &cnt) == 1)
-                dec = 1;
-            char hnf[CNG_PATH_MAX];
-            if (cng_resolve_at(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0)
+            int dst_l2s = cng_l2s_resolve(dsth, data, sizeof data, &cnt) == 1;
+            int src_ok =
+                cng_resolve_at(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0;
+            if (dst_l2s && src_ok && !(rfl & ~(unsigned)CNG_RENAME_EXCHANGE) &&
+                cng_l2s_resolve(hnf, sdata, sizeof sdata, 0) == 1 &&
+                strcmp(sdata, data) == 0)
+                return 0;
+            dec = dst_l2s && !exch;
+            if (src_ok)
                 fix = cng_l2s_rename_prep(hnf, absdata, sizeof absdata);
+            /* Under EXCHANGE the destination's name moves to the source's
+             * place as well, and a legacy link of its lands there the same
+             * way (sdata is free: the pair was not one group). */
+            if (src_ok && exch)
+                fix_back = cng_l2s_rename_prep(dsth, sdata, sizeof sdata);
         }
         long r = reissue(a0, (long)op, a2, (long)np, a4, a5, nr);
         if (r == 0 && dec && !cng_fs_host_ro(cng_g_fs, data))
             cng_l2s_decref(data, cnt); /* not on a :ro mount: see unlinkat */
         if (r == 0 && fix)
             cng_l2s_rename_fixup(dsth, absdata);
+        if (r == 0 && fix_back)
+            cng_l2s_rename_fixup(hnf, sdata);
         return r;
     }
 

@@ -100,6 +100,14 @@ if [ "$m10_ready" -eq 1 ]; then
          ln sl sl2; echo rc=$?; stat -c "%F %Y" sl sl2; readlink sl2; cat sl2;
          mkdir d; ln sl d/sl3; readlink d/sl3; cat d/sl3; echo rc=$?'
 
+    # rename(2) of a name onto another name of the same file does nothing:
+    # both names stay and the count is unchanged. The host saw two symlinks
+    # and moved one over the other.
+    l2s_diff "mv between two names of one file does nothing" \
+        'cd /tmp; echo x>m; ln m n; mv m n; echo mv=$?; ls m n; stat -c %h m n;
+         mkdir d; ln n d/o; mv d/o m; echo mv=$?; ls m n d; stat -c %h m n d/o;
+         echo y>p; mv p n; echo mv=$?; stat -c %h m n d/o; cat n d/o'
+
     l2s_diff "double ln refuses with EEXIST" \
         'cd /tmp; echo hi>a; ln a b; ln a b 2>&1; echo rc=$?'
 
