@@ -13,7 +13,9 @@
  * otherwise, which is what fakeroot-style installs check.
  *
  * These syscalls are trapped only when --fake-id is active (see seccomp.c), so
- * cng_cred_handle's !fake_id branch is reached only via an -R trampoline.
+ * cng_cred_handle's !fake_id branch is reached through an -R trampoline, a
+ * tracee's trap-everything filter, or an ambient filter's trap of a setter it
+ * refuses — Android's refuses most of them (see real_set).
  */
 #include "cng/monitor.h"
 #include "cng/procreg.h"
@@ -190,6 +192,10 @@ void cng_cred_exec(const char *host) {
 
 #define ID_KEEP ((unsigned)-1) /* setres*id / setre*id "leave unchanged" */
 
+/* The fake set's privilege is an effective uid of 0, which is what it reports
+ * the full capability set for. The rules below take it as an argument, since
+ * the host's own set (cng_cred_handle without --fake-id) is judged the way the
+ * kernel judges it: by CAP_SETUID for a uid, CAP_SETGID for a gid or groups. */
 static int cred_priv(const struct cng_cred *c) { return c->euid == 0; }
 
 /* Is v one of the current real/effective/saved ids? (unprivileged constraint) */
@@ -206,10 +212,10 @@ static int in_gset(const struct cng_cred *c, unsigned v) {
  * question is asked (measured; the "leave unchanged" reading of -1 belongs to
  * the setreuid/setresuid family only, and was being applied to these two,
  * which installed 4294967295 as every id). */
-static long do_setuid(struct cng_cred *c, unsigned u) {
+static long do_setuid(struct cng_cred *c, int priv, unsigned u) {
     if (u == ID_KEEP)
         return -EINVAL;
-    if (cred_priv(c)) {
+    if (priv) {
         c->ruid = c->euid = c->suid = c->fsuid = u;
         return 0;
     }
@@ -219,10 +225,10 @@ static long do_setuid(struct cng_cred *c, unsigned u) {
     }
     return -EPERM;
 }
-static long do_setgid(struct cng_cred *c, unsigned g) {
+static long do_setgid(struct cng_cred *c, int priv, unsigned g) {
     if (g == ID_KEEP)
         return -EINVAL;
-    if (cred_priv(c)) {
+    if (priv) {
         c->rgid = c->egid = c->sgid = c->fsgid = g;
         return 0;
     }
@@ -235,15 +241,16 @@ static long do_setgid(struct cng_cred *c, unsigned g) {
 
 /* setreuid(2): each supplied id must be a current id when unprivileged. The
  * saved uid follows the new euid if ruid changed or euid moved off ruid. */
-static long do_setreuid(struct cng_cred *c, unsigned r, unsigned e) {
+static long do_setreuid(struct cng_cred *c, int priv, unsigned r,
+                        unsigned e) {
     struct cng_cred nc = *c;
     if (r != ID_KEEP) {
-        if (!cred_priv(c) && r != c->ruid && r != c->euid)
+        if (!priv && r != c->ruid && r != c->euid)
             return -EPERM;
         nc.ruid = r;
     }
     if (e != ID_KEEP) {
-        if (!cred_priv(c) && e != c->ruid && e != c->euid && e != c->suid)
+        if (!priv && e != c->ruid && e != c->euid && e != c->suid)
             return -EPERM;
         nc.euid = e;
     }
@@ -253,15 +260,16 @@ static long do_setreuid(struct cng_cred *c, unsigned r, unsigned e) {
     *c = nc;
     return 0;
 }
-static long do_setregid(struct cng_cred *c, unsigned r, unsigned e) {
+static long do_setregid(struct cng_cred *c, int priv, unsigned r,
+                        unsigned e) {
     struct cng_cred nc = *c;
     if (r != ID_KEEP) {
-        if (!cred_priv(c) && r != c->rgid && r != c->egid)
+        if (!priv && r != c->rgid && r != c->egid)
             return -EPERM;
         nc.rgid = r;
     }
     if (e != ID_KEEP) {
-        if (!cred_priv(c) && e != c->rgid && e != c->egid && e != c->sgid)
+        if (!priv && e != c->rgid && e != c->egid && e != c->sgid)
             return -EPERM;
         nc.egid = e;
     }
@@ -273,9 +281,9 @@ static long do_setregid(struct cng_cred *c, unsigned r, unsigned e) {
 }
 
 /* setresuid(2): unprivileged may set each of r/e/s only to a current id. */
-static long do_setresuid(struct cng_cred *c, unsigned r, unsigned e,
-                         unsigned s) {
-    if (!cred_priv(c)) {
+static long do_setresuid(struct cng_cred *c, int priv, unsigned r,
+                         unsigned e, unsigned s) {
+    if (!priv) {
         if (r != ID_KEEP && !in_uset(c, r))
             return -EPERM;
         if (e != ID_KEEP && !in_uset(c, e))
@@ -292,9 +300,9 @@ static long do_setresuid(struct cng_cred *c, unsigned r, unsigned e,
     c->fsuid = c->euid;
     return 0;
 }
-static long do_setresgid(struct cng_cred *c, unsigned r, unsigned e,
-                         unsigned s) {
-    if (!cred_priv(c)) {
+static long do_setresgid(struct cng_cred *c, int priv, unsigned r,
+                         unsigned e, unsigned s) {
+    if (!priv) {
         if (r != ID_KEEP && !in_gset(c, r))
             return -EPERM;
         if (e != ID_KEEP && !in_gset(c, e))
@@ -314,16 +322,16 @@ static long do_setresgid(struct cng_cred *c, unsigned r, unsigned e,
 
 /* setfsuid/setfsgid(2): return the previous fs id; change it only to a current
  * id (or anything, when privileged). Never fails. */
-static long do_setfsuid(struct cng_cred *c, unsigned u) {
+static long do_setfsuid(struct cng_cred *c, int priv, unsigned u) {
     unsigned old = c->fsuid;
-    if (u != ID_KEEP && (cred_priv(c) || u == c->ruid || u == c->euid ||
+    if (u != ID_KEEP && (priv || u == c->ruid || u == c->euid ||
                          u == c->suid || u == c->fsuid))
         c->fsuid = u;
     return old;
 }
-static long do_setfsgid(struct cng_cred *c, unsigned g) {
+static long do_setfsgid(struct cng_cred *c, int priv, unsigned g) {
     unsigned old = c->fsgid;
-    if (g != ID_KEEP && (cred_priv(c) || g == c->rgid || g == c->egid ||
+    if (g != ID_KEEP && (priv || g == c->rgid || g == c->egid ||
                          g == c->sgid || g == c->fsgid))
         c->fsgid = g;
     return old;
@@ -331,8 +339,9 @@ static long do_setfsgid(struct cng_cred *c, unsigned g) {
 
 /* The group list is guest memory, so it is validated before it is walked: the
  * kernel answers -EFAULT for a bad one, and we run with SIGSEGV masked. */
-static long do_setgroups(struct cng_cred *c, int n, const unsigned *g) {
-    if (!cred_priv(c))
+static long do_setgroups(struct cng_cred *c, int priv, int n,
+                         const unsigned *g) {
+    if (!priv)
         return -EPERM;
     if (n < 0 || n > CNG_NGROUPS_MAX)
         return -EINVAL;
@@ -481,8 +490,8 @@ static long do_capset(struct cap_header *hdr, const struct cap_data *data) {
     return cng_fake_root() ? 0 : -EPERM;
 }
 
-/* Non-faking re-issue for the -R trampoline path: consult the Android block-list
- * so a re-issue can never trap and die (see blocklist.c). */
+/* Non-faking re-issue: consult the ambient block-list so a re-issue can never
+ * trap and die (see blocklist.c). */
 static long reissue_cred(long nr, long a0, long a1, long a2, long a3, long a4,
                          long a5) {
     if (nr >= 0 && nr < CNG_NR_MAX && cng_blocked[nr]) {
@@ -490,6 +499,142 @@ static long reissue_cred(long nr, long a0, long a1, long a2, long a3, long a4,
         return -ENOSYS;
     }
     return cng_syscall6(a0, a1, a2, a3, a4, a5, nr);
+}
+
+/* ---- without --fake-id: the host's own set ---------------------------------
+ *
+ * The ids are then the kernel's, and so are the answers: a setter is re-issued.
+ * Our filter traps this family only under --fake-id, so one arrives here
+ * through an -R trampoline, a tracee's trap-everything filter, or the trap of
+ * an ambient filter that refuses it. Android's app filter refuses every uid
+ * and gid setter but setresuid (bionic's SECCOMP_BLOCKLIST_APP.TXT); capset is
+ * allowed. All of them were answered ENOSYS, under -R on any host as well:
+ * `setgid(getgid())`, which is how many a program drops a set-id bit it may
+ * have been started with, failed outright where the kernel says 0.
+ *
+ * A setter the host refuses is answered the way the kernel would answer this
+ * process: by the rules the fake set runs (above), applied to the real ids and
+ * to the capability the kernel asks for. An error is the kernel's error, in
+ * its order; a call that changes nothing succeeds; and a change the rules
+ * allow — which takes the capability, or ids that differ, and an Android app
+ * has neither — is EPERM, since the one call that could make it is the one
+ * refused. setfsuid and setfsgid answer the current id, which is how they
+ * report a change not made. Nothing here issues a setter.
+ *
+ * The fs ids are read with setfsuid(-1), which changes nothing. Where that is
+ * refused too, fsuid is euid: every exec makes them equal, every other setter
+ * moves the one with the other, and the filter has been there since this
+ * program's exec (it is inherited, and measured at startup). */
+static int real_ids(struct cng_cred *c, int *upriv, int *gpriv) {
+    unsigned id[6];
+    if (reissue_cred(__NR_getresuid, (long)&id[0], (long)&id[1], (long)&id[2],
+                     0, 0, 0) < 0 ||
+        reissue_cred(__NR_getresgid, (long)&id[3], (long)&id[4], (long)&id[5],
+                     0, 0, 0) < 0)
+        return -1;
+    c->ruid = id[0];
+    c->euid = id[1];
+    c->suid = id[2];
+    c->rgid = id[3];
+    c->egid = id[4];
+    c->sgid = id[5];
+    c->fsuid = cng_blocked[__NR_setfsuid]
+                   ? c->euid
+                   : (unsigned)cng_syscall6(-1, 0, 0, 0, 0, 0, __NR_setfsuid);
+    c->fsgid = cng_blocked[__NR_setfsgid]
+                   ? c->egid
+                   : (unsigned)cng_syscall6(-1, 0, 0, 0, 0, 0, __NR_setfsgid);
+    c->ngroups = 0;
+    /* Unreadable capabilities are none, which is what an app has. */
+    struct cap_header h = {CAP_VER_3, 0};
+    struct cap_data d[2];
+    unsigned eff = reissue_cred(__NR_capget, (long)&h, (long)d, 0, 0, 0, 0) == 0
+                       ? d[0].effective
+                       : 0;
+    *upriv = (eff >> 7) & 1; /* CAP_SETUID */
+    *gpriv = (eff >> 6) & 1; /* CAP_SETGID */
+    return 0;
+}
+
+/* The kernel keeps a group list sorted, duplicates and all, so two lists are
+ * the same list when they are the same once sorted. */
+static void sort_groups(unsigned *g, int n) {
+    for (int i = 1; i < n; i++)
+        for (int j = i; j > 0 && g[j - 1] > g[j]; j--) {
+            unsigned t = g[j];
+            g[j] = g[j - 1];
+            g[j - 1] = t;
+        }
+}
+
+static int same_set(struct cng_cred *a, struct cng_cred *b) {
+    if (a->ruid != b->ruid || a->euid != b->euid || a->suid != b->suid ||
+        a->fsuid != b->fsuid || a->rgid != b->rgid || a->egid != b->egid ||
+        a->sgid != b->sgid || a->fsgid != b->fsgid ||
+        a->ngroups != b->ngroups)
+        return 0;
+    sort_groups(a->groups, a->ngroups);
+    sort_groups(b->groups, b->ngroups);
+    for (int i = 0; i < a->ngroups; i++)
+        if (a->groups[i] != b->groups[i])
+            return 0;
+    return 1;
+}
+
+static long real_set(long nr, long a0, long a1, long a2) {
+    struct cng_cred was, c;
+    int up, gp;
+    if (real_ids(&was, &up, &gp) < 0) {
+        cng_note_blocked((int)nr);
+        return -ENOSYS;
+    }
+    memcpy(&c, &was, (unsigned long)&((struct cng_cred *)0)->groups);
+    c.ngroups = 0;
+    unsigned u0 = (unsigned)a0, u1 = (unsigned)a1, u2 = (unsigned)a2;
+    long r;
+    switch (nr) {
+    case __NR_setuid:
+        r = do_setuid(&c, up, u0);
+        break;
+    case __NR_setgid:
+        r = do_setgid(&c, gp, u0);
+        break;
+    case __NR_setreuid:
+        r = do_setreuid(&c, up, u0, u1);
+        break;
+    case __NR_setregid:
+        r = do_setregid(&c, gp, u0, u1);
+        break;
+    case __NR_setresuid:
+        r = do_setresuid(&c, up, u0, u1, u2);
+        break;
+    case __NR_setresgid:
+        r = do_setresgid(&c, gp, u0, u1, u2);
+        break;
+    case __NR_setfsuid:
+        r = do_setfsuid(&c, up, u0);
+        break;
+    case __NR_setfsgid:
+        r = do_setfsgid(&c, gp, u0);
+        break;
+    case __NR_setgroups:
+        /* Only a caller with CAP_SETGID gets past the first check, and only
+         * then is there a list of the host's to compare with. */
+        r = do_setgroups(&c, gp, (int)a0, (const unsigned *)a1);
+        if (r == 0) {
+            long n = reissue_cred(__NR_getgroups, CNG_NGROUPS_MAX,
+                                  (long)was.groups, 0, 0, 0, 0);
+            was.ngroups = n < 0 ? -1 : (int)n;
+        }
+        break;
+    default:
+        return -ENOSYS;
+    }
+    if (r < 0 || same_set(&was, &c))
+        return r;
+    /* Allowed, and not to be had: the platform's refusal, said once. */
+    cng_note_blocked((int)nr);
+    return (nr == __NR_setfsuid || nr == __NR_setfsgid) ? r : -EPERM;
 }
 
 /* A setter: run it against a copy of the set and publish the copy if it
@@ -506,23 +651,21 @@ static long reissue_cred(long nr, long a0, long a1, long a2, long a3, long a4,
 long cng_cred_handle(long nr, long a0, long a1, long a2, long a3, long a4,
                      long a5) {
     if (!cng_g_fake_id) {
-        /* Reached only via an -R trampoline (these are trapped only under
-         * --fake-id). Getters read the real ids; the setters sit on Android's
-         * block-list, so emulate them rather than re-issue from a handler. */
+        /* The host's set (see real_set): the kernel answers, or, for a setter
+         * the host refuses, the kernel's rules do. */
         switch (nr) {
-        case __NR_setfsuid:
-        case __NR_setfsgid:
-            return 0; /* previous fs id (unknown here) is reported as 0 */
         case __NR_setuid:
         case __NR_setgid:
         case __NR_setreuid:
         case __NR_setregid:
         case __NR_setresuid:
         case __NR_setresgid:
+        case __NR_setfsuid:
+        case __NR_setfsgid:
         case __NR_setgroups:
-        case __NR_capset:
-            cng_note_blocked((int)nr);
-            return -ENOSYS;
+            if (cng_blocked[nr])
+                return real_set(nr, a0, a1, a2);
+            return cng_syscall6(a0, a1, a2, a3, a4, a5, nr);
         default:
             return reissue_cred(nr, a0, a1, a2, a3, a4, a5);
         }
@@ -567,23 +710,25 @@ long cng_cred_handle(long nr, long a0, long a1, long a2, long a3, long a4,
         return 0;
     }
     case __NR_setuid:
-        CRED_SET(do_setuid(c, (unsigned)a0));
+        CRED_SET(do_setuid(c, cred_priv(c), (unsigned)a0));
     case __NR_setgid:
-        CRED_SET(do_setgid(c, (unsigned)a0));
+        CRED_SET(do_setgid(c, cred_priv(c), (unsigned)a0));
     case __NR_setreuid:
-        CRED_SET(do_setreuid(c, (unsigned)a0, (unsigned)a1));
+        CRED_SET(do_setreuid(c, cred_priv(c), (unsigned)a0, (unsigned)a1));
     case __NR_setregid:
-        CRED_SET(do_setregid(c, (unsigned)a0, (unsigned)a1));
+        CRED_SET(do_setregid(c, cred_priv(c), (unsigned)a0, (unsigned)a1));
     case __NR_setresuid:
-        CRED_SET(do_setresuid(c, (unsigned)a0, (unsigned)a1, (unsigned)a2));
+        CRED_SET(do_setresuid(c, cred_priv(c), (unsigned)a0, (unsigned)a1,
+                              (unsigned)a2));
     case __NR_setresgid:
-        CRED_SET(do_setresgid(c, (unsigned)a0, (unsigned)a1, (unsigned)a2));
+        CRED_SET(do_setresgid(c, cred_priv(c), (unsigned)a0, (unsigned)a1,
+                              (unsigned)a2));
     case __NR_setfsuid:
-        CRED_SET(do_setfsuid(c, (unsigned)a0));
+        CRED_SET(do_setfsuid(c, cred_priv(c), (unsigned)a0));
     case __NR_setfsgid:
-        CRED_SET(do_setfsgid(c, (unsigned)a0));
+        CRED_SET(do_setfsgid(c, cred_priv(c), (unsigned)a0));
     case __NR_setgroups:
-        CRED_SET(do_setgroups(c, (int)a0, (const unsigned *)a1));
+        CRED_SET(do_setgroups(c, cred_priv(c), (int)a0, (const unsigned *)a1));
     case __NR_getgroups:
         return do_getgroups((int)a0, (unsigned *)a1);
     case __NR_capget:

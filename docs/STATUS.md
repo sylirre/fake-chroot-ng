@@ -3786,6 +3786,37 @@ vfork/`posix_spawn` child-stack handling.
     build held a link up for the child's whole life (8 s against 38 ms with
     real hardlinks).
 
+- [x] **M84 — the uid and gid setters without `-u`**
+  Android's app filter refuses every uid and gid setter but `setresuid`
+  (bionic's `SECCOMP_BLOCKLIST_APP.TXT`: `setuid setgid setreuid setregid
+  setresgid setfsuid setfsgid setgroups`; `capset` is allowed). Its trap reached
+  the credential handler, which answered all of them ENOSYS, and so did every
+  setter under `-R` on any host, where nothing refuses them: `-R` rewrites every
+  `svc` site, and the handler took any setter it saw without `--fake-id` for a
+  refused one. `setgid(getgid())` — how many a program drops a set-id bit it
+  may have been started with — failed outright, and `setfsuid` answered 0.
+  - The probe now measures the credential family. A setter the host allows is
+    re-issued; one it refuses is answered the way the kernel would answer this
+    process, by the rules the fake set runs, applied to the real ids and to
+    `CAP_SETUID`/`CAP_SETGID` (no longer euid 0, for this set): EINVAL for an
+    id of -1, EPERM for a change, and 0 for a call that changes nothing.
+    `setgroups` without the capability is EPERM before its size or pointer is
+    looked at (measured on the host kernel; qemu-user checks both itself
+    first). `setfsuid`/`setfsgid` answer the current id.
+  - Divergence: a change the rules allow — which takes the capability, or ids
+    that differ, and an app's process has neither — is EPERM, since the one
+    call that could make it is the one refused (said once on stderr, like any
+    other refusal). No setter is translated into an allowed one.
+  - `CNG_SETID_DENY=1` takes the eight as refused on any host: marked after the
+    probe and trapped by our own filter, as Android's would deliver them.
+  - Tests: `-t blocktest`'s `setid` rows (each through a trap and through `-R`,
+    refused and as measured; the previous build answers -38 to all 64), and
+    `tests/guests/setid.c` in M9 on every tier the host has, with and without
+    the knob, against a kernel's own text (libc's setxid broadcast to a second
+    thread included). nettest's default-branch leg used `setgid` as its
+    blocked syscall, which never reached that branch; it uses
+    `get_robust_list` now.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

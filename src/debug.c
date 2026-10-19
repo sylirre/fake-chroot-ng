@@ -2248,6 +2248,95 @@ int cng_cmd_blocktest(int argc, char **argv, char **envp, unsigned long *auxv) {
         if (ls >= 0)
             sys_close((int)ls);
     }
+
+    /* The uid and gid setters without --fake-id. Android's app filter refuses
+     * all of them but setresuid, and every one was answered ENOSYS — from a
+     * trap of that filter, and from -R on any host, where nothing refuses
+     * them. Each row is what the kernel answers a process with no capability
+     * and one uid and one gid (an app's process; measured on the host, whose
+     * setgroups is EPERM ahead of a bad size or pointer). Taken as Android
+     * takes them, through the trap and through an -R trampoline, and then as
+     * this host has them, where they are re-issued — but for the two rows
+     * qemu-user answers itself, checking setgroups' arguments first. A
+     * process that is not like that is answered differently, and skipped. */
+    {
+        unsigned ru[3] = {0}, rg[3] = {0}, hdr[2] = {0x20080522u, 0};
+        unsigned cd[6] = {0};
+        int plain =
+            CNG_SYS(__NR_getresuid, &ru[0], &ru[1], &ru[2], 0, 0, 0) == 0 &&
+            CNG_SYS(__NR_getresgid, &rg[0], &rg[1], &rg[2], 0, 0, 0) == 0 &&
+            CNG_SYS(__NR_capget, hdr, cd, 0, 0, 0, 0) == 0 &&
+            !(cd[0] & 0xc0) /* CAP_SETGID, CAP_SETUID */ && ru[0] == ru[1] &&
+            ru[1] == ru[2] && rg[0] == rg[1] && rg[1] == rg[2];
+        long U = ru[0], G = rg[0];
+        const struct {
+            const char *what;
+            long nr, a0, a1, a2, want;
+            int refused_only;
+        } t[] = {
+            {"setuid self", __NR_setuid, U, 0, 0, 0, 0},
+            {"setuid other", __NR_setuid, U + 1, 0, 0, -EPERM, 0},
+            {"setuid -1", __NR_setuid, -1, 0, 0, -EINVAL, 0},
+            {"setgid self", __NR_setgid, G, 0, 0, 0, 0},
+            {"setgid other", __NR_setgid, G + 1, 0, 0, -EPERM, 0},
+            {"setreuid keep", __NR_setreuid, -1, -1, 0, 0, 0},
+            {"setreuid other", __NR_setreuid, -1, U + 1, 0, -EPERM, 0},
+            {"setregid self", __NR_setregid, G, G, 0, 0, 0},
+            {"setresuid keep", __NR_setresuid, -1, -1, -1, 0, 0},
+            {"setresgid self", __NR_setresgid, G, -1, G, 0, 0},
+            {"setresgid other", __NR_setresgid, -1, -1, G + 1, -EPERM, 0},
+            {"setfsuid other", __NR_setfsuid, U + 1, 0, 0, U, 0},
+            {"setfsuid -1", __NR_setfsuid, -1, 0, 0, U, 0},
+            {"setfsgid other", __NR_setfsgid, G + 1, 0, 0, G, 0},
+            {"setgroups none", __NR_setgroups, 0, 0, 0, -EPERM, 0},
+            {"setgroups huge", __NR_setgroups, -1, 0, 0, -EPERM, 1},
+            {"setgroups fault", __NR_setgroups, 1, 8, 0, -EPERM, 1},
+        };
+        const int nt = (int)(sizeof t / sizeof t[0]);
+        if (!plain) {
+            cng_dprintf(1, "blocktest setid: SKIP (privileged, or ids that "
+                           "differ)\n");
+        } else {
+            unsigned char was[CNG_NR_MAX];
+            memcpy(was, cng_blocked, sizeof was);
+            int asked[2] = {0, 0}, right[2] = {0, 0};
+            for (int pass = 0; pass < 2; pass++) {
+                if (pass == 0)
+                    for (int i = 0; i < cng_setid_deny_n; i++)
+                        cng_blocked[cng_setid_deny_nrs[i]] = 1;
+                else
+                    memcpy(cng_blocked, was, sizeof was);
+                for (int i = 0; i < nt; i++)
+                    for (int trapped = 1; trapped >= 0; trapped--) {
+                        if (pass == 1 && t[i].refused_only)
+                            continue;
+                        long r = cng_dispatch(t[i].nr, t[i].a0, t[i].a1,
+                                              t[i].a2, 0, 0, 0, trapped);
+                        asked[pass]++;
+                        if (r == t[i].want) {
+                            right[pass]++;
+                            continue;
+                        }
+                        cng_dprintf(1,
+                                    "blocktest setid: %s (%s, %s) = %ld, "
+                                    "want %ld\n",
+                                    t[i].what, pass ? "as measured" : "refused",
+                                    trapped ? "trap" : "-R", r, t[i].want);
+                    }
+            }
+            unsigned ru2[3] = {0}, rg2[3] = {0};
+            CNG_SYS(__NR_getresuid, &ru2[0], &ru2[1], &ru2[2], 0, 0, 0);
+            CNG_SYS(__NR_getresgid, &rg2[0], &rg2[1], &rg2[2], 0, 0, 0);
+            int kept = !memcmp(ru, ru2, sizeof ru) && !memcmp(rg, rg2, sizeof rg);
+            int ok4 = right[0] == asked[0] && right[1] == asked[1] && kept;
+            cng_dprintf(1,
+                        "blocktest setid: refused %d/%d, as measured %d/%d "
+                        "as the kernel answers, ids kept=%d -> %s\n",
+                        right[0], asked[0], right[1], asked[1], kept,
+                        ok4 ? "OK" : "FAIL");
+            fails += !ok4;
+        }
+    }
     return fails ? 1 : 0;
 }
 
@@ -6897,7 +6986,10 @@ int cng_cmd_nettest(int argc, char **argv, char **envp, unsigned long *auxv) {
                     ok ? "OK" : "FAIL");
         fails += !ok;
     }
-    /* 2b) a blocked non-path syscall reaching default -> emulated ENOSYS. */
+    /* 2b) a blocked non-path syscall reaching default -> emulated ENOSYS.
+     * get_robust_list: Android refuses it and the dispatcher has no case for
+     * it. (setgid stood here, but never reached default — it had a case of its
+     * own, whose ENOSYS was the bug cred.c's real_set fixes.) */
     {
         struct cng_ucontext uc;
         cng_siginfo_t si;
@@ -6905,11 +6997,12 @@ int cng_cmd_nettest(int argc, char **argv, char **envp, unsigned long *auxv) {
         memset(&si, 0, sizeof si);
         si.si_code = CNG_SYS_SECCOMP;
         si._u._sigsys.call_addr = (void *)0x1000;
-        uc.uc_mcontext.regs[8] = __NR_setgid;
+        uc.uc_mcontext.regs[8] = __NR_get_robust_list;
         cng_sigsys_body(&uc, &si);
         long got = (long)uc.uc_mcontext.regs[0];
         int ok = (got == -ENOSYS);
-        cng_dprintf(1, "nettest blocked-direct: setgid=%d want=%d -> %s\n",
+        cng_dprintf(1,
+                    "nettest blocked-direct: get_robust_list=%d want=%d -> %s\n",
                     (int)got, (int)-ENOSYS, ok ? "OK" : "FAIL");
         fails += !ok;
     }

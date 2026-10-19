@@ -549,6 +549,13 @@ static void help(char **envp) {
                       "slave and a pipe, so it is served from TCGETS, "
                       "TIOCGPGRP and getsid. Test aid: a host that serves it "
                       "never takes that path."},
+        {"CNG_SETID_DENY", "Without -u, take setuid, setgid, setreuid, "
+                      "setregid, setresgid, setfsuid, setfsgid and setgroups "
+                      "as refused by the host, as Android's app filter "
+                      "refuses them, so they are answered from the real ids "
+                      "and capabilities the way the kernel would answer "
+                      "them. Test aid: a host that allows them never takes "
+                      "that path."},
         {"CNG_BROKER_NO_PEERCRED", "Behave as if the kernel would not say who "
                       "is on the other end of the IPC broker's rendezvous "
                       "socket, which refuses the connection. Test aid: a "

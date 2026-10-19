@@ -61,8 +61,35 @@ static const int probe_set[] = {
     __NR_bind,       __NR_connect,    __NR_sendto,     __NR_sendmsg,
     __NR_getsockname, __NR_getpeername, __NR_accept,   __NR_accept4,
     __NR_recvfrom,   __NR_recvmsg,    __NR_sendmmsg,   __NR_recvmmsg,
+    /* The credential family, re-issued without --fake-id (cred.c), and the
+     * readers a refused setter is answered from. Android's app filter refuses
+     * every uid and gid setter but setresuid. Last, because four of them can
+     * act on these arguments — setre[ug]id(-1, 0) and setres[ug]id(-1, 0, 0)
+     * are a real change for a child holding the capability — and the child
+     * exits straight after; everything else here fails on -1 or a NULL
+     * pointer, or (setfsuid, setfsgid) takes -1 as no id at all. */
+    __NR_getresuid,  __NR_getresgid,  __NR_getgroups,  __NR_capget,
+    __NR_capset,     __NR_setfsuid,   __NR_setfsgid,   __NR_setuid,
+    __NR_setgid,     __NR_setgroups,  __NR_setresuid,  __NR_setreuid,
+    __NR_setregid,   __NR_setresgid,
 };
 #define NPROBE ((int)(sizeof probe_set / sizeof probe_set[0]))
+
+/* What CNG_SETID_DENY takes as refused: the uid and gid setters bionic's
+ * SECCOMP_BLOCKLIST_APP.TXT lists, which is all of them but setresuid. */
+int cng_g_setid_deny = 0;
+const int cng_setid_deny_nrs[] = {
+    __NR_setuid,   __NR_setgid,   __NR_setreuid, __NR_setregid,
+    __NR_setresgid, __NR_setfsuid, __NR_setfsgid, __NR_setgroups,
+};
+const int cng_setid_deny_n =
+    (int)(sizeof cng_setid_deny_nrs / sizeof cng_setid_deny_nrs[0]);
+
+static void setid_deny(void) {
+    if (cng_g_setid_deny)
+        for (int i = 0; i < cng_setid_deny_n; i++)
+            cng_blocked[cng_setid_deny_nrs[i]] = 1;
+}
 
 static unsigned char *g_probe_map; /* MAP_SHARED page: child marks, parent reads */
 
@@ -81,6 +108,7 @@ void cng_probe_blocked(void) {
                            CNG_MAP_SHARED | CNG_MAP_ANONYMOUS, -1, 0);
     if (g_probe_map == CNG_MAP_FAILED || cng_is_err((long)g_probe_map)) {
         g_probe_map = 0;
+        setid_deny();
         return; /* no probe -> nothing blocked; gate-net remains the backstop */
     }
     memset(g_probe_map, 0, CNG_NR_MAX);
@@ -106,4 +134,5 @@ void cng_probe_blocked(void) {
     }
     sys_munmap(g_probe_map, 4096);
     g_probe_map = 0;
+    setid_deny();
 }

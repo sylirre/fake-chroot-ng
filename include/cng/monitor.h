@@ -434,11 +434,20 @@ void cng_nnp_fork_child(int val);
 long cng_user_strcopyin(char *dst, const char *src, unsigned long cap);
 
 /* Ambient-seccomp block-list: cng_blocked[nr] != 0 means Android blocks that
- * syscall, so dispatch emulates ENOSYS instead of re-issuing it. Populated by
- * cng_probe_blocked() at monitor install (a no-op result off Android). */
+ * syscall, so dispatch emulates ENOSYS instead of re-issuing it — or, for the
+ * few with an answer of their own (accept, the uid/gid setters), gives that.
+ * Populated by cng_probe_blocked() at monitor install (a no-op result off
+ * Android). */
 #define CNG_NR_MAX 512
 extern unsigned char cng_blocked[CNG_NR_MAX];
 void cng_probe_blocked(void);
+/* CNG_SETID_DENY=1: take the uid and gid setters Android's app filter refuses
+ * as refused here too — marked blocked after the probe, and trapped by our own
+ * filter so they reach the dispatcher as that filter's trap would deliver them
+ * (cred.c). */
+extern int cng_g_setid_deny;
+extern const int cng_setid_deny_nrs[];
+extern const int cng_setid_deny_n;
 
 /* Is a signal pending that the guest would take delivery of, judged against the
  * mask of the frame `uc` will restore (NULL on the -R tier, which has no frame

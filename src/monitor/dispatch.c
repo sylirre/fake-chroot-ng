@@ -6027,7 +6027,10 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * against the synthetic credential set in cred.c, which enforces real POSIX
      * privilege rules. These never re-issue under --fake-id: the setters sit on
      * Android's seccomp block-list, and a re-issue from inside this (SIGSYS)
-     * handler force-kills the process (masked nested seccomp SIGSYS). */
+     * handler force-kills the process (masked nested seccomp SIGSYS). Without
+     * it they arrive from -R, a tracee, or that block-list's own trap, and are
+     * re-issued unless the probe found them refused — then cred.c answers from
+     * the real ids what the kernel would. */
     case __NR_getuid:
     case __NR_geteuid:
     case __NR_getgid:

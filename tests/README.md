@@ -44,7 +44,10 @@ expected failure:
   `faccessat2`, `name_to_handle_at`, `fchmodat2`, `rseq`, `set_robust_list`, the
   6.13 `*xattrat` family). The emulation answers `ENOSYS` as an older kernel
   would; a leg that needs the real call, or a host-built reference that issues
-  it, skips.
+  it, skips. The uid and gid setters are refused too (all but `setresuid`), and
+  answered from the real ids as the kernel would answer an app's process (m9;
+  `CNG_SETID_DENY=1` takes them as refused anywhere, and
+  `tests/guests/ambtrap.c` installs such a filter where seccomp is live).
 * **SELinux hides or refuses what a kernel would allow**: hardlinks (`ln` is
   `EACCES`, so the l2s fallback is what runs), `stat` and `open` of
   `/proc/{loadavg,uptime,stat,version}` and `/proc/sys/kernel/overflow{u,g}id`

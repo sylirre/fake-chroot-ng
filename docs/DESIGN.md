@@ -282,9 +282,11 @@ Two layers handle this:
   dispatcher. Since our filter only traps syscalls we have explicit handlers
   for, anything reaching the dispatcher's `default` was trapped by *Android* —
   so we emulate `-ENOSYS` directly instead of re-issuing. Credential setters are
-  likewise emulated in place (against the fake-identity credential set under
-  `--fake-id`, else `-ENOSYS`). Nothing is re-issued, so this does not depend on
-  nested signal delivery. (The M8
+  likewise emulated in place: against the fake-identity credential set under
+  `--fake-id`; else, for a setter the probe below found refused, from the real
+  ids and capabilities by the kernel's own rules — 0 for a call that changes
+  nothing, EPERM or EINVAL as the kernel would say (M84). Nothing is re-issued,
+  so this does not depend on nested signal delivery. (The M8
   trampoline path passes `trapped=0`, where an unhandled syscall is an ordinary
   one to run, not a blocked one.)
 - **Block-list probe (for re-issued path syscalls).** Some syscalls we *do*
