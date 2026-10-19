@@ -187,6 +187,12 @@ check_contains "l2s reads a group's count from its own marker only" \
 # file's own inode (M10's race leg drives the exchange against real readers).
 check_contains "l2s first link moves the file by exchange, or in two steps" \
     "l2s-swap: exchange=1 two_steps=1 -> OK" "$out"
+# A link of a symlink (not followed) is the symlink's: the fallback opened the
+# source to copy it and the pin refused that with ELOOP. The new name is a
+# second symlink with the same text and times; a text in the ".l2s." grammar
+# is not copied.
+check_contains "l2s link of a symlink makes a symlink with its text" \
+    "l2s-symlink: rc=0 lnk=1 text=1 times=1 guard=1 -> OK" "$out"
 check_contains "fchdir updates virtual cwd" "fchdir: cwd=/w -> OK" "$out"
 check_contains "chdir through a symlink records the directory it landed in" \
     "chdir-symlink: rc=0 cwd=/w -> OK" "$out"

@@ -4462,6 +4462,44 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
                 sw_ok[1], sw_ok[0] && sw_ok[1] ? "OK" : "FAIL");
     fails += !(sw_ok[0] && sw_ok[1]);
 
+    /* A link of a symlink, not followed, links the symlink: the new name
+     * reads the same text and carries the same times. The fallback used to
+     * open the source to copy it, which the pin refused with ELOOP. A text in
+     * the ".l2s." grammar is not copied (it could be taken for a name of a
+     * group beside it), and the source is never followed either way. */
+    char hsym[CNG_PATH_MAX], ssl[144], ssl2[144], rlk[16];
+    cng_dispatch(__NR_symlinkat, (long)"a", CNG_AT_FDCWD, (long)"/w/lsym", 0, 0,
+                 0, 0);
+    long ts_sym[4] = {1234567890, 0, 1234567890, 0};
+    dbg_mkpath(hsym, sizeof hsym, rootfs, "/w/lsym", 0, 0);
+    CNG_SYS(__NR_utimensat, CNG_AT_FDCWD, hsym, ts_sym, CNG_AT_SYMLINK_NOFOLLOW,
+            0, 0);
+    long syl = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/lsym",
+                            CNG_AT_FDCWD, (long)"/w/lsym2", 0, 0, 0);
+    long syr = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD, (long)"/w/lsym2",
+                            (long)rlk, sizeof rlk, 0, 0, 0);
+    long sy1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/lsym",
+                            (long)ssl, CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0);
+    long sy2 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/lsym2",
+                            (long)ssl2, CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0);
+    int sy_lnk = sy1 == 0 && sy2 == 0 && (ST_MODE(ssl2) & 0170000) == 0120000;
+    int sy_text = (syr == 1 && rlk[0] == 'a');
+    int sy_time = sy_lnk && ST_MTIME(ssl2) == 1234567890 &&
+                  ST_MTIME(ssl) == 1234567890;
+    dbg_mkpath(hsym, sizeof hsym, rootfs, "/w/lsym9", 0, 0);
+    CNG_SYS(__NR_symlinkat, ".l2s.9", CNG_AT_FDCWD, hsym, 0, 0, 0);
+    long syg = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/lsym9",
+                            CNG_AT_FDCWD, (long)"/w/lsym9b", 0, 0, 0);
+    long sy9 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/lsym9b",
+                            (long)ssl2, CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0);
+    int sy_guard = syg == -EPERM && sy9 == -ENOENT;
+    int sy_ok = syl == 0 && sy_lnk && sy_text && sy_time && sy_guard;
+    cng_dprintf(1,
+                "l2s-symlink: rc=%d lnk=%d text=%d times=%d guard=%d -> %s\n",
+                (int)syl, sy_lnk, sy_text, sy_time, sy_guard,
+                sy_ok ? "OK" : "FAIL");
+    fails += !sy_ok;
+
     cng_blocked[__NR_linkat] = 0;
     cng_g_l2s = 0;
 

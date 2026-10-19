@@ -30,6 +30,8 @@ int cng_g_l2s_force = 0;
 #define ST_INO_OFF   8
 #define ST_MODE_OFF  16
 #define ST_NLINK_OFF 20
+#define ST_ATIM_OFF  72
+#define ST_MTIM_OFF  88
 #define ST_SIZE      128
 /* struct statx field offsets. */
 #define STX_MASK_OFF  0
@@ -685,6 +687,47 @@ static int l2s_materialize(const char *src, const char *dst) {
     return (int)rc;
 }
 
+/* The host's /proc: the one place a symlink is not the guest's but a
+ * descriptor's magic link (the AT_EMPTY_PATH source is spelled as one), the
+ * same zone pin.c hands over unpinned. */
+static int l2s_under_proc(const char *p) {
+    return strncmp(p, "/proc", 5) == 0 && (p[5] == '\0' || p[5] == '/');
+}
+
+/* link(2) of a symlink links the symlink itself: the kernel gives the new name
+ * the same inode, so it reads the same text. A symlink cannot be a group's
+ * data file — a group's names are followed onto it, and a relative text would
+ * then be read against the store — so the new name is a second symlink with
+ * that text, carrying the original's times as one inode would (its count
+ * stays 1, the one divergence). The source is read, never opened or followed:
+ * l2s_materialize used to open it, which the pin refused with ELOOP. A text
+ * in the ".l2s." grammar is not copied, as the guest's own symlinkat of one
+ * is refused (dispatch.c): beside a data file of that name the copy would be
+ * taken for a name of its group that was never counted. 0 or -errno. */
+static int l2s_copy_symlink(const char *src, const char *dst, const void *st) {
+    char tgt[CNG_PATH_MAX];
+    long n = l2s_readlink(src, tgt, sizeof tgt - 1);
+    if (n < 0)
+        return (int)n;
+    tgt[n] = '\0';
+    if (cng_l2s_hidden(l2s_basename(tgt)))
+        return -EPERM;
+    long r = l2s_symlink(tgt, dst);
+    if (r < 0)
+        return (int)r;
+    if (!cng_blocked[__NR_utimensat]) {
+        struct cng_pin p;
+        long ts[4];
+        memcpy(ts, (const char *)st + ST_ATIM_OFF, sizeof ts / 2);
+        memcpy(ts + 2, (const char *)st + ST_MTIM_OFF, sizeof ts / 2);
+        if (cng_pin_at(CNG_AT_FDCWD, dst, &p) == 0)
+            CNG_SYS(__NR_utimensat, p.dfd, (long)p.name, (long)ts,
+                    CNG_AT_SYMLINK_NOFOLLOW, 0, 0);
+        cng_unpin(&p);
+    }
+    return 0;
+}
+
 /* What `src` is to a link: 1 a member of a group (`data` and `*count`
  * filled), 0 a file of its own, or -errno. */
 static int l2s_link_source(const char *src, int own, char *data, size_t dsz,
@@ -759,6 +802,11 @@ static int l2s_first_link(const char *src, const char *dst, const char *ddir,
         L2S_LOG("[cng] l2s: src %s missing\n", src);
         return -ENOENT;
     }
+    /* A descriptor's magic link is followed by the copy below, as the
+     * AT_EMPTY_PATH publish means it to be; any other symlink is linked as
+     * itself. */
+    if (is_lnk(st) && !l2s_under_proc(src))
+        return l2s_copy_symlink(src, dst, st);
     if (!is_reg(st) || !own) /* e.g. /proc/self/fd/N O_TMPFILE: copy contents */
         return 1;
     ino = *(unsigned long long *)((char *)st + ST_INO_OFF);

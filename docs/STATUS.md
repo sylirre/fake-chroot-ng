@@ -231,8 +231,11 @@ vfork/`posix_spawn` child-stack handling.
     rewritten svc sites; the seccomp tier covers it on devices).
   - Accepted divergences (deliberate, documented):
     `readlink("/proc/self/fd/N")` on a link-opened fd can show the store path
-    when the guest has a live `/proc`; `ln -P` of a symlink copies the
-    target's contents instead of linking the symlink itself; the marker
+    when the guest has a live `/proc`; `ln -P` of a symlink makes a second
+    symlink with the same text and times, each counting 1 link, not 2 (a
+    symlink cannot be a group's data file: a relative text would be read
+    against the store), and one whose text is in the `.l2s.` grammar is
+    refused `EPERM`; the marker
     read-modify-write is not atomic under concurrent link/unlink; a guest
     cannot create files matching the `.l2s.` name grammar, nor (M60) a
     symlink whose target's last component matches it (denied `ENOENT`);

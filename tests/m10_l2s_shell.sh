@@ -92,6 +92,14 @@ if [ "$m10_ready" -eq 1 ]; then
         'cd /tmp; mkdir -p t/x t/y; echo hi>t/x/a; ln t/x/a t/x/b;
          ln t/x/a t/y/c; rm -rf t; echo rc=$?; ls -a'
 
+    # link(2) of a symlink links the symlink: a second name with the same
+    # text and times, followed by neither (the count is the one divergence,
+    # so it is not printed). The fallback opened the source and drew ELOOP.
+    l2s_diff "ln of a symlink links the symlink" \
+        'cd /tmp; echo hi>a; ln -s a sl; touch -h -d "2020-01-02 03:04:05" sl;
+         ln sl sl2; echo rc=$?; stat -c "%F %Y" sl sl2; readlink sl2; cat sl2;
+         mkdir d; ln sl d/sl3; readlink d/sl3; cat d/sl3; echo rc=$?'
+
     l2s_diff "double ln refuses with EEXIST" \
         'cd /tmp; echo hi>a; ln a b; ln a b 2>&1; echo rc=$?'
 
