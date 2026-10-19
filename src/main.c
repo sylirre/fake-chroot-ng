@@ -411,11 +411,13 @@ static void help(char **envp) {
                       "backing file where the host refuses link(2) (Android / "
                       "SELinux answers EACCES/EXDEV/EPERM). Backing files live "
                       "in a per-rootfs store '<rootfs>/.l2s', invisible to the "
-                      "guest; the group presents as ordinary regular files "
-                      "sharing one inode — across directories, through mv and "
-                      "rm — which lets package managers such as apk/dpkg "
-                      "unpack. Off by default: without it the host's refusal "
-                      "is reported to the guest unchanged."},
+                      "guest; the group presents as ordinary files sharing one "
+                      "inode — across directories, through mv and rm — which "
+                      "lets package managers such as apk/dpkg unpack. The "
+                      "hardlinks proot's own link2symlink made (a rootfs "
+                      "installed by proot-distro) are read and kept the way "
+                      "proot keeps them. Off by default: without it the host's "
+                      "refusal is reported to the guest unchanged."},
         {"-R, --rewrite", "Rewrite the guest's svc instruction sites to "
                       "trampolines: ahead of time where an object's section "
                       "headers say its code is, and on its first trap for a "

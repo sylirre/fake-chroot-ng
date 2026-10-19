@@ -4648,6 +4648,230 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
                 nd_pipe, nd_sock, nd_ok ? "OK" : "FAIL");
     fails += !nd_ok;
 
+    /* proot's groups, laid down by hand as proot-distro's proot writes them:
+     * members are symlinks holding the indirection's absolute host path, the
+     * indirection names "<itself>.<CCCC>" beside it, CCCC the count. Read as
+     * the one regular file a hardlink is, and kept with proot's bookkeeping:
+     * a link renames the data to the next count and repoints the indirection,
+     * an unlink the other way, the last one removes both. A moved tree (an
+     * old rootfs prefix in both texts) is read from this rootfs's store and
+     * healed; a chain that leaves the rootfs, or whose indirection names data
+     * in another directory, is an ordinary symlink. */
+    char pst[CNG_PATH_MAX], pind[CNG_PATH_MAX], pdat[CNG_PATH_MAX];
+    char ph[CNG_PATH_MAX], prt[CNG_PATH_MAX], psa[144], psb[144];
+    dbg_mkpath(pst, sizeof pst, rootfs, "/.l2s", 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, pst, 0700, 0, 0, 0);
+    dbg_mkpath(pdat, sizeof pdat, rootfs, "/.l2s/.l2s.pa0001.0002", 0, 0);
+    long pfd = sys_openat(CNG_AT_FDCWD, pdat, CNG_O_CREAT | CNG_O_WRONLY, 0644);
+    if (pfd >= 0) {
+        sys_write((int)pfd, "pr", 2);
+        sys_close((int)pfd);
+    }
+    dbg_mkpath(pind, sizeof pind, rootfs, "/.l2s/.l2s.pa0001", 0, 0);
+    CNG_SYS(__NR_symlinkat, pdat, CNG_AT_FDCWD, pind, 0, 0, 0);
+    dbg_mkpath(ph, sizeof ph, rootfs, "/w/pa", 0, 0);
+    CNG_SYS(__NR_symlinkat, pind, CNG_AT_FDCWD, ph, 0, 0, 0);
+    dbg_mkpath(ph, sizeof ph, rootfs, "/w/pb", 0, 0);
+    CNG_SYS(__NR_symlinkat, pind, CNG_AT_FDCWD, ph, 0, 0, 0);
+    /* Presented: lstat and stat say a regular file of two links, one inode
+     * for both names; readlink is EINVAL; the contents are the data's. */
+    long pr1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/pa",
+                            (long)psa, CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0);
+    long pr2 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/pb",
+                            (long)psb, 0, 0, 0, 0);
+    long prl = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD, (long)"/w/pa",
+                            (long)prt, sizeof prt, 0, 0, 0);
+    char pb[4];
+    long prd = -1;
+    char psf[144];
+    long psr = -1;
+    long po = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/pb",
+                           CNG_O_RDONLY, 0, 0, 0, 0);
+    if (po >= 0) {
+        prd = sys_read((int)po, pb, sizeof pb);
+        psr = cng_dispatch(__NR_fstat, po, (long)psf, 0, 0, 0, 0, 0);
+        sys_close((int)po);
+    }
+    int pr_read = pr1 == 0 && pr2 == 0 && ST_ISREG(psa) && ST_ISREG(psb) &&
+                  ST_NLINK(psa) == 2 && ST_NLINK(psb) == 2 &&
+                  ST_INO(psa) == ST_INO(psb) && prl == -EINVAL && prd == 2 &&
+                  pb[0] == 'p' && psr == 0 && ST_NLINK(psf) == 2;
+    /* A link: the data is at .0003, the indirection names it, the new
+     * member carries the indirection's path, every name counts three. */
+    long prk = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/pa",
+                            CNG_AT_FDCWD, (long)"/w/pc", 0, 0, 0);
+    dbg_mkpath(pdat, sizeof pdat, rootfs, "/.l2s/.l2s.pa0001.0003", 0, 0);
+    long pn = sys_readlinkat(CNG_AT_FDCWD, pind, prt, sizeof prt - 1);
+    int pr_ind3 = pn > 0 && (prt[pn] = '\0', strcmp(prt, pdat) == 0);
+    dbg_mkpath(ph, sizeof ph, rootfs, "/w/pc", 0, 0);
+    pn = sys_readlinkat(CNG_AT_FDCWD, ph, prt, sizeof prt - 1);
+    int pr_mem = pn > 0 && (prt[pn] = '\0', strcmp(prt, pind) == 0);
+    int pr_three = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/pb",
+                                (long)psb, 0, 0, 0, 0) == 0 &&
+                   ST_NLINK(psb) == 3 && ST_INO(psb) == ST_INO(psa);
+    /* A followed link reaches the data file, and joins the group too. */
+    long prf = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/pb",
+                            CNG_AT_FDCWD, (long)"/w/pd", CNG_AT_SYMLINK_FOLLOW,
+                            0, 0);
+    int pr_follow = prf == 0 &&
+                    cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/pd",
+                                 (long)psb, CNG_AT_SYMLINK_NOFOLLOW, 0, 0,
+                                 0) == 0 &&
+                    ST_NLINK(psb) == 4 && ST_INO(psb) == ST_INO(psa);
+    /* An unlink, a rename over a name, a rename between two names (nothing
+     * happens), then the rest: the data and the indirection go with the
+     * last. */
+    long pu1 = cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/pd", 0, 0,
+                            0, 0, 0);
+    long pmv = cng_dispatch(__NR_renameat, CNG_AT_FDCWD, (long)"/w/pa",
+                            CNG_AT_FDCWD, (long)"/w/pb", 0, 0, 0);
+    po = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/pn",
+                      CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (po >= 0)
+        sys_close((int)po);
+    long pov = cng_dispatch(__NR_renameat, CNG_AT_FDCWD, (long)"/w/pn",
+                            CNG_AT_FDCWD, (long)"/w/pc", 0, 0, 0);
+    dbg_mkpath(pdat, sizeof pdat, rootfs, "/.l2s/.l2s.pa0001.0002", 0, 0);
+    int pr_two = pu1 == 0 && pmv == 0 && pov == 0 &&
+                 cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/pa",
+                              (long)psb, 0, 0, 0, 0) == 0 &&
+                 ST_NLINK(psb) == 2 &&
+                 CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, pdat, psb,
+                         CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0;
+    long pu2 = cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/pa", 0, 0,
+                            0, 0, 0);
+    long pu3 = cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/pb", 0, 0,
+                            0, 0, 0);
+    dbg_mkpath(pdat, sizeof pdat, rootfs, "/.l2s/.l2s.pa0001.0001", 0, 0);
+    int pr_gone = pu2 == 0 && pu3 == 0 &&
+                  CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, pind, psb,
+                          CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == -ENOENT &&
+                  CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, pdat, psb,
+                          CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == -ENOENT;
+    /* A moved tree: both texts carry an old rootfs path. Read from this
+     * rootfs's store; the member is repointed at once, the indirection by
+     * the next change of the count. */
+    dbg_mkpath(pdat, sizeof pdat, rootfs, "/.l2s/.l2s.pm0001.0002", 0, 0);
+    pfd = sys_openat(CNG_AT_FDCWD, pdat, CNG_O_CREAT | CNG_O_WRONLY, 0644);
+    if (pfd >= 0)
+        sys_close((int)pfd);
+    dbg_mkpath(pind, sizeof pind, rootfs, "/.l2s/.l2s.pm0001", 0, 0);
+    CNG_SYS(__NR_symlinkat, "/nonexistent-old-root/.l2s/.l2s.pm0001.0002",
+            CNG_AT_FDCWD, pind, 0, 0, 0);
+    char pm1[CNG_PATH_MAX];
+    dbg_mkpath(pm1, sizeof pm1, rootfs, "/w/pm1", 0, 0);
+    CNG_SYS(__NR_symlinkat, "/nonexistent-old-root/.l2s/.l2s.pm0001",
+            CNG_AT_FDCWD, pm1, 0, 0, 0);
+    dbg_mkpath(ph, sizeof ph, rootfs, "/w/pm2", 0, 0);
+    CNG_SYS(__NR_symlinkat, "/nonexistent-old-root/.l2s/.l2s.pm0001",
+            CNG_AT_FDCWD, ph, 0, 0, 0);
+    int pr_moved = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/pm1",
+                                (long)psa, CNG_AT_SYMLINK_NOFOLLOW, 0, 0,
+                                0) == 0 &&
+                   ST_ISREG(psa) && ST_NLINK(psa) == 2;
+    pn = sys_readlinkat(CNG_AT_FDCWD, pm1, prt, sizeof prt - 1);
+    long pmk = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/pm2",
+                            CNG_AT_FDCWD, (long)"/w/pm3", 0, 0, 0);
+    dbg_mkpath(pdat, sizeof pdat, rootfs, "/.l2s/.l2s.pm0001.0003", 0, 0);
+    long pn2 = sys_readlinkat(CNG_AT_FDCWD, pind, ph, sizeof ph - 1);
+    pr_moved = pr_moved && pn > 0 && (prt[pn] = '\0', !strcmp(prt, pind)) &&
+               pmk == 0 && pn2 > 0 && (ph[pn2] = '\0', !strcmp(ph, pdat));
+    /* proot without PROOT_L2S_DIR: the indirection and the data beside the
+     * first name, a member elsewhere naming them by host path. */
+    char pdd[CNG_PATH_MAX];
+    dbg_mkpath(pdd, sizeof pdd, rootfs, "/w/pdir", 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, pdd, 0755, 0, 0, 0);
+    dbg_mkpath(pdat, sizeof pdat, rootfs, "/w/pdir/.l2s.f0001.0002", 0, 0);
+    pfd = sys_openat(CNG_AT_FDCWD, pdat, CNG_O_CREAT | CNG_O_WRONLY, 0644);
+    if (pfd >= 0)
+        sys_close((int)pfd);
+    dbg_mkpath(pind, sizeof pind, rootfs, "/w/pdir/.l2s.f0001", 0, 0);
+    CNG_SYS(__NR_symlinkat, pdat, CNG_AT_FDCWD, pind, 0, 0, 0);
+    dbg_mkpath(ph, sizeof ph, rootfs, "/w/pdir/f", 0, 0);
+    CNG_SYS(__NR_symlinkat, pind, CNG_AT_FDCWD, ph, 0, 0, 0);
+    dbg_mkpath(ph, sizeof ph, rootfs, "/w/pdf", 0, 0);
+    CNG_SYS(__NR_symlinkat, pind, CNG_AT_FDCWD, ph, 0, 0, 0);
+    int pr_beside = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD,
+                                 (long)"/w/pdf", (long)psa, 0, 0, 0, 0) == 0 &&
+                    cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD,
+                                 (long)"/w/pdir/f", (long)psb,
+                                 CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0) == 0 &&
+                    ST_ISREG(psa) && ST_NLINK(psa) == 2 &&
+                    ST_INO(psa) == ST_INO(psb);
+    /* A listing says what the stat says: the member's record is a regular
+     * file with the data's inode. */
+    unsigned long long pdi = 0;
+    unsigned pdt = 0;
+    long pdfd = sys_openat(CNG_AT_FDCWD, pdd, CNG_O_RDONLY | CNG_O_DIRECTORY, 0);
+    pr_beside = pr_beside && pdfd >= 0 &&
+                cng_l2s_dirent(pdfd, "f", &pdi, &pdt) == 1 && pdt == 8 &&
+                pdi == ST_INO(psa);
+    if (pdfd >= 0)
+        sys_close((int)pdfd);
+    /* The indirection is in plain sight here, and its text is a host path:
+     * readlink says the guest's own name for the data file. */
+    long pdr = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD,
+                            (long)"/w/pdir/.l2s.f0001", (long)prt,
+                            sizeof prt - 1, 0, 0, 0);
+    pr_beside = pr_beside && pdr == 23 &&
+                !strncmp(prt, "/w/pdir/.l2s.f0001.0002", 23);
+    /* A chain a killed process left cut (the data renamed to .0003, the
+     * indirection still naming .0002): a stat fails as for the dangling
+     * symlink proot shows, and the next change of the group mends it. */
+    dbg_mkpath(pdat, sizeof pdat, rootfs, "/.l2s/.l2s.pc0001.0003", 0, 0);
+    pfd = sys_openat(CNG_AT_FDCWD, pdat, CNG_O_CREAT | CNG_O_WRONLY, 0644);
+    if (pfd >= 0)
+        sys_close((int)pfd);
+    dbg_mkpath(pind, sizeof pind, rootfs, "/.l2s/.l2s.pc0001", 0, 0);
+    dbg_mkpath(pdat, sizeof pdat, rootfs, "/.l2s/.l2s.pc0001.0002", 0, 0);
+    CNG_SYS(__NR_symlinkat, pdat, CNG_AT_FDCWD, pind, 0, 0, 0);
+    dbg_mkpath(ph, sizeof ph, rootfs, "/w/pc1", 0, 0);
+    CNG_SYS(__NR_symlinkat, pind, CNG_AT_FDCWD, ph, 0, 0, 0);
+    dbg_mkpath(ph, sizeof ph, rootfs, "/w/pc2", 0, 0);
+    CNG_SYS(__NR_symlinkat, pind, CNG_AT_FDCWD, ph, 0, 0, 0);
+    long pcs = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/pc1",
+                            (long)psa, 0, 0, 0, 0);
+    long pcl = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/pc1",
+                            CNG_AT_FDCWD, (long)"/w/pc3", 0, 0, 0);
+    dbg_mkpath(pdat, sizeof pdat, rootfs, "/.l2s/.l2s.pc0001.0004", 0, 0);
+    int pr_cut = pcs == -ENOENT && pcl == 0 &&
+                 cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/pc2",
+                              (long)psa, 0, 0, 0, 0) == 0 &&
+                 ST_ISREG(psa) && ST_NLINK(psa) == 4 &&
+                 CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, pdat, psb,
+                         CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0;
+    /* Not groups: an indirection outside the rootfs (its text a host path
+     * the view does not name), and one that names data in another
+     * directory. Both stay symlinks to lstat. */
+    dbg_mkpath(ph, sizeof ph, rootfs, "/w/px1", 0, 0);
+    CNG_SYS(__NR_symlinkat, "/etc/.l2s.passwd0001", CNG_AT_FDCWD, ph, 0, 0, 0);
+    dbg_mkpath(pind, sizeof pind, rootfs, "/.l2s/.l2s.px0001", 0, 0);
+    dbg_mkpath(pdat, sizeof pdat, rootfs, "/w/pdir/.l2s.px0001.0002", 0, 0);
+    pfd = sys_openat(CNG_AT_FDCWD, pdat, CNG_O_CREAT | CNG_O_WRONLY, 0644);
+    if (pfd >= 0)
+        sys_close((int)pfd);
+    CNG_SYS(__NR_symlinkat, pdat, CNG_AT_FDCWD, pind, 0, 0, 0);
+    dbg_mkpath(ph, sizeof ph, rootfs, "/w/px2", 0, 0);
+    CNG_SYS(__NR_symlinkat, pind, CNG_AT_FDCWD, ph, 0, 0, 0);
+    int pr_hostile =
+        cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/px1", (long)psa,
+                     CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0) == 0 &&
+        (ST_MODE(psa) & 0170000) == 0120000 &&
+        cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/px2", (long)psb,
+                     CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0) == 0 &&
+        (ST_MODE(psb) & 0170000) == 0120000;
+    int pr_ok = pr_read && prk == 0 && pr_ind3 && pr_mem && pr_three &&
+                pr_follow && pr_two && pr_gone && pr_moved && pr_beside &&
+                pr_cut && pr_hostile;
+    cng_dprintf(1,
+                "l2s-proot: read=%d link=%d ind3=%d member=%d three=%d "
+                "follow=%d two=%d gone=%d moved=%d beside=%d cut=%d "
+                "hostile=%d -> %s\n",
+                pr_read, (int)prk, pr_ind3, pr_mem, pr_three, pr_follow, pr_two,
+                pr_gone, pr_moved, pr_beside, pr_cut, pr_hostile,
+                pr_ok ? "OK" : "FAIL");
+    fails += !pr_ok;
+
     cng_blocked[__NR_linkat] = 0;
     cng_g_l2s = 0;
 

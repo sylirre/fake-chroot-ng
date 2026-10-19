@@ -3710,6 +3710,57 @@ vfork/`posix_spawn` child-stack handling.
     timer was the first try, and it starved the loop wherever a read takes
     longer than the interval — natively on a TCG VM, with no chroot-ng at all.
 
+- [x] **M82 — `-l` reads and keeps the hardlink groups proot made**
+  A rootfs installed through proot-distro holds its hardlinks the way proot's
+  link2symlink wrote them: every name a symlink holding the HOST path of an
+  indirection symlink `.l2s.<name><NNNN>` in proot's l2s directory
+  (proot-distro's `PROOT_L2S_DIR` is `<rootfs>/.l2s`, the same as the store;
+  without it, beside the first name), which names the data file beside it,
+  `<indirection>.<CCCC>`, CCCC the live count. The guest-level walk re-rooted
+  those host paths, so every name dangled into `<rootfs><rootfs>/.l2s`: cat,
+  exec and stat failed and `rm` left the count where it was. arm64chroot gained
+  the same support in its `bddbec9`, and the owner chose full bookkeeping over
+  a read-only presentation.
+  - Read: `cng_l2s_resolve` recognizes a member when the whole chain checks
+    out and presents it as the data file with that count, so every caller —
+    stat/statx/fstat, getdents' `d_type`/`d_ino`, `readlink` (EINVAL), the
+    no-follow calls, exec's own name, the same-file rename — treats it as one
+    of the emulation's own names. The walker maps the host paths (members and
+    indirections, `cng_l2s_untranslate_target`) into the guest view, and the
+    indirection that sits in plain sight in proot's per-directory layout reads
+    back as the guest path of its data file.
+  - Kept: a link of a member (or of the data file a followed link reaches) is
+    a member with the same text after the count went up; an unlink, or a
+    rename over a member, takes it down; the last removes the data and the
+    indirection. A count change is proot's two renames — the data file to its
+    new count, the indirection repointed by a symlink renamed over it — under
+    the store lock; a reader that finds the data missing looks again a few
+    times, and a chain a killed process left cut is mended by the next change
+    (the one data file of that name, found by a scan). New groups are still
+    made in chroot-ng's scheme, which proot does not read.
+  - Contained: a member's text is placed as the emulation's own targets are (a
+    canonical path in a place of the guest's own, or a stale store path healed
+    onto this rootfs's store, which a moved tree's texts are; both texts are
+    then rewritten to the current path). Of the indirection's text only the
+    basename is used, `<indirection>.<CCCC>`, and the data file is taken beside
+    the indirection; anything else is an ordinary symlink. The two-step
+    first-link fallback no longer renames over an entry it did not make: an
+    indirection of proot's for a file named by digits spells a data name of
+    chroot-ng's.
+  - Not covered: proot takes no lock, so proot and chroot-ng changing one group
+    at the same moment can still end a count one off; a name added or removed
+    while another process opens a different name of the group can fail that
+    open for the length of the two renames (as under proot); and a member of a
+    cut chain answers as the dangling symlink proot shows (stat ENOENT) until
+    a change of the group mends it.
+  - Tests: `-t l2stest`'s `l2s-proot` (presentation incl. fstat, `d_type` and
+    the indirection's readlink, link/followed link/unlink/rename bookkeeping
+    on the host, a moved tree, the per-directory layout, a cut chain mended,
+    two hostile chains), and an M10 differential: the same script over real
+    hardlinks and over proot's layout laid down by hand must print the same
+    bytes — including busybox run through a member — and the store must then
+    hold what proot itself would leave. The previous build fails both.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

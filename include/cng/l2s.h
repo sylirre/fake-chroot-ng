@@ -34,6 +34,17 @@
  * A directory listing says the same: the names' dirents carry the data file's
  * d_type/d_ino rather than the symlinks' own (cng_l2s_dirent).
  *
+ * The groups proot's own link2symlink made — a rootfs installed by
+ * proot-distro holds them — are read and kept as well: every name a symlink to
+ * the HOST path of an indirection symlink ".l2s.<name><NNNN>" (in proot's l2s
+ * directory, proot-distro's being this same "<rootfs>/.l2s", or beside the
+ * first name), which names the data file beside it, "<indirection>.<CCCC>",
+ * CCCC the live count. cng_l2s_resolve presents a member as the data file with
+ * that count, so every caller above treats it as one of ours; a link or an
+ * unlink renames the data file to the new count and repoints the indirection,
+ * as proot does, so the tree goes on working under proot. New groups are made
+ * in the scheme above, which proot does not read (l2s.c, "proot's groups").
+ *
  * All paths here are already rootfs-resolved *host* paths. Freestanding: raw
  * syscalls only, safe to call from the SIGSYS handler. Triggered as the linkat
  * fallback, and only when opted into with -l/--link2symlink.

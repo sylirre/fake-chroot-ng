@@ -64,7 +64,8 @@ Common options: `-u/--fake-id[=ID]` (fake user identity — `ID` is a `uid` or
 SRC — a directory or a single file, as `mount --bind` takes either — at guest
 path DST, read-only with `:ro`), `-E/--env VAR=VAL` (set a guest environment
 variable — see below), `-w/--work-dir DIR` (start the guest in
-DIR — see below), `-l/--link2symlink` (emulate hardlinks where the host refuses `link(2)`),
+DIR — see below), `-l/--link2symlink` (emulate hardlinks where the host refuses `link(2)`;
+it also reads and keeps the hardlinks of a rootfs installed by `proot-distro`),
 `-R/--rewrite` (ahead-of-time `svc` rewriting), `--no-proc` (turn off the `/proc`
 emulation described below), `--no-dev` (turn off the `/dev` passthrough),
 `--share-abstract-sockets` (don't isolate abstract AF_UNIX names per rootfs), `--shared-proc` (share the process view between

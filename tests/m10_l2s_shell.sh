@@ -206,6 +206,66 @@ if [ "$m10_ready" -eq 1 ]; then
     rm -rf "$RO" "$REM"
 fi
 
+# proot-distro's groups. A rootfs installed through proot-distro holds the
+# hardlinks proot made: every name a symlink holding the HOST path of an
+# indirection symlink in "<rootfs>/.l2s", which names the data file beside it,
+# "<indirection>.<CCCC>", CCCC the live count. They are laid down here by hand
+# as proot writes them, and for the oracle as the real hardlinks they stand
+# for; the same script must print the same bytes. A third group's texts name
+# an old rootfs path (a moved tree), a fourth is proot's layout without
+# PROOT_L2S_DIR (the chain beside the first name). Then the tree must be what
+# proot itself would leave, so it goes on working under proot: the counts in
+# the names, the indirections naming the data, the moved group's texts
+# repointed, the groups whose last name went gone. Before, every name was a
+# symlink dangling into "<rootfs><rootfs>/.l2s".
+if [ "$m10_ready" -eq 1 ]; then
+    RO=$(mktemp -d); REM=$(mktemp -d)
+    cp -a "$M10_ALPINE/." "$RO"; cp -a "$M10_ALPINE/." "$REM"
+    P=$(cd "$REM" && pwd -P)
+    mkdir -p "$RO/g/s" "$RO/h" "$REM/g/s" "$REM/h" "$REM/.l2s"
+    printf 'hello\n' > "$RO/g/a"; ln "$RO/g/a" "$RO/g/b"; ln "$RO/g/a" "$RO/g/s/c"
+    printf 'hello\n' > "$REM/.l2s/.l2s.a0001.0003"
+    ln -s "$P/.l2s/.l2s.a0001.0003" "$REM/.l2s/.l2s.a0001"
+    for _n in a b s/c; do ln -s "$P/.l2s/.l2s.a0001" "$REM/g/$_n"; done
+    cp "$M10_ALPINE/bin/busybox" "$RO/g/echo"; ln "$RO/g/echo" "$RO/g/true"
+    cp "$M10_ALPINE/bin/busybox" "$REM/.l2s/.l2s.echo0001.0002"
+    ln -s "$P/.l2s/.l2s.echo0001.0002" "$REM/.l2s/.l2s.echo0001"
+    for _n in echo true; do ln -s "$P/.l2s/.l2s.echo0001" "$REM/g/$_n"; done
+    _old=/nonexistent/old-rootfs/.l2s
+    printf 'moved\n' > "$RO/g/m1"; ln "$RO/g/m1" "$RO/g/m2"
+    printf 'moved\n' > "$REM/.l2s/.l2s.m10001.0002"
+    ln -s "$_old/.l2s.m10001.0002" "$REM/.l2s/.l2s.m10001"
+    for _n in m1 m2; do ln -s "$_old/.l2s.m10001" "$REM/g/$_n"; done
+    printf 'beside\n' > "$RO/h/p"; ln "$RO/h/p" "$RO/g/q"
+    printf 'beside\n' > "$REM/h/.l2s.p0001.0002"
+    ln -s "$P/h/.l2s.p0001.0002" "$REM/h/.l2s.p0001"
+    ln -s "$P/h/.l2s.p0001" "$REM/h/p"; ln -s "$P/h/.l2s.p0001" "$REM/g/q"
+    s='cd /g; stat -c "%h %F %s" a b s/c;
+       [ "$(stat -c %i a)" = "$(stat -c %i s/c)" ] && echo same-ino;
+       cat s/c; readlink b; echo rl=$?; ls -a . s; find . -type f | sort;
+       ln b d; stat -c %h a d; rm a; stat -c %h b d s/c; mv b s/c; echo mv=$?;
+       stat -c %h b s/c d; echo new > n; mv n d; stat -c %h b s/c d; cat d b;
+       ./echo via-member; stat -c %h echo true;
+       stat -c %h m1 m2; cat m2; ln m1 m3; rm m1; stat -c %h m2 m3;
+       stat -c %h q /h/p; cat q; rm /h/p q; ls -a /h; rm b s/c; ls -a . s'
+    out_o=$("$M10_ORACLE" "$RO" /bin/sh -c "$s" 2>/dev/null); rc_o=$?
+    out_e=$(run -R -l "$REM" /bin/sh -c "$s" 2>/dev/null); rc_e=$?
+    if [ "$out_o" = "$out_e" ] && [ "$rc_o" = "$rc_e" ]; then
+        pass=$((pass + 1)); echo "  ok   m10 proot-distro's groups read as hardlinks"
+    else
+        fail=$((fail + 1)); echo "  FAIL m10 proot-distro's groups read as hardlinks"
+        echo "    oracle rc=$rc_o: $(printf %s "$out_o" | head -c 600)"
+        echo "    chroot rc=$rc_e: $(printf %s "$out_e" | head -c 600)"
+    fi
+    left=$(cd "$REM" && ls -A .l2s | grep -v '^\.lock$' | tr '\n' ' ';
+        readlink .l2s/.l2s.echo0001 .l2s/.l2s.m10001 g/echo g/m2 g/m3 |
+            sed "s|^$P|P|" | tr '\n' ' '; ls -A h | tr '\n' ' ')
+    check "m10 ...and proot's bookkeeping is what proot would leave" \
+        ".l2s.echo0001 .l2s.echo0001.0002 .l2s.m10001 .l2s.m10001.0002 P/.l2s/.l2s.echo0001.0002 P/.l2s/.l2s.m10001.0002 P/.l2s/.l2s.echo0001 P/.l2s/.l2s.m10001 P/.l2s/.l2s.m10001 " \
+        "$left"
+    rm -rf "$RO" "$REM"
+fi
+
 # The dirents themselves. Every leg above goes through busybox, which stats
 # each entry it lists, so a record that lies about a link — the kernel's is the
 # symlink's own: DT_LNK, the link's inode — never showed. GNU ls -F, find

@@ -203,6 +203,13 @@ check_contains "l2s rename between two names of one file does nothing" \
 # pipe, one socket. The copy path opened the FIFO and hung until a writer came.
 check_contains "l2s links of a FIFO and a socket share the node" \
     "l2s-node: fifo=1 pipe=1 socket=1 -> OK" "$out"
+# A proot-distro rootfs holds the groups proot made (members naming an
+# indirection by host path, the count in the data file's name). They are read
+# as hardlinks and kept with proot's bookkeeping; a moved tree's texts heal, a
+# cut chain is mended by the next change, chains that leave the view are not
+# groups. M10 diffs the same against real hardlinks.
+check_contains "l2s reads and keeps the groups proot made" \
+    "l2s-proot: read=1 link=0 ind3=1 member=1 three=1 follow=1 two=1 gone=1 moved=1 beside=1 cut=1 hostile=1 -> OK" "$out"
 check_contains "fchdir updates virtual cwd" "fchdir: cwd=/w -> OK" "$out"
 check_contains "chdir through a symlink records the directory it landed in" \
     "chdir-symlink: rc=0 cwd=/w -> OK" "$out"

@@ -1334,12 +1334,20 @@ int cng_resolve_lim(const char *path, int deref_final, char *out, size_t outsz,
             /* ...unless the link is the l2s emulation's own, which to the
              * guest is a regular file and not a symlink at all: refusing it
              * made openat2(RESOLVE_NO_SYMLINKS) ELOOP on an emulated hardlink
-             * where a real one opens. */
-            char d[CNG_PATH_MAX];
+             * where a real one opens. A member of one of proot's groups
+             * names its data file only through a second link, the
+             * indirection, which is no more the guest's symlink than the
+             * first: the walk goes on from the data file itself. (A link of
+             * our own names the data file by its text, as it stands.) */
+            char d[CNG_PATH_MAX], dg[CNG_PATH_MAX];
             if (!(cng_g_l2s && cng_l2s_resolve(host, d, sizeof d, 0) == 1)) {
                 lim->err = -ELOOP;
                 return -ELOOP;
             }
+            const char *lb = strrchr(link, '/'), *db = strrchr(d, '/');
+            if (strcmp(lb ? lb + 1 : link, db ? db + 1 : d) != 0 &&
+                cng_host_dir_guest(d, dg, sizeof dg) == 0)
+                cng_strlcpy(link, dg, sizeof link);
         }
         if (++nlinks > 40)
             return -ELOOP;
@@ -4421,12 +4429,27 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             return xlate_errno(p);
         /* A link2symlink entry presents as a regular file: readlink must fail
          * with EINVAL rather than leak the backing path — including through a
-         * real dirfd, which xlate passes through untranslated. */
+         * real dirfd, which xlate passes through untranslated. A link of
+         * proot's own bookkeeping (an indirection, in plain sight where proot
+         * kept a group beside its first name) is a symlink, and its text is
+         * the HOST path of the file it names: the guest is told its own name
+         * for that file, as proot tells it. */
         if (cng_g_l2s) {
-            char hnf[CNG_PATH_MAX], data[CNG_PATH_MAX];
-            if (cng_resolve_at(a0, gp, 0, hnf, sizeof hnf) == 0 &&
-                cng_l2s_resolve(hnf, data, sizeof data, 0) == 1)
-                return -EINVAL;
+            char hnf[CNG_PATH_MAX], data[CNG_PATH_MAX], gv[CNG_PATH_MAX];
+            if (cng_resolve_at(a0, gp, 0, hnf, sizeof hnf) == 0) {
+                if (cng_l2s_resolve(hnf, data, sizeof data, 0) == 1)
+                    return -EINVAL;
+                long n = cng_pin_readlink(hnf, data, sizeof data - 1);
+                if (n > 0 && (data[n] = '\0', data[0] == '/') &&
+                    cng_l2s_untranslate_target(data, gv, sizeof gv)) {
+                    long gl = (long)strlen(gv);
+                    if (gl > bufsiz)
+                        gl = bufsiz;
+                    if (cng_user_copyout((void *)a2, gv, (unsigned long)gl) < 0)
+                        return -EFAULT;
+                    return gl;
+                }
+            }
         }
         /* An fd link reports a HOST path (the kernel names the open file
          * description), and a map_files link the host path of the mapped file.
