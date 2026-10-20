@@ -9357,6 +9357,195 @@ static int pt_sim_forkkick(void) {
     return fails;
 }
 
+/* The -R tier's native wait (cng_pt_wait_native): the kernel's own wait for a
+ * process that cannot be owed an emulated stop, which has to let go the moment
+ * one can be. Every -R wait used to poll the registry in 50 ms slices instead,
+ * so a shell's every fork and waitpid took 51 ms under it.
+ *
+ * Checked: the kick handler's part on frames inside the wait (synthesized — no
+ * live thread can be held at a chosen pc); a kick taken between the wait's look
+ * at the registry and its svc, which only the compare can catch, and the probe
+ * is exactly there; a child's PTRACE_TRACEME while its parent sleeps in the
+ * kernel's wait, whose kick must end that wait and hand it to the registry; and
+ * a tracer's fork, which traces nothing and gets the kernel's wait back. Run
+ * before anything here makes this process a tracer. */
+static int g_nw_calls, g_nw_wfd;
+
+static void pt_nwait_kick_probe(void) {
+    char c = 'g';
+    if (g_nw_calls++ == 0)
+        cng_pt_kick((s32)sys_getpid(), (s32)sys_gettid(), CNG_PT_KICK_WAKE);
+    else
+        sys_write(g_nw_wfd, &c, 1); /* let the child exit */
+}
+
+static void pt_nwait_traceme_probe(void) {
+    char c = 'w';
+    sys_write(g_nw_wfd, &c, 1);
+}
+
+/* Has task `pid` gone to sleep? Field 3 of its stat, after the ")". */
+static int pt_nwait_sleeping(long pid) {
+    char path[48], buf[256];
+    cng_snprintf(path, sizeof path, "/proc/%ld/stat", pid);
+    long fd = sys_openat(CNG_AT_FDCWD, path, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    if (fd < 0)
+        return 0;
+    long n = sys_read((int)fd, buf, sizeof buf - 1);
+    sys_close((int)fd);
+    if (n <= 0)
+        return 0;
+    buf[n] = 0;
+    const char *p = buf + n;
+    while (p > buf && p[-1] != ')')
+        p--;
+    return p > buf && p[0] == ' ' && p[1] == 'S';
+}
+
+static int pt_sim_nwait(void) {
+    int fails = 0;
+    long kicked = CNG_WAIT_KICKED;
+    u64 chk = (u64)(unsigned long)cng_wait_unless_check;
+    u64 svc = (u64)(unsigned long)cng_wait_unless_svc;
+    u64 bail = (u64)(unsigned long)cng_wait_unless_bail;
+    static struct cng_ucontext uc;
+    struct cng_uregs *f = cng_pt_uregs(&uc);
+    int ok = 1;
+    f->pc = chk; /* before the compare: it would pass on a stale count */
+    cng_pt_kick_taken(&uc, CNG_PT_KICK_WAKE);
+    ok &= f->pc == bail;
+    f->pc = svc; /* at the svc, made or about to be remade */
+    cng_pt_kick_taken(&uc, CNG_PT_KICK_WAKE);
+    ok &= f->pc == bail;
+    f->pc = svc + 4; /* the svc cut short by the kick */
+    f->x[0] = (u64)(s64)-EINTR;
+    cng_pt_kick_taken(&uc, CNG_PT_KICK_WAKE);
+    ok &= f->pc == svc + 4 && (s64)f->x[0] == kicked;
+    f->x[0] = 1234; /* the svc done: its answer stands */
+    cng_pt_kick_taken(&uc, CNG_PT_KICK_WAKE);
+    ok &= f->pc == svc + 4 && f->x[0] == 1234;
+    f->pc = (u64)(unsigned long)cng_syscall6 + 8; /* anyone else's EINTR */
+    f->x[0] = (u64)(s64)-EINTR;
+    cng_pt_kick_taken(&uc, CNG_PT_KICK_WAKE);
+    ok &= (s64)f->x[0] == -EINTR;
+    cng_dprintf(1, "ptracetest native wait: a kick's frame -> %s\n",
+                ok ? "OK" : "FAIL");
+    fails += !ok;
+
+    int p[2];
+    if (CNG_SYS(__NR_pipe2, p, 0, 0, 0, 0, 0) < 0) {
+        cng_dprintf(1, "ptracetest native wait: no pipe -> FAIL\n");
+        return fails + 1;
+    }
+    long kid = CNG_SYS(__NR_clone, 17 /*SIGCHLD*/, 0, 0, 0, 0, 0);
+    if (kid == 0) {
+        /* Released by the second pass; a wait that slept through the kick
+         * never makes one, and is ended by this child giving up instead. */
+        struct { int fd; short ev, rev; } pfd = {p[0], 1 /*POLLIN*/, 0};
+        struct { long s, ns; } ts = {5, 0};
+        sys_close(p[1]);
+        long n;
+        while ((n = CNG_SYS(__NR_ppoll, &pfd, 1, &ts, 0, 8, 0)) == -EINTR)
+            ;
+        sys_exit_group(n > 0 ? 7 : 8);
+    }
+    sys_close(p[0]);
+    g_nw_wfd = p[1];
+    g_nw_calls = 0;
+    cng_g_wait_native_probe = pt_nwait_kick_probe;
+    int st = 0;
+    long out = 0;
+    int nat = kid > 0 && cng_pt_wait_native(__NR_wait4, kid,
+                                            (long)(unsigned long)&st, 0, 0, 0,
+                                            &out);
+    cng_g_wait_native_probe = 0;
+    sys_close(p[1]);
+    ok = nat && out == kid && (st & 0x7f) == 0 && ((st >> 8) & 0xff) == 7 &&
+         g_nw_calls == 2;
+    cng_dprintf(1, "ptracetest native wait: a kick before the svc -> %s\n",
+                ok ? "OK" : "FAIL");
+    if (!ok)
+        cng_dprintf(1, "  native=%d wait=%ld status=0x%x passes=%d\n", nat,
+                    out, st, g_nw_calls);
+    fails += !ok;
+
+    if (CNG_SYS(__NR_pipe2, p, 0, 0, 0, 0, 0) < 0) {
+        cng_dprintf(1, "ptracetest native wait: no pipe -> FAIL\n");
+        return fails + 1;
+    }
+    long me = sys_getpid();
+    kid = CNG_SYS(__NR_clone, 17 /*SIGCHLD*/, 0, 0, 0, 0, 0);
+    if (kid == 0) {
+        char c = 0;
+        sys_close(p[1]);
+        while (sys_read(p[0], &c, 1) == -EINTR)
+            ;
+        /* The parent is past its look at the registry; let it reach the
+         * kernel's wait, so that is what the kick has to end. */
+        struct { long s, ns; } ts = {0, 5000000};
+        for (int i = 0; i < 400 && !pt_nwait_sleeping(me); i++)
+            CNG_SYS(__NR_nanosleep, &ts, 0, 0, 0, 0, 0);
+        if (cng_pt_syscall(CNG_PTRACE_TRACEME, 0, 0, 0) != 0)
+            sys_exit_group(91);
+        cng_pt_signal_route(sys_getpid(), 19 /*SIGSTOP*/);
+        sys_exit_group(4);
+    }
+    sys_close(p[0]);
+    g_nw_wfd = p[1];
+    cng_g_wait_native_probe = pt_nwait_traceme_probe;
+    st = 0;
+    nat = kid > 0 && cng_pt_wait_native(__NR_wait4, kid,
+                                        (long)(unsigned long)&st, 0, 0, 0,
+                                        &out);
+    cng_g_wait_native_probe = 0;
+    sys_close(p[1]);
+    ok = kid > 0 && !nat;
+    cng_dprintf(1, "ptracetest native wait: a child's TRACEME ends it -> %s\n",
+                ok ? "OK" : "FAIL");
+    if (!ok)
+        cng_dprintf(1, "  native=%d wait=%ld status=0x%x\n", nat, out, st);
+    fails += !ok;
+    if (kid <= 0 || nat)
+        return fails + 2;
+    long r = cng_pt_wait4(kid, (u64)(unsigned long)&st, 0, 0, 0);
+    ok = r == kid && (st & 0xff) == 0x7f && ((st >> 8) & 0xff) == 19;
+    cng_dprintf(1, "ptracetest native wait: the registry has its stop -> %s\n",
+                ok ? "OK" : "FAIL");
+    fails += !ok;
+    cng_pt_syscall(CNG_PTRACE_CONT, kid, 0, 0);
+    r = cng_pt_wait4(kid, (u64)(unsigned long)&st, 0, 0, 0);
+    ok = r == kid && (st & 0x7f) == 0 && ((st >> 8) & 0xff) == 4;
+    cng_dprintf(1, "ptracetest native wait: tracee exited clean -> %s\n",
+                ok ? "OK" : "FAIL");
+    fails += !ok;
+
+    /* A tracer now. Its fork is not, and waits as the kernel does. */
+    kid = cng_dispatch(__NR_clone, 17 /*SIGCHLD*/, 0, 0, 0, 0, 0, 0);
+    if (kid == 0) {
+        long gk = CNG_SYS(__NR_clone, 17 /*SIGCHLD*/, 0, 0, 0, 0, 0);
+        if (gk == 0)
+            sys_exit_group(6);
+        int gst = 0;
+        long gout = 0;
+        if (gk < 0 || !cng_pt_wait_native(__NR_wait4, gk,
+                                          (long)(unsigned long)&gst, 0, 0, 0,
+                                          &gout))
+            sys_exit_group(1);
+        sys_exit_group(gout == gk && (gst & 0x7f) == 0 &&
+                               ((gst >> 8) & 0xff) == 6
+                           ? 0
+                           : 2);
+    }
+    r = kid > 0 ? cng_pt_wait4(kid, (u64)(unsigned long)&st, 0, 0, 0) : kid;
+    ok = r == kid && (st & 0x7f) == 0 && ((st >> 8) & 0xff) == 0;
+    cng_dprintf(1, "ptracetest native wait: a tracer's fork is none -> %s\n",
+                ok ? "OK" : "FAIL");
+    if (!ok)
+        cng_dprintf(1, "  wait=%ld status=0x%x\n", r, st);
+    fails += !ok;
+    return fails;
+}
+
 int cng_cmd_ptracetest(int argc, char **argv, char **envp, unsigned long *auxv) {
     (void)argc;
     (void)argv;
@@ -9422,6 +9611,7 @@ int cng_cmd_ptracetest(int argc, char **argv, char **envp, unsigned long *auxv) 
     fails += ptstep_case("braaz is refused, not guessed", 0xD61F0820u, &r, 0, 1);
 
     cng_pt_init();
+    fails += pt_sim_nwait();
     fails += pt_sim_sigsys(auxv);
     fails += pt_sim_forkkick();
 

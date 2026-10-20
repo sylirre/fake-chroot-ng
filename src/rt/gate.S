@@ -28,6 +28,40 @@ cng_syscall6:
     ret
     .size cng_syscall6, . - cng_syscall6
 
+/* The kickable wait (ptrace.c, cng_pt_wait_native): an -R guest's blocking
+ * wait4 or waitid, made as the guest issued it — unless a ptrace kick has been
+ * taken since the caller read *kicks as `seen`.
+ *
+ * long cng_wait_unless(long a0, a1, a2, a3, a4, long nr,
+ *                      const unsigned *kicks, unsigned seen)
+ *   a0..a4 in x0..x4, nr in x5 (the svc's sixth argument, which neither call
+ *   reads), kicks in x6, seen in w7.
+ *
+ * The compare covers a kick taken before it; one taken from the compare up to
+ * and including the svc — where the value read is already stale, or a restart
+ * of the svc is pending — has its handler resume here at the bail instead
+ * (cng_pt_kick_taken); and one that interrupts the svc has its -EINTR replaced
+ * the same way. The bail's -512 is CNG_WAIT_KICKED: ERESTARTSYS, which no wait
+ * ever returns to user space. */
+    .global cng_wait_unless
+    .type cng_wait_unless, %function
+cng_wait_unless:
+    mov     x8, x5
+    .global cng_wait_unless_check
+cng_wait_unless_check:
+    ldr     w9, [x6]
+    cmp     w9, w7
+    b.ne    cng_wait_unless_bail
+    .global cng_wait_unless_svc
+cng_wait_unless_svc:
+    svc     #0
+    ret
+    .global cng_wait_unless_bail
+cng_wait_unless_bail:
+    mov     x0, #-512
+    ret
+    .size cng_wait_unless, . - cng_wait_unless
+
 /* The bounce (sigsys.c): a syscall the SIGSYS handler must not run itself —
  * a wait that installs a signal mask of its own for its duration — is run from
  * here instead, in the guest's own context, with the guest's own registers.

@@ -3919,6 +3919,58 @@ vfork/`posix_spawn` child-stack handling.
     the child with no entry, every run. With M86, the waitnowait leg passed
     4000 runs out of 4000.
 
+- [x] **M88 — every wait under -R polled the ptrace registry, traced or not**
+  The SIGSYS tier traps `wait4`/`waitid` only on a tracer, but every
+  rewritten site reaches the dispatcher, which sent each one to the
+  registry-aware wait. That wait polls in 50 ms slices: a non-blocking host
+  wait, then a futex sleep that only a tracee's stop or exit cuts short.
+  Nothing traced means nothing cuts it short, so a child's exit was seen up
+  to 50 ms late. Under qemu-user a fork, `_exit` and `waitpid` took 51.6 ms
+  under `-R` against 0.74 ms without it, and every shell pipeline paid that
+  per command. The loop also swallowed EINTR: a signal handler without
+  SA_RESTART that ran during the wait did not end it, as the kernel's does.
+  - A process that has never been a tracer, and that nothing in the registry
+    names as one, waits in the kernel (`cng_pt_wait_native`): the guest's
+    call as it issued it, on its own mask. The process-wide `g_pt_tracer` is
+    set by `cng_pt_arm_tracer`, as permanent as the SIGSYS tier's tracer
+    filter, and cleared by a fork, whose child traces nothing.
+  - What has to work is letting go. A child's `PTRACE_TRACEME` makes its
+    parent a tracer while the parent may be asleep in that wait, and only
+    the kick it sends can end the wait. So the blocking wait goes through a
+    stub in the gate (`cng_wait_unless`). The stub makes the svc only while a
+    count of kicks taken still holds the value read before the registry was
+    looked at. The kick handler (`cng_pt_kick_taken`) sends a thread
+    interrupted between that compare and the svc, or at the svc with a
+    restart pending, to the stub's bail. It turns an -EINTR its kick
+    inflicted on the svc into the same answer, `CNG_WAIT_KICKED`. The wait
+    then looks again, and a tracer by now goes to the registry. A guest's own
+    EINTR is still the guest's.
+  - Other threads: becoming a tracer kicks every other thread when any of
+    them is in such a wait, on either tier. `PTRACE_TRACEME` kicks its
+    parent process-directed, so a parent whose main thread blocks the kick
+    is still reached. A kick that landed while a guest handler ran on top of
+    the wait, which the kernel then restarted, is missed. The tracee's
+    re-kick every 500 ms of an uncollected stop now carries its own magic
+    (`CNG_PT_KICK_REWAKE`), and a tracer with a thread still in a native wait
+    forwards it to its threads.
+  - The registry-aware wait stays for a tracer, a wait with the kick blocked,
+    and a session whose kick signal could not be delivered at startup
+    (`cng_g_kick_live`). Without a registry (`--no-ptrace`) the wait is the
+    kernel's outright; before, it spun, since there was no futex to sleep on.
+  - Cost: under qemu-user a fork, `_exit` and `waitpid` round trip is 2.0 ms
+    under `-R`, against 51.6 ms before. A blocking wait costs one more syscall
+    (the mask read), and a non-blocking one none.
+  - Test: `-t ptracetest`'s `native wait` rows (m18). They check the kick
+    handler on synthesized frames inside the stub. A test aid,
+    `cng_g_wait_native_probe`, takes a kick between the look at the registry
+    and the svc, which must not be slept through. A child's `PTRACE_TRACEME`
+    while its parent sleeps in the kernel's wait must hand the wait to the
+    registry, which then reports the stop and the exit. A tracer's fork must
+    wait natively again. In m8, the `waitintr` guest is checked against the
+    kernel: waitpid and waitid interrupted with and without SA_RESTART, and
+    uninterrupted. The previous build returns the child, 5 s later, where the
+    kernel returns EINTR.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

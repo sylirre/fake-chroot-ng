@@ -42,6 +42,23 @@ check_contains "...and the tracee's next signal still stops" \
     "fork kick: the next signal stops -> OK" "$ptout"
 check_contains "...and its exit reaches the tracer" \
     "fork kick: tracee exited clean -> OK" "$ptout"
+# The -R tier's waits: the kernel's own for a process that cannot be owed an
+# emulated stop, where every one used to poll the registry in 50 ms slices.
+# What has to hold is the hand-over — a kick taken between the wait's look at
+# the registry and its svc, or one cutting the svc short, ends the wait so it
+# looks again; a child's PTRACE_TRACEME does that to a parent asleep in it.
+check_contains "-R native wait: a kick on the wait's frame ends it" \
+    "native wait: a kick's frame -> OK" "$ptout"
+check_contains "-R native wait: a kick before its svc is not slept through" \
+    "native wait: a kick before the svc -> OK" "$ptout"
+check_contains "-R native wait: a child's TRACEME hands it to the registry" \
+    "native wait: a child's TRACEME ends it -> OK" "$ptout"
+check_contains "...which then reports the child's stop" \
+    "native wait: the registry has its stop -> OK" "$ptout"
+check_contains "...and its exit" \
+    "native wait: tracee exited clean -> OK" "$ptout"
+check_contains "-R native wait: a tracer's fork waits natively again" \
+    "native wait: a tracer's fork is none -> OK" "$ptout"
 # The pointer-auth mask gdb asks for whenever AT_HWCAP says PACA, and is fatal
 # about ("unable to fetch pauth registers"). Measured rather than asked for, so
 # what is asserted is the shape the kernel's own answer always has.

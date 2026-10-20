@@ -30,6 +30,17 @@ extern char __cng_gate_end[];
 extern char cng_bounce_wait[];
 extern char cng_bounce_svc_end[];
 
+/* The kickable wait in the gate (see gate.S): wait4/waitid `nr` with a0..a4,
+ * made only while *kicks still reads `seen`. CNG_WAIT_KICKED means a ptrace
+ * kick came first or cut the wait short; nothing else returns it. The labels
+ * are what the kick handler tests the interrupted pc against. */
+#define CNG_WAIT_KICKED (-512)
+long cng_wait_unless(long a0, long a1, long a2, long a3, long a4, long nr,
+                     const volatile unsigned *kicks, unsigned seen);
+extern char cng_wait_unless_check[];
+extern char cng_wait_unless_svc[];
+extern char cng_wait_unless_bail[];
+
 #define CNG_SYS(nr, a, b, c, d, e, f)                                          \
     cng_syscall6((long)(a), (long)(b), (long)(c), (long)(d), (long)(e),        \
                  (long)(f), (nr))

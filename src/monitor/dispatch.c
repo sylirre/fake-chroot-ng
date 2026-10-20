@@ -5799,11 +5799,18 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_ptrace:
         return cng_pt_syscall(a0, a1, (u64)a2, (u64)a3);
 
+    /* The waits are trapped only on a tracer, but every -R site reaches the
+     * dispatcher, so there the guest's own wait is made by the kernel unless
+     * this process could be owed an emulated stop (cng_pt_wait_native). */
     case __NR_wait4:
-        return cng_pt_wait4(a0, (u64)a1, a2, (u64)a3, cng_pt_cur_uc());
-
-    case __NR_waitid:
+    case __NR_waitid: {
+        long w;
+        if (!trapped && cng_pt_wait_native(nr, a0, a1, a2, a3, a4, &w))
+            return w;
+        if (nr == __NR_wait4)
+            return cng_pt_wait4(a0, (u64)a1, a2, (u64)a3, cng_pt_cur_uc());
         return cng_pt_waitid(a0, a1, (u64)a2, a3, (u64)a4, cng_pt_cur_uc());
+    }
 
     /* A stop signal aimed at a tracee becomes a cooperative group-stop: a real
      * SIGSTOP would freeze it inside its ptrace service loop, and every later

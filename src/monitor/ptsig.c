@@ -223,6 +223,7 @@ static void pt_trace_handler(int sig, cng_siginfo_t *si, void *ucv) {
  * the number is probed downwards at startup rather than assumed. Chosen once,
  * before the guest can fork, so every process in the session agrees. */
 int cng_g_kicksig = CNG_PT_KICKSIG;
+int cng_g_kick_live;
 static volatile int g_kick_seen;
 
 static void pt_kick_handler(int sig, cng_siginfo_t *si, void *ucv) {
@@ -234,16 +235,24 @@ static void pt_kick_handler(int sig, cng_siginfo_t *si, void *ucv) {
         int magic = (int)si->_u._pad[1];
         switch (magic) {
         case CNG_PT_KICK_WAKE:
+        case CNG_PT_KICK_REWAKE:
             g_kick_seen++;
-            return; /* the EINTR it inflicts is the whole point */
+            break; /* the EINTR it inflicts is the whole point */
         case CNG_PT_KICK_ARM:
             cng_pt_arm_tracer();
-            return;
+            break;
         case CNG_PT_KICK_ATTACH:
             cng_pt_set_frame(cng_pt_uregs(uc), uc);
             cng_pt_service_kick(cng_pt_uregs(uc));
+            break;
+        default:
+            pt_deliver_to_guest(sig, si, ucv);
             return;
         }
+        /* Last, after an attach stop the kick may have been held in: what it
+         * does to a native wait it interrupted is make it look again. */
+        cng_pt_kick_taken(uc, magic);
+        return;
     }
     pt_deliver_to_guest(sig, si, ucv);
 }
@@ -331,8 +340,10 @@ void cng_pt_pick_kicksig(void) {
         cng_pt_sig_install_kick();
         int before = g_kick_seen;
         cng_pt_kick((s32)sys_getpid(), (s32)sys_gettid(), CNG_PT_KICK_WAKE);
-        if (g_kick_seen != before)
+        if (g_kick_seen != before) {
+            cng_g_kick_live = 1;
             return;
+        }
         struct pt_ksigaction dfl; /* unusable: put it back and try the next */
         memset(&dfl, 0, sizeof dfl);
         sys_rt_sigaction(s, &dfl, 0);

@@ -151,6 +151,21 @@ static int g_pt_local;
  * reported. */
 static int g_pt_traced;
 
+/* Has any task of this process entered the tracer role (cng_pt_arm_tracer)?
+ * The -R tier's counterpart of the tracer filter, and as permanent: from then
+ * on its waits go through the registry, never straight to the kernel
+ * (cng_pt_wait_native). A fork starts over, as the child traces nothing. */
+static int g_pt_tracer;
+
+/* How many of this process's tasks are in a native wait right now, so that
+ * becoming a tracer knows to kick them out of it. */
+static int g_pt_nwait;
+
+/* Bumped by every ptrace kick this process takes; the word cng_wait_unless
+ * compares, so a kick taken between a wait's look at the registry and its svc
+ * is not slept through. */
+static volatile u32 g_pt_kicks;
+
 static void pt_traced_inc(void) {
     if (__atomic_add_fetch(&g_pt_traced, 1, __ATOMIC_SEQ_CST) == 1)
         cng_pt_sig_trace_enter();
@@ -313,18 +328,24 @@ static void pt_bump_gen(void) {
  * SIGCHLD exactly as the kernel raises it on a tracee state change (a gdb-style
  * event loop), and the reserved kick signal, whose handler does nothing but
  * inflict EINTR on a tracer still blocked in a *native* wait4 — the window
- * before its first trapped wait. */
-static void pt_wake_tracer(s32 tr) {
+ * before its first trapped wait, or on -R a wait that went to the kernel
+ * before the tracer knew it was one. A repeated wake for a stop still
+ * uncollected says so with its own magic (cng_pt_kick_taken). */
+static void pt_kick_tracer(s32 tr, int magic) {
     if (tr <= 0)
         return;
     CNG_SYS(__NR_kill, tr, 17 /*SIGCHLD*/, 0, 0, 0, 0);
-    cng_pt_kick(tr, tr, CNG_PT_KICK_WAKE);
+    cng_pt_kick(tr, tr, magic);
 }
+
+static void pt_wake_tracer(s32 tr) { pt_kick_tracer(tr, CNG_PT_KICK_WAKE); }
 
 /* Queue the reserved kick signal at one task, carrying `magic` in si_value so
  * the handler can tell it from a guest-directed signal of the same number.
  * Thread-targeted (rt_tgsigqueueinfo): the kick sets per-task state, and a
- * process-directed signal could land on any thread. */
+ * process-directed signal could land on any thread. A `tid` of 0 asks for
+ * exactly that, for a kick any thread can act on: the kernel hands it to one
+ * that does not block it. */
 void cng_pt_kick(s32 tgid, s32 tid, int magic) {
     struct {
         int signo, errno_, code;
@@ -341,7 +362,8 @@ void cng_pt_kick(s32 tgid, s32 tid, int magic) {
     si.pid = (int)sys_getpid();
     si.uid = 0;
     si.sival_int = magic;
-    if (CNG_SYS(__NR_rt_tgsigqueueinfo, tgid, tid, cng_g_kicksig, &si, 0, 0) < 0)
+    if (tid <= 0 ||
+        CNG_SYS(__NR_rt_tgsigqueueinfo, tgid, tid, cng_g_kicksig, &si, 0, 0) < 0)
         CNG_SYS(__NR_rt_sigqueueinfo, tgid, cng_g_kicksig, &si, 0, 0, 0);
 }
 
@@ -961,7 +983,7 @@ static int pt_service_loop(struct pt_self *s, struct cng_uregs *r,
             /* Still unreaped after 500 ms: our publish-time wake may have raced
              * the tracer's entry into its wait. Re-kick until it is collected. */
             if (!__atomic_load_n(&e->reported, __ATOMIC_ACQUIRE))
-                pt_wake_tracer(tr);
+                pt_kick_tracer(tr, CNG_PT_KICK_REWAKE);
         }
         seen = __atomic_load_n(&e->cmd_seq, __ATOMIC_ACQUIRE);
         int leave = 0;
@@ -1283,6 +1305,10 @@ void cng_pt_fork_child(struct cng_uregs *r, int event) {
             memset(s, 0, sizeof *s);
     }
     __atomic_store_n(&g_pt_traced, 0, __ATOMIC_SEQ_CST);
+    /* The parent's tracees are its own, and the only thread here was in the
+     * fork, not in a wait. */
+    __atomic_store_n(&g_pt_tracer, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_pt_nwait, 0, __ATOMIC_SEQ_CST);
     s32 tracer = g_fork_inherit.tracer;
     u32 opts = g_fork_inherit.options;
     u32 seize = g_fork_inherit.seize;
@@ -1486,8 +1512,11 @@ static long pt_traceme(void) {
      * point of TRACEME — so nothing has armed its side of the interception.
      * Kick it: its handler installs the tracer filter, and the EINTR that comes
      * with the kick knocks it out of any native wait4 it is already blocked in,
-     * so the retry lands in the trapped one that can see our stops. */
-    cng_pt_kick((s32)ppid, (s32)ppid, CNG_PT_KICK_ARM);
+     * so the retry lands in the trapped one that can see our stops. Any of its
+     * threads will do — arming kicks the rest (cng_pt_arm_tracer) — and one
+     * that does not block the kick has to: a parent whose main thread blocks
+     * every signal while another thread waits never armed at all. */
+    cng_pt_kick((s32)ppid, 0, CNG_PT_KICK_ARM);
     return 0;
 }
 
@@ -1933,6 +1962,70 @@ static int pt_signal_pending(const struct cng_ucontext *uc) {
 #define PT_WNOHANG   1
 #define PT_WPOLL_MS  50
 
+/* May a wait be left to the kernel? Only while it cannot be owed an emulated
+ * stop: this process has never been a tracer, and nothing in the registry
+ * names it as one — a child's PTRACE_TRACEME does that before the kick that
+ * arms us lands. Without a registry there are no emulated stops at all. */
+static int pt_wait_untraced(void) {
+    if (!g_tab)
+        return 1;
+    if (__atomic_load_n(&g_pt_tracer, __ATOMIC_SEQ_CST))
+        return 0;
+    if (!__atomic_load_n(&g_tab->any_trace, __ATOMIC_ACQUIRE))
+        return 1;
+    return !pt_have_tracee(-1);
+}
+
+void (*cng_g_wait_native_probe)(void); /* test aid, see ptrace.h */
+
+int cng_pt_wait_native(long nr, long a0, long a1, long a2, long a3, long a4,
+                       long *out) {
+    if (!pt_wait_untraced())
+        return 0;
+    long options = nr == __NR_wait4 ? a2 : a3;
+    long r;
+    if ((options & PT_WNOHANG) || !g_tab) {
+        r = CNG_SYS(nr, a0, a1, a2, a3, a4, 0);
+    } else {
+        /* Blocking, so it must stay reachable by the kick that makes this
+         * process a tracer while it sleeps: with no kick that can be
+         * delivered, or this one blocked, the wait goes through the
+         * registry, as every -R wait used to. */
+        unsigned long blocked = 0;
+        if (!cng_g_kick_live ||
+            CNG_SYS(__NR_rt_sigprocmask, 0 /*SIG_BLOCK*/, 0, &blocked,
+                    sizeof blocked, 0, 0) < 0 ||
+            (blocked & (1UL << (cng_g_kicksig - 1))))
+            return 0;
+        __atomic_add_fetch(&g_pt_nwait, 1, __ATOMIC_SEQ_CST);
+        for (;;) {
+            u32 seen = __atomic_load_n(&g_pt_kicks, __ATOMIC_SEQ_CST);
+            if (!pt_wait_untraced()) {
+                r = CNG_WAIT_KICKED;
+                break;
+            }
+            /* A kick taken from here on, up to the svc or during it, comes
+             * back as CNG_WAIT_KICKED (see cng_pt_kick_taken); most are no
+             * news for this wait, which is then simply made again. */
+            if (cng_g_wait_native_probe)
+                cng_g_wait_native_probe();
+            r = cng_wait_unless(a0, a1, a2, a3, a4, nr, &g_pt_kicks, seen);
+            if (r != CNG_WAIT_KICKED)
+                break;
+        }
+        __atomic_sub_fetch(&g_pt_nwait, 1, __ATOMIC_SEQ_CST);
+        if (r == CNG_WAIT_KICKED)
+            return 0; /* a tracer now: the registry-aware wait takes over */
+    }
+    /* As the registry-aware wait does: a child reaped here may have been
+     * traced through a PTRACE_TRACEME whose kick this wait never needed. */
+    if (nr == __NR_wait4 && r > 0 && g_tab &&
+        __atomic_load_n(&g_tab->any_trace, __ATOMIC_ACQUIRE))
+        cng_pt_note_reaped(r);
+    *out = r;
+    return 1;
+}
+
 long cng_pt_wait4(long pid, u64 status, long options, u64 rusage,
                   const struct cng_ucontext *uc) {
     for (;;) {
@@ -2258,17 +2351,10 @@ void cng_pt_arm_tracee(void) {
     cng_install_seccomp_traceall();
 }
 
-void cng_pt_arm_tracer(void) {
-    struct pt_self *s = pt_self_get(1);
-    if (!s || s->tracer_armed)
-        return;
-    s->tracer_armed = 1;
-    g_pt_local = 1;
-    if (!cng_g_sigsys_ready || cng_install_seccomp_tracer() < 0)
-        return;
-    /* A multithreaded tracer (gdb) may wait on a thread other than the one that
-     * attached, and a seccomp filter is per-task, so kick the siblings to
-     * install it too. Threads created later inherit it. */
+/* Kick every other thread of this process to arm itself as a tracer too. The
+ * kick also ends a native wait the thread sleeps in (cng_pt_kick_taken), which
+ * then finds this process a tracer and goes to the registry. */
+static void pt_kick_siblings(void) {
     long fd = sys_openat(CNG_AT_FDCWD, "/proc/self/task",
                          CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
     if (fd < 0)
@@ -2297,4 +2383,51 @@ void cng_pt_arm_tracer(void) {
         }
     }
     sys_close((int)fd);
+}
+
+void cng_pt_arm_tracer(void) {
+    /* The process-wide half first, and ahead of anything that can fail: what a
+     * wait on -R reads to decide it may no longer go straight to the kernel.
+     * A sibling already blocked in such a wait made that decision before this
+     * store, so it is kicked out of it to look again (cng_pt_wait_native) —
+     * the store and its count of waiters are read crosswise, so either it sees
+     * the store or this sees it counted. */
+    int kick = !__atomic_exchange_n(&g_pt_tracer, 1, __ATOMIC_SEQ_CST) &&
+               __atomic_load_n(&g_pt_nwait, __ATOMIC_SEQ_CST) > 0;
+    struct pt_self *s = pt_self_get(1);
+    if (s && !s->tracer_armed) {
+        s->tracer_armed = 1;
+        g_pt_local = 1;
+        /* A multithreaded tracer (gdb) may wait on a thread other than the one
+         * that attached, and a seccomp filter is per-task, so kick the siblings
+         * to install it too. Threads created later inherit it. */
+        if (cng_g_sigsys_ready && cng_install_seccomp_tracer() == 0)
+            kick = 1;
+    }
+    if (kick)
+        pt_kick_siblings();
+}
+
+void cng_pt_kick_taken(struct cng_ucontext *uc, int magic) {
+    __atomic_add_fetch(&g_pt_kicks, 1, __ATOMIC_SEQ_CST);
+    /* Interrupted inside a native wait (cng_wait_unless): between its compare
+     * and its svc the kick count it read is stale, and at the svc a restart
+     * may be pending that would put the thread back to sleep on it, so resume
+     * at the bail instead; and an -EINTR the kick inflicted on the svc is ours,
+     * not the guest's, and is answered the same way. */
+    struct cng_uregs *r = cng_pt_uregs(uc);
+    if (r->pc >= (u64)cng_wait_unless_check &&
+        r->pc <= (u64)cng_wait_unless_svc)
+        r->pc = (u64)cng_wait_unless_bail;
+    else if (r->pc == (u64)cng_wait_unless_svc + 4 && (s64)r->x[0] == -EINTR)
+        r->x[0] = (u64)(s64)CNG_WAIT_KICKED;
+    /* A tracer's tracee re-kicks it while a stop goes uncollected, but at its
+     * main thread. A sibling still in a native wait has missed the kick that
+     * should have ended it — one that landed while a guest handler ran on top
+     * of the wait, which the kernel then restarted — and only another kick
+     * can reach it there. */
+    if (magic == CNG_PT_KICK_REWAKE &&
+        __atomic_load_n(&g_pt_tracer, __ATOMIC_SEQ_CST) &&
+        __atomic_load_n(&g_pt_nwait, __ATOMIC_SEQ_CST) > 0)
+        pt_kick_siblings();
 }

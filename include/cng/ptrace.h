@@ -136,6 +136,8 @@ static inline struct cng_uregs *cng_pt_uregs(struct cng_ucontext *uc) {
 #define CNG_PT_KICKSIG   64 /* the intent; cng_g_kicksig is what is used */
 #define CNG_PT_KICK_ATTACH 0x50544b21 /* "PTK!" — adopt attach/interrupt/stopsig */
 #define CNG_PT_KICK_WAKE   0x50545721 /* "PTW!" — no-op; EINTRs a blocked wait */
+#define CNG_PT_KICK_REWAKE 0x50545221 /* "PTR!" — WAKE again, for a stop still
+                                       * uncollected after a while */
 #define CNG_PT_KICK_ARM    0x50544121 /* "PTA!" — install the tracer filter here */
 
 /* --no-ptrace: refuse guest ptrace outright (-EPERM) and keep the registry
@@ -248,6 +250,26 @@ long cng_pt_wait4(long pid, u64 status, long options, u64 rusage,
 long cng_pt_waitid(long idtype, long id, u64 infop, long options, u64 rusage,
                    const struct cng_ucontext *uc);
 
+/* The -R tier's wait4/waitid (`nr`, guest arguments a0..a4) for a process that
+ * cannot be owed an emulated stop — it has never been a tracer and nothing
+ * names it as one: made by the kernel as the guest issued it, on the guest's
+ * own mask, so it returns the moment a child does. The wait above, which has
+ * to poll the registry, cost every -R wait up to its 50 ms slice — a shell's
+ * every fork and waitpid. Returns 1 with the result in *out, or 0 for the
+ * caller to use the wait above: a tracer, the kick blocked, or a kick that
+ * made this process a tracer while it slept (cng_pt_kick_taken). Only for the
+ * trampoline tier: from the SIGSYS handler every signal is masked. */
+int cng_pt_wait_native(long nr, long a0, long a1, long a2, long a3, long a4,
+                       long *out);
+/* Test aid: when set, run in a blocking native wait after its look at the
+ * registry and before its svc, which is where a kick has to be caught by the
+ * compare rather than by the svc's EINTR (-t ptracetest). */
+extern void (*cng_g_wait_native_probe)(void);
+
+/* The kick handler's report of a kick of ours (`magic`) it took, with the
+ * frame it interrupted: what ends a native wait, see cng_wait_unless. */
+void cng_pt_kick_taken(struct cng_ucontext *uc, int magic);
+
 /* process_vm_readv/writev where the peer is one of our stopped tracees: served
  * over the mailbox, because the host may refuse the real thing. `flags` is the
  * call's last argument, which the kernel requires to be 0. Returns 1 and sets
@@ -324,8 +346,11 @@ void cng_pt_sig_trace_leave(void);
 /* Install the kick handler. Called once per process at monitor install, and
  * again after the emulated execve resets dispositions. cng_pt_pick_kicksig
  * settles which signal number that is (see cng_g_kicksig) — SIGRTMAX where it
- * can be queued, the first lower one that can be otherwise. */
+ * can be queued, the first lower one that can be otherwise. cng_g_kick_live
+ * says one was actually delivered; without it nothing that waits on a kick to
+ * be woken can be left to sleep in the kernel (cng_pt_wait_native). */
 extern int cng_g_kicksig;
+extern int cng_g_kick_live;
 void cng_pt_sig_install_kick(void);
 void cng_pt_pick_kicksig(void);
 /* The emulated execve's counterpart to the kernel resetting dispositions:
