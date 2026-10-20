@@ -32,6 +32,16 @@ check_contains "SIGSYS tier: the tracer reads the trapped register file" \
     "sigsys tier: regs at the entry stop -> OK" "$ptout"
 check_contains "SIGSYS tier: syscall-exit stop carries the result" \
     "sigsys tier: syscall-exit stop -> OK" "$ptout"
+# A PTRACE_ATTACH whose kick reaches a new process on the way out of its fork,
+# before the converted clone's child-side hooks have run. Those hooks wiped the
+# attach the kick had just recorded, so the tracee never stopped again: the
+# rare "usr1 odd: killed 9" of the waitnowait scenario below, made certain.
+check_contains "an attach kick ahead of the fork's child hooks: attach stop" \
+    "fork kick: attach stop -> OK" "$ptout"
+check_contains "...and the tracee's next signal still stops" \
+    "fork kick: the next signal stops -> OK" "$ptout"
+check_contains "...and its exit reaches the tracer" \
+    "fork kick: tracee exited clean -> OK" "$ptout"
 # The pointer-auth mask gdb asks for whenever AT_HWCAP says PACA, and is fatal
 # about ("unable to fetch pauth registers"). Measured rather than asked for, so
 # what is asserted is the shape the kernel's own answer always has.

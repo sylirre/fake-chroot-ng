@@ -264,6 +264,10 @@ void cng_tramp_dispatch(struct cng_uregs *r);
  * the result lands in x0 and — in the child — the caller-supplied child stack
  * in sp, for the tier's exit to install. Both tiers and the tests call it. */
 void cng_clone_convert(struct cng_uregs *ur);
+/* Test aid: when set, run in the child the moment the clone returns there and
+ * before any fork-child hook, which is where a signal sent to the new pid on
+ * the way out of the clone is delivered (-t ptracetest). */
+extern void (*cng_g_fork_child_probe)(void);
 
 /* One-shot-per-number diagnostic for a syscall we emulate away. */
 void cng_note_blocked(int nr);

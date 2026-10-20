@@ -3743,6 +3743,9 @@ static long mmsg_deadline_report(struct mmsg_deadline *d, long tp,
     return 0;
 }
 
+/* Test aid, see monitor.h: the child's first moment out of a converted clone. */
+void (*cng_g_fork_child_probe)(void);
+
 /* clone, for the process-making kinds the tiers trap (a thread's clone runs
  * natively on both: the filter tests CLONE_VM/CLONE_VFORK, tramp.S does the
  * same). `ur` is the guest's register frame — the SIGSYS tier's signal context
@@ -3772,10 +3775,28 @@ static long mmsg_deadline_report(struct mmsg_deadline *d, long tp,
  * makes the new process visible as a guest one. The child cannot do this
  * itself: nothing guarantees it makes another traced syscall before something
  * reads its /proc entry — and a tracer attaching to it by pid needs it to be a
- * known guest process. */
+ * known guest process.
+ *
+ * Every signal but SIGSYS is blocked from before the fork until each side is
+ * done here, which is the mask the SIGSYS tier's handler runs all of this
+ * under anyway. The -R trampoline runs it on the guest's own mask, and the
+ * child's hooks rebuild per-process state that came across the fork describing
+ * the parent: a handler delivered to the child on the way out of the clone ran
+ * against the parent's state, and whatever it recorded was then wiped by the
+ * hooks. That is how a PTRACE_ATTACH was lost. The parent handed the new pid
+ * over as soon as its fork returned, and the tracer's attach kick reached the
+ * child before cng_pt_fork_child had run. The child attached, stopped and was
+ * resumed, and the hook then cleared the per-task table the attach lived in,
+ * so the tracee never stopped again and its exit was never published (the
+ * tracer, finding a zombie, reported it killed by SIGKILL). SIGSYS stays open
+ * for the gate-net, as in the handler, because a masked seccomp SIGSYS kills.
+ * The child inherits the blocked mask, and each side puts the guest's back
+ * once it is done with the fork. */
 void cng_clone_convert(struct cng_uregs *ur) {
     unsigned long orig_flags = (unsigned long)ur->x[0];
     unsigned long child_stack = (unsigned long)ur->x[1];
+    unsigned long hold = ~0UL & ~(1UL << (CNG_SIGSYS - 1)), mask = 0;
+    CNG_SYS(__NR_rt_sigprocmask, 0 /*SIG_BLOCK*/, &hold, &mask, 8, 0, 0);
     /* Decided before the fork, from the flags the guest asked for: the
      * conversion below erases CLONE_VFORK, and a tracer following vforks must
      * still see EVENT_VFORK rather than EVENT_FORK. */
@@ -3791,6 +3812,8 @@ void cng_clone_convert(struct cng_uregs *ur) {
     long ret = cng_syscall6(flags, 0, (long)ur->x[2], (long)ur->x[3],
                             (long)ur->x[4], (long)ur->x[5], __NR_clone);
     if (ret == 0) {
+        if (cng_g_fork_child_probe)
+            cng_g_fork_child_probe();
         cng_nnp_fork_child(nnp); /* one task, holding what we held */
         cng_rseq_fork_child(rseq_keep);
         cng_exec_fork_child(); /* an exec another thread had in flight is not ours */
@@ -3801,6 +3824,7 @@ void cng_clone_convert(struct cng_uregs *ur) {
             ur->sp = child_stack;
         ur->x[0] = 0;
         cng_pt_fork_child(ur, ev);
+        CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, &mask, 0, 8, 0, 0);
         return;
     }
     ur->x[0] = (u64)ret;
@@ -3813,6 +3837,7 @@ void cng_clone_convert(struct cng_uregs *ur) {
         if (orig_flags & CNG_CLONE_VFORK)
             cng_pt_report_event(ur, CNG_PTRACE_EVENT_VFORK_DONE, (u64)ret);
     }
+    CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, &mask, 0, 8, 0, 0);
 }
 
 long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,

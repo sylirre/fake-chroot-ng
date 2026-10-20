@@ -3864,6 +3864,33 @@ vfork/`posix_spawn` child-stack handling.
     no-registry run shows the guest still signals its own processes. The
     previous build delivers 6 and 2 SIGURGs to the holders.
 
+- [x] **M86 — an attach that reached a new process before its fork hooks was lost under -R**
+  M18's `ptrace waitnowait` leg failed about one run in a hundred on the dev
+  host, and two to four on the device, as "usr1 odd: killed 9". Its tracer
+  attaches to a grandchild whose pid the middle process hands over as soon
+  as its fork returns. On the `-R` tier the converted clone's child-side
+  hooks ran on the guest's own signal mask, so the attach kick could be
+  handled in the child on the way out of the clone, ahead of them. The child
+  attached, reported its attach stop and was resumed. Then
+  `cng_pt_fork_child` cleared the per-task table the attach had been recorded
+  in (it describes the parent's threads) and the traced count with it. The
+  tracee kept our signal hooks with nothing behind them: its SIGUSR1 went
+  straight to its own handler with no stop, its exit was never published, and
+  the tracer, finding a zombie it is not the parent of, reported it killed by
+  SIGKILL. The SIGSYS tier was never exposed: its handler masks every signal
+  but SIGSYS.
+  - `cng_clone_convert` blocks every signal but SIGSYS from before the clone
+    until each side is done with it, which is the SIGSYS tier's mask, and
+    each side then puts the guest's mask back. A signal sent meanwhile is
+    taken at that point. SIGSYS stays open for the gate-net, as in the
+    handler.
+  - Test: `-t ptracetest`'s `fork kick` rows (m18). A test aid,
+    `cng_g_fork_child_probe`, parks the child in that window until the
+    tracer's `PTRACE_ATTACH` has queued the kick. The tracee must then stop
+    for the attach and again for its own SIGUSR1. The previous build lets the
+    SIGUSR1 kill it, every run. The waitnowait leg went from 20 failures in
+    2000 runs to none of this kind in 3000.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

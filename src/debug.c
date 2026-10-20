@@ -9205,6 +9205,94 @@ static int pt_sim_sigsys(unsigned long *auxv) {
     return fails;
 }
 
+/* A tracer's PTRACE_ATTACH reaching a new process on the way out of its fork.
+ * The parent hands the pid over as soon as its fork returns, so the attach
+ * kick can be delivered to the child before the child-side hooks of the
+ * converted clone have run. The -R tier ran those hooks on the guest's own
+ * mask, so the kick was handled first, and cng_pt_fork_child then wiped the
+ * per-task table the attach had been recorded in: the tracee stopped for the
+ * attach and never again. Its signals went straight to its own dispositions
+ * and its exit was never published. That is what `ptrace waitnowait` hit,
+ * about one run in a hundred, as "usr1 odd: killed 9". The probe parks the
+ * child in exactly that window until the tracer's attach has queued the kick.
+ * Then the child raises SIGUSR1 at itself, which must arrive as a stop. */
+static int g_fk_ready, g_fk_go;
+
+static void pt_forkkick_probe(void) {
+    char c = 'r';
+    sys_write(g_fk_ready, &c, 1);
+    while (sys_read(g_fk_go, &c, 1) == -EINTR)
+        ;
+}
+
+static int pt_sim_forkkick(void) {
+    static char *argv[] = {"/pt-forkkick", 0};
+    static char *envp[] = {0};
+    /* The attach is refused for a pid the registry does not know, and the
+     * converted clone publishes the child only for a parent it knows. */
+    cng_procreg_init(0);
+    cng_procreg_publish(argv, envp, 0, 0, argv[0], "/");
+    int rdy[2], go[2];
+    if (CNG_SYS(__NR_pipe2, rdy, 0, 0, 0, 0, 0) < 0 ||
+        CNG_SYS(__NR_pipe2, go, 0, 0, 0, 0, 0) < 0) {
+        cng_dprintf(1, "ptracetest fork kick: no pipe -> FAIL\n");
+        return 1;
+    }
+    g_fk_ready = rdy[1];
+    g_fk_go = go[0];
+    cng_g_fork_child_probe = pt_forkkick_probe;
+    long kid = cng_dispatch(__NR_clone, 17 /*SIGCHLD*/, 0, 0, 0, 0, 0, 0);
+    if (kid == 0) {
+        CNG_SYS(__NR_tgkill, sys_getpid(), sys_gettid(), 10 /*SIGUSR1*/, 0, 0,
+                0);
+        sys_exit_group(3);
+    }
+    cng_g_fork_child_probe = 0;
+    sys_close(rdy[1]);
+    sys_close(go[0]);
+    if (kid < 0) {
+        cng_dprintf(1, "ptracetest fork kick: no fork -> FAIL\n");
+        return 1;
+    }
+    /* The tracer's own kicks (its tracees' stops wake it) interrupt reads. */
+    char c = 0;
+    while (sys_read(rdy[0], &c, 1) == -EINTR)
+        ;
+    long ar = cng_pt_syscall(CNG_PTRACE_ATTACH, kid, 0, 0);
+    sys_write(go[1], &c, 1);
+    sys_close(rdy[0]);
+    sys_close(go[1]);
+
+    int fails = 0, st = 0;
+    long r = ar == 0 ? cng_pt_wait4(kid, (u64)(unsigned long)&st, 0, 0, 0) : ar;
+    int ok = r == kid && (st & 0xff) == 0x7f && ((st >> 8) & 0xff) == 19;
+    cng_dprintf(1, "ptracetest fork kick: attach stop -> %s\n",
+                ok ? "OK" : "FAIL");
+    fails += !ok;
+    cng_pt_syscall(CNG_PTRACE_CONT, kid, 0, 0);
+    st = 0;
+    r = cng_pt_wait4(kid, (u64)(unsigned long)&st, 0, 0, 0);
+    ok = r == kid && (st & 0xff) == 0x7f && ((st >> 8) & 0xff) == 10;
+    cng_dprintf(1, "ptracetest fork kick: the next signal stops -> %s\n",
+                ok ? "OK" : "FAIL");
+    if (!ok)
+        cng_dprintf(1, "  wait=%ld status=0x%x\n", r, st);
+    fails += !ok;
+    /* Suppressed, so the tracee leaves by its own exit. A wait that already
+     * reaped it above has nothing left to collect. */
+    if (r == kid && (st & 0xff) == 0x7f) {
+        cng_pt_syscall(CNG_PTRACE_CONT, kid, 0, 0);
+        r = cng_pt_wait4(kid, (u64)(unsigned long)&st, 0, 0, 0);
+        ok = r == kid && (st & 0x7f) == 0 && ((st >> 8) & 0xff) == 3;
+    } else {
+        ok = 0;
+    }
+    cng_dprintf(1, "ptracetest fork kick: tracee exited clean -> %s\n",
+                ok ? "OK" : "FAIL");
+    fails += !ok;
+    return fails;
+}
+
 int cng_cmd_ptracetest(int argc, char **argv, char **envp, unsigned long *auxv) {
     (void)argc;
     (void)argv;
@@ -9271,6 +9359,7 @@ int cng_cmd_ptracetest(int argc, char **argv, char **envp, unsigned long *auxv) 
 
     cng_pt_init();
     fails += pt_sim_sigsys(auxv);
+    fails += pt_sim_forkkick();
 
     cng_dprintf(1, "ptracetest: %d failure(s)\n", fails);
     return fails ? 1 : 0;
