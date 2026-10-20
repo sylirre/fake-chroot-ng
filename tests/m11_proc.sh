@@ -83,6 +83,11 @@ check_contains "another guest process is described from the registry" \
     "proctest other-pid: -> OK" "$out"
 check_contains "a child's exec outranks the fork publish; a dead pid stops answering" \
     "proctest fork-guard+stale-pid: -> OK" "$out"
+# A child the scheduler runs ahead of its parent's publish registers itself, so
+# a process it forks in that gap is published too, rather than invisible for
+# good — refused by PTRACE_ATTACH and hidden from kill.
+check_contains "a child that forks before its parent publishes it is registered" \
+    "proctest fork before the parent publishes: y -> OK" "$out"
 check_contains "mounts describes the rootfs and binds" "proctest mounts:" "$out"
 check_contains "mountinfo carries the root device row" "proctest mountinfo:" "$out"
 check_contains "loadavg has the kernel's five fields" "proctest loadavg:" "$out"

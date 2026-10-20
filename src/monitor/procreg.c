@@ -618,28 +618,39 @@ void cng_procreg_publish(char **argv, char **envp, const void *auxv,
     seq_release(e, s);
 }
 
-void cng_procreg_fork(int child) {
-    if (!g_tab || child <= 0)
+/* Copy the forking process's entry into its child's slot: the parent's job,
+ * done once its clone returns, and the child's fallback when the parent does
+ * not get there (cng_procreg_fork_child). */
+static void fork_copy(int forker, int child) {
+    if (!g_tab || forker <= 0 || child <= 0)
         return;
-    struct cng_procsnap snap;
-    if (!cng_procreg_get((int)sys_getpid(), &snap))
-        return; /* we are not registered: nothing to inherit */
     /* The child may not be scheduled yet, but its stat file exists the moment
-     * clone() returns, so its starttime is already readable. */
+     * clone() returns, so its starttime is already readable from either side.
+     *
+     * The child itself may have beaten us here: it publishes its own identity
+     * when it loads a program, and that is newer than this forked copy (as is
+     * the same copy, written by a child that gave up waiting for its parent).
+     * A slot already stamped with the child's live starttime is its work —
+     * leave it. That is asked again once the lock is ours, since it may have
+     * been written in between. Failing to take the lock means the same thing
+     * (the child is the only other writer of its slot), so back off there
+     * too. */
+    struct cng_procsnap snap;
+    if (!cng_procreg_get(forker, &snap))
+        return; /* the forker is not registered: nothing to inherit */
     u64 start = cng_proc_starttime(child, 0);
     struct proc_ent *e = slot_for(child);
     if (!e)
         return;
-    /* The child itself may have beaten us here: it publishes its own identity
-     * when it loads a program, and that is newer than this forked copy. A slot
-     * already stamped with the child's live starttime is its work — leave it.
-     * Failing to take the lock means the same thing (the child is the only
-     * other writer of its slot), so back off there too. */
     if (start && __atomic_load_n(&e->start, __ATOMIC_ACQUIRE) == start)
         return;
     u32 s = seq_acquire(e, 4096);
     if (!s)
         return;
+    if (start && e->start == start) {
+        seq_release(e, s);
+        return;
+    }
     e->start = start;
     e->cmd_len = snap.cmd_len;
     e->env_len = snap.env_len;
@@ -652,6 +663,67 @@ void cng_procreg_fork(int child) {
     memcpy(e->exe, snap.exe, snap.exe_len);
     memcpy(e->cwd, snap.cwd, snap.cwd_len);
     seq_release(e, s);
+}
+
+void cng_procreg_fork(int child) {
+    fork_copy((int)sys_getpid(), child);
+}
+
+/* Is `pid`'s slot stamped with `start`, and not in the middle of a write? */
+static int fork_published(int pid, u64 start) {
+    int i = slot_of(pid);
+    if (i < 0)
+        return 0;
+    struct proc_ent *e = &g_tab->ent[i];
+    u32 s1 = __atomic_load_n(&e->seq, __ATOMIC_ACQUIRE);
+    if (s1 & 1)
+        return 0;
+    u64 st = __atomic_load_n(&e->start, __ATOMIC_ACQUIRE);
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    return st == start && __atomic_load_n(&e->seq, __ATOMIC_RELAXED) == s1;
+}
+
+/* Wait for the parent's copy rather than write one of our own alongside it:
+ * the two halves would each claim a free slot as often as not, since neither
+ * would yet see the other's, and leave the process holding two. A parent the
+ * scheduler gets back to is what is waited for — first by yielding to it,
+ * then in 1 ms naps up to about a tenth of a second. One that will not be
+ * coming (it died, a stop holds it longer than that, or the registry had no
+ * slot for us) leaves the copy to us. The bound is only the price of that
+ * last case, never what correctness rests on: a copy of our own is still
+ * the right one, it just risks a second slot. */
+#define FORK_WAIT_YIELDS 64
+#define FORK_WAIT_NAPS   100
+
+void cng_procreg_fork_child(int forker) {
+    if (!g_tab || forker <= 0)
+        return;
+    int me = (int)sys_getpid();
+    u64 start = cng_proc_starttime(me, 0);
+    if (!start)
+        return; /* no stamp to recognize the parent's copy by, nor to write */
+    /* A parent with no entry of its own publishes nothing, and has nothing
+     * for us to copy either: waiting for it would only delay every fork. Its
+     * starttime is not asked (it has just forked us, so the pid is its own),
+     * which keeps this to the one /proc read our own stamp needs. */
+    int fi = slot_of(forker);
+    if (fi < 0 || !__atomic_load_n(&g_tab->ent[fi].start, __ATOMIC_ACQUIRE))
+        return;
+    for (int t = 0; t < FORK_WAIT_YIELDS + FORK_WAIT_NAPS; t++) {
+        if (fork_published(me, start))
+            return;
+        if (t < FORK_WAIT_YIELDS) {
+            CNG_SYS(__NR_sched_yield, 0, 0, 0, 0, 0, 0);
+            continue;
+        }
+        int zombie = 0;
+        if (!((t - FORK_WAIT_YIELDS) % 16) &&
+            (!cng_proc_starttime(forker, &zombie) || zombie))
+            break; /* the parent is gone: nobody else will write it */
+        struct cng_timespec nap = {0, 1000000};
+        CNG_SYS(__NR_nanosleep, &nap, 0, 0, 0, 0, 0);
+    }
+    fork_copy(forker, me);
 }
 
 void cng_procreg_set_cwd(const char *cwd_guest) {

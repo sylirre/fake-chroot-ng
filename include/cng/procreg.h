@@ -95,6 +95,13 @@ void cng_procreg_publish(char **argv, char **envp, const void *auxv,
  * a forked child need not make another traced syscall before something reads
  * its /proc entry. */
 void cng_procreg_fork(int child);
+/* The child's half: do not go on to run guest code before that copy has
+ * landed. A child the scheduler ran ahead of its parent's publish found no
+ * entry of its own when it forked in turn, so its child was never published:
+ * invisible for good, refused by PTRACE_ATTACH and hidden from kill. Waits a
+ * bounded time for the parent, then copies `forker`'s entry (the pid the clone
+ * was issued from, sampled before it) itself. */
+void cng_procreg_fork_child(int forker);
 
 /* Update just our own cwd (chdir/fchdir), so another process reading
  * /proc/<pid>/cwd sees the live value. */

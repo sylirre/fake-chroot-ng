@@ -268,6 +268,10 @@ void cng_clone_convert(struct cng_uregs *ur);
  * before any fork-child hook, which is where a signal sent to the new pid on
  * the way out of the clone is delivered (-t ptracetest). */
 extern void (*cng_g_fork_child_probe)(void);
+/* Test aid: when set, run in the parent the moment the clone returns there and
+ * before it publishes the child, which is a parent the scheduler has not run
+ * since its clone, with the child already going (-t proctest). */
+extern void (*cng_g_fork_parent_probe)(long kid);
 
 /* One-shot-per-number diagnostic for a syscall we emulate away. */
 void cng_note_blocked(int nr);

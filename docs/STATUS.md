@@ -3891,6 +3891,34 @@ vfork/`posix_spawn` child-stack handling.
     SIGUSR1 kill it, every run. The waitnowait leg went from 20 failures in
     2000 runs to none of this kind in 3000.
 
+- [x] **M87 — a process forked before its parent was published stayed invisible**
+  The parent publishes a child into the process registry once its clone
+  returns, and the scheduler need not run it again before the child is well
+  into guest code. A child that forked in that gap found no entry of its own
+  for `cng_procreg_fork` to copy, so its own child was never published at
+  all: invisible in `/proc`, ESRCH to `PTRACE_ATTACH`, and since M85 hidden
+  from `kill`. That was the other `ptrace waitnowait` failure, about one run
+  in 3000 on the dev host: the attach failed, the cleanup kill could not reach
+  the grandchild, and it spun forever holding the test's output pipe.
+  - The child waits for its parent's copy before it runs any guest code:
+    yielding first, then in 1 ms naps up to about a tenth of a second. If
+    the parent does not come through (it is gone, stopped for longer than
+    that, or the registry had no slot to give), the child copies the parent's
+    entry itself. A parent with no entry of its own is not waited for at all.
+    Both halves always writing was the alternative, and they would each claim
+    a free slot as often as not and leave the process holding two. The
+    parent's copy now checks the stamp again under the slot lock, so it
+    cannot overwrite an exec the child published in between.
+  - Cost: the parent's `fork()` is unchanged. The child runs its first
+    instruction about 0.23 ms later under qemu-user (1.04 to 1.27 ms): its
+    own starttime read, and the parent's publish it now waits out. A forker
+    with no entry is recognized from its slot alone, with no `/proc` read.
+  - Test: `-t proctest` leg 3c (m11). A second test aid,
+    `cng_g_fork_parent_probe`, holds the parent before its publish until the
+    child has forked and looked its own child up. The previous build leaves
+    the child with no entry, every run. With M86, the waitnowait leg passed
+    4000 runs out of 4000.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

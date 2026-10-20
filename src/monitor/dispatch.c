@@ -3743,8 +3743,9 @@ static long mmsg_deadline_report(struct mmsg_deadline *d, long tp,
     return 0;
 }
 
-/* Test aid, see monitor.h: the child's first moment out of a converted clone. */
+/* Test aids, see monitor.h: each side's first moment out of a converted clone. */
 void (*cng_g_fork_child_probe)(void);
+void (*cng_g_fork_parent_probe)(long kid);
 
 /* clone, for the process-making kinds the tiers trap (a thread's clone runs
  * natively on both: the filter tests CLONE_VM/CLONE_VFORK, tramp.S does the
@@ -3772,10 +3773,14 @@ void (*cng_g_fork_child_probe)(void);
  *    parent's stack, so the frame's sp is left alone. A bare glibc vfork hands
  *    the parent's own sp, which is the same value the frame already holds.
  * The parent then publishes the child into the PID registry, which is what
- * makes the new process visible as a guest one. The child cannot do this
- * itself: nothing guarantees it makes another traced syscall before something
- * reads its /proc entry — and a tracer attaching to it by pid needs it to be a
- * known guest process.
+ * makes the new process visible as a guest one. The child cannot be left to
+ * do this alone: nothing guarantees it makes another traced syscall before
+ * something reads its /proc entry — and a tracer attaching to it by pid needs
+ * it to be a known guest process. It does wait for it, though, before it runs
+ * any guest code, and copies the entry itself if the parent does not come
+ * through: one the scheduler had not run again since its clone left a child
+ * that went on to fork with no entry of its own to copy, and that child's
+ * own child stayed invisible for good.
  *
  * Every signal but SIGSYS is blocked from before the fork until each side is
  * done here, which is the mask the SIGSYS tier's handler runs all of this
@@ -3807,6 +3812,10 @@ void cng_clone_convert(struct cng_uregs *ur) {
     int nnp = cng_nnp_get();
     /* Same for the rseq registration the child inherits (execve.c). */
     int rseq_keep = cng_rseq_fork_prepare();
+    /* And for whose registry entry the child copies: by then its getppid
+     * names a parent only while that parent lives, and under CLONE_PARENT
+     * never this process at all. */
+    int forker = (int)sys_getpid();
     long flags = (long)(orig_flags &
                         ~(unsigned long)(CNG_CLONE_VM | CNG_CLONE_VFORK));
     long ret = cng_syscall6(flags, 0, (long)ur->x[2], (long)ur->x[3],
@@ -3814,6 +3823,7 @@ void cng_clone_convert(struct cng_uregs *ur) {
     if (ret == 0) {
         if (cng_g_fork_child_probe)
             cng_g_fork_child_probe();
+        cng_procreg_fork_child(forker); /* registered before any guest code */
         cng_nnp_fork_child(nnp); /* one task, holding what we held */
         cng_rseq_fork_child(rseq_keep);
         cng_exec_fork_child(); /* an exec another thread had in flight is not ours */
@@ -3829,6 +3839,8 @@ void cng_clone_convert(struct cng_uregs *ur) {
     }
     ur->x[0] = (u64)ret;
     if (ret > 0) {
+        if (cng_g_fork_parent_probe)
+            cng_g_fork_parent_probe(ret);
         cng_procreg_fork((int)ret);
         cng_pt_report_event(ur, ev, (u64)ret);
         /* A real vfork would have suspended us until the child exec'd or

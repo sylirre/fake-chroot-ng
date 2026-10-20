@@ -7169,6 +7169,17 @@ static unsigned dbg_capget(int pid, long *out) {
     return dat[0];
 }
 
+/* proctest's slow parent: held after its clone, before it publishes the child,
+ * until the child has reported. */
+static int g_slow_rfd = -1;
+static char g_slow_verdict;
+
+static void proc_slow_parent(long kid) {
+    (void)kid;
+    while (sys_read(g_slow_rfd, &g_slow_verdict, 1) == -EINTR)
+        ;
+}
+
 /* Count of NUL-separated entries in a cmdline/environ blob. */
 static int pt_nul_fields(const char *b, long n) {
     int c = 0;
@@ -7427,6 +7438,59 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
         else
             cng_dprintf(1, "proctest fork-guard+stale-pid: -> %s\n",
                         ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 3c) a child that forks before its parent has published it. The parent
+     *     publishes the child once its clone returns, and the scheduler need
+     *     not run it again before the child is well into guest code. A child
+     *     that forked in that gap found no entry of its own to copy, so its
+     *     own child was never published at all: invisible in /proc, refused
+     *     to PTRACE_ATTACH with ESRCH and hidden from kill. That orphaned
+     *     the waitnowait grandchild in m18 now and then. The child now waits
+     *     for its parent's copy a bounded time, then makes its own. The probe
+     *     holds the parent in exactly that gap until the child has looked, so
+     *     the child has to fall back to its own copy (about 100 ms). */
+    {
+        int vfd[2] = {-1, -1};
+        int ok = CNG_SYS(__NR_pipe2, vfd, 0, 0, 0, 0, 0) == 0;
+        g_slow_rfd = vfd[0];
+        g_slow_verdict = 0;
+        cng_g_fork_parent_probe = proc_slow_parent;
+        long kid = ok ? cng_dispatch(__NR_clone, 17 /*SIGCHLD*/, 0, 0, 0, 0,
+                                     0, 0)
+                      : -1;
+        if (kid == 0) {
+            cng_g_fork_parent_probe = 0; /* our own fork must not wait */
+            struct cng_procsnap snap;
+            char v = cng_procreg_get((int)sys_getpid(), &snap) ? 'y' : 's';
+            long g = cng_dispatch(__NR_clone, 17, 0, 0, 0, 0, 0, 0);
+            if (g == 0) {
+                struct cng_timespec nap = {5, 0};
+                CNG_SYS(__NR_nanosleep, &nap, 0, 0, 0, 0, 0);
+                sys_exit_group(0);
+            }
+            if (v == 'y' && (g <= 0 || !cng_procreg_has((int)g)))
+                v = 'g';
+            if (g > 0) {
+                CNG_SYS(__NR_kill, g, 9, 0, 0, 0, 0);
+                sys_wait4((int)g, 0, 0, 0);
+            }
+            cng_write_all(vfd[1], &v, 1);
+            sys_exit_group(0);
+        }
+        cng_g_fork_parent_probe = 0;
+        if (vfd[0] >= 0) {
+            sys_close(vfd[0]);
+            sys_close(vfd[1]);
+        }
+        ok &= kid > 0 && g_slow_verdict == 'y';
+        if (kid > 0)
+            sys_wait4((int)kid, 0, 0, 0);
+        /* 's': the child had no entry of its own; 'g': it had, and still the
+         * grandchild it forked was not published. */
+        cng_dprintf(1, "proctest fork before the parent publishes: %c -> %s\n",
+                    g_slow_verdict ? g_slow_verdict : '-', ok ? "OK" : "FAIL");
         fails += !ok;
     }
 
