@@ -97,7 +97,9 @@ BIN  := $(BUILD)/chroot-ng
 .PHONY: all clean run test probe
 all: $(BIN)
 
-$(BIN): $(OBJ)
+# The linker script shapes the image as much as the objects do (its PHDRS is
+# the whole program header table), so a change to it relinks.
+$(BIN): $(OBJ) scripts/chroot-ng.ld
 	$(CC) $(LDFLAGS) -o $@ $(OBJ)
 	@echo "built $@"
 
