@@ -105,12 +105,24 @@ pt_oracle_build() {
     return 1
 }
 
-# One scenario, both ways. Extra arguments are passed to both runs, with the
-# binary's own path substituted per side (the exec scenarios re-exec themselves).
+# One scenario, both ways. Each side is given its own binary's path after the
+# scenario name (the exec scenarios re-exec themselves).
+#
+# pt_case SCENARIO [LACKING WHY] — LACKING is the line the kernel side prints
+# when this host's kernel predates what the scenario asks for. There is no
+# reference to compare with then: the emulation answers as the kernel uname
+# advertises, not as the one underneath, so the leg is skipped, saying WHY.
 pt_case() {
     _sc=$1
     _oracle_out=$(cd "$PT_DIR" && timeout 60 "./$(basename "$PT_ORACLE")" \
         "$_sc" "./$(basename "$PT_ORACLE")" 2>/dev/null)
+    if [ -n "${2:-}" ]; then
+        case "$_oracle_out" in
+        *"$2"*)
+            skip "ptrace $_sc: $3"
+            return ;;
+        esac
+    fi
     _guest_out=$(run_t 90 -R / "$PT_GUEST" "$_sc" "$PT_GUEST" 2>/dev/null)
     if [ "$_oracle_out" = "$_guest_out" ]; then
         pass=$((pass + 1))
@@ -138,8 +150,9 @@ else
     # what the stacked trap-everything filter exists for.
     pt_case sysstop
     # PTRACE_GET_SYSCALL_INFO, which modern strace prefers over pairing the
-    # stops itself.
-    pt_case sysinfo
+    # stops itself. A kernel before 5.3 answers it EIO (Android 4.19 devices).
+    pt_case sysinfo "syscall_info unsupported" \
+        "the host kernel predates PTRACE_GET_SYSCALL_INFO (5.3), so it is no reference"
     # A tracer cancelling a syscall at its entry stop and substituting the
     # return value — proot's whole method.
     pt_case cancel
