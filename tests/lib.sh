@@ -25,12 +25,13 @@
 #   CNG_GUEST_XLATE      1 when a compiled guest's own path syscalls get
 #                        translated here (see guest_xlate_ready)
 #   CNG_ALPINE/_DEBIAN/_ORACLE  rootfs + differential-oracle locations
+#   cng_rootfs NAME fetch  provision a pinned rootfs image on demand
 #   skip MSG             uniform, counted "  skip <msg>" reporting
 #   elf_type / elf_machine / elf_has_interp   ELF facts without file(1)
 #
 # Overridable from the environment: BIN, QEMU (set empty to force direct
-# execution), GUESTCC, GUESTLD, GUEST_BINDS, CNG_ROOTFS_DIR, CNG_ALPINE,
-# CNG_DEBIAN, CNG_ORACLE, CNG_SYSROOT. See tests/README.md.
+# execution), GUESTCC, GUESTLD, GUEST_BINDS, CNG_ROOTFS_DIR, CNG_ROOTFS_FETCH,
+# CNG_ALPINE, CNG_DEBIAN, CNG_ORACLE, CNG_SYSROOT. See tests/README.md.
 
 pass=${pass:-0}
 fail=${fail:-0}
@@ -384,27 +385,199 @@ cng_probe_caps() {
 
 # ---- guest rootfs images + the differential oracle ------------------------
 # Several milestones need a real AArch64 userland (Alpine busybox, Debian glibc)
-# and M10 needs the arm64chroot oracle. None of that can be assumed present, so
-# search a few locations and let the milestone skip cleanly.
+# and M10 needs the arm64chroot oracle. The userlands are pinned images the
+# suite provisions itself under $CNG_ROOTFS_DIR (default tests/.cache/rootfs):
+# Alpine at startup, since seven milestones use it, and Debian only when M10
+# reaches its one leg, which needs the oracle as well. The oracle is another
+# project and cannot be fetched, so it is searched for. A milestone left
+# without an image or the oracle skips cleanly.
 
-# cng_find_rootfs NAME MARKER — first candidate dir containing MARKER, or empty.
-cng_find_rootfs() {
-    for _c in ${CNG_ROOTFS_DIR:+"$CNG_ROOTFS_DIR/$1"} \
-        "tests/.cache/rootfs/$1" \
-        ${HOME:+"$HOME/arm64chroot/tests/.cache/rootfs/$1"} \
-        ${HOME:+"$HOME/arm64-rootfs/$1"}; do
-        if [ -x "$_c/$2" ]; then
-            echo "$_c"
-            return 0
+# cng_rootfs_pin NAME — the image NAME is provisioned from: _rf_file (the
+# tarball's name under downloads/), _rf_url, _rf_sha (its sha256) and
+# _rf_marker (the program that makes a tree usable). Bumping an image is an
+# edit here and nothing else: a provisioned tree is stamped with the hash it
+# came from, and one stamped with another is replaced on the next run.
+cng_rootfs_pin() {
+    case "$1" in
+    alpine)
+        # The stock minirootfs: the suite only ever calls bin/busybox in it.
+        _rf_file=alpine-minirootfs-3.20.3-aarch64.tar.gz
+        _rf_url=https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64/$_rf_file
+        _rf_sha=041fa34a81788242df9e78fa69b97ab45b8ec47ddbf88864755610414a7bf3de
+        _rf_marker=bin/busybox
+        ;;
+    debian)
+        # Debian publishes no minirootfs. The official debian:trixie-20261020-slim
+        # image is a single layer per platform, and Docker Hub serves a layer by
+        # its own sha256: the linux/arm64/v8 one's digest is pin and checksum.
+        _rf_file=debian-trixie-20261020-slim-arm64.tar.gz
+        _rf_sha=ddc0c1e36a6793411b6c8d48e1ddad2987405d377da92bcf532ed3181c2e4d62
+        _rf_url=https://registry-1.docker.io/v2/library/debian/blobs/sha256:$_rf_sha
+        _rf_marker=bin/ls
+        ;;
+    *) return 1 ;;
+    esac
+}
+
+# cng_get URL OUT [HEADER] — download URL to OUT ("-" is stdout).
+cng_get() {
+    if have curl; then
+        curl -fsSL --retry 3 --connect-timeout 30 ${3:+-H "$3"} -o "$2" "$1"
+    elif have wget; then
+        wget -q -T 30 ${3:+--header="$3"} -O "$2" "$1"
+    else
+        return 127
+    fi
+}
+
+# cng_rootfs_fetch NAME OUT — download NAME's pinned tarball to OUT.
+cng_rootfs_fetch() {
+    case "$1" in
+    debian)
+        # Even an anonymous pull from Docker Hub needs a bearer token.
+        _tok=$(cng_get "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/debian:pull" - |
+            sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p')
+        [ -n "$_tok" ] && cng_get "$_rf_url" "$2" "Authorization: Bearer $_tok"
+        ;;
+    *) cng_get "$_rf_url" "$2" ;;
+    esac
+}
+
+cng_sha256() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
+
+# cng_rootfs_lock NAME — runs sharing $CNG_ROOTFS_DIR take turns provisioning.
+# mkdir is the one atomic test-and-set every host has; a lock whose owner has
+# died is taken over. Released by removing the directory.
+cng_rootfs_lock() {
+    _lk=$CNG_ROOTFS_DIR/.$1.lock
+    _n=0
+    until mkdir "$_lk" 2>/dev/null; do
+        _p=$(cat "$_lk/pid" 2>/dev/null)
+        if [ -n "$_p" ] && ! kill -0 "$_p" 2>/dev/null; then
+            rm -rf "$_lk"
+            continue
         fi
+        [ "$_n" = 0 ] && echo "  waiting for another run to provision $1" >&2
+        _n=$((_n + 1))
+        [ "$_n" -le 900 ] || return 1
+        sleep 1
     done
-    echo ""
+    echo $$ >"$_lk/pid"
+}
+
+# cng_rootfs NAME [fetch] — CNG_ROOTFS is set to $CNG_ROOTFS_DIR/NAME when that
+# tree is usable, otherwise emptied with the reason in CNG_ROOTFS_WHY. A tree is
+# usable once it has its marker and is stamped with the pinned hash, or carries
+# no stamp at all: one staged by hand is used as it is and never touched. With
+# "fetch", a missing or stale tree is provisioned.
+cng_rootfs() {
+    CNG_ROOTFS=
+    CNG_ROOTFS_WHY=
+    cng_rootfs_pin "$1" || return 1
+    _rf_dir=$CNG_ROOTFS_DIR/$1
+    _rf_stamp=$CNG_ROOTFS_DIR/.$1.sha256
+    cng_rootfs_usable && return 0
+    if [ "${2:-}" != fetch ]; then
+        CNG_ROOTFS_WHY="not provisioned yet"
+        return 1
+    fi
+    if ! mkdir -p "$CNG_ROOTFS_DIR/downloads" || ! cng_rootfs_lock "$1"; then
+        CNG_ROOTFS_WHY="cannot lock $CNG_ROOTFS_DIR for provisioning"
+        return 1
+    fi
+    cng_rootfs_provision "$1"
+    _rc=$?
+    rm -rf "$CNG_ROOTFS_DIR/.$1.lock"
+    return $_rc
+}
+
+cng_rootfs_usable() {
+    [ -x "$_rf_dir/$_rf_marker" ] || return 1
+    [ ! -e "$_rf_stamp" ] || [ "$(cat "$_rf_stamp")" = "$_rf_sha" ] || return 1
+    CNG_ROOTFS=$_rf_dir
+}
+
+# cng_rootfs_provision NAME — under the lock. The tarball in downloads/ is
+# downloaded first when absent (never with CNG_ROOTFS_FETCH=0) and checked
+# against the pin either way. It is unpacked beside the tree and renamed into
+# place, so a run that dies midway leaves nothing half-written under the name.
+cng_rootfs_provision() {
+    cng_rootfs_usable && return 0 # another run got there first
+    if [ -e "$_rf_dir" ] && [ ! -e "$_rf_stamp" ]; then
+        CNG_ROOTFS_WHY="$_rf_dir has no $_rf_marker and was not provisioned here"
+        return 1
+    fi
+    if ! have sha256sum; then
+        CNG_ROOTFS_WHY="no sha256sum to check $_rf_file with"
+        return 1
+    fi
+    _tb=$CNG_ROOTFS_DIR/downloads/$_rf_file
+    if [ "$(cng_sha256 "$_tb")" != "$_rf_sha" ]; then
+        if [ "${CNG_ROOTFS_FETCH:-1}" = 0 ]; then
+            CNG_ROOTFS_WHY="no $_rf_file matching its pin in downloads/, and CNG_ROOTFS_FETCH=0"
+            return 1
+        fi
+        echo "  fetching $_rf_file" >&2
+        if ! cng_rootfs_fetch "$1" "$_tb.part"; then
+            rm -f "$_tb.part"
+            CNG_ROOTFS_WHY="cannot download $_rf_url"
+            return 1
+        fi
+        if [ "$(cng_sha256 "$_tb.part")" != "$_rf_sha" ]; then
+            rm -f "$_tb.part"
+            CNG_ROOTFS_WHY="$_rf_file does not match its pinned sha256"
+            return 1
+        fi
+        if ! mv -f "$_tb.part" "$_tb"; then
+            CNG_ROOTFS_WHY="cannot store $_tb"
+            return 1
+        fi
+    fi
+    _new=$CNG_ROOTFS_DIR/.$1.new
+    rm -rf "$_new"
+    if ! mkdir "$_new" || ! (cd "$_new" && gzip -dc "$_tb" | tar -xof -) ||
+        [ ! -x "$_new/$_rf_marker" ]; then
+        rm -rf "$_new"
+        CNG_ROOTFS_WHY="cannot unpack $_rf_file"
+        return 1
+    fi
+    # Only a tree stamped as provisioned here gets this far to be replaced.
+    rm -rf "$_rf_dir"
+    if [ -e "$_rf_dir" ]; then
+        rm -rf "$_new"
+        CNG_ROOTFS_WHY="cannot remove the stale $_rf_dir"
+        return 1
+    fi
+    if ! echo "$_rf_sha" >"$_rf_stamp" || ! mv "$_new" "$_rf_dir"; then
+        rm -rf "$_new"
+        CNG_ROOTFS_WHY="cannot move the unpacked tree to $_rf_dir"
+        return 1
+    fi
+    CNG_ROOTFS=$_rf_dir
 }
 
 cng_detect_images() {
-    CNG_ALPINE="${CNG_ALPINE:-$(cng_find_rootfs alpine bin/busybox)}"
-    CNG_DEBIAN="${CNG_DEBIAN:-$(cng_find_rootfs debian-fresh bin/ls)}"
-    [ -n "$CNG_DEBIAN" ] || CNG_DEBIAN="$(cng_find_rootfs debian bin/ls)"
+    # Absolute, since the provisioning and the milestones change directory.
+    CNG_ROOTFS_DIR="${CNG_ROOTFS_DIR:-tests/.cache/rootfs}"
+    case "$CNG_ROOTFS_DIR" in
+    /*) : ;;
+    *) CNG_ROOTFS_DIR=$PWD/$CNG_ROOTFS_DIR ;;
+    esac
+    CNG_ALPINE="${CNG_ALPINE:-}"
+    CNG_ALPINE_WHY=
+    if [ -z "$CNG_ALPINE" ]; then
+        cng_rootfs alpine fetch
+        CNG_ALPINE=$CNG_ROOTFS
+        CNG_ALPINE_WHY=$CNG_ROOTFS_WHY
+    fi
+    # Only looked for here: M10 provisions it when it reaches the Debian leg.
+    CNG_DEBIAN="${CNG_DEBIAN:-}"
+    CNG_DEBIAN_WHY=
+    if [ -z "$CNG_DEBIAN" ]; then
+        cng_rootfs debian
+        CNG_DEBIAN=$CNG_ROOTFS
+        CNG_DEBIAN_WHY=$CNG_ROOTFS_WHY
+    fi
 
     # The oracle is a host-native emulator, not an AArch64 program: usable only
     # where its own machine matches this host.
@@ -459,7 +632,7 @@ cng_platform_banner() {
     printf '  guest cc      %s\n' \
         "$([ -n "$GUESTCC" ] && echo "$GUESTCC ($GUEST_LD_DESC)" ||
             echo 'none — guest-binary legs will skip')"
-    printf '  alpine rootfs %s\n' "${CNG_ALPINE:-none}"
-    printf '  debian rootfs %s\n' "${CNG_DEBIAN:-none}"
+    printf '  alpine rootfs %s\n' "${CNG_ALPINE:-none ($CNG_ALPINE_WHY)}"
+    printf '  debian rootfs %s\n' "${CNG_DEBIAN:-none ($CNG_DEBIAN_WHY)}"
     printf '  l2s oracle    %s\n' "${CNG_ORACLE:-none}"
 }

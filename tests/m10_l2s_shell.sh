@@ -362,6 +362,14 @@ fi
 # Gated on a smoke test proving translation is live — a dynamic-glibc guest
 # under -R + qemu can silently run untranslated (ld.so-loaded libc.so has no
 # rewritten svc sites), which would read the HOST's /etc, not the guest's.
+# The image is provisioned here and nowhere else: nothing but this leg uses
+# it, and the leg needs the oracle too, which most hosts lack.
+m10_deb_why=
+if [ "$m10_ready" -eq 1 ] && [ -z "$M10_DEBIAN" ]; then
+    cng_rootfs debian fetch
+    M10_DEBIAN=$CNG_ROOTFS
+    m10_deb_why=$CNG_ROOTFS_WHY
+fi
 if [ "$m10_ready" -eq 1 ] && [ -n "$M10_DEBIAN" ] && [ -x "$M10_DEBIAN/bin/ls" ]; then
     RD=$(mktemp -d)
     cp -a "$M10_DEBIAN/." "$RD"
@@ -390,7 +398,7 @@ if [ "$m10_ready" -eq 1 ] && [ -n "$M10_DEBIAN" ] && [ -x "$M10_DEBIAN/bin/ls" ]
     esac
     rm -rf "$RD"
 elif [ "$m10_ready" -eq 1 ]; then
-    skip "debian leg: no debian rootfs"
+    skip "debian leg: no debian rootfs${m10_deb_why:+ ($m10_deb_why)}"
 fi
 
 unset CNG_L2S_FORCE

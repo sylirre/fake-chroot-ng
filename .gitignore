@@ -7,5 +7,5 @@
 *.tmp
 tests/artifacts/
 
-# Rootfs images the test harness looks for (tests/lib.sh), fetched by CI.
+# Rootfs images and their tarballs, provisioned by the test harness (tests/lib.sh).
 /tests/.cache/

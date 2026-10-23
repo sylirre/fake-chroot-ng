@@ -27,7 +27,8 @@ separately in the summary, so a partial run never reads like full coverage:
 == summary: 312 passed, 0 failed, 1 skipped ==
 ```
 
-Common reasons: no AArch64 guest toolchain; no Alpine/Debian rootfs image; no
+Common reasons: no AArch64 guest toolchain; an Alpine/Debian rootfs image that
+could not be provisioned (no network, `CNG_ROOTFS_FETCH=0`); no
 host-native `arm64chroot` oracle (M10 is differential against it); the host has
 no working SysV shm to diff against (Android drops it); the guest links
 dynamically *and* the seccomp tier is inert, so neither tier reaches libc's own
@@ -83,8 +84,9 @@ expected failure:
 | `GUESTCC` | compiler for `tests/guests/*.c`. Unset = probe a candidate list |
 | `GUESTLD` | link mode for those guests: `-static-pie`, `-static`, or empty for dynamic. Unset = try each in that order and keep the first that both links an AArch64 binary and runs here |
 | `GUEST_BINDS` | extra `-b SRC:DST` args a dynamic guest needs to find its ELF interpreter inside a synthetic rootfs. Auto-derived (`/system`, `/apex`, `/linkerconfig`, …) when the guest is not static |
-| `CNG_ROOTFS_DIR` | directory holding `alpine/`, `debian-fresh/` rootfs images |
-| `CNG_ALPINE`, `CNG_DEBIAN` | individual rootfs paths, overriding the search |
+| `CNG_ROOTFS_DIR` | where the `alpine/` and `debian/` rootfs images are provisioned (default `tests/.cache/rootfs`) |
+| `CNG_ROOTFS_FETCH` | `0` = never download a rootfs tarball; one already in `$CNG_ROOTFS_DIR/downloads/` is still unpacked |
+| `CNG_ALPINE`, `CNG_DEBIAN` | individual rootfs paths, used as they are instead of provisioning one |
 | `CNG_ORACLE` | `arm64chroot` binary for M10's real-hardlink differential. Dropped automatically if its machine does not match the host — it is a host-native emulator, not an AArch64 program |
 | `CNG_SYSROOT` | sysroot holding the AArch64 ELF interpreter for M4 (cross host default `/usr/aarch64-linux-gnu`; empty on an AArch64 host, where it is on the system paths) |
 
@@ -93,11 +95,24 @@ dynamic even where the probed link mode is static — M23 builds one deliberatel
 since the noexec `.so` path only exists for a guest whose own `ld.so` maps
 libraries.
 
-Rootfs images are searched in `$CNG_ROOTFS_DIR`, `tests/.cache/rootfs/`,
-`$HOME/arm64chroot/tests/.cache/rootfs/` and `$HOME/arm64-rootfs/`. The suite
-only ever calls `bin/busybox` inside the Alpine one, so a stock minirootfs
-tarball is enough: that is what CI (`.github/workflows/tests.yml`, a hosted
-Linux AArch64 runner) unpacks into `tests/.cache/rootfs/alpine`.
+The suite provisions its rootfs images itself, under `$CNG_ROOTFS_DIR`. Each one
+is a pinned tarball (`cng_rootfs_pin` in `tests/lib.sh`) that is downloaded
+once into `downloads/`, checked against its sha256, and unpacked under its own
+name:
+
+* **`alpine/`** is the stock Alpine minirootfs (~3.5 MB), provisioned at
+  startup. The suite only ever calls `bin/busybox` inside it.
+* **`debian/`** is the arm64 layer of the official `debian:trixie-…-slim` image,
+  fetched from Docker Hub (~30 MB). It is provisioned only when M10 reaches its
+  Debian leg, which needs the arm64chroot oracle as well.
+
+A tree is stamped with the hash it came from (`.alpine.sha256` beside it), so
+bumping a pin replaces it on the next run. A tree that carries no stamp was
+staged by hand, and is used as it is and never touched. Runs that share
+`$CNG_ROOTFS_DIR` take turns provisioning. On a host without network access,
+copy the tarball into `downloads/` yourself; with `CNG_ROOTFS_FETCH=0`, the
+legs skip instead of trying the network. CI (`.github/workflows/tests.yml`, a
+hosted Linux AArch64 runner) caches `downloads/` between runs.
 
 ## Adding a milestone script
 

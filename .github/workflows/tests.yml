@@ -9,11 +9,12 @@
 #
 # tests/lib.sh resolves everything host-dependent (no emulator, native gcc as the
 # guest toolchain, static-PIE guests) and prints what it found at the top of the
-# log. What it cannot find on its own is a guest userland: the Alpine legs need
-# a minirootfs at tests/.cache/rootfs/alpine, which is fetched here (~3.5 MB,
-# pinned by hash, cached between runs). No Debian image and no arm64chroot
-# oracle, so the differential l2s legs (M10 and friends) report as skipped; the
-# summary line counts them separately from passes.
+# log. It provisions the guest userland too: the Alpine minirootfs is fetched
+# into tests/.cache/rootfs on first use (~3.5 MB, pinned by hash in
+# tests/lib.sh), and only its tarball is cached between runs here. There is no
+# arm64chroot oracle, so the differential l2s legs (M10 and friends) report as
+# skipped, and the Debian image only M10 would fetch is never downloaded; the
+# summary line counts skips separately from passes.
 
 name: tests
 
@@ -29,11 +30,6 @@ permissions:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-
-env:
-  ALPINE_BRANCH: v3.20
-  ALPINE_VER: 3.20.3
-  ALPINE_SHA256: 041fa34a81788242df9e78fa69b97ab45b8ec47ddbf88864755610414a7bf3de
 
 jobs:
   test:
@@ -53,32 +49,15 @@ jobs:
           make --version
           uname -srm
 
-      - name: Restore Alpine minirootfs tarball
-        id: alpine
+      # The tarballs `make test` provisions its rootfs images from. Only they
+      # are cached: every run unpacks a fresh tree, since one restored from a
+      # cache would have to be trusted to keep every mode bit and symlink
+      # intact. tests/lib.sh holds the pins, so editing it renews the cache.
+      - name: Restore rootfs tarballs
         uses: actions/cache@v6
         with:
           path: tests/.cache/rootfs/downloads
-          key: alpine-minirootfs-${{ env.ALPINE_VER }}-aarch64-${{ env.ALPINE_SHA256 }}
-
-      - name: Fetch Alpine minirootfs tarball
-        if: steps.alpine.outputs.cache-hit != 'true'
-        run: |
-          tb="alpine-minirootfs-${ALPINE_VER}-aarch64.tar.gz"
-          mkdir -p tests/.cache/rootfs/downloads
-          curl -fsSL --retry 3 -o "tests/.cache/rootfs/downloads/$tb" \
-            "https://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}/releases/aarch64/$tb"
-
-      # Extracted fresh every run: the tarball is the durable thing, the tree is
-      # cheap to rebuild and a rootfs restored from a cache would have to be
-      # trusted to keep every mode bit and symlink intact.
-      - name: Unpack Alpine rootfs
-        run: |
-          tb="alpine-minirootfs-${ALPINE_VER}-aarch64.tar.gz"
-          echo "${ALPINE_SHA256}  tests/.cache/rootfs/downloads/$tb" | sha256sum -c -
-          rm -rf tests/.cache/rootfs/alpine
-          mkdir -p tests/.cache/rootfs/alpine
-          tar -xzf "tests/.cache/rootfs/downloads/$tb" -C tests/.cache/rootfs/alpine --no-same-owner
-          test -x tests/.cache/rootfs/alpine/bin/busybox
+          key: rootfs-downloads-${{ hashFiles('tests/lib.sh') }}
 
       # Warnings are defects here (see AGENTS.md), so they fail the build. Set
       # through the environment, not the make command line: a command-line
