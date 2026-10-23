@@ -9,10 +9,15 @@
  * recorded nothing about the name: the readback has to resolve the spelling
  * on its own, and the reply it then sends has to reach the client.
  *
+ * The spelling resolves while its binder lives and holds the directory, as a
+ * service does. So the server stays bound until the client says it is done:
+ * a server that left right after its reply would race the client's own
+ * readback of the reply's source, and the slower side would decide the answer.
+ *
  *   uxreply server SRV        bind SRV, take one datagram, print its source,
- *                             answer "pong" to that source
+ *                             answer "pong" to that source, wait for "done"
  *   uxreply client SRV CLI    bind CLI, send "ping" to SRV, print the answer
- *                             and where it came from
+ *                             and where it came from, send "done" to SRV
  */
 #include <stdio.h>
 #include <string.h>
@@ -62,6 +67,7 @@ int main(int argc, char **argv) {
         show_addr("from", &from, flen);
         printf(" reply=%d\n",
                sendto(s, "pong", 4, 0, (struct sockaddr *)&from, flen) == 4);
+        recv(s, buf, sizeof buf, 0); /* "done", or the timeout */
         return 0;
     }
     if (argc < 4)
@@ -86,5 +92,6 @@ int main(int argc, char **argv) {
     printf("client: reply=%.*s ", (int)n, buf);
     show_addr("from", &from, flen);
     printf("\n");
+    sendto(s, "done", 4, 0, (struct sockaddr *)&srv, sizeof srv);
     return 0;
 }

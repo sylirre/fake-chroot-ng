@@ -78,7 +78,11 @@ else
     # service answers at the source address its recvfrom reports. Server and
     # client are two invocations, neither forked from the other, each with a
     # pathname of its own: the server must read the client's name back as
-    # the guest bound it, and its reply must arrive.
+    # the guest bound it, and its reply must arrive. The server stays bound
+    # until the client is done, as a service does: a spelling resolves only
+    # while its binder holds the directory, and a server gone right after its
+    # reply left the client's readback to whichever process the scheduler ran
+    # first (always the server on a 4.19 Pixel 5).
     if guest_cc "$M26D/uxreply" tests/guests/uxreply.c; then
         R=$(mktemp -d); mkdir -p "$R/bin" "$R/run"
         cp "$M26D/uxreply" "$R/bin/uxreply"
