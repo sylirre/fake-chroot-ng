@@ -31,7 +31,7 @@ check_contains "outside dir: a copy received over a socket is closed" \
     "outside dir-scm: rc=-9 -> OK" "$out"
 case "$out" in
 *"outside pidfd: unavailable"*)
-    skip "pidfd_getfd import: no pidfd_open here" ;;
+    skip "pidfd_getfd import: no pidfd_open or pidfd_getfd here" ;;
 *)
     check_contains "outside dir: pidfd_getfd's copy is closed and the call is EPERM" \
         "outside dir-pidfd_getfd: rc=-1 -> OK" "$out"

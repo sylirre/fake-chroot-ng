@@ -732,8 +732,17 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
             }
             OUT_LEG(k == 0 ? "dir-scm" : "file-scm", k == 0 ? -EBADF : 0, got);
         }
-        /* Out of another table: our own, through pidfd_getfd. */
+        /* Out of another table: our own, through pidfd_getfd. Having
+         * pidfd_open does not mean having pidfd_getfd: Android's 4.19 kernels
+         * carry a backport of the first (for lmkd) and not the second, which
+         * answers ENOSYS there. A descriptor that is no pidfd tells the two
+         * apart — EBADF where the call exists. */
         long pfd = CNG_SYS(__NR_pidfd_open, sys_getpid(), 0, 0, 0, 0, 0);
+        if (pfd >= 0 &&
+            cng_dispatch(__NR_pidfd_getfd, -1, 0, 0, 0, 0, 0, 0) == -ENOSYS) {
+            sys_close((int)pfd);
+            pfd = -ENOSYS;
+        }
         if (pfd >= 0) {
             OUT_LEG("dir-pidfd_getfd", -EPERM,
                     cng_dispatch(__NR_pidfd_getfd, pfd, od, 0, 0, 0, 0, 0));
