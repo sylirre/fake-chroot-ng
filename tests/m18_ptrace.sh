@@ -300,8 +300,15 @@ fi
 # is inert the filter cannot go in at all, and an option that needs one is then
 # a refusal to enter the guest -- which is the same fact, told the only way an
 # inert host can tell it (it used to run the guest anyway, with the option
-# silently inert, behind a warning).
-if guest_cc_report "$PT_DIR/nnprivs" tests/guests/nnprivs.c; then
+# silently inert, behind a warning). A kernel before 4.10 has no NoNewPrivs line
+# in /proc/self/status to show the bit through (Android 8's 3.18), and the
+# guest's own prctl is answered by the monitor, so there is no reading the bit
+# there at all.
+if ! guest_cc_report "$PT_DIR/nnprivs" tests/guests/nnprivs.c; then
+    :
+elif [ "$(emu_t 30 "$PT_DIR/nnprivs" 2>/dev/null)" = absent ]; then
+    skip "which options install a monitor: /proc/self/status has no NoNewPrivs line on this kernel (4.10+)"
+else
     out=$(run_t 60 / "$PT_DIR/nnprivs" 2>/dev/null)
     check_contains "an identity view with nothing to translate installs no monitor" \
         "nnp=0" "$out"
