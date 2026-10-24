@@ -2090,6 +2090,15 @@ static long ro_refusal_name(long dirfd, const char *gp, const char *host,
     return ro_refusal(host, atflags);
 }
 
+/* The script the running program was exec'd to interpret, when that exec ran
+ * it from one of our fds: the number and the file it named at the commit. */
+static int g_script_fd = -1;
+static struct cng_fdid g_script_id;
+
+void cng_fd_reopen_script(int fd) {
+    g_script_fd = cng_fdid_of(fd, &g_script_id) == 0 ? fd : -1;
+}
+
 /* An open the host refused on a path naming one of *our own* fds. We hold that
  * descriptor, so the guest can still be served — two distinct refusals, two
  * answers (apk 3 runs into both when it execs a package script and the shebang
@@ -2098,13 +2107,26 @@ static long ro_refusal_name(long dirfd, const char *gp, const char *host,
  *  - the inode already grants us the access asked for, so the refusal did not
  *    come from DAC. On Android that is SELinux declining an app an `open` on
  *    the tmpfs inode behind a memfd — where apk 3 keeps its scripts (mode 0777,
- *    owned by us). A fresh description of the same file is exactly what the
- *    open would have produced: duplicate ours and rewind it. The duplicate
- *    shares the original's file offset, hence the rewind — a real open always
- *    starts at 0.
+ *    owned by us). A fresh description of the same file is what the open would
+ *    have produced, and a duplicate of ours is one when its access mode is the
+ *    one asked for: duplicate it and rewind it. The duplicate shares the
+ *    original's file offset, hence the rewind — a real open always starts
+ *    at 0.
  *  - the inode denies it and the guest is fake-root: real root would have
  *    bypassed DAC, so lend the inode the owner bit *through the fd* (no path
  *    race), reopen properly, and put the mode straight back.
+ *
+ * A duplicate of a *wider* description is not what was asked for. memfd_create
+ * only makes O_RDWR files, and reopening one O_RDONLY through its own link is
+ * the one way to a read-only description of it — how Chrome makes the read-only
+ * half of every shared-memory region, which it checks with F_GETFL before it
+ * hands it to a less trusted process. An O_RDWR duplicate failed that CHECK and
+ * killed the browser; the host's refusal is what proot and a native process
+ * get, and Chrome answers it by falling back to a file under /dev/shm. So a
+ * narrower open gets `err`, with one exception: the script a #! exec ran from
+ * this fd (cng_fd_reopen_script), opened O_RDONLY. Its interpreter only reads
+ * it — busybox sh running an apk 3 package script — and was handed nothing it
+ * could open otherwise.
  *
  * Returns the new fd, or `err` unchanged when this is not that case. */
 long cng_fd_reopen(const char *host, long flags, long mode, long err) {
@@ -2133,8 +2155,10 @@ long cng_fd_reopen(const char *host, long flags, long mode, long err) {
         long cur = CNG_SYS(__NR_fcntl, fd, 3 /*F_GETFL*/, 0, 0, 0, 0);
         if (cur < 0)
             return err;
-        if ((cur & 3) != CNG_O_RDWR && (cur & 3) != acc)
-            return err; /* our fd cannot serve that access mode */
+        if ((cur & 3) != acc &&
+            !((cur & 3) == CNG_O_RDWR && acc == CNG_O_RDONLY &&
+              fd == g_script_fd && cng_fd_is(fd, &g_script_id)))
+            return err; /* a duplicate would not have that access mode */
         long nfd = CNG_SYS(__NR_fcntl, fd,
                            ((int)flags & CNG_O_CLOEXEC) ? 1030 /*F_DUPFD_CLOEXEC*/
                                                         : 0 /*F_DUPFD*/,

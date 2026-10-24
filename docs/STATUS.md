@@ -4048,6 +4048,30 @@ vfork/`posix_spawn` child-stack handling.
     fails the 15 rows a claim or a remap decides. qemu-user drops MSG_CTRUNC
     from a cut record, so the flag is checked natively only.
 
+- [x] **M92 — a refused read-only reopen of a memfd was served writable**
+  Chrome 156 makes every shared-memory region with `memfd_create` and takes
+  its read-only half with `open("/proc/self/fd/N", O_RDONLY)`; before that half
+  goes to another process it CHECKs with `F_GETFL` that it is read-only
+  (`PlatformSharedMemoryRegion::Take`). Android's policy refuses an app the
+  reopen, and `cng_fd_reopen` answered the refusal with a duplicate of the
+  descriptor it held — O_RDWR, as `memfd_create` makes it — so the browser died
+  of the CHECK (SIGTRAP, `brk #0`) as it started on Termux. Under proot the
+  refusal reaches Chrome, which falls back to a file under /dev/shm.
+  - A duplicate is the open's answer only where its access mode is the one
+    asked for. A narrower open keeps the host's refusal, except for the script
+    a `#!` exec ran from that descriptor, opened O_RDONLY: its interpreter only
+    reads it, and that is the apk 3 package-script case the duplicate was made
+    for. The exec's commit records the script by number and identity
+    (`cng_fd_reopen_script`), so a number since handed to another file is not
+    it.
+  - Test: `fd_reopen` in faketest (the refusal, the script, the same mode, a
+    script's number reused), and m7's `tests/guests/memfdro.c` on both tiers: a
+    read-only reopen is read-only or refused, never writable; a same-mode one
+    reads from the start; a script runs from one by either exec spelling; a
+    close-on-exec one is gone for its interpreter. The previous build fails 5
+    of those on the device (its "read-only" duplicate let the test write into
+    the memfd).
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

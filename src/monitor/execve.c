@@ -442,6 +442,7 @@ struct exec_job {
     int sheb_hasarg[SHEB_MAX];
     int depth;
     int gfd;
+    int script_fd; /* the guest fd a #! script was run from, or -1 */
     int dirfd, flags;
     const char *path; /* the guest's spelling (in the snapshot) */
     char **argv, **envp;
@@ -1640,6 +1641,7 @@ static long execve_plan(struct exec_job *j, int dirfd, const char *path,
     int depth = 0;          /* how many #! levels were followed */
     j->dirfd = dirfd;
     j->flags = flags;
+    j->script_fd = -1;
     j->path = path;
     j->argv = argv;
     j->envp = envp;
@@ -1829,6 +1831,8 @@ static long execve_plan(struct exec_job *j, int dirfd, const char *path,
             sheb_arg[depth][alen] = '\0';
         }
         cur = sheb_interp[depth];
+        if (depth == 0)
+            j->script_fd = gfd; /* what the interpreter will be told to read */
         gfd = -1; /* the image to load is now the interpreter, by path */
         nofollow = 0;
     }
@@ -2034,6 +2038,12 @@ static long execve_commit(struct exec_job *j, unsigned long *out_sp,
      * like a real execve. Close FD_CLOEXEC descriptors (see cng_close_cloexec)
      * before entering the new program. */
     cng_close_cloexec();
+    /* The interpreter is handed the script by the name the guest ran it by,
+     * and a /proc/self/fd one is a reopen the host may refuse (SELinux on a
+     * memfd): cng_fd_reopen answers it from the fd. Only from one that
+     * survived the close above — a close-on-exec one is gone, and the
+     * interpreter's open of it fails as it does on a kernel. */
+    cng_fd_reopen_script(j->script_fd);
     cng_reset_signals();
     /* System V shm attaches do not survive execve. A real one tears down the
      * address space; ours keeps it, so the mappings have to go explicitly (and

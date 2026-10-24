@@ -1587,39 +1587,62 @@ int cng_cmd_faketest(int argc, char **argv, char **envp, unsigned long *auxv) {
 
     /* The other refusal kind, which no DAC change can fix: the inode grants
      * the access and the open is still denied (on Android, SELinux on the
-     * tmpfs inode behind a memfd — where apk 3 keeps package scripts). The
-     * refusal cannot be provoked on a devbox, so drive cng_fd_reopen directly
-     * with a memfd and a simulated EACCES: it must hand back a usable
-     * duplicate, rewound to the start even though ours sits at EOF. */
+     * tmpfs inode behind a memfd — where apk 3 keeps package scripts, and
+     * where Chrome keeps every shared-memory region). The refusal cannot be
+     * provoked on a devbox, so drive cng_fd_reopen directly with a memfd and a
+     * simulated EACCES. A duplicate is handed back, rewound to the start even
+     * though ours sits at EOF, only where it is the description that was asked
+     * for: the same access mode, or the script a #! exec ran from this fd
+     * opened O_RDONLY by its interpreter. A read-only open of any other O_RDWR
+     * memfd keeps the refusal — the duplicate would report O_RDWR from
+     * F_GETFL, which Chrome CHECKs — and so does the script's number once it
+     * names another file. */
     {
         long mfd = sys_memfd_create("cng-fdreopen", 1 /*MFD_CLOEXEC*/);
-        int dup_ok = 0, content = 0;
+        long narrower = 1, reused = 1;
+        int script = 0, content = 0, exact = 0;
         if (mfd >= 0) {
             sys_write((int)mfd, "SCRIPT", 6); /* our offset is now at EOF */
             char pfd[40];
-            size_t k = cng_strlcpy(pfd, "/proc/self/fd/", sizeof pfd);
-            char d[8];
-            int di = 0;
-            for (long v = mfd; di < 7; v /= 10) {
-                d[di++] = (char)('0' + v % 10);
-                if (v < 10)
-                    break;
-            }
-            while (di > 0 && k + 1 < sizeof pfd)
-                pfd[k++] = d[--di];
-            pfd[k] = '\0';
+            cng_snprintf(pfd, sizeof pfd, "/proc/self/fd/%d", (int)mfd);
+            narrower = cng_fd_reopen(pfd, CNG_O_RDONLY, 0, -EACCES);
+            if (narrower >= 0)
+                sys_close((int)narrower);
+            cng_fd_reopen_script((int)mfd);
             long nfd = cng_fd_reopen(pfd, CNG_O_RDONLY, 0, -EACCES);
             if (nfd >= 0) {
-                dup_ok = 1;
+                script = 1;
                 char b[8];
                 long n = sys_read((int)nfd, b, sizeof b);
                 content = (n == 6 && b[0] == 'S' && b[5] == 'T');
                 sys_close((int)nfd);
             }
+            cng_fd_reopen_script(-1);
+            nfd = cng_fd_reopen(pfd, CNG_O_RDWR, 0, -EACCES);
+            if (nfd >= 0) {
+                exact = 1;
+                sys_close((int)nfd);
+            }
+            /* The record outlives the file: the number handed to another. */
+            cng_fd_reopen_script((int)mfd);
             sys_close((int)mfd);
+            long other = sys_memfd_create("cng-fdreopen2", 1 /*MFD_CLOEXEC*/);
+            if (other == mfd) {
+                reused = cng_fd_reopen(pfd, CNG_O_RDONLY, 0, -EACCES);
+                if (reused >= 0)
+                    sys_close((int)reused);
+            }
+            if (other >= 0)
+                sys_close((int)other);
+            cng_fd_reopen_script(-1);
         }
-        cng_dprintf(1, "fd_reopen: dup=%d content=%d -> %s\n", dup_ok, content,
-                    (dup_ok && content) ? "OK" : "FAIL");
+        cng_dprintf(1, "fd_reopen: narrower=%ld script=%d content=%d exact=%d"
+                       " reused=%ld -> %s\n",
+                    narrower, script, content, exact, reused,
+                    (narrower == -EACCES && script && content && exact &&
+                     reused == -EACCES)
+                        ? "OK"
+                        : "FAIL");
     }
 
     /* fchmodat2 answered ENOSYS — by a kernel predating it (Linux < 6.6), or by

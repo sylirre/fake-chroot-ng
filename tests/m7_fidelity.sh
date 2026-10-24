@@ -17,8 +17,13 @@ check_contains "stat and fstat agree about ownership under --fake-id" \
     "stat_vs_fstat stat=0:0 fstat=0:0 -> OK" "$out"
 check_contains "fake-root reopens a file it may execute but not read" \
     "fakeroot_reopen: opened=1 mode_kept=1 -> OK" "$out"
-check_contains "a refused reopen is served from the fd we hold, rewound" \
-    "fd_reopen: dup=1 content=1 -> OK" "$out"
+# A reopen the host refused is served from the fd we hold only as the
+# description the open asked for. A read-only reopen of an O_RDWR memfd is how
+# Chrome makes the read-only half of a shared-memory region, and an O_RDWR
+# duplicate failed its F_GETFL CHECK: the refusal stands, except for the script
+# a #! exec ran from that fd — and not once its number names another file.
+check_contains "a refused reopen is served from the fd we hold, in its mode" \
+    "fd_reopen: narrower=-13 script=1 content=1 exact=1 reused=-13 -> OK" "$out"
 check_contains "fake-root passes fchmodat2's ENOSYS on for the fallback" \
     "fchmodat2_enosys=-38 want=-38 -> OK" "$out"
 check_contains "supplementary groups empty" "ngroups=0"           "$out"
@@ -364,6 +369,48 @@ elif guest_cc_report "$SCD/scmcred" tests/guests/scmcred.c; then
     scm_rows "real ids" -R "" "$(id -u)" "$(id -g)"
 fi
 rm -rf "$SCD"
+
+# A memfd reopened through its own /proc link. memfd_create only makes O_RDWR
+# files, and that open is the one way to a read-only description of one —
+# Chrome's read-only half of every shared-memory region, which it CHECKs with
+# F_GETFL — and how an interpreter reads a script run from a memfd (apk 3).
+# Android's policy refuses an app the open, and the O_RDWR duplicate chroot-ng
+# answered with killed Chrome. Where the host opens it, the description is
+# read-only; where it refuses, the refusal stands — never a writable one. The
+# exception is the script a #! exec ran from the fd, by either spelling, which
+# its interpreter reads whatever the host says; a close-on-exec one is gone by
+# then, as it is on a kernel.
+MRD=$(mktemp -d)
+if ! guest_xlate_ready "memfd reopen legs"; then
+    :
+elif guest_cc_report "$MRD/memfdro" tests/guests/memfdro.c; then
+    mkdir -p "$MRD/rootfs/bin"; cp "$MRD/memfdro" "$MRD/rootfs/bin/"
+    tiers=-R
+    [ "$CNG_SECCOMP_LIVE" = 1 ] && tiers="-R none"
+    for tier in $tiers; do
+        t=$tier; [ "$t" = none ] && t=
+        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+        out=$(run_t 60 $t $GUEST_BINDS "$MRD/rootfs" /bin/memfdro 2>/dev/null)
+        case "$out" in
+        *"ro open=0 "*)
+            check_contains "memfd ($tier): a read-only reopen is read-only" \
+                "ro open=0 accmode=0 write=9" "$out" ;;
+        *)
+            check_contains "memfd ($tier): ...or the host's refusal, never a writable one" \
+                "ro open=13" "$out" ;;
+        esac
+        check_contains "memfd ($tier): a reopen in its own mode reads from the start" \
+            "rw open=0 accmode=2 read=data" "$out"
+        check_contains "memfd ($tier): a script run from one is read by its interpreter" \
+            "script interp open=0 head=1" "$out"
+        check_contains "memfd ($tier): ...and the exec says so" "script status=0" "$out"
+        check_contains "memfd ($tier): ...run through execveat's AT_EMPTY_PATH too" \
+            "script-at interp open=0 head=1" "$out"
+        check_contains "memfd ($tier): a close-on-exec one is gone for the interpreter" \
+            "cloexec interp open=2 head=0" "$out"
+    done
+fi
+rm -rf "$MRD"
 
 # --- the initial program's own /proc/self/exe ------------------------------
 # Every program after the first gets its exe link from the emulated execve; the

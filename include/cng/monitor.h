@@ -396,9 +396,16 @@ int cng_fd_is(int fd, const struct cng_fdid *id);
 
 /* Serve an open the host refused (`err`) on a path naming one of our own fds,
  * from that descriptor: a duplicate when the inode grants the access anyway
- * (a non-DAC refusal, e.g. SELinux on a memfd), or a mode-borrowing reopen
- * under fake-root. Returns the new fd, or `err`. */
+ * (a non-DAC refusal, e.g. SELinux on a memfd) and the description's access
+ * mode is the one asked for, or a mode-borrowing reopen under fake-root.
+ * Returns the new fd, or `err`. */
 long cng_fd_reopen(const char *host, long flags, long mode, long err);
+
+/* The script a #! exec ran from one of our fds (`fd`, or -1 for none): the one
+ * descriptor whose refused O_RDONLY reopen cng_fd_reopen still answers with a
+ * duplicate of a wider description, because the interpreter it was handed to
+ * only reads it. Set by every exec's commit. */
+void cng_fd_reopen_script(int fd);
 
 /* Is a guest byte range safe to dereference from the handler? Every signal but
  * SIGSYS is masked there, so a SIGSEGV on a bad guest pointer is unblockable and
