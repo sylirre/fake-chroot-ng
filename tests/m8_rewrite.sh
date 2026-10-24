@@ -243,8 +243,13 @@ if guest_xlate_ready "vfork-under-rewrite leg" &&
     check_contains "a bare vfork child exits on the parent's stack" \
         "vfork-exit: exited 7" "$out"
     check_contains "a vfork child execs" "vfork-exec: exited 42" "$out"
-    check_contains "a posix_spawn child resumes on its own stack and execs" \
-        "spawn-exec: exited 42" "$out"
+    case "$out" in
+    *"posix_spawn: none in this libc"*)
+        skip "posix_spawn under -R: the guest's libc has none (bionic before API 28)" ;;
+    *)
+        check_contains "a posix_spawn child resumes on its own stack and execs" \
+            "spawn-exec: exited 42" "$out" ;;
+    esac
     check_contains "the exec'd program got its argv" "argv1=from-vforker" "$out"
     if [ -n "$want" ]; then
         check "and the outcomes match the same program under the kernel" \
