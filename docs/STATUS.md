@@ -3537,14 +3537,15 @@ vfork/`posix_spawn` child-stack handling.
 
 - [x] **M77 — under -R a thread that freed its own stack killed the process**
   Found behind M76: with the JVM past its startup probe, `java` under -R died
-  of a SEGV as soon as its first thread ended. musl's `__unmapself` and bionic's
-  `_exit_with_stack_teardown` end a detached thread with an `munmap` of the
-  stack it is standing on and an `exit` (`mov x8,#215; svc 0; [mov x0,#0;]
-  mov x8,#93; svc 0`), and every detached thread of those libcs takes that
-  road — the JVM's all are. The rewriter replaced both `svc` with branches to
-  trampolines, and a trampoline builds its frame on the caller's stack and reads
-  every register back from it, so the thread returned from the munmap to a
-  frame that was gone. The default action of that SEGV takes the whole process.
+  of a SEGV as soon as its first thread ended. musl's `__unmapself` and
+  bionic's `_exit_with_stack_teardown` end a detached thread with an `munmap`
+  of the stack it is standing on and an `exit` (`mov x8,#215; svc 0; [mov
+  x0,#0;] mov x8,#93; svc 0`, bionic's with w8 — matched only since M90), and
+  every detached thread of those libcs takes that road — the JVM's all are.
+  The rewriter replaced both `svc` with branches to trampolines, and a
+  trampoline builds its frame on the caller's stack and reads every register
+  back from it, so the thread returned from the munmap to a frame that was
+  gone. The default action of that SEGV takes the whole process.
   - `scan()` leaves the pair alone: the munmap is told from any other by an
     exit two or three words on, and the exit by an munmap two or three words
     before it (`stack_teardown`), so a program's ordinary calls are rewritten as
@@ -4006,6 +4007,17 @@ vfork/`posix_spawn` child-stack handling.
     binaries itself, so it is skipped under qemu-user. The plain chain leg
     crashed 2 runs in 30 on the S7 before (9 in 100 with the first half of
     this alone) and none in 400 after.
+
+- [x] **M90 — bionic's stack teardown was rewritten after all**
+  M77 leaves alone the `svc` pair a detached thread frees its own stack with,
+  recognising each by the `mov x8, #nr` before it. bionic writes the number
+  into w8 (`mov w8, #215` and `mov w8, #93`, on Android 8 and 15 alike), so its
+  `_exit_with_stack_teardown` was rewritten like any other site wherever its
+  code is rewritten ahead of time (a static bionic program, or a library
+  copied because its file may not be mapped executable), and every detached
+  thread then died of a SEGV on its way out. The match ignores the width bit
+  now. `unmapself.c` wrote bionic's sequence with x8, which is how it passed;
+  it writes w8 now, and the previous rewriter fails it.
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 

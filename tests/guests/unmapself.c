@@ -4,8 +4,12 @@
  * four instructions of assembly that touch no stack at all — unmap, then exit:
  *
  *     musl   __unmapself:               mov x8,#215; svc 0; mov x8,#93; svc 0
- *     bionic _exit_with_stack_teardown: mov x8,#215; svc 0; mov x0,#0;
- *                                       mov x8,#93; svc 0
+ *     bionic _exit_with_stack_teardown: mov w8,#215; svc 0; mov x0,#0;
+ *                                       mov w8,#93; svc 0
+ *
+ * bionic writes the number into w8, as every Android from 8 to 15 has it;
+ * written here with x8, this passed while the rewriter recognised only that,
+ * and rewrote the real thing.
  *
  * Every detached thread of a musl or bionic program ends this way (the JVM's
  * all are, being created detached). The -R rewriter replaces each `svc` with a
@@ -55,10 +59,10 @@ __asm__(".text\n"
         ".global cng_teardown_bionic\n"
         ".type cng_teardown_bionic, %function\n"
         "cng_teardown_bionic:\n"
-        "    mov x8, #215\n"
+        "    mov w8, #215\n"
         "    svc #0\n"
         "    mov x0, #0\n"
-        "    mov x8, #93\n"
+        "    mov w8, #93\n"
         "    svc #0\n"
         ".size cng_teardown_bionic, .-cng_teardown_bionic\n");
 extern void cng_teardown_musl(void *base, unsigned long len)

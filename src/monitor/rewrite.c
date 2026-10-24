@@ -23,8 +23,10 @@ extern char cng_svc_tramp_back[];
 #define SVC0_INSN    0xD4000001u /* `svc #0` */
 #define B_OPCODE     0x14000000u /* unconditional branch */
 #define BRANCH_REACH (1L << 27)  /* +-128 MiB */
-#define MOVZ_X8_MASK 0xFFE0001Fu /* movz x8, #imm16 (hw=0) */
-#define MOVZ_X8      0xD2800008u
+/* movz x8 or w8, #imm16 (hw=0): the width bit is left out, since bionic loads
+ * its syscall numbers as `mov w8, #nr`, and musl and glibc as `mov x8, #nr`. */
+#define MOVZ_X8_MASK 0x7FE0001Fu
+#define MOVZ_X8      0x52800008u
 #define NR_RT_SIGRETURN 139u
 #define NR_MUNMAP       215u
 #define NR_EXIT         93u
@@ -189,8 +191,8 @@ static int writes_x8(uint32_t w) {
     return 0;
 }
 
-/* Is the word at `a` an `svc #0` with `mov x8, #nr` in the word before it? Reads
- * `a - 4` and `a`, so the caller keeps both inside the mapping. */
+/* Is the word at `a` an `svc #0` with `mov x8, #nr` (or w8) in the word before
+ * it? Reads `a - 4` and `a`, so the caller keeps both inside the mapping. */
 static int svc_nr(unsigned long a, unsigned long floor, unsigned nr) {
     if (a < floor + 4 || *(uint32_t *)a != SVC0_INSN)
         return 0;
@@ -201,7 +203,9 @@ static int svc_nr(unsigned long a, unsigned long floor, unsigned nr) {
 /* One of the two `svc` of a thread freeing its own stack: unmap the stack it is
  * standing on, then exit. musl's __unmapself is exactly
  *     mov x8,#215; svc 0; mov x8,#93; svc 0
- * and bionic's _exit_with_stack_teardown has a `mov x0,#0` between them. The
+ * and bionic's _exit_with_stack_teardown has a `mov x0,#0` between them and
+ * the numbers in w8 (Android 8 to 15 alike), which went unrecognised while
+ * only x8 was matched. The
  * munmap is told from the others by the exit that follows it, and the exit by
  * the munmap before it, so that a program's ordinary munmap and exit are as
  * they were. `hi` bounds the look ahead, which is the only read that could
