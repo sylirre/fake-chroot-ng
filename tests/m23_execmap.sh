@@ -107,3 +107,49 @@ else
     fi
 fi
 rm -rf "$XMR"
+
+# mremap(MREMAP_DONTUNMAP) out of the loader's copy of an image. The move
+# leaves the old range mapped, reading back what backs it: the file's bytes
+# for the file mapping a kernel exec makes, zero-fill for the anonymous copy
+# the loader makes instead. V8 moves its builtins out of the text of the
+# binary that carries them and CHECKs the first word at both addresses, and
+# every Chrome renderer died of it. The oracle is the kernel's own move of a
+# private mapping of the same program's file, whichever answer this kernel
+# gives (EINVAL before 5.13); anonymous memory must still come back zeroed.
+# -F loads the image from the file, where the kernel answers by itself.
+out=$(run -t bpftest 2>&1)
+check_contains "mremap with MREMAP_DONTUNMAP traps" \
+    "bpftest mremap DONTUNMAP traps: TRAP -> OK" "$out"
+check_contains "...and a realloc's growth runs native" \
+    "bpftest mremap a growth that may move runs native: ALLOW -> OK" "$out"
+check_contains "...and so does a fixed move without it" \
+    "bpftest mremap a fixed move runs native: ALLOW -> OK" "$out"
+DUM=$(mktemp -d)
+dum_rows() { # tier-desc, extra flags
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+    out=$(run_t 60 $2 $GUEST_BINDS "$DUM/rootfs" /bin/dontunmap 2>/dev/null)
+    case "$out" in
+    *"anon r=0 "*)
+        check_contains "DONTUNMAP ($1): anonymous memory moves and leaves zero-fill" \
+            "anon r=0 kept=0 zeroed=1" "$out"
+        _want=$(printf '%s\n' "$out" | sed -n 's/^file //p')
+        check_contains "DONTUNMAP ($1): ...a file mapping keeps its bytes, or says EINVAL" \
+            "file r=" "$out"
+        check_contains "DONTUNMAP ($1): the image's own pages move as that file mapping does" \
+            "image ${_want:-?}" "$out"
+        ;;
+    *"anon r="*) skip "DONTUNMAP ($1): this kernel has no MREMAP_DONTUNMAP" ;;
+    *) check_contains "DONTUNMAP ($1): the guest ran" "anon r=" "$out" ;;
+    esac
+}
+if ! guest_xlate_ready "DONTUNMAP legs"; then
+    :
+elif guest_cc_report "$DUM/dontunmap" tests/guests/dontunmap.c; then
+    mkdir -p "$DUM/rootfs/bin"; cp "$DUM/dontunmap" "$DUM/rootfs/bin/"
+    dum_rows "-R" -R
+    if [ "$CNG_SECCOMP_LIVE" = 1 ]; then
+        dum_rows "seccomp" ""
+        dum_rows "-F" -F
+    fi
+fi
+rm -rf "$DUM"

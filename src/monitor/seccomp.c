@@ -673,6 +673,29 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
     f[n++] = (struct sock_filter)CNG_BPF_STMT(
         CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* reload A=nr */
 
+    /* mremap, only with MREMAP_DONTUNMAP (args[3]): the move that leaves the
+     * old range mapped, where a copy the loader made of an image reads back
+     * zeroes and the file mapping it stands in for reads back the file
+     * (execmap.c). Every other mremap — realloc growing a large block — stays
+     * off the handler, and DONTUNMAP itself is rare: V8 moving its builtins,
+     * a garbage collector's userfaultfd compaction. */
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, (uint32_t)__NR_mremap, 0,
+        5); /* not mremap -> reload nr */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_ARGS + 24); /* A = flags */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_ALU | CNG_BPF_AND | CNG_BPF_K, CNG_MREMAP_DONTUNMAP);
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, 0, 1,
+        0); /* no DONTUNMAP -> allow, DONTUNMAP -> trap */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
+                                              CNG_SECCOMP_RET_TRAP);
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_RET | CNG_BPF_K, CNG_SECCOMP_RET_ALLOW); /* no DONTUNMAP */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* reload A=nr */
+
     /* The mask-taking waits (see the note in path_syscalls): trapped only
      * when the sigset argument is non-NULL. It is a pointer, so both halves
      * are tested. Offsets: for each, "not this nr" skips the whole block;

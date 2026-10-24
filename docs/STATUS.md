@@ -4072,6 +4072,34 @@ vfork/`posix_spawn` child-stack handling.
     of those on the device (its "read-only" duplicate let the test write into
     the memfd).
 
+- [x] **M93 — an image moved with MREMAP_DONTUNMAP read back zeroes**
+  The loader's anonymous strategy copies an image in where a kernel exec maps
+  it from the file, and `mremap(MREMAP_DONTUNMAP)` tells the two apart: the old
+  range stays mapped, and its next touch faults in the file's bytes for a file
+  mapping, zero-fill for anonymous memory. V8 moves its embedded builtins out
+  of the text of the binary that carries them that way, then CHECKs the first
+  word at both addresses (`OS::RemapPages`), and every Chrome renderer and
+  utility process died of it. `-F`, which maps the image from the file, was
+  not affected.
+  - The loader records the pages it filled from the file (`cng_loaded.copied`,
+    one range per PT_LOAD with a file part) and the generation entering
+    publishes them (`cng_execmap_images`). The filter traps mremap only with the
+    flag; a move out of a copy is the kernel's, and the old range then gets back
+    the bytes that moved, written through /proc/self/mem
+    (`cng_execmap_dontunmap`), which takes the range's own protection as it is.
+  - Where the kernel moves no file mapping this way (5.7–5.12 refuse all but
+    private anonymous memory) or /proc/self/mem cannot be written, both probed
+    once, the guest is told EINVAL, as it would be for the file mapping.
+  - Limits: a page the guest wrote reads back as written where the kernel would
+    refault the file's bytes (which keeps -R's rewritten sites); a range moved
+    once is not recorded again; a guest that unmaps part of its own image
+    leaves a stale record (munmap is not trapped); the copies execmap makes of
+    a guest's own mmaps are not recorded.
+  - Test: m23's `tests/guests/dontunmap.c` against the kernel's own move of a
+    private mapping of the same program's file, on -R, seccomp and -F, with
+    anonymous memory still reading back zeroed; bpftest checks that only the
+    flag traps.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

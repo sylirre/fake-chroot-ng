@@ -6346,6 +6346,19 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_mprotect:
         return reissue(a0, a1, a2, a3, a4, a5, nr);
 
+    /* mremap with MREMAP_DONTUNMAP, which leaves the old range mapped — and
+     * reading what backs it: a file's bytes, or zero-fill. The loader's images
+     * are anonymous copies standing in for file mappings, so a move out of one
+     * is made as a file mapping's would be (execmap.c). The filter traps only
+     * the flag; under -R every mremap comes here and the rest go straight back
+     * out. */
+    case __NR_mremap:
+        if (!((unsigned long)a3 & CNG_MREMAP_DONTUNMAP) ||
+            !cng_execmap_copied((unsigned long)a0, (unsigned long)a1))
+            return reissue(a0, a1, a2, a3, a4, a5, nr);
+        return cng_execmap_dontunmap((unsigned long)a0, (unsigned long)a1,
+                                     (unsigned long)a2, a3, (unsigned long)a4);
+
     /* --- credential syscalls (trapped only when --fake-id is active) ---
      * All get/set uid/gid family, groups, and capability calls are emulated
      * against the synthetic credential set in cred.c, which enforces real POSIX

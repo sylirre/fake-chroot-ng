@@ -30,6 +30,7 @@
  * a thread that could not be reached. See the block comments on each below.
  */
 #include "cng/broker.h" /* cng_broker_env: no getenv in a freestanding build */
+#include "cng/execmap.h"
 #include "cng/l2s.h"
 #include "cng/loader.h"
 #include "cng/monitor.h"
@@ -1435,6 +1436,9 @@ void cng_exec_generation(const struct cng_loaded *prog,
     }
     neu[2].lo = stack_lo;
     neu[2].len = stack_len;
+    /* The images' copied pages are the ones an mremap has to move as file
+     * mappings from now on, and the outgoing images' are nobody's. */
+    cng_execmap_images(prog, interp);
 
     /* Retire the outgoing generation, unless another thread may still be in it.
      * A range the incoming one has already taken over is dropped rather than

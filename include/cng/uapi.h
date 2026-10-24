@@ -69,6 +69,11 @@
 #define CNG_MAP_FIXED_NOREPLACE 0x100000
 #define CNG_MAP_FAILED          ((void *)-1L)
 
+/* mremap flags */
+#define CNG_MREMAP_MAYMOVE   0x1
+#define CNG_MREMAP_FIXED     0x2
+#define CNG_MREMAP_DONTUNMAP 0x4 /* 5.7; any private mapping since 5.13 */
+
 /* openat2(2): struct open_how and its resolve constraints. The struct is the
  * kernel's ABI — three u64s, and `size` is checked against it — so it is
  * spelled out here rather than read a field at a time. */

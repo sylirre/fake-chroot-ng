@@ -546,11 +546,11 @@ int cng_build_seccomp_traceall(struct sock_filter *f, int cap);
 int cng_build_seccomp_tracer(struct sock_filter *f, int cap);
 
 /* Upper bound on the filter's instruction count: prologue + the designed-ENOSYS
- * block + gate + the clone/prctl/ioctl/mmap/wait/read blocks + one check per
- * trapped syscall + the two tail RETs. Raised from 128 for the AF_UNIX and
- * credential additions and from 256 for the :ro-by-descriptor ones (M45),
- * which put one check per mutating ioctl request into the ioctl block; the
- * largest configuration (every optional set on, a :ro bind in the view) is
+ * block + gate + the clone/prctl/ioctl/mmap/mprotect/mremap/wait/read blocks +
+ * one check per trapped syscall + the two tail RETs. Raised from 128 for the
+ * AF_UNIX and credential additions and from 256 for the :ro-by-descriptor ones
+ * (M45), which put one check per mutating ioctl request into the ioctl block;
+ * the largest configuration (every optional set on, a :ro bind in the view) is
  * measured by `-t bpftest`, which refuses a build that leaves fewer than eight
  * spare, since the builder has no bounds check of its own. The kernel's own
  * limit is 4096 instructions; the tail's per-syscall jump offset is a u8, which

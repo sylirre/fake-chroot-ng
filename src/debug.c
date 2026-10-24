@@ -8769,6 +8769,48 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
         }
     }
 
+    /* mremap traps when — and only when — its flags (args[3]) carry
+     * MREMAP_DONTUNMAP: the move that leaves the old range mapped, which a
+     * loader copy has to answer as the file mapping it stands in for. A
+     * realloc's growth and an ordinary move stay native, and so does the
+     * dispatcher's own re-issue. */
+    {
+        static const struct {
+            const char *what;
+            u32 flags;
+            unsigned long ip;
+            u32 want;
+        } mr[] = {
+            {"DONTUNMAP traps",
+             CNG_MREMAP_MAYMOVE | CNG_MREMAP_FIXED | CNG_MREMAP_DONTUNMAP,
+             0x1000, CNG_SECCOMP_RET_TRAP},
+            {"a growth that may move runs native", CNG_MREMAP_MAYMOVE, 0x1000,
+             CNG_SECCOMP_RET_ALLOW},
+            {"a fixed move runs native", CNG_MREMAP_MAYMOVE | CNG_MREMAP_FIXED,
+             0x1000, CNG_SECCOMP_RET_ALLOW},
+            {"an in-place resize runs native", 0, 0x1000,
+             CNG_SECCOMP_RET_ALLOW},
+            {"the dispatcher's own re-issue is allowed",
+             CNG_MREMAP_MAYMOVE | CNG_MREMAP_DONTUNMAP, 0,
+             CNG_SECCOMP_RET_ALLOW},
+        };
+        for (unsigned k = 0; k < sizeof mr / sizeof mr[0]; k++) {
+            u32 d[16];
+            int bad = 0;
+            bpf_data(d, __NR_mremap, mr[k].ip ? mr[k].ip : gate, 0);
+            d[10] = mr[k].flags; /* args[3] low */
+            u32 got = bpf_run(f, n, d, &bad);
+            int ok = !bad && got == mr[k].want;
+            cng_dprintf(1, "bpftest mremap %s: %s -> %s\n", mr[k].what,
+                        bad ? "malformed"
+                        : got == CNG_SECCOMP_RET_TRAP    ? "TRAP"
+                        : got == CNG_SECCOMP_RET_ALLOW   ? "ALLOW"
+                                                         : "other",
+                        ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+    }
+
     /* The mask-taking waits: trapped only with a sigset pointer, which is a
      * pointer, so both halves are tested — a pointer whose low word is zero
      * is still a pointer. The always-trapped three and signalfd4 sit in the

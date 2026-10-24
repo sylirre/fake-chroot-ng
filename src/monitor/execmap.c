@@ -250,3 +250,142 @@ long cng_execmap(unsigned long addr, unsigned long len, long prot, long flags,
                     have < mlen ? mlen - have : 0);
     return (long)p;
 }
+
+/* ---- the loader's copies under mremap(MREMAP_DONTUNMAP) -------------------
+ *
+ * The loader's anonymous strategy copies an image in where a kernel exec maps
+ * it from the file, and a mremap that moves pages away tells the two apart:
+ * MREMAP_DONTUNMAP leaves the old range mapped, and its next touch faults in
+ * what that mapping is backed by — the file's bytes for a file mapping, zeroes
+ * for an anonymous one. V8 moves its embedded builtins, which live in the text
+ * of the binary that embeds it, into its code range this way and CHECKs that
+ * the first word reads the same at both addresses; against a copy it read 0 at
+ * the old one, and every Chrome renderer died of the CHECK.
+ *
+ * So the move is the kernel's, and the old range gets back the bytes that
+ * moved: the content a file mapping leaves there. Written through
+ * /proc/self/mem, which takes the old range's own protection as it is — the
+ * same write a debugger's breakpoint makes, instruction-cache maintenance
+ * included — and answers a range that went away under us with an errno where
+ * a store of ours would fault in a handler that cannot take one. A page the
+ * guest had written reads back as written, where the kernel would refault the
+ * file's own bytes: the copy has no file under it to refault from, and the
+ * one difference that matters — -R's rewritten svc sites — is better kept.
+ *
+ * Not every kernel moves a file mapping this way: DONTUNMAP is 5.7, and until
+ * 5.13 it refused anything but private anonymous memory with EINVAL. There a
+ * copy would move as the anonymous memory it is, so the guest is told what the
+ * kernel tells it for the file mapping, before anything moves. That is
+ * also the answer where the write cannot be made: a range left zeroed is the
+ * very failure this exists for, and EINVAL is one every caller of a 5.12
+ * kernel already has a path for (V8's is to copy the builtins instead).
+ *
+ * Only the copies the running images were loaded as are known. A guest that
+ * unmaps part of its own image and maps something else there leaves a stale
+ * record behind (munmap is not trapped), and pages moved out of a copy are
+ * not one at their new address, so moving them on again moves them as the
+ * anonymous memory they are there. Neither is something a program does to
+ * its own text. */
+static struct cng_load_range g_copied[2 * CNG_LOAD_COPIED];
+static int g_ncopied;
+
+void cng_execmap_images(const struct cng_loaded *prog,
+                        const struct cng_loaded *interp) {
+    const struct cng_loaded *img[2] = {prog, interp};
+    int n = 0;
+    for (int k = 0; k < 2; k++)
+        for (int i = 0; img[k] && i < img[k]->ncopied; i++)
+            g_copied[n++] = img[k]->copied[i];
+    g_ncopied = n;
+}
+
+int cng_execmap_copied(unsigned long addr, unsigned long len) {
+    unsigned long end = addr + len;
+    if (end < addr)
+        end = ~0UL;
+    for (int i = 0; i < g_ncopied; i++)
+        if (addr < g_copied[i].hi && g_copied[i].lo < end)
+            return 1;
+    return 0;
+}
+
+/* Does this kernel move a private file mapping with MREMAP_DONTUNMAP, and can
+ * the old range then be written through /proc/self/mem? Asked of a one-page
+ * private mapping of a memfd — a file mapping like any other, to mremap — and
+ * of /proc/self/mem against the old range it leaves, which is read-only.
+ * 1 yes, -1 no; asked once. */
+static int g_dontunmap_files;
+
+static int dontunmap_probe(void) {
+    unsigned long pg = cng_page_size;
+    long mfd = sys_memfd_create("cng-dontunmap", 1 /*MFD_CLOEXEC*/);
+    if (mfd < 0)
+        return -1; /* no memfd: a kernel well before DONTUNMAP */
+    int ok = -1;
+    void *p = sys_ftruncate((int)mfd, (long)pg) == 0
+                  ? sys_mmap(0, pg, CNG_PROT_READ, CNG_MAP_PRIVATE, (int)mfd, 0)
+                  : CNG_MAP_FAILED;
+    if (!cng_is_err((long)p) && p != CNG_MAP_FAILED) {
+        long q = CNG_SYS(__NR_mremap, p, pg, pg,
+                         CNG_MREMAP_MAYMOVE | CNG_MREMAP_DONTUNMAP, 0, 0);
+        if (!cng_is_err(q)) {
+            long m = sys_openat(CNG_AT_FDCWD, "/proc/self/mem",
+                                CNG_O_RDWR | CNG_O_CLOEXEC, 0);
+            char one = 1;
+            if (m >= 0 && sys_pwrite64((int)m, &one, 1, (long)p) == 1 &&
+                *(volatile char *)p == 1)
+                ok = 1;
+            if (m >= 0)
+                sys_close((int)m);
+            sys_munmap((void *)q, pg);
+        }
+        sys_munmap(p, pg);
+    }
+    sys_close((int)mfd);
+    return ok;
+}
+
+long cng_execmap_dontunmap(unsigned long old, unsigned long len,
+                           unsigned long nlen, long flags,
+                           unsigned long naddr) {
+    int v = __atomic_load_n(&g_dontunmap_files, __ATOMIC_ACQUIRE);
+    if (!v) {
+        v = dontunmap_probe();
+        __atomic_store_n(&g_dontunmap_files, v, __ATOMIC_RELEASE);
+    }
+    long m = v > 0 ? sys_openat(CNG_AT_FDCWD, "/proc/self/mem",
+                                CNG_O_RDWR | CNG_O_CLOEXEC, 0)
+                   : -1;
+    if (m < 0) {
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] mremap %lx+%lu DONTUNMAP of a loader copy ->"
+                           " EINVAL (%s)\n",
+                        old, len, v > 0 ? "no /proc/self/mem" : "kernel");
+        return -EINVAL;
+    }
+    long r = CNG_SYS(__NR_mremap, old, len, nlen, flags, naddr, 0);
+    if (!cng_is_err(r)) {
+        for (int i = 0; i < g_ncopied; i++) {
+            unsigned long lo = g_copied[i].lo > old ? g_copied[i].lo : old;
+            unsigned long hi =
+                g_copied[i].hi < old + len ? g_copied[i].hi : old + len;
+            while (lo < hi) {
+                long w = sys_pwrite64((int)m, (void *)(r + (lo - old)), hi - lo,
+                                      (long)lo);
+                if (w <= 0) {
+                    if (cng_g_debug)
+                        cng_dprintf(2, "[cng] mremap DONTUNMAP: restoring"
+                                       " %lx-%lx failed (%ld)\n",
+                                    lo, hi, w);
+                    break;
+                }
+                lo += (unsigned long)w;
+            }
+        }
+    }
+    sys_close((int)m);
+    if (cng_g_debug)
+        cng_dprintf(2, "[cng] mremap %lx+%lu DONTUNMAP of a loader copy -> %lx\n",
+                    old, len, r);
+    return r;
+}

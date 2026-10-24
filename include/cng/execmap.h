@@ -34,4 +34,20 @@ extern int cng_g_execmap_force;
 long cng_execmap(unsigned long addr, unsigned long len, long prot, long flags,
                  long fd, unsigned long off);
 
+/* The loader's own copies, which stand in for the file mappings a kernel
+ * exec makes: the program and its interpreter as cng_exec_generation names
+ * them (either may be null), recorded until the next exec replaces them. */
+struct cng_loaded;
+void cng_execmap_images(const struct cng_loaded *prog,
+                        const struct cng_loaded *interp);
+
+/* Does [addr, addr+len) touch one of those copies? */
+int cng_execmap_copied(unsigned long addr, unsigned long len);
+
+/* mremap(2) with MREMAP_DONTUNMAP on a range that does: the move a file
+ * mapping makes, which leaves the file's bytes at the old address where an
+ * anonymous one leaves zero-fill. Returns what the kernel returns. */
+long cng_execmap_dontunmap(unsigned long old, unsigned long len,
+                           unsigned long nlen, long flags, unsigned long naddr);
+
 #endif /* CNG_EXECMAP_H */

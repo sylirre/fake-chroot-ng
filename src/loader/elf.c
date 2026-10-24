@@ -537,10 +537,11 @@ int cng_elf_map(const struct cng_elf_plan *plan, unsigned long base_hint,
     if (!plan->is_dyn &&
         cng_hits_monitor(lo, span + (cng_g_rewrite ? CNG_TRAMP_POOL : 0)))
         return CNG_LOAD_ECLOBBER;
-    int rc = cng_g_loader_file ? map_file(plan->fd, eh, ph, plan->is_dyn, lo,
-                                          span, base_hint, &bias, &maplen)
-                               : map_anon(plan->fd, eh, ph, plan->is_dyn, lo,
-                                          span, base_hint, &bias, &maplen);
+    int anon = !cng_g_loader_file;
+    int rc = anon ? map_anon(plan->fd, eh, ph, plan->is_dyn, lo, span,
+                             base_hint, &bias, &maplen)
+                  : map_file(plan->fd, eh, ph, plan->is_dyn, lo, span,
+                             base_hint, &bias, &maplen);
     if (rc == CNG_LOAD_EEXEC) {
         /* Anonymous executable memory was denied (e.g. NO_NEW_PRIVS revoking
          * execmem on Android). Fall back to file-backed exec mapping, which
@@ -554,6 +555,7 @@ int cng_elf_map(const struct cng_elf_plan *plan, unsigned long base_hint,
          * the probe was granted and the real mprotect was not. */
         if (!plan->file_ok)
             return CNG_LOAD_EINVAL;
+        anon = 0;
         rc = map_file(plan->fd, eh, ph, plan->is_dyn, lo, span, base_hint, &bias,
                       &maplen);
     }
@@ -580,6 +582,18 @@ int cng_elf_map(const struct cng_elf_plan *plan, unsigned long base_hint,
     out->load_hi = bias + hi;
     out->map_lo = bias + lo;
     out->map_len = maplen;
+    /* What the kernel would have mapped from the file, page-rounded the way
+     * elf_map() rounds it, where we copied it instead. */
+    out->ncopied = 0;
+    for (int i = 0; anon && i < eh->e_phnum && out->ncopied < CNG_LOAD_COPIED;
+         i++) {
+        if (ph[i].p_type != PT_LOAD || !ph[i].p_filesz)
+            continue;
+        unsigned long v = bias + ph[i].p_vaddr;
+        out->copied[out->ncopied].lo = cng_page_down(v);
+        out->copied[out->ncopied].hi = cng_page_up(v + ph[i].p_filesz);
+        out->ncopied++;
+    }
     out->is_dyn = plan->is_dyn;
     return CNG_LOAD_OK;
 }
