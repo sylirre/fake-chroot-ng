@@ -92,7 +92,9 @@ static inline struct cng_uregs *cng_pt_uregs(struct cng_ucontext *uc) {
  * CAP_SYS_ADMIN, which the guest holds under fake-root; it suspends the
  * tracee's own filters, of which it has none it can see. A host kernel built
  * without checkpoint/restore support does not know the option at all, and the
- * emulation then answers it EINVAL as that kernel does. */
+ * emulation then answers it EINVAL as that kernel does; one before 4.3 has no
+ * such bit, and the emulation refuses it as that kernel refuses a bit outside
+ * its mask (EIO from SEIZE, EINVAL from SETOPTIONS). */
 #define CNG_PTRACE_O_TRACESYSGOOD    0x0001
 #define CNG_PTRACE_O_TRACEFORK       0x0002
 #define CNG_PTRACE_O_TRACEVFORK      0x0004
