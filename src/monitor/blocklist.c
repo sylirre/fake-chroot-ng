@@ -58,7 +58,12 @@ static const int probe_set[] = {
      * re-issue out of the handler. */
     __NR_setxattrat, __NR_getxattrat, __NR_listxattrat, __NR_removexattrat,
     __NR_file_getattr, __NR_file_setattr,
-    __NR_bind,       __NR_connect,    __NR_sendto,     __NR_sendmsg,
+    /* The pidfd pair dispatch re-issues once the hidden-process view has
+     * judged it. A filter that predates them traps both (Android 8 on a 3.18
+     * kernel, measured), where the kernel itself would answer ENOSYS. pid -1
+     * and fd -1 are refused before anything is looked up. */
+    __NR_pidfd_open, __NR_pidfd_getfd,
+    __NR_bind,      __NR_connect,    __NR_sendto,     __NR_sendmsg,
     __NR_getsockname, __NR_getpeername, __NR_accept,   __NR_accept4,
     __NR_recvfrom,   __NR_recvmsg,    __NR_sendmmsg,   __NR_recvmmsg,
     /* The credential family, re-issued without --fake-id (cred.c), and the

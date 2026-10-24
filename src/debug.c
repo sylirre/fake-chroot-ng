@@ -736,8 +736,11 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
          * pidfd_open does not mean having pidfd_getfd: Android's 4.19 kernels
          * carry a backport of the first (for lmkd) and not the second, which
          * answers ENOSYS there. A descriptor that is no pidfd tells the two
-         * apart — EBADF where the call exists. */
-        long pfd = CNG_SYS(__NR_pidfd_open, sys_getpid(), 0, 0, 0, 0, 0);
+         * apart — EBADF where the call exists. An older filter traps both
+         * (Android 8), which this driver, with no handler, would die of. */
+        long pfd = cng_blocked[__NR_pidfd_open]
+                       ? -ENOSYS
+                       : CNG_SYS(__NR_pidfd_open, sys_getpid(), 0, 0, 0, 0, 0);
         if (pfd >= 0 &&
             cng_dispatch(__NR_pidfd_getfd, -1, 0, 0, 0, 0, 0, 0) == -ENOSYS) {
             sys_close((int)pfd);
