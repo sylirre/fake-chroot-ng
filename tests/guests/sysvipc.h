@@ -20,6 +20,14 @@
  * setting it makes the switch fall through to EINVAL instead (measured on the
  * host, both ways round).
  *
+ * Two more reasons for the shim come from Termux, which moves SysV IPC out of
+ * its sysroot into packages of its own. Without libandroid-sysv-semaphore
+ * there is no <sys/sem.h> at all, and the kernel's uapi header stands in for
+ * it, with the 64-bit semid_ds under the usual name -- the rename bionic's own
+ * header makes. And libandroid-shmem's <sys/shm.h> turns shmget, shmat, shmdt
+ * and shmctl into macros for its in-process emulation over ashmem, which never
+ * reaches a kernel or a monitor: a guest built on it tests nothing here.
+ *
  * Define CNG_SYSVIPC_FORCE_SYSCALL to take this path on any libc. That is how
  * the shim is tested: build the guests with it on a platform whose wrappers do
  * exist and the differential against the real kernel still has to pass, which
@@ -30,7 +38,17 @@
 
 #include <sys/ipc.h>
 #include <sys/msg.h>
+#if defined(__has_include)
+#if __has_include(<sys/sem.h>)
 #include <sys/sem.h>
+#else
+#include <linux/sem.h>
+#define semid_ds semid64_ds
+#define CNG_SYSVIPC_NO_SEM_H 1
+#endif
+#else
+#include <sys/sem.h>
+#endif
 #include <sys/shm.h>
 
 /* semctl's fourth argument, under our own name. glibc and musl leave the union
@@ -45,7 +63,8 @@ union cng_semun {
 };
 
 #if defined(CNG_SYSVIPC_FORCE_SYSCALL) \
-    || (defined(__BIONIC__) && __ANDROID_API__ < 26)
+    || (defined(__BIONIC__) && __ANDROID_API__ < 26) \
+    || defined(CNG_SYSVIPC_NO_SEM_H) || defined(shmat)
 
 #include <stdarg.h>
 #include <stddef.h>
@@ -132,6 +151,11 @@ static inline int cng_shmctl(int shmid, int cmd, struct shmid_ds *buf) {
     return (int)syscall(SYS_shmctl, shmid, cmd, buf);
 }
 
+/* Undefined first: the names may be libandroid-shmem's macros already. */
+#undef shmget
+#undef shmat
+#undef shmdt
+#undef shmctl
 #define semget cng_semget
 #define semop  cng_semop
 #define semctl cng_semctl
