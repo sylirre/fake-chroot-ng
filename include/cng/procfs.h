@@ -136,4 +136,9 @@ int cng_procfs_synth_access(const char *canon, int mode, int follow);
  * not. This is how the fallback above gets exercised off a device. */
 extern int cng_g_proc_deny_stat;
 
+/* CNG_PROCFS_REOPEN_DENY=1: take the read-only reopen of a synthesized view's
+ * memfd as refused, which Android's policy does and a test host does not, so
+ * the view is served from a file of ours instead (procfs.c, store_on). */
+extern int cng_g_procfs_reopen_deny;
+
 #endif /* CNG_PROCFS_H */

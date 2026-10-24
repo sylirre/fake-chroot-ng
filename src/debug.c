@@ -7287,6 +7287,11 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
     static char *gargv[] = {"/bin/busybox", "sh", "-c", "true", 0};
     static char *genvp[] = {"PATH=/usr/bin:/bin", "HOME=/root", 0};
     cng_g_host_envp = envp; /* shared_dir env lookups (file-tier fallback) */
+    /* The views from files of ours rather than memfds, as a host that will
+     * not reopen a memfd makes them — taken from the environment, since the
+     * same checks are run both ways. */
+    const char *rdeny = cng_broker_env("CNG_PROCFS_REOPEN_DENY");
+    cng_g_procfs_reopen_deny = rdeny && rdeny[0] != '0';
     cng_g_shared_proc = 1;
     cng_procfs_init();
     cng_procreg_publish(gargv, genvp, 0, 0, cng_g_exe_guest, "/");
@@ -7728,9 +7733,11 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
         fails += !ok;
 
         /* overflowuid / overflowgid: the kernel's default id and nothing else,
-         * and from a memfd — forced above, since a test host can read the real
-         * ones, which would otherwise pass through and prove nothing. The fd's
-         * own link says which it was. */
+         * and from a view of ours — forced above, since a test host can read
+         * the real ones, which would otherwise pass through and prove nothing.
+         * The fd's own link says which it was: the memfd's name, or the name
+         * of the file of ours that stands in where the memfd stayed writable
+         * (CNG_PROCFS_REOPEN_DENY, Android). */
         static const char *const ovf[] = {"/proc/sys/kernel/overflowuid",
                                           "/proc/sys/kernel/overflowgid"};
         for (int i = 0; i < 2; i++) {
@@ -7742,9 +7749,9 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
                               : -1;
             if (tl >= 0)
                 tgt[tl] = '\0';
-            cng_snprintf(want, sizeof want, "/memfd:cng-proc:%s (deleted)", ovf[i]);
             ok = n == 6 && !strcmp(buf, "65534\n") && tl > 0 &&
-                 !strcmp(tgt, want);
+                 cng_procfs_link_name(tgt, want, sizeof want) &&
+                 !strcmp(want, ovf[i]);
             if (fd >= 0)
                 sys_close((int)fd);
             cng_dprintf(1, "proctest %s: %ld bytes -> %s\n", ovf[i] + 17, n,
@@ -7764,23 +7771,32 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
      *
      *     The one way to a read-only description of a memfd is to reopen it
      *     through its own /proc link, and a host policy may refuse that —
-     *     Android's does (EACCES). The fd then stays writable, as synth_seal
-     *     says it does, and there is nothing to assert: that is reported as
-     *     such, rather than as the guest being handed a writable /proc file
-     *     on a host that could have given it a read-only one. */
+     *     Android's does (EACCES), and CNG_PROCFS_REOPEN_DENY says it does.
+     *     The view is then a file of ours, opened read-only for real, in a
+     *     private directory under the temp directory. Only where neither can
+     *     be had does the fd stay writable, as synth_seal says it does, and
+     *     there is nothing to assert: that is reported as such, rather than
+     *     as the guest being handed a writable /proc file on a host that
+     *     could have given it a read-only one. */
     long ro_probe = -1, ro_mfd = sys_memfd_create("cng-probe", CNG_MFD_CLOEXEC);
     if (ro_mfd >= 0) {
         char rl[40];
         cng_snprintf(rl, sizeof rl, "/proc/self/fd/%ld", ro_mfd);
-        ro_probe = sys_openat(CNG_AT_FDCWD, rl, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+        ro_probe = cng_g_procfs_reopen_deny
+                       ? -EACCES
+                       : sys_openat(CNG_AT_FDCWD, rl, CNG_O_RDONLY | CNG_O_CLOEXEC,
+                                    0);
         if (ro_probe >= 0)
             sys_close((int)ro_probe);
         sys_close((int)ro_mfd);
     }
-    if (ro_mfd >= 0 && ro_probe < 0) {
+    char ro_dir[CNG_PATH_MAX];
+    if (ro_mfd >= 0 && ro_probe < 0 &&
+        cng_private_tmp_dir("chroot-ng-proc.v1", ro_dir, sizeof ro_dir) != 0) {
         cng_dprintf(1,
                     "proctest synth fd is read-only: unavailable (the host "
-                    "refuses to reopen a memfd, errno %ld)\n",
+                    "refuses to reopen a memfd, errno %ld, and there is no "
+                    "private temp directory)\n",
                     -ro_probe);
     } else {
         long fd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/proc/loadavg",

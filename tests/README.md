@@ -55,8 +55,11 @@ expected failure:
   (they are synthesized for that reason, and so is their `stat` —
   `CNG_PROC_DENY_STAT=1` forces that path elsewhere, `CNG_OVERFLOWID_SYNTH=1`
   the open of the sysctls),
-  reopening a memfd through `/proc/self/fd/N` (so a synthesized fd stays
-  writable), and opening `/dev/pts`. The ioctls on a pty are a whitelist as
+  reopening a memfd through `/proc/self/fd/N` (so a synthesized fd's read-only
+  view is an unlinked file in a private directory under `$TMPDIR` instead —
+  `CNG_PROCFS_REOPEN_DENY=1` forces that elsewhere — and a guest's own
+  read-only reopen of its memfd is refused, as there, except for the script a
+  `#!` exec ran from one), and opening `/dev/pts`. The ioctls on a pty are a whitelist as
   well: `TCGETS2` and the other termios2 commands are `EACCES`, which the
   monitor answers from `TCGETS`/`TCSETS*` (m27; `CNG_TERMIOS2_DENY=1` forces
   that path on a host that serves them), and so is `TIOCGSID` on a slave and

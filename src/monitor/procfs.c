@@ -15,6 +15,7 @@
 /* aarch64 struct stat / statfs field offsets (stable syscall ABI). */
 #define STAT_DEV_OFF   0
 #define STAT_INO_OFF   8
+#define STAT_NLINK_OFF 20
 #define STATFS_TYPE_OFF 0
 
 /* Which file a synthesized fd holds. */
@@ -729,7 +730,36 @@ static int put_maps(int fd, const char *host) {
  * is per filesystem — a guest file with the memfd's number, moved onto the
  * memfd's old descriptor number, passed as the memfd and was truncated and
  * rewritten with /proc/stat, through a description of our own opened for
- * writing on a file the guest may only have been able to read. */
+ * writing on a file the guest may only have been able to read.
+ *
+ * Where a view is a file of ours instead (store_view), the pair is not enough:
+ * a memfd's inode number comes from a counter that only goes up, but ext4
+ * hands a freed inode number to the very next file it makes, so a /proc/uptime
+ * opened onto the number a closed /proc/loadavg had came back as the same
+ * device and inode, and was rewritten as loadavg. Each such file is named with
+ * a pid and counter of its own (see store_view), and that pair is the third
+ * part of the identity: the tag, 0 for a memfd and anything not ours. */
+struct pf_id {
+    unsigned long dev, ino, tag;
+};
+static unsigned long store_tag(int fd, unsigned long dev);
+
+static int pf_id_of(int fd, struct pf_id *id) {
+    struct cng_fdid f;
+    if (cng_fdid_of(fd, &f) != 0)
+        return -1;
+    id->dev = f.dev;
+    id->ino = f.ino;
+    id->tag = store_tag(fd, f.dev);
+    return 0;
+}
+
+static int pf_is(int fd, const struct pf_id *id) {
+    struct pf_id cur;
+    return pf_id_of(fd, &cur) == 0 && cur.dev == id->dev &&
+           cur.ino == id->ino && cur.tag == id->tag;
+}
+
 /*
  * An entry is three facts about one descriptor — its number, the kind of file
  * it regenerates as, and the identity that proves the number still names it —
@@ -755,13 +785,13 @@ static struct {
     unsigned seq; /* even: settled; odd: being rewritten by its claimant */
     int fd1;      /* fd + 1, so a zeroed table means "all free" */
     int kind;
-    struct cng_fdid id;
+    struct pf_id id;
 } g_pf[CNG_SYNTH_FD_SLOTS];
 
 /* A settled copy of entry i, and the sequence it was taken at; 0 while a
  * claimant is rewriting it. */
 static int pf_snap(int i, unsigned *seq, int *fd1, int *kind,
-                   struct cng_fdid *id) {
+                   struct pf_id *id) {
     unsigned s = __atomic_load_n(&g_pf[i].seq, __ATOMIC_ACQUIRE);
     if (s & 1)
         return 0;
@@ -769,6 +799,7 @@ static int pf_snap(int i, unsigned *seq, int *fd1, int *kind,
     *kind = __atomic_load_n(&g_pf[i].kind, __ATOMIC_RELAXED);
     id->dev = __atomic_load_n(&g_pf[i].id.dev, __ATOMIC_RELAXED);
     id->ino = __atomic_load_n(&g_pf[i].id.ino, __ATOMIC_RELAXED);
+    id->tag = __atomic_load_n(&g_pf[i].id.tag, __ATOMIC_RELAXED);
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
     if (__atomic_load_n(&g_pf[i].seq, __ATOMIC_RELAXED) != s)
         return 0;
@@ -790,17 +821,18 @@ static int pf_claim(int i, unsigned seq) {
 
 /* Settle a claimed entry: its facts, then the sequence that publishes them. */
 static void pf_settle(int i, unsigned seq, int fd1, int kind,
-                      const struct cng_fdid *id) {
+                      const struct pf_id *id) {
     __atomic_store_n(&g_pf[i].fd1, fd1, __ATOMIC_RELAXED);
     __atomic_store_n(&g_pf[i].kind, kind, __ATOMIC_RELAXED);
     __atomic_store_n(&g_pf[i].id.dev, id->dev, __ATOMIC_RELAXED);
     __atomic_store_n(&g_pf[i].id.ino, id->ino, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_pf[i].id.tag, id->tag, __ATOMIC_RELAXED);
     __atomic_store_n(&g_pf[i].seq, seq + 2, __ATOMIC_RELEASE);
 }
 
 static void pf_track(int fd, int kind) {
-    struct cng_fdid nid;
-    if (cng_fdid_of(fd, &nid) != 0)
+    struct pf_id nid;
+    if (pf_id_of(fd, &nid) != 0)
         return;
     /* The entry this very number had, first: it described the file the
      * number named before this one, so it is stale by the new file's
@@ -814,15 +846,15 @@ static void pf_track(int fd, int kind) {
         for (int i = 0; i < CNG_SYNTH_FD_SLOTS; i++) {
             unsigned s;
             int f1, k;
-            struct cng_fdid id;
+            struct pf_id id;
             if (!pf_snap(i, &s, &f1, &k, &id))
                 continue;
             int take = pass == 0   ? f1 == fd + 1
                        : pass == 1 ? f1 == 0
-                                   : f1 > 0 && !cng_fd_is(f1 - 1, &id);
+                                   : f1 > 0 && !pf_is(f1 - 1, &id);
             if (!take || !pf_claim(i, s))
                 continue;
-            if (f1 > 0 && cng_fd_is(f1 - 1, &id)) {
+            if (f1 > 0 && pf_is(f1 - 1, &id)) {
                 pf_settle(i, s, f1, k, &id);
                 continue;
             }
@@ -845,7 +877,7 @@ static long synth_reopen(int fd, long oflags) {
     return sys_openat(CNG_AT_FDCWD, link, oflags | CNG_O_CLOEXEC, 0);
 }
 
-static void regen(int fd, int kind, const struct cng_fdid *id) {
+static void regen(int fd, int kind, const struct pf_id *id) {
     /* The guest holds a read-only description, so the rewrite goes through a
      * writable one taken for the call. Where that cannot be had, the fd itself
      * is tried: it is writable exactly when the seal below could not be
@@ -855,14 +887,32 @@ static void regen(int fd, int kind, const struct cng_fdid *id) {
      * number is at that moment — the caller checked it a syscall ago, and the
      * number is in the guest's table. So what came back is checked against
      * the memfd's identity before a byte of it is truncated: a description
-     * of something else is closed and left as it was. */
+     * of something else is closed and left as it was.
+     *
+     * Two threads reading the file at once both rewrite it, each with the
+     * clock it read, and the later write wins whichever clock is older: a
+     * rewrite held up between its clock and its write — on f2fs, behind the
+     * inode lock of the other's — put an older uptime back over a newer one,
+     * and the rewind that asked for the newer read the very bytes it had
+     * read before. So a rewrite through a description of ours holds that
+     * description's flock across the clock and the write, and the next one
+     * waits for it. Never blocking: a guest may flock its own description of
+     * the same file, and a fork mid-rewrite leaves the child holding ours, so
+     * after a bounded wait the rewrite goes ahead unlocked. Through the
+     * guest's own description nothing is locked — that lock is the guest's. */
     long w = synth_reopen(fd, CNG_O_RDWR);
-    if (w >= 0 && !cng_fd_is((int)w, id)) {
+    if (w >= 0 && !pf_is((int)w, id)) {
         sys_close((int)w);
         return;
     }
+    for (int t = 0; w >= 0 && t < 256; t++) {
+        if (CNG_SYS(__NR_flock, w, 2 /* LOCK_EX */ | 4 /* LOCK_NB */, 0, 0, 0,
+                    0) != -EWOULDBLOCK)
+            break;
+        CNG_SYS(__NR_sched_yield, 0, 0, 0, 0, 0, 0);
+    }
     int wfd = w >= 0 ? (int)w : fd;
-    if ((w >= 0 || cng_fd_is(fd, id)) && sys_ftruncate(wfd, 0) == 0) {
+    if ((w >= 0 || pf_is(fd, id)) && sys_ftruncate(wfd, 0) == 0) {
         sys_lseek(wfd, 0, CNG_SEEK_SET);
         switch (kind) {
         case PF_LOADAVG:
@@ -888,17 +938,17 @@ void cng_procfs_pre_read(int fd, long off) {
     for (int i = 0; i < CNG_SYNTH_FD_SLOTS; i++) {
         unsigned s;
         int f1, kind;
-        struct cng_fdid id;
+        struct pf_id id;
         if (!pf_snap(i, &s, &f1, &kind, &id) || f1 != fd + 1)
             continue;
-        if (!cng_fd_is(fd, &id)) {
+        if (!pf_is(fd, &id)) {
             /* Stale: the fd was reused. Retired only as it was judged — an
              * entry another thread has made here since is not this one —
              * and the scan goes on, for the entry the number's current
              * file may have. */
             if (pf_claim(i, s)) {
-                struct cng_fdid none = {0, 0};
-                if (cng_fd_is(fd, &id)) /* put back meanwhile (see pf_track) */
+                struct pf_id none = {0, 0, 0};
+                if (pf_is(fd, &id)) /* put back meanwhile (see pf_track) */
                     pf_settle(i, s, f1, kind, &id);
                 else
                     pf_settle(i, s, 0, 0, &none);
@@ -971,21 +1021,222 @@ static long synth_memfd(int refreshable, const char *name) {
     (CNG_O_APPEND | CNG_O_NONBLOCK | CNG_O_DSYNC | CNG___O_SYNC |              \
      CNG_O_NOATIME | CNG_O_NOCTTY | CNG_O_LARGEFILE)
 
+/* ---- read-only views where a memfd cannot be reopened -------------------
+ *
+ * The one way to a read-only description of a memfd is a reopen through its
+ * own /proc link, and Android's policy refuses an app the `open` of the tmpfs
+ * inode behind one. The view then stayed the O_RDWR memfd memfd_create made —
+ * which Chrome refuses: it dup()s the /proc/<pid>/status of each child it
+ * starts and CHECKs that the file it hands on is read-only. So there the view
+ * is copied into a file of ours instead, in a private directory under the temp
+ * directory (cng_private_tmp_dir), opened O_RDONLY for real, and unlinked
+ * before the guest sees it: a file on /data is one an app may open, and
+ * reopen through its link as the refresh does.
+ *
+ * The file carries the view's name as the memfd does, for the same reason:
+ * the name is what every route to the description keeps, and the link reads
+ * "<dir>/cng-proc.<pid>.<n>:<name> (deleted)", '/' and '%' escaped. The pid
+ * and counter only keep two views of one file apart while both are being
+ * made. A process killed between the create and the unlink leaves its file
+ * behind in that directory, a few hundred bytes nothing reads.
+ *
+ * Settled once per process, and only where the memfd reopen is refused: a
+ * host that grants it never makes the directory. */
+#define STORE_STEM     "chroot-ng-proc.v1"
+#define STORE_HEAD     "cng-proc."
+#define STORE_HEAD_LEN 9
+#define STORE_LEAF_MAX 255 /* NAME_MAX: the leaf is one path component */
+static char g_store[CNG_PATH_MAX];
+static unsigned long g_store_dev;
+static long g_store_fstype;
+static unsigned g_store_seq;
+static int g_store_state; /* 0 unasked, 1 in use, -1 not used here */
+int cng_g_procfs_reopen_deny = 0;
+
+static int store_on(void) {
+    int v = __atomic_load_n(&g_store_state, __ATOMIC_ACQUIRE);
+    if (v)
+        return v;
+    v = -1;
+    long mfd = sys_memfd_create("cng-probe", CNG_MFD_CLOEXEC);
+    if (mfd >= 0) {
+        long ro = cng_g_procfs_reopen_deny ? -EACCES
+                                           : synth_reopen((int)mfd, CNG_O_RDONLY);
+        char st[128];
+        long sf[16];
+        if (ro >= 0)
+            sys_close((int)ro);
+        else if (cng_private_tmp_dir(STORE_STEM, g_store, sizeof g_store) == 0 &&
+                 CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, g_store, st, 0, 0, 0) ==
+                     0 &&
+                 CNG_SYS(__NR_statfs, g_store, sf, 0, 0, 0, 0) == 0) {
+            g_store_dev = *(unsigned long *)(st + STAT_DEV_OFF);
+            g_store_fstype = *(long *)((char *)sf + STATFS_TYPE_OFF);
+            v = 1;
+        }
+        sys_close((int)mfd);
+    }
+    __atomic_store_n(&g_store_state, v, __ATOMIC_RELEASE);
+    return v;
+}
+
+/* A /proc name as one path component: '%' and '/' as %25 and %2F. 0, or -1
+ * when it does not fit. */
+static int store_encode(const char *name, char *out, size_t sz) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t k = 0;
+    for (const char *p = name; *p; p++) {
+        if (*p == '%' || *p == '/') {
+            if (k + 3 >= sz)
+                return -1;
+            out[k++] = '%';
+            out[k++] = hex[(unsigned char)*p >> 4];
+            out[k++] = hex[*p & 15];
+        } else {
+            if (k + 1 >= sz)
+                return -1;
+            out[k++] = *p;
+        }
+    }
+    out[k] = '\0';
+    return 0;
+}
+
+/* The /proc name in `n` bytes of an encoded component. 1, or 0 for anything
+ * store_encode did not write. */
+static int store_decode(const char *in, size_t n, char *out, size_t sz) {
+    size_t k = 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = in[i];
+        if (c == '/')
+            return 0;
+        if (c == '%') {
+            if (i + 2 >= n)
+                return 0;
+            if (!strncmp(in + i, "%2F", 3))
+                c = '/';
+            else if (!strncmp(in + i, "%25", 3))
+                c = '%';
+            else
+                return 0;
+            i += 2;
+        }
+        if (k + 1 >= sz)
+            return 0;
+        out[k++] = c;
+    }
+    out[k] = '\0';
+    return k > 0;
+}
+
+/* A read-only description of the view in `fd`, through a file of ours named
+ * after it; -1 where the store is not in use or the file cannot be made. */
+static long store_view(int fd, const char *name, long gflags) {
+    if (store_on() <= 0)
+        return -1;
+    char enc[STORE_LEAF_MAX + 1];
+    if (store_encode(name, enc, sizeof enc) != 0)
+        return -1;
+    char leaf[STORE_LEAF_MAX + 64], path[CNG_PATH_MAX];
+    unsigned seq = __atomic_fetch_add(&g_store_seq, 1, __ATOMIC_RELAXED);
+    size_t ll = cng_snprintf(leaf, sizeof leaf, STORE_HEAD "%ld.%u:%s",
+                             sys_getpid(), seq, enc);
+    if (ll > STORE_LEAF_MAX ||
+        cng_snprintf(path, sizeof path, "%s/%s", g_store, leaf) >= sizeof path)
+        return -1;
+    long w = sys_openat(CNG_AT_FDCWD, path,
+                        CNG_O_RDWR | CNG_O_CREAT | CNG_O_EXCL | CNG_O_NOFOLLOW |
+                            CNG_O_CLOEXEC,
+                        0600);
+    if (w < 0)
+        return -1;
+    char buf[4096];
+    long off = 0, n;
+    int ok = 1;
+    while (ok && (n = sys_pread64(fd, buf, sizeof buf, off)) != 0) {
+        if (n == -EINTR)
+            continue;
+        ok = n > 0 && cng_write_all((int)w, buf, (size_t)n) == n;
+        off += n;
+    }
+    long ro = ok ? sys_openat(CNG_AT_FDCWD, path,
+                              CNG_O_RDONLY | CNG_O_NOFOLLOW | CNG_O_CLOEXEC |
+                                  (gflags & SYNTH_STATUS_FLAGS),
+                              0)
+                 : -1;
+    CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, path, 0, 0, 0, 0);
+    sys_close((int)w);
+    return ro;
+}
+
+/* The /proc name behind a store file's link text, as cng_procfs_link_name
+ * gives a memfd's. */
+static int store_link_name(const char *tgt, char *out, size_t sz) {
+    if (store_on() <= 0)
+        return 0;
+    size_t dl = strlen(g_store), n = strlen(tgt);
+    if (strncmp(tgt, g_store, dl) || tgt[dl] != '/' ||
+        strncmp(tgt + dl + 1, STORE_HEAD, STORE_HEAD_LEN) ||
+        n < dl + 1 + STORE_HEAD_LEN + SYNTH_LINK_TAIL_LEN ||
+        strcmp(tgt + n - SYNTH_LINK_TAIL_LEN, SYNTH_LINK_TAIL))
+        return 0;
+    const char *leaf = tgt + dl + 1 + STORE_HEAD_LEN;
+    const char *end = tgt + n - SYNTH_LINK_TAIL_LEN;
+    const char *c = leaf;
+    while (c < end && *c != ':')
+        c++;
+    if (c >= end)
+        return 0;
+    return store_decode(c + 1, (size_t)(end - c - 1), out, sz);
+}
+
+/* The tag of a file of ours (struct pf_id): the pid and counter its name
+ * carries, read back from the fd's link. Asked only of a file on the store's
+ * device, where ours are; 0 for every other. */
+static unsigned long store_tag(int fd, unsigned long dev) {
+    if (dev != g_store_dev || store_on() <= 0)
+        return 0;
+    char link[40], tgt[CNG_PATH_MAX];
+    cng_snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+    long n = sys_readlinkat(CNG_AT_FDCWD, link, tgt, sizeof tgt - 1);
+    size_t dl = strlen(g_store);
+    if (n <= 0 || (size_t)n <= dl + 1 + STORE_HEAD_LEN)
+        return 0;
+    tgt[n] = '\0';
+    if (strncmp(tgt, g_store, dl) || tgt[dl] != '/' ||
+        strncmp(tgt + dl + 1, STORE_HEAD, STORE_HEAD_LEN))
+        return 0;
+    unsigned long pid = 0, seq = 0;
+    const char *p = tgt + dl + 1 + STORE_HEAD_LEN;
+    for (; *p >= '0' && *p <= '9'; p++)
+        pid = pid * 10 + (unsigned long)(*p - '0');
+    if (*p++ != '.')
+        return 0;
+    for (; *p >= '0' && *p <= '9'; p++)
+        seq = seq * 10 + (unsigned long)(*p - '0');
+    return *p == ':' ? (pid << 32 | (seq & 0xffffffffUL)) + 1 : 0;
+}
+
 /* Turn the writable memfd holding a finished view into what the guest opened:
  * a read-only description, with the status flags it asked for. The memfd is
- * reopened through its own /proc link with O_RDONLY and the new description is
+ * reopened through its own /proc link with O_RDONLY — or, where the host
+ * refuses that, a file of ours is (see above) — and the new description is
  * dup3'd over the same fd number, so the number the guest gets is still the
- * lowest that was free (or the reserved slot) and the inode the refresh
- * bookkeeping recorded is unchanged.
+ * lowest that was free (or the reserved slot). The refresh bookkeeping takes
+ * the inode after this.
  *
  * memfd_create only ever hands out O_RDWR, and that was what the guest got: a
  * /proc file it could write(), ftruncate(), mmap(MAP_SHARED|PROT_WRITE) and
  * see O_RDWR from F_GETFL on — every one of which the kernel refuses on the
- * real file (EBADF, EINVAL, EACCES, O_RDONLY; measured). Where the reopen is
- * refused the writable fd stands, as before: the content is right and only the
+ * real file (EBADF, EINVAL, EACCES, O_RDONLY; measured). Where neither route
+ * can be had the writable fd stands: the content is right and only the
  * description's mode is wrong. */
-static void synth_seal(int fd, long gflags) {
-    long ro = synth_reopen(fd, CNG_O_RDONLY | (gflags & SYNTH_STATUS_FLAGS));
+static void synth_seal(int fd, const char *name, long gflags) {
+    long ro = cng_g_procfs_reopen_deny
+                  ? -EACCES
+                  : synth_reopen(fd, CNG_O_RDONLY | (gflags & SYNTH_STATUS_FLAGS));
+    if (ro < 0)
+        ro = store_view(fd, name, gflags);
     if (ro < 0) {
         if (cng_g_debug)
             cng_dprintf(2, "[cng] procfs fd %d stays writable: reopen errno=%ld\n",
@@ -1362,7 +1613,7 @@ int cng_procfs_open(const char *canon, long gflags, long *ret) {
         return 0;
     }
 
-    synth_seal((int)fd, gflags); /* read-only from here, like the real file */
+    synth_seal((int)fd, link, gflags); /* read-only from here, like the real file */
     sys_lseek((int)fd, 0, CNG_SEEK_SET);
     if (!(gflags & CNG_O_CLOEXEC))
         sys_fcntl((int)fd, CNG_F_SETFD, 0); /* the guest did not ask for it */
@@ -1401,9 +1652,21 @@ static unsigned long memfd_dev(void) {
     return g_memfd_dev;
 }
 
+/* Could the file a stat describes be one of our views? The first cut, ahead
+ * of the link read that settles it: a memfd — whose device is the kernel's
+ * internal tmpfs, one for the whole system — or, where the views are files of
+ * ours (store_on), an unlinked file on the device their directory is on. The
+ * link count keeps every file of the rootfs, which may well be on that same
+ * device, from paying for a readlink on each stat. */
+static int synth_backed(unsigned long dev, unsigned nlink) {
+    if (memfd_dev() && dev == memfd_dev())
+        return 1;
+    return nlink == 0 && store_on() > 0 && dev == g_store_dev;
+}
+
 int cng_procfs_link_name(const char *tgt, char *out, size_t sz) {
     if (strncmp(tgt, SYNTH_LINK_HEAD, SYNTH_LINK_HEAD_LEN))
-        return 0;
+        return store_link_name(tgt, out, sz);
     size_t n = strlen(tgt);
     if (n < SYNTH_LINK_HEAD_LEN + 1 + SYNTH_LINK_TAIL_LEN ||
         strcmp(tgt + n - SYNTH_LINK_TAIL_LEN, SYNTH_LINK_TAIL))
@@ -1514,8 +1777,8 @@ static int synth_statx_gone(const char *name, unsigned long long ino,
 
 int cng_procfs_fix_fd(int fd, void *stat) {
     char *st = (char *)stat;
-    if (fd < 0 || *(unsigned long *)(st + STAT_DEV_OFF) != memfd_dev() ||
-        !memfd_dev())
+    if (fd < 0 || !synth_backed(*(unsigned long *)(st + STAT_DEV_OFF),
+                                ST_U32(st, STAT_NLINK_OFF)))
         return 0;
     char name[CNG_PATH_MAX];
     if (!synth_name_of(fd, name, sizeof name))
@@ -1529,7 +1792,8 @@ int cng_procfs_fix_fd(int fd, void *stat) {
 
 int cng_procfs_fix_path(long dirfd, const char *path, void *stat) {
     char *st = (char *)stat;
-    if (*(unsigned long *)(st + STAT_DEV_OFF) != memfd_dev() || !memfd_dev())
+    if (!synth_backed(*(unsigned long *)(st + STAT_DEV_OFF),
+                      ST_U32(st, STAT_NLINK_OFF)))
         return 0;
     char name[CNG_PATH_MAX];
     if (!synth_name_at(dirfd, path, name, sizeof name))
@@ -1551,7 +1815,10 @@ static unsigned long statx_dev(const char *sx) {
 
 static int fix_statx(long dirfd, const char *path, int fd, unsigned flags,
                      unsigned mask, char *sx) {
-    if (statx_dev(sx) != memfd_dev() || !memfd_dev())
+    /* stx_nlink is there only when stx_mask says so; without it, take the
+     * file for an unlinked one and let the link read decide. */
+    unsigned nlink = (ST_U32(sx, 0) & 0x4 /*STATX_NLINK*/) ? ST_U32(sx, 16) : 0;
+    if (!synth_backed(statx_dev(sx), nlink))
         return 0;
     char name[CNG_PATH_MAX];
     int ours = fd >= 0 ? synth_name_of(fd, name, sizeof name)
@@ -1678,7 +1945,8 @@ int cng_procfs_synth_access(const char *canon, int mode, int follow) {
 int cng_procfs_fstatfs(int fd, void *buf) {
     char st[128];
     if (fd < 0 || sys_fstat(fd, st) != 0 ||
-        *(unsigned long *)(st + STAT_DEV_OFF) != memfd_dev() || !memfd_dev())
+        !synth_backed(*(unsigned long *)(st + STAT_DEV_OFF),
+                      ST_U32(st, STAT_NLINK_OFF)))
         return 0;
     char name[CNG_PATH_MAX];
     if (!synth_name_of(fd, name, sizeof name))
@@ -1691,8 +1959,10 @@ int cng_procfs_fstatfs(int fd, void *buf) {
 #define TMPFS_MAGIC 0x01021994L
 int cng_procfs_fix_path_statfs(long dirfd, const char *path, void *buf) {
     /* statfs names no inode, so the filesystem type is the first cut: only a
-     * name that landed on a tmpfs can have landed on a memfd. */
-    if (*(long *)((char *)buf + STATFS_TYPE_OFF) != TMPFS_MAGIC)
+     * name that landed on a tmpfs can have landed on a memfd, and only one on
+     * the store's filesystem on a file of ours. */
+    long type = *(long *)((char *)buf + STATFS_TYPE_OFF);
+    if (type != TMPFS_MAGIC && !(store_on() > 0 && type == g_store_fstype))
         return 0;
     char name[CNG_PATH_MAX];
     if (!synth_name_at(dirfd, path, name, sizeof name))

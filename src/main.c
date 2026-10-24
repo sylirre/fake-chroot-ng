@@ -537,6 +537,12 @@ static void help(char **envp) {
                       "the guest's view as if the host kernel had refused "
                       "them, which Android's SELinux policy does. Test aid: "
                       "a host that allows them never takes that path."},
+        {"CNG_PROCFS_REOPEN_DENY", "Take the reopen that makes a synthesized "
+                      "/proc file read-only as refused, as Android's SELinux "
+                      "policy refuses an app the reopen of a memfd, so the "
+                      "read-only view is served from a file in a private "
+                      "directory under $TMPDIR. Test aid: a host that allows "
+                      "the reopen never takes that path."},
         {"CNG_TERMIOS2_DENY", "Refuse the termios2 ioctls (TCGETS2, TCSETS2, "
                       "...) with EACCES before the host is asked, as "
                       "Android's policy does, so they are served from "

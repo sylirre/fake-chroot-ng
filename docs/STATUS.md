@@ -4100,6 +4100,43 @@ vfork/`posix_spawn` child-stack handling.
     anonymous memory still reading back zeroed; bpftest checks that only the
     flag traps.
 
+- [x] **M94 — synthesized /proc files were writable on Android**
+  A synthesized view is a memfd made read-only by reopening it through its own
+  link (`synth_seal`), and Android's policy refuses that reopen, so the guest
+  was handed an O_RDWR /proc file. Chrome dup()s the `/proc/<pid>/status` of
+  each child it starts and CHECKs that what it hands on is read-only; the
+  browser died of that next.
+  - Where the reopen is refused (asked once per process), the view is copied
+    into a file in a private per-uid directory under the temp directory
+    (`cng_private_tmp_dir`: the /dev/shm stand-in's search, now shared), opened
+    O_RDONLY for real, and unlinked before the guest sees it. The file carries
+    the view's name as the memfd does —
+    `<dir>/cng-proc.<pid>.<n>:<name, %-escaped> (deleted)` — so the fd links,
+    the stat family and statfs find the real file the same way; their first
+    cuts take an unlinked file on the directory's device (or filesystem) beside
+    a memfd. The refresh reopens it O_RDWR through its link, which an app may
+    do on /data. A link names the view before it is untranslated, since on
+    Termux the directory is inside a -b bind of $PREFIX/tmp.
+  - The refresh table knew a view by device and inode, and a memfd's inode
+    number only goes up; ext4 hands a freed one to the very next file, so an
+    uptime view opened onto a closed loadavg view's number matched its entry
+    and was rewritten as loadavg (proctest's reused-by-another-kind check, on
+    the VM). A file of ours is also known by the pid and counter in its name.
+  - Two threads reading one view at once both rewrite it with the clock each
+    read, and the later write won whichever clock was older. On a file, a
+    rewrite held up behind the other's inode lock made that real: m11's
+    procrace lost a refresh in about one run in four on the device. A rewrite
+    through a description of ours now holds that description's flock across
+    the clock and the write — non-blocking, with a bounded wait, since a guest
+    may flock its own description and a fork can leave the child holding ours.
+  - `CNG_PROCFS_REOPEN_DENY=1` takes the reopen as refused anywhere.
+  - Test: m11 runs proctest a second time with the knob and a fresh $TMPDIR:
+    every check holds, the fd is read-only for real, its link names the view,
+    and the directory is empty afterwards. On the device the read-only check,
+    skipped until now, runs.
+  With M92–M94, `google-chrome --no-sandbox` starts under `-u` on Termux
+  (headless: `--dump-dom` of a page, exit 0).
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

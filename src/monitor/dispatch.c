@@ -2425,10 +2425,13 @@ static long rl_fdlink(long dirfd, const char *host, long ubuf, int bufsiz) {
     long ol = tl;
     if ((size_t)tl < sizeof tgt && tgt[0] == '/') {
         tgt[tl] = '\0';
-        /* A synthesized /proc file's fd is a memfd named after it: the link
-         * says so, not "memfd:... (deleted)". */
-        if (cng_fs_untranslate(cng_g_fs, tgt, guest, sizeof guest) == 0 ||
-            (!cng_g_no_proc && cng_procfs_link_name(tgt, guest, sizeof guest))) {
+        /* A synthesized /proc file's fd is a memfd named after it, or a file
+         * of ours that is: the link says so, not "memfd:... (deleted)". Asked
+         * first, since the file can sit inside the view — $TMPDIR under a
+         * -b bind of the temp directory — where untranslating it would name
+         * the directory instead. */
+        if ((!cng_g_no_proc && cng_procfs_link_name(tgt, guest, sizeof guest)) ||
+            cng_fs_untranslate(cng_g_fs, tgt, guest, sizeof guest) == 0) {
             out = guest;
             ol = (long)strlen(guest);
         }

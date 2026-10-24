@@ -114,11 +114,14 @@ check_contains "uptime is synthesized" "proctest uptime:" "$out"
 # F_GETFL — all refused on the real file (EBADF, EINVAL, EACCES, O_RDONLY). The
 # status flags it did ask for (O_APPEND) still come back from F_GETFL.
 # The only way to a read-only description of a memfd is to reopen it through its
-# own /proc link, and Android's policy refuses that: the driver says so, and the
-# fd stays writable there (documented at synth_seal) — nothing to hold it to.
+# own /proc link, and Android's policy refuses that. There the view is a file of
+# ours instead, in a private directory under $TMPDIR, opened read-only for real
+# and unlinked: Chrome dup()s a child's /proc/<pid>/status and CHECKs that what
+# it hands on is read-only. Only with no such directory either does the fd stay
+# writable (documented at synth_seal), and the driver says so.
 case "$out" in
 *"proctest synth fd is read-only: unavailable"*)
-    skip "synthesized fds are read-only: this host refuses to reopen a memfd, so they stay writable"
+    skip "synthesized fds are read-only: this host refuses to reopen a memfd and has no private temp directory"
     ;;
 *)
     check_contains "a synthesized fd is read-only, with the guest's status flags" \
@@ -126,6 +129,23 @@ case "$out" in
         "$out"
     ;;
 esac
+# The same driver with that reopen taken as refused (CNG_PROCFS_REOPEN_DENY),
+# which is what reaches the files off a device: every check holds as it does
+# from a memfd — content, refresh, identity, the fd link's name — and nothing
+# is left in the directory once the views are closed.
+PTS=$(mktemp -d)
+out=$(TMPDIR="$PTS" CNG_PROCFS_REOPEN_DENY=1 run -t proctest -r "$PT" -b "$PTB":/usr 2>&1); rc=$?
+check "proctest overall, views from files of ours" 0 "$rc"
+check_contains "...read-only for real, with the guest's status flags" \
+    "proctest synth fd is read-only: accmode=0 append=1 write=-9 ftruncate=-22 mmap_rw=-13" \
+    "$out"
+check_contains "...refreshed through the file on a rewind" \
+    "proctest synth fd identity: dev+ino=1 reused number left alone=1 -> OK" "$out"
+check_contains "...and named by its link as the memfd is" \
+    "proctest overflowuid: 6 bytes -> OK" "$out"
+check "...and the directory holds nothing afterwards" "" \
+    "$(ls -A "$PTS/chroot-ng-proc.v1.$(id -u)" 2>&1)"
+rm -rf "$PTS"
 # ...and the open flags are judged as the kernel judges them on the real file,
 # in its order: O_TRUNC is write intent (EACCES on a 0444 file), O_CREAT|O_EXCL
 # is EEXIST on a name that exists, O_DIRECTORY is ENOTDIR, O_DIRECT EINVAL,

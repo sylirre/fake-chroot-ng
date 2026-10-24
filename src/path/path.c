@@ -167,9 +167,13 @@ void cng_dev_shm_init(void) {
         canon_dev_dir(g_shm_host, sizeof g_shm_host);
         return;
     }
+    cng_private_tmp_dir("chroot-ng-shm.v1", g_shm_host, sizeof g_shm_host);
+}
+
+int cng_private_tmp_dir(const char *stem, char *out, size_t sz) {
     /* Not cng_broker_shared_dir(): that list starts at /dev/shm, which is the
-     * one place this cannot use — we are here because it is unusable, and under
-     * the force knob because we are pretending it is. */
+     * one place the /dev/shm stand-in cannot use — it is made because that is
+     * unusable, and under the force knob because we are pretending it is. */
     const char *cand[] = {cng_broker_env("TMPDIR"),
                           cng_broker_env("XDG_RUNTIME_DIR"), "/data/local/tmp",
                           "/tmp"};
@@ -178,7 +182,7 @@ void cng_dev_shm_init(void) {
             continue;
         char path[CNG_PATH_MAX];
         /* Same shape as the broker's own files: named, versioned, per-uid. */
-        if (cng_snprintf(path, sizeof path, "%s/chroot-ng-shm.v1.%u", cand[i],
+        if (cng_snprintf(path, sizeof path, "%s/%s.%u", cand[i], stem,
                          (unsigned)sys_getuid()) >= sizeof path)
             continue;
         long r = CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, (long)path, 0700, 0, 0, 0);
@@ -186,10 +190,11 @@ void cng_dev_shm_init(void) {
             continue;
         if (!shm_dir_ours(path))
             continue; /* something else is sitting on the name */
-        cng_strlcpy(g_shm_host, path, sizeof g_shm_host);
-        canon_dev_dir(g_shm_host, sizeof g_shm_host);
-        return;
+        cng_strlcpy(out, path, sz);
+        canon_dev_dir(out, sz);
+        return 0;
     }
+    return -1;
 }
 
 /* The whitelist node a canonical guest path names, itself or by a subpath:

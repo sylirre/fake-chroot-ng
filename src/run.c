@@ -257,6 +257,11 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
         if (!strncmp(*e, "CNG_PROC_DENY_STAT=", 19) && (*e)[19] != '\0' &&
             (*e)[19] != '0')
             cng_g_proc_deny_stat = 1;
+        /* CNG_PROCFS_REOPEN_DENY=1 takes the memfd reopen that makes a
+         * synthesized view read-only as refused, as Android's policy does. */
+        if (!strncmp(*e, "CNG_PROCFS_REOPEN_DENY=", 23) && (*e)[23] != '\0' &&
+            (*e)[23] != '0')
+            cng_g_procfs_reopen_deny = 1;
         /* CNG_TERMIOS2_DENY=1 refuses the termios2 ioctls with EACCES before
          * the host is asked, as Android's SELinux policy does. */
         if (!strncmp(*e, "CNG_TERMIOS2_DENY=", 18) && (*e)[18] != '\0' &&
