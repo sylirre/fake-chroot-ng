@@ -922,7 +922,11 @@ static void pt_self_detach(struct pt_self *s) {
 
 /* Is task `tid` gone (reaped) or a zombie? A tracer that died leaves its
  * tracees parked forever otherwise. `ppid_out`, when asked for, gets the task's
- * parent — 0 if there was no /proc entry to read it from. */
+ * parent — 0 if there was no /proc entry to read it from. A task /proc does
+ * not show counts as gone, and that is more than the reaped ones: under
+ * hidepid=2 (every Android since 7) a kernel before 4.10 shows only a task the
+ * reader may ptrace, and one whose mm is gone — exiting, or a zombie — is
+ * nobody's to ptrace. */
 static int pt_task_dead(s32 tid, s32 *ppid_out) {
     if (ppid_out)
         *ppid_out = 0;
@@ -953,6 +957,20 @@ static int pt_task_dead(s32 tid, s32 *ppid_out) {
         *ppid_out = par;
     }
     return st == 'Z' || st == 'X' || st == 'x';
+}
+
+/* Is task `tid` a child of ours, exited or not? Asked of the kernel, for
+ * where /proc will not say (see pt_task_dead): a waitid that only peeks at
+ * what it would collect fails ECHILD for anything else. waitid takes __WALL
+ * only since 4.7 and refuses it EINVAL before, where a child whose exit
+ * signal is not SIGCHLD cannot be asked about at all. */
+static int pt_our_child(s32 tid) {
+    u8 si[128];
+    long opts = 4 /*WEXITED*/ | 1 /*WNOHANG*/ | 0x01000000 /*WNOWAIT*/;
+    long r = CNG_SYS(__NR_waitid, 1 /*P_PID*/, tid, si, opts | CNG_WALL, 0, 0);
+    if (r == -EINVAL)
+        r = CNG_SYS(__NR_waitid, 1 /*P_PID*/, tid, si, opts, 0, 0);
+    return r == 0;
 }
 
 /* ---- tracee: the service loop ---- */
@@ -1919,9 +1937,14 @@ static s32 pt_reap_dead(s32 wpid, int *status) {
          * reported an ordinary exit(12) to the tracer as killed by SIGKILL.
          * What this exists for is a tracee that is NOT our child: PTRACE_ATTACH'd
          * or auto-attached through a fork, whose death nothing else tells us
-         * about. A task with no /proc entry left has no parent to read, and if
-         * it were ours the host wait would have freed this link already. */
-        if (par == me)
+         * about. A task with no /proc entry left has no parent to read, and was
+         * taken to be no child of ours, since the host wait would have freed
+         * the link of one already — but /proc hides more than the reaped (see
+         * pt_task_dead): on Android 8's 3.18 every child of ours that left as
+         * a tracee was reported killed by SIGKILL, the window between its mm
+         * going and wait4 finding a zombie being the one this runs in. Where
+         * there is no parent to read, the kernel's own wait is asked. */
+        if (par == me || (par == 0 && pt_our_child(t)))
             continue;
         /* It may also have published an exit of its own while /proc was being
          * read — every check above is on state sampled before that. Claim the
