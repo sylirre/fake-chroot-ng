@@ -99,8 +99,15 @@ check_contains "l2s decref reclaims the backing on last unlink" \
     "l2s-decref: nlink_after1=1 gone=1 -> OK" "$out"
 check_contains "l2s backing pair lives in the central store, names stay clean" \
     "l2s-store: store=1 user_clean=1 -> OK" "$out"
-check_contains "l2s fstat/AT_EMPTY_PATH/statx-mask report emulated nlink" \
-    "l2s-fstat: fd=1 empty=1 emptyx=1 mask=1 -> OK" "$out"
+case "$out" in
+*"l2s-fstat: fd=1 empty=1 emptyx=-1 mask=-1 -> OK"*)
+    skip "l2s statx legs: this host has no statx to issue (kernel or ambient filter)"
+    check_contains "l2s fstat/AT_EMPTY_PATH report emulated nlink" \
+        "l2s-fstat: fd=1 empty=1 emptyx=-1 mask=-1 -> OK" "$out" ;;
+*)
+    check_contains "l2s fstat/AT_EMPTY_PATH/statx-mask report emulated nlink" \
+        "l2s-fstat: fd=1 empty=1 emptyx=1 mask=1 -> OK" "$out" ;;
+esac
 check_contains "l2s readlink via dirfd refuses with EINVAL" \
     "l2s-dirfd-readlink: einval=1 -> OK" "$out"
 check_contains "l2s cross-directory link shares inode/count via the store" \

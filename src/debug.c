@@ -3420,7 +3420,9 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
 
     /* fd-based stat: fstat and the AT_EMPTY_PATH forms must report the
      * emulated st_nlink too (tar/rsync/coreutils stat open fds), and statx
-     * must pass the guest's mask through while advertising STATX_NLINK. */
+     * must pass the guest's mask through while advertising STATX_NLINK —
+     * where there is a statx to issue (-1 where there is not: a kernel before
+     * 4.11, or a filter that predates it, answers ENOSYS). */
     int f_nlink = 0, ep_nlink = 0, epx = 0, xmask = 0;
     long bf2 = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/b",
                             CNG_O_RDONLY, 0, 0, 0, 0);
@@ -3434,15 +3436,17 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
         char sxb[256];
         long r3 = cng_dispatch(__NR_statx, bf2, (long)"", CNG_AT_EMPTY_PATH,
                                CNG_STATX_BASIC_STATS, (long)sxb, 0, 0);
-        epx = (r3 == 0 && STX_NLINK(sxb) == 2 &&
-               (STX_MASK(sxb) & CNG_STATX_NLINK));
+        epx = r3 == -ENOSYS ? -1
+                            : (r3 == 0 && STX_NLINK(sxb) == 2 &&
+                               (STX_MASK(sxb) & CNG_STATX_NLINK));
         sys_close((int)bf2);
     }
     char sxp[256];
     long rxp = cng_dispatch(__NR_statx, CNG_AT_FDCWD, (long)"/w/b", 0,
                             CNG_STATX_NLINK, (long)sxp, 0, 0);
-    xmask = (rxp == 0 && STX_NLINK(sxp) == 2 &&
-             (STX_MASK(sxp) & CNG_STATX_NLINK));
+    xmask = rxp == -ENOSYS ? -1
+                           : (rxp == 0 && STX_NLINK(sxp) == 2 &&
+                              (STX_MASK(sxp) & CNG_STATX_NLINK));
     int ok_fd = (f_nlink && ep_nlink && epx && xmask);
     cng_dprintf(1, "l2s-fstat: fd=%d empty=%d emptyx=%d mask=%d -> %s\n",
                 f_nlink, ep_nlink, epx, xmask, ok_fd ? "OK" : "FAIL");
@@ -7882,7 +7886,7 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
         static const char *const names[] = {"/proc/loadavg",
                                             "/proc/self/cmdline",
                                             "/proc/self/mounts"};
-        int st_ok = 1, sx_ok = 1, fs_ok = 1;
+        int st_ok = 1, sx_ok = 1, fs_ok = 1, sx_none = 0;
         char proc_st[144];
         long rproc = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/proc",
                                   (long)proc_st, 0, 0, 0, 0);
@@ -7915,6 +7919,11 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
                               : -1;
             if (fd >= 0)
                 sys_close((int)fd);
+            /* A host with no statx to issue — a kernel before 4.11, or a
+             * filter that predates it and traps it — answers ENOSYS to both
+             * forms, and there is nothing to compare: statx reads -1. */
+            int no_sx = r3 == -ENOSYS && r4 == -ENOSYS;
+            sx_none |= no_sx;
             if (r1 == -EACCES) {
                 /* The host refuses the path form outright — Android denies
                  * stat of the global files it hides, which is why they are
@@ -7929,11 +7938,11 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
                          *(unsigned *)(fs + 24) == 0 &&   /* st_uid */
                          *(long long *)(fs + 48) == 0 &&  /* st_size */
                          !memcmp(fs, proc_st, 8);         /* st_dev */
-                sx_ok &= r4 == 0 &&
+                sx_ok &= no_sx || (r4 == 0 &&
                          *(unsigned *)(fx + 16) == 1 &&   /* stx_nlink */
                          *(unsigned *)(fx + 20) == 0 &&   /* stx_uid */
                          *(unsigned short *)(fx + 28) == (0100000 | 0444) &&
-                         *(unsigned long long *)(fx + 40) == 0; /* stx_size */
+                         *(unsigned long long *)(fx + 40) == 0); /* stx_size */
                 fs_ok &= r6 == 0 && *(long *)ff == 0x9fa0; /* PROC_SUPER_MAGIC */
                 continue;
             }
@@ -7942,7 +7951,7 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
             st_ok &= r1 == 0 && r2 == 0 && r2b == 0 &&
                      !memcmp(ps, fs, 120) && !memcmp(fs, es, 120);
             /* statx: everything but the spare tail */
-            sx_ok &= r3 == 0 && r4 == 0 && !memcmp(px, fx, 152);
+            sx_ok &= no_sx || (r3 == 0 && r4 == 0 && !memcmp(px, fx, 152));
             fs_ok &= r5 == 0 && r6 == 0 && !memcmp(pf, ff, 120);
         }
         /* a held entry outlives its process */
@@ -8031,9 +8040,10 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
                  plain_ok;
         cng_dprintf(1,
                     "proctest synth fd stat: fstat=%d statx=%d fstatfs=%d "
-                    "outlives=%d link=%d dup=%d plain=%d -> %s\n",
-                    st_ok, sx_ok, fs_ok, keep_ok, link_ok, dup_ok, plain_ok,
-                    ok ? "OK" : "FAIL");
+                    "outlives=%d link=%d dup=%d plain=%d -> %s%s\n",
+                    st_ok, sx_none ? -1 : sx_ok, fs_ok, keep_ok, link_ok,
+                    dup_ok, plain_ok, ok ? "OK" : "FAIL",
+                    sx_none ? " (-1 = not issuable here)" : "");
         fails += !ok;
     }
 

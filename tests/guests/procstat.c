@@ -14,7 +14,10 @@
  *
  * Prints one line per file, "<name>: ok" or the first thing that was wrong.
  * It asserts nothing about the host: the same output is right where the host
- * answers every one of these itself and where it refuses them all.
+ * answers every one of these itself and where it refuses them all. A host
+ * with no statx at all (a kernel before 4.11, or a filter that predates it) is
+ * the exception, since nothing can answer what nobody can ask: the statx
+ * forms are left out there, and a last line says so.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -46,6 +49,23 @@ static unsigned long long sx_u64(const struct sx *s, int o) {
 }
 
 static char why[160];
+
+/* statx answered ENOSYS: there is none to ask on this host. */
+static int no_statx;
+
+/* statx, or 1 with no_statx set where there is none. */
+static int statx_of(int dfd, const char *name, int flags, struct sx *sx) {
+    memset(sx, 0, sizeof *sx);
+    if (no_statx)
+        return 1;
+    if (syscall(__NR_statx, dfd, name, flags, 0x7ffu /* STATX_BASIC_STATS */,
+                sx->b) == 0)
+        return 0;
+    if (errno != ENOSYS)
+        return -1;
+    no_statx = 1;
+    return 1;
+}
 
 static int bad(const char *what, const char *fmt, long a, long b) {
     int n = snprintf(why, sizeof why, "%s: ", what);
@@ -103,15 +123,15 @@ static int one(const char *name, int procfd) {
     if (check_st("lstat", &ls, &st))
         return 1;
 
-    memset(&sx, 0, sizeof sx);
-    if (syscall(__NR_statx, AT_FDCWD, name, 0, 0x7ffu /* STATX_BASIC_STATS */,
-                sx.b))
+    int r = statx_of(AT_FDCWD, name, 0, &sx);
+    if (r < 0)
         return fail_errno("statx");
-    if (shape("statx", sx_u32(&sx, 28) & 0xffff, sx_u32(&sx, 16),
+    if (r == 0 &&
+        shape("statx", sx_u32(&sx, 28) & 0xffff, sx_u32(&sx, 16),
               (long)sx_u64(&sx, 40), sx_u32(&sx, 20), sx_u32(&sx, 24)))
         return 1;
-    if (sx_u64(&sx, 32) != st.st_ino ||
-        makedev(sx_u32(&sx, 136), sx_u32(&sx, 140)) != st.st_dev)
+    if (r == 0 && (sx_u64(&sx, 32) != st.st_ino ||
+                   makedev(sx_u32(&sx, 136), sx_u32(&sx, 140)) != st.st_dev))
         return bad("statx", "identity %ld, want %ld", (long)sx_u64(&sx, 32),
                    (long)st.st_ino);
 
@@ -127,10 +147,10 @@ static int one(const char *name, int procfd) {
         return fail_errno("fstat O_PATH");
     if (check_st("fstat O_PATH", &ps, &st))
         return 1;
-    memset(&sx, 0, sizeof sx);
-    if (syscall(__NR_statx, pfd, "", AT_EMPTY_PATH, 0x7ffu, sx.b))
+    r = statx_of(pfd, "", AT_EMPTY_PATH, &sx);
+    if (r < 0)
         return fail_errno("statx O_PATH");
-    if (sx_u64(&sx, 32) != st.st_ino)
+    if (r == 0 && sx_u64(&sx, 32) != st.st_ino)
         return bad("statx O_PATH", "identity %ld, want %ld",
                    (long)sx_u64(&sx, 32), (long)st.st_ino);
     close(pfd);
@@ -189,5 +209,7 @@ int main(void) {
         }
         fflush(stdout);
     }
+    if (no_statx)
+        printf("statx: none on this host\n");
     return rc;
 }

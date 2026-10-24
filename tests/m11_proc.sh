@@ -143,9 +143,15 @@ check_contains "synthesized /proc opens judge their flags as the kernel does" \
 # read "/memfd:cng-proc (deleted)". Now the real file's — found again from the
 # memfd's name, so a dup'd fd and a stat through the link agree too, and a
 # held entry of a process that is gone still reads as a /proc regular file.
+# A host with no statx to issue cannot be asked the statx half (statx=-1).
+sfd_needle="proctest synth fd stat: fstat=1 statx=1 fstatfs=1 outlives=1 link=1 dup=1 plain=1 -> OK"
+case "$out" in
+*"proctest synth fd stat: fstat=1 statx=-1 "*)
+    skip "synthesized fd statx: this host has no statx to issue (kernel or ambient filter)"
+    sfd_needle="proctest synth fd stat: fstat=1 statx=-1 fstatfs=1 outlives=1 link=1 dup=1 plain=1 -> OK" ;;
+esac
 check_contains "a synthesized fd stats as the real /proc file, and outlives it" \
-    "proctest synth fd stat: fstat=1 statx=1 fstatfs=1 outlives=1 link=1 dup=1 plain=1 -> OK" \
-    "$out"
+    "$sfd_needle" "$out"
 check_contains "stat falls back to synthesis where the host denies it" \
     "proctest stat:" "$out"
 check_contains "overflowuid is the kernel default, from a memfd, where forced" \
@@ -329,8 +335,20 @@ rm -rf "$PN_ROOT"
 # itself: on a device the refusal is real, and elsewhere CNG_PROC_DENY_STAT=1
 # makes the second run take the same path (/proc/stat and the overflow{u,g}id
 # sysctls, readable here, join it with CNG_PROCSTAT_SYNTH and
-# CNG_OVERFLOWID_SYNTH).
+# CNG_OVERFLOWID_SYNTH). Where the host has no statx at all the guest leaves
+# that form out and says so on a last line, which is taken off and noted.
 PS_ROOT=$(mktemp -d)
+ps_nostatx() {
+    case "$ps_got" in
+    *"
+statx: none on this host")
+        ps_got=${ps_got%"
+statx: none on this host"}
+        [ -n "${ps_noted:-}" ] ||
+            skip "statx of a synthesized /proc file: this host has no statx to issue"
+        ps_noted=1 ;;
+    esac
+}
 if guest_xlate_ready "synthesized /proc stat leg" &&
     guest_cc_report "$PS_ROOT/procstat" tests/guests/procstat.c; then
     ps_want="/proc/version: ok
@@ -341,6 +359,7 @@ if guest_xlate_ready "synthesized /proc stat leg" &&
 /proc/sys/kernel/overflowgid: ok"
     # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
     ps_got=$(run_t 60 -R $GUEST_BINDS "$PS_ROOT" /procstat 2>/dev/null)
+    ps_nostatx
     if [ "$ps_got" = "$ps_want" ]; then
         pass=$((pass + 1))
         echo "  ok   stat and access of a synthesized /proc file agree with the file it is served as"
@@ -352,6 +371,7 @@ if guest_xlate_ready "synthesized /proc stat leg" &&
     # shellcheck disable=SC2086
     ps_got=$(CNG_PROC_DENY_STAT=1 CNG_PROCSTAT_SYNTH=1 CNG_OVERFLOWID_SYNTH=1 \
         run_t 60 -R $GUEST_BINDS "$PS_ROOT" /procstat 2>/dev/null)
+    ps_nostatx
     if [ "$ps_got" = "$ps_want" ]; then
         pass=$((pass + 1))
         echo "  ok   ...and with the host's own refusal of each call forced"
