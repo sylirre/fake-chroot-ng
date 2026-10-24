@@ -5,7 +5,8 @@
  *
  * The policy whitelists, per object class, the ioctls an app domain may issue,
  * and the list is short for a pty: TCGETS, TCSETS*, TIOCGWINSZ and a few more
- * are on it, the rest answer EACCES -- on a terminal and on a pipe alike. A
+ * are on it (Android 8's has no TCSETSF yet), the rest answer EACCES -- on a
+ * terminal and on a pipe alike. A
  * guest runs its ioctls natively, so it met the refusal itself. The requests
  * below are the ones a libc turns into a verdict about the terminal, and the
  * filter traps exactly these (seccomp.c) so that the dispatcher can answer
@@ -36,5 +37,10 @@ extern int cng_g_termios2_deny;
  * refuses on a pty slave and on a pipe; it is then served from TCGETS,
  * TIOCGPGRP and getsid. */
 extern int cng_g_tiocgsid_deny;
+
+/* CNG_TCSETSF_DENY=1: the same for TCSETSF (tcsetattr(TCSAFLUSH)), which
+ * Android 8's policy refuses on a pty; it is then served from TCFLSH and
+ * TCSETSW, and so is the TCSETSF2 that falls back to it. */
+extern int cng_g_tcsetsf_deny;
 
 #endif /* CNG_TTY_H */

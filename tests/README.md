@@ -63,7 +63,8 @@ expected failure:
   on a pipe, answered from `TCGETS`, `TIOCGPGRP` and `getsid`
   (`CNG_TIOCGSID_DENY=1`). qemu-user answers `TIOCGSID` with success and no
   session, so m27 asks the host once, outside the monitor, and judges only the
-  forced rows there.
+  forced rows there. Android 8's list lacks `TCSETSF` too (`tcsetattr` with
+  `TCSAFLUSH`), answered from `TCFLSH` and `TCSETSW` (`CNG_TCSETSF_DENY=1`).
 * **The kernel is built without checkpoint/restore support**: no
   `/proc/self/timers`, and `PTRACE_O_SUSPEND_SECCOMP` is `EINVAL`.
 * **`$TMPDIR` is inside `$PREFIX`, which the harness binds** for a guest's

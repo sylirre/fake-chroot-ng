@@ -38,6 +38,19 @@
  * logged by the policy -- every time. CNG_TERMIOS2_DENY=1 forces the tier on
  * any host.
  *
+ * ---- TCSETSF: tcsetattr(TCSAFLUSH) ----
+ *
+ * The one classic setter an older policy leaves off the list: Android 8's
+ * lets TCSETS, TCSETSW and TCFLSH through on a pty and refuses TCSETSF
+ * (measured on a 3.18 device), which every password prompt asks for -- and
+ * which TCSETSF2 above falls back to. The kernel's TCSETSF is TCSETSW's wait
+ * for the output to drain, then an input flush, then the change; on a pty
+ * slave, the only terminal such a policy is about, there is no output queue
+ * to wait for, and it is served as TCFLSH(TCIFLUSH) and then TCSETSW. A
+ * descriptor that is no terminal is ENOTTY to both, as it is to TCSETSF. The
+ * host is asked first, and the refusal remembered once the pair has proved
+ * it is about TCSETSF; CNG_TCSETSF_DENY=1 forces the tier on any host.
+ *
  * ---- TIOCGSID: the session a terminal belongs to ----
  *
  * tcgetsid(3), which login, script and agetty ask. Android's SELinux policy
@@ -70,9 +83,14 @@
 
 int cng_g_termios2_deny = 0;
 int cng_g_tiocgsid_deny = 0;
+int cng_g_tcsetsf_deny = 0;
 
 #define TC_GETS    0x5401u
 #define TC_SETS    0x5402u
+#define TC_SETSW   0x5403u
+#define TC_SETSF   0x5404u
+#define TC_FLSH    0x540bu
+#define TC_IFLUSH  0      /* TCFLSH's TCIFLUSH */
 #define TC_GETS2   0x802c542au
 #define TC_SETS2   0x402c542bu
 #define TC_SETSW2  0x402c542cu
@@ -93,6 +111,7 @@ const unsigned cng_ioctl_tty[] = {
     TC_SETSW2,
     TC_SETSF2,
     TC_GSID,
+    TC_SETSF,
 };
 const int cng_ioctl_tty_n =
     (int)(sizeof cng_ioctl_tty / sizeof cng_ioctl_tty[0]);
@@ -188,6 +207,45 @@ static void tc_shadow_put(u64 key, u32 ispeed, u32 ospeed) {
     __atomic_store_n(&tc_shadow[slot].key, key, __ATOMIC_RELEASE);
 }
 
+/* Set once the host refused TCSETSF where the pair answering for it was not
+ * refused: the host is not asked again. */
+static int tcsf_host_lacks;
+
+static int tcsf_refused(void) {
+    return cng_g_tcsetsf_deny ||
+           __atomic_load_n(&tcsf_host_lacks, __ATOMIC_RELAXED);
+}
+
+/* TCSETSF without TCSETSF, from a termios in our own memory. */
+static long tc_flush_set(int fd, void *t) {
+    long r = sys_ioctl(fd, TC_FLSH, (void *)TC_IFLUSH);
+    if (r == 0)
+        r = sys_ioctl(fd, TC_SETSW, t);
+    if (r == 0)
+        __atomic_store_n(&tcsf_host_lacks, 1, __ATOMIC_RELAXED);
+    return r;
+}
+
+/* TCSETSF from our own memory: the host's, or the pair where it refuses. */
+static long tc_setsf(int fd, void *t) {
+    long r = tcsf_refused() ? -EACCES : sys_ioctl(fd, TC_SETSF, t);
+    return r == -EACCES ? tc_flush_set(fd, t) : r;
+}
+
+/* The guest's own TCSETSF: the host handed the guest's pointer, as termios2's
+ * are, so an unmapped one is the kernel's EFAULT; on the refusal, the termios
+ * is copied in and set by the pair. */
+static long tty_setsf(long fd, long argp) {
+    long r = tcsf_refused() ? -EACCES
+                            : CNG_SYS(__NR_ioctl, fd, TC_SETSF, argp, 0, 0, 0);
+    if (r != -EACCES)
+        return r;
+    u8 buf[TC_TERMIOS_SZ];
+    if (cng_user_copyin(buf, (const void *)argp, sizeof buf) < 0)
+        return -EFAULT;
+    return tc_flush_set((int)fd, buf);
+}
+
 /* Set once the host refused a termios2 command that the classic one answering
  * for it was not refused (so the refusal was about termios2): the host is not
  * asked again. */
@@ -232,7 +290,8 @@ static long tty_termios2(long fd, unsigned req, long argp) {
         memcpy(&ispeed, buf + TC_TERMIOS_SZ, 4);
         memcpy(&ospeed, buf + TC_TERMIOS_SZ + 4, 4);
         unsigned hcmd = TC_SETS + (req - TC_SETS2); /* TCSETS, TCSETSW, TCSETSF */
-        r = sys_ioctl((int)fd, hcmd, buf);
+        r = hcmd == TC_SETSF ? tc_setsf((int)fd, buf)
+                             : sys_ioctl((int)fd, hcmd, buf);
         if (r < 0)
             return r;
         if (((cflag & TC_CBAUD) == TC_BOTHER ||
@@ -368,5 +427,9 @@ static long tty_tiocgsid(long fd, long argp) {
 }
 
 long cng_tty_ioctl(long fd, unsigned req, long argp) {
-    return req == TC_GSID ? tty_tiocgsid(fd, argp) : tty_termios2(fd, req, argp);
+    if (req == TC_GSID)
+        return tty_tiocgsid(fd, argp);
+    if (req == TC_SETSF)
+        return tty_setsf(fd, argp);
+    return tty_termios2(fd, req, argp);
 }

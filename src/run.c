@@ -266,6 +266,10 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
         if (!strncmp(*e, "CNG_TIOCGSID_DENY=", 18) && (*e)[18] != '\0' &&
             (*e)[18] != '0')
             cng_g_tiocgsid_deny = 1;
+        /* CNG_TCSETSF_DENY=1 does the same for TCSETSF. */
+        if (!strncmp(*e, "CNG_TCSETSF_DENY=", 17) && (*e)[17] != '\0' &&
+            (*e)[17] != '0')
+            cng_g_tcsetsf_deny = 1;
         /* CNG_SETID_DENY=1 takes the uid and gid setters as refused by an
          * ambient filter, as Android's refuses them (cred.c). */
         if (!strncmp(*e, "CNG_SETID_DENY=", 15) && (*e)[15] != '\0' &&

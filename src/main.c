@@ -549,6 +549,11 @@ static void help(char **envp) {
                       "slave and a pipe, so it is served from TCGETS, "
                       "TIOCGPGRP and getsid. Test aid: a host that serves it "
                       "never takes that path."},
+        {"CNG_TCSETSF_DENY", "Refuse TCSETSF (tcsetattr with TCSAFLUSH) with "
+                      "EACCES before the host is asked, as Android 8's "
+                      "policy does on a pty, so it is served from TCFLSH and "
+                      "TCSETSW -- and so is TCSETSF2. Test aid: a host that "
+                      "serves it never takes that path."},
         {"CNG_SETID_DENY", "Without -u, take setuid, setgid, setreuid, "
                       "setregid, setresgid, setfsuid, setfsgid and setgroups "
                       "as refused by the host, as Android's app filter "
