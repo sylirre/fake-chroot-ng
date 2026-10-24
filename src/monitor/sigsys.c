@@ -655,16 +655,20 @@ static int cng_scratch_slot(long tid) {
  * So what the guest asked for is kept, per thread, for de_thread to read: a
  * thread that has asked for every signal to be blocked is, for a moment, left
  * alone and waited for, like the kernel's de_thread does for one already
- * exiting. It is a hint with a deadline (execve.c gives it a few milliseconds),
- * not a refusal: a thread that really does sit with everything blocked — the
- * sigwait thread of a daemon — is told after that as it always was. `how` and
+ * exiting. It is a hint with a deadline (execve.c gives it a few milliseconds,
+ * and up to a second while it is not asleep), not a refusal: a thread that
+ * really does sit with everything blocked — the sigwait thread of a daemon —
+ * is told after that as it always was. `how` and
  * `set` are the call's own; the SIGSYS tier, which computes the resulting mask,
  * passes it as a SETMASK. */
 void cng_sig_note_mask(int how, unsigned long set) {
-    int i = cng_scratch_slot(sys_gettid());
-    if (i < 0)
-        return;
     int full = (set | (1UL << (CNG_SIGSYS - 1))) == ~0UL;
+    int i = cng_scratch_slot(sys_gettid());
+    if (i < 0) {
+        if (full && how != 1 && cng_dethread_doomed())
+            cng_dethread_die();
+        return;
+    }
     int cur = __atomic_load_n(&cng_scr[i].sigfull, __ATOMIC_RELAXED);
     if (how == 2 /*SETMASK*/)
         cur = full;
@@ -672,7 +676,15 @@ void cng_sig_note_mask(int how, unsigned long set) {
         cur = 1;
     else if (how == 1 /*UNBLOCK*/ && set)
         cur = 0;
-    __atomic_store_n(&cng_scr[i].sigfull, cur, __ATOMIC_RELAXED);
+    /* The mask first, then whether an exec is killing this thread: de_thread
+     * says so first and reads the mask after, and the four are sequentially
+     * consistent, so one side always sees the other. A thread whose whole
+     * mask the exec read too early sees the exec, and exits here: it was
+     * told without its mask, and the request, sent microseconds after the
+     * read, used to be delivered as its unmap returned, onto no stack. */
+    __atomic_store_n(&cng_scr[i].sigfull, cur, __ATOMIC_SEQ_CST);
+    if (cur && cng_dethread_doomed())
+        cng_dethread_die();
 }
 
 /* Has thread `tid` asked for every signal to be blocked? Read by another thread
@@ -683,7 +695,7 @@ int cng_sig_all_blocked(long tid) {
         unsigned i = (h + k) % CNG_SCR_N;
         long t = __atomic_load_n(&cng_scr[i].tid, __ATOMIC_ACQUIRE);
         if (t == tid)
-            return __atomic_load_n(&cng_scr[i].sigfull, __ATOMIC_RELAXED);
+            return __atomic_load_n(&cng_scr[i].sigfull, __ATOMIC_SEQ_CST);
         if (t == 0)
             return 0;
     }
@@ -806,14 +818,15 @@ static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {
      * die here and now — wherever this thread was, in the guest or nested
      * inside a dispatch of its own — or carry the exec it planned. */
     void (*fn)(void *, void *) = sigsys_on_scratch;
-    switch (cng_dethread_request(si)) {
+    /* A sibling's exec is killing this thread: whatever this SIGSYS is, it is
+     * the request too. One sent while another SIGSYS was pending (a trap's)
+     * was merged into it, and execve.c tells a thread only once. */
+    int req = cng_dethread_request(si);
+    if (!req && cng_dethread_doomed())
+        req = CNG_DT_DIE;
+    switch (req) {
     case CNG_DT_DIE:
-        /* Killed by a sibling's exec, which is a SIGKILL from the kernel's
-         * de_thread: a tracer of this thread is shown that death, and the
-         * per-task ptrace state goes back with the task. */
-        cng_pt_exit_report(9 /*SIGKILL*/);
-        for (;;)
-            sys_exit(0);
+        cng_dethread_die(); /* killed by a sibling's exec */
     case CNG_DT_EXEC:
         fn = takeover_on_scratch;
         break;

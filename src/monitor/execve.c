@@ -412,7 +412,9 @@ static long exec_args_take(struct exec_args *a, const char *path, char **argv,
  *    that is gone. What cannot take it is a thread that has SIGSYS blocked,
  *    which the mediation makes impossible for a guest short of editing its
  *    own signal frame, and which qemu-user's own threads are: those are left
- *    alone, since they are not the guest's.
+ *    alone, since they are not the guest's. Sent once a second, not once a
+ *    round (see cng_dethread), and any SIGSYS a sibling takes meanwhile is
+ *    taken for it, which a request merged into a pending SIGSYS needs.
  *  - CNG_DT_EXEC: carry out the exec I planned. Sent by a non-leader thread
  *    to the group leader, with the plan in g_job; the requester then exits.
  *    The leader kills the rest, maps the images, runs the commit and enters
@@ -455,6 +457,10 @@ struct exec_job {
 static struct exec_job g_job;
 static long g_exec_claim;
 
+/* The thread whose exec is killing its siblings, and the process it is
+ * doing it in, for as long as it is (cng_dethread); 0 otherwise. */
+static long g_dt_killer, g_dt_pid;
+
 int cng_exec_pending(void) {
     return __atomic_load_n(&g_job.pending, __ATOMIC_ACQUIRE);
 }
@@ -467,6 +473,7 @@ void cng_exec_fork_child(void) {
     if (__atomic_exchange_n(&g_job.pending, 0, __ATOMIC_RELAXED))
         exec_args_free(&g_job.args); /* the child's own copy of the snapshot */
     __atomic_store_n(&g_exec_claim, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_dt_killer, 0, __ATOMIC_RELAXED);
 }
 
 /* Send a de_thread request to `tid`: 0, or -errno (-ESRCH: no such thread). */
@@ -488,6 +495,23 @@ static long dethread_send(long tid, int what) {
     si.sival_int = CNG_DT_MAGIC + what;
     return CNG_SYS(__NR_rt_tgsigqueueinfo, sys_getpid(), tid, CNG_SIGSYS, &si, 0,
                    0);
+}
+
+/* Sequentially consistent, against cng_sig_note_mask's store: a thread that
+ * blocks every signal after this exec has read its mask sees the exec, and
+ * one this exec saw with a whole mask is left alone (dt_round). */
+int cng_dethread_doomed(void) {
+    long k = __atomic_load_n(&g_dt_killer, __ATOMIC_SEQ_CST);
+    return k && k != sys_gettid() &&
+           __atomic_load_n(&g_dt_pid, __ATOMIC_RELAXED) == sys_getpid();
+}
+
+/* Exit as the kernel's de_thread kills: a SIGKILL, which a tracer of this
+ * thread is shown, and the per-task ptrace state goes back with the task. */
+void cng_dethread_die(void) {
+    cng_pt_exit_report(9 /*SIGKILL*/);
+    for (;;)
+        sys_exit(0);
 }
 
 int cng_dethread_request(const cng_siginfo_t *si) {
@@ -635,6 +659,21 @@ static int task_state(long tid) {
     return TASK_LIVE;
 }
 
+/* Is `tid` asleep in a syscall it can be woken from (State: S)? A thread on
+ * its way out is running, waiting to run, or in the uninterruptible wait of
+ * its unmap. */
+static int task_asleep(long tid) {
+    static const char *const keys[] = {"State:"};
+    char path[64], v[1][STATUS_LINE];
+    cng_snprintf(path, sizeof path, "/proc/self/task/%ld/status", tid);
+    if (!(status_scan(path, keys, 1, v) & 1))
+        return 0;
+    const char *st = v[0];
+    while (*st == ' ' || *st == '\t')
+        st++;
+    return *st == 'S';
+}
+
 /* The process's thread count as the kernel has it (Threads: in its status
  * file): every task of the group not yet released, listed or not. -1 when it
  * cannot be read. */
@@ -668,18 +707,34 @@ static int task_unreachable(long tid) {
  * kernel's de_thread.
  *
  * The siblings are the kernel's list, /proc/self/task, read afresh every
- * round and each listed one told again — a request already pending is not
- * queued twice, and the answer says whether the thread is there at all — so
- * that neither the count of them nor a thread that arrives late is a
- * problem: a table of them used to hold 4096, and the exec went ahead beside
- * the rest without a word; and a sibling can clone a thread between being
- * listed and taking the request. One with the request pending cannot (the
- * kernel restarts its clone into the handler, which never comes back; under
- * qemu-user the one clone in flight completes, and no other), so each
- * round's newcomers were cloned by an earlier round's threads before their
- * own request landed, and the rounds end. A listing that takes more
- * than one read can skip a thread while others exit under it, so the
- * kernel's count of them (Threads: in the status file, which covers every
+ * round, and each listed one is told once and then only looked for, so that
+ * neither the count of them nor a thread that arrives late is a problem: a
+ * table of them used to hold 4096, and the exec went ahead beside the rest
+ * without a word; and a sibling can clone a thread between being listed and
+ * taking the request.
+ *
+ * Once, because a request the kernel has delivered is no longer pending, and
+ * one sent then is not merged with it the way a pending one is (SIGSYS is no
+ * realtime signal): it is delivered too, on top. A thread that the scheduler
+ * leaves sitting at the handler's first instruction — one of a few dozen on
+ * four slow cores — took a request every round, a frame of 4.6 KiB each on
+ * the alternate stack the handler runs on, and bionic's is 16 KiB: the
+ * fourth found no room, and the kernel killed the whole process with a
+ * SIGSEGV (Android 8's M6 chain shape, one run in fifteen). A request is
+ * still lost where one SIGSYS is pending already (a seccomp trap's, between
+ * the trap and its delivery) — and that one is then taken for the request
+ * (cng_dethread_doomed). What is left is a thread that took over the tid of
+ * one that died, which has been told nothing: so the told are forgotten once
+ * a second and every thread still listed is told again, a frame a second
+ * for one that is starved meanwhile.
+ *
+ * One with the request pending cannot clone (the kernel restarts its clone
+ * into the handler, which never comes back; under qemu-user the one clone in
+ * flight completes, and no other), so each round's newcomers were cloned by
+ * an earlier round's threads before their own request landed, and the rounds
+ * end. A listing that takes more than one read can skip a thread while
+ * others exit under it, so the kernel's count of them (Threads: in the
+ * status file, which covers every
  * task a listing could show) has the last word: as long as it exceeds this
  * thread plus what was given up on, something remains and the next round
  * lists it.
@@ -692,11 +747,41 @@ static int task_unreachable(long tid) {
  * counted, and are looked at again once a second: a zombie a tracer reaps
  * has its tid free to be reused by a thread that is the guest's. A thread
  * that is reachable and merely slow — parked in an uninterruptible wait, say
- * — is waited for as long as it takes, as the kernel would; telling it
- * again each round is also what reaches a thread that took over the tid of
- * one that died. */
+ * — is waited for as long as it takes, as the kernel would. */
 static struct cng_tab g_dt_left = CNG_TAB_INIT(long);
 static unsigned long g_dt_nleft;
+
+/* Who has been told since the last mark: a bit per tid, over every tid a
+ * 64-bit kernel can hand out (PID_MAX_LIMIT), which is 512 KiB of address
+ * space and only the pages holding this process's tids ever touched. Mapped
+ * for the de_thread, and mapped afresh at each mark to forget. Without it
+ * (no memory) every listed thread is told every round, as it used to be. */
+#define DT_TID_LIMIT (1UL << 22)
+static unsigned long *g_dt_told;
+
+static void dt_told_map(void) {
+    void *p = sys_mmap(0, DT_TID_LIMIT / 8, CNG_PROT_READ | CNG_PROT_WRITE,
+                       CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    g_dt_told = cng_is_err((long)p) ? 0 : cng_own_map(p, DT_TID_LIMIT / 8);
+}
+
+static void dt_told_unmap(void) {
+    if (g_dt_told) {
+        cng_own_drop(g_dt_told, DT_TID_LIMIT / 8);
+        sys_munmap(g_dt_told, DT_TID_LIMIT / 8);
+    }
+    g_dt_told = 0;
+}
+
+/* Has `tid` been told since the last mark? Records that it is, from now. */
+static int dt_told(long tid) {
+    if (!g_dt_told || tid <= 0 || (unsigned long)tid >= DT_TID_LIMIT)
+        return 0;
+    unsigned long bit = 1UL << (tid % 64), *w = &g_dt_told[tid / 64];
+    int was = (*w & bit) != 0;
+    *w |= bit;
+    return was;
+}
 
 static int dt_left(long tid) {
     for (unsigned long i = 0; i < g_dt_nleft; i++)
@@ -748,7 +833,7 @@ static long dt_left_revisit(long pid) {
 static char g_dt_dents[16384];
 
 static long dt_round(long pid, long me, int mark, int first, int grace,
-                     long *told) {
+                     int patient, long *told) {
     long fd = sys_openat(CNG_AT_FDCWD, "/proc/self/task",
                          CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
     if (fd < 0)
@@ -790,10 +875,25 @@ static long dt_round(long pid, long me, int mark, int first, int grace,
              * kernel kills the whole process for it. Held back while the
              * grace lasts, and still waited for: it counts as there until it
              * is gone, as the kernel's de_thread waits for one that is
-             * exiting. Past the grace it is told like any other, so a thread
-             * that sits with everything blocked for good is not left. */
-            if (grace && cng_sig_all_blocked(tid)) {
+             * exiting. Past the grace, still for as long as it is running or
+             * waiting to run, up to a second: leaving takes microseconds,
+             * unless the scheduler leaves the thread between the unmap and
+             * the exit, which on a loaded device it did for longer than the
+             * grace. One asleep in a syscall is not leaving (a daemon's
+             * sigwait thread) and is told like any other past the grace, as
+             * is anything past the second, so a thread that sits with
+             * everything blocked for good is not left. One that blocks
+             * everything once this exec has begun never gets here: it sees
+             * the exec and exits there (cng_sig_note_mask). */
+            if (cng_sig_all_blocked(tid) &&
+                (grace || (patient && !task_asleep(tid)))) {
                 live++;
+                continue;
+            }
+            /* Told already (see cng_dethread): only whether it is there. */
+            if (dt_told(tid)) {
+                if (CNG_SYS(__NR_tgkill, pid, tid, 0, 0, 0, 0) != -ESRCH)
+                    live++;
                 continue;
             }
             if (dethread_send(tid, CNG_DT_DIE) == -ESRCH)
@@ -811,17 +911,26 @@ static long dt_round(long pid, long me, int mark, int first, int grace,
  * microseconds, so this is generous, and an exec that does have such a thread to
  * kill waits that much longer for it and no more. */
 #define DT_GRACE_SPINS 100
+/* ...and while it is not asleep, how many more: a second's worth. */
+#define DT_PATIENCE_SPINS 10000
 
 static void cng_dethread(void) {
     long pid = sys_getpid(), me = sys_gettid(), told = 0;
     g_dt_nleft = 0;
+    __atomic_store_n(&g_dt_pid, pid, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_dt_killer, me, __ATOMIC_SEQ_CST);
+    dt_told_map();
     for (unsigned spin = 0;; spin++) {
         int mark = spin % 10000 == 0; /* once a second */
-        if (mark && spin)
+        if (mark && spin) {
             dt_left_revisit(pid);
-        long live = dt_round(pid, me, mark, !spin, spin < DT_GRACE_SPINS, &told);
+            dt_told_unmap(); /* forget who was told */
+            dt_told_map();
+        }
+        long live = dt_round(pid, me, mark, !spin, spin < DT_GRACE_SPINS,
+                             spin < DT_PATIENCE_SPINS, &told);
         if (live < 0)
-            return;
+            break;
         if (!spin && cng_g_debug && live)
             cng_dprintf(2, "[cng] exec: de_thread: %ld sibling thread(s)\n",
                         live);
@@ -836,6 +945,8 @@ static void cng_dethread(void) {
         struct cng_timespec nap = {0, 100 * 1000}; /* 100 us */
         CNG_SYS(__NR_nanosleep, &nap, 0, 0, 0, 0, 0);
     }
+    dt_told_unmap();
+    __atomic_store_n(&g_dt_killer, 0, __ATOMIC_RELEASE);
     if (cng_g_debug && told)
         cng_dprintf(2, "[cng] exec: de_thread: done, %ld request(s) sent\n",
                     told);

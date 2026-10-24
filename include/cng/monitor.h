@@ -139,6 +139,11 @@ void cng_cred_exec(const char *host);
 int cng_dethread_request(const cng_siginfo_t *si);
 #define CNG_DT_DIE  1
 #define CNG_DT_EXEC 2
+/* Is a sibling's exec killing this thread right now? Then whatever SIGSYS it
+ * takes is taken for the request, which that SIGSYS may have displaced. */
+int cng_dethread_doomed(void);
+/* Exit as a thread the kernel's de_thread kills. */
+__attribute__((noreturn)) void cng_dethread_die(void);
 /* One of the waits that install a signal mask of their own (rt_sigsuspend,
  * rt_sigtimedwait, ppoll, pselect6, epoll_pwait[2])? Trapped when they carry
  * a mask, so SIGSYS can be taken out of it. */

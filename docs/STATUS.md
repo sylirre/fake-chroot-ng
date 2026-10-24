@@ -2916,23 +2916,24 @@ vfork/`posix_spawn` child-stack handling.
   ahead beside them — old threads running the old program through the fd
   cleanup, the signal reset and the mapping reclaim — without a word, since a
   full table read the same as a complete one. A thread a sibling cloned
-  between being listed and taking its request was missed the same way, at
-  any thread count. The listing is the kernel's own now, read afresh every
-  round until it is empty, and every listed sibling is told again each round
-  (a request already pending is not queued twice, and the answer doubles as
-  the existence probe — which also reaches a thread that took over the tid
-  of one that died); a listing that takes more than one read can skip an
-  entry while threads exit under it, so the kernel's own count (`Threads:`)
-  has the last word. What cannot take the request — a zombie, or a thread
-  that keeps `SIGSYS` blocked: qemu-user's own, or a guest that edited its
-  signal frame — is given up on after a second as before, kept apart in a
-  small table that grows, and looked at again once a second; a blocked
-  thread is sampled ten times a millisecond apart first, so a writer of ours
-  holding every signal off for a moment is not mistaken for one. The status
-  fields are read by streaming the file: a `Groups:` line of a process with
-  many supplementary groups runs past any one buffer, and every field wanted
-  comes after it. `tests/guests/spawnexec.c` execs from 4500 parked threads
-  and from sixteen chains that clone their successor at birth; the old
+  between being listed and taking its request was missed the same way, at any
+  thread count. The listing is the kernel's own now, read afresh every round
+  until it is empty, and every listed sibling is told again each round (a
+  request already pending is not queued twice, and the answer doubles as the
+  existence probe — which also reaches a thread that took over the tid of one
+  that died; once a second since M89, which found that a request already
+  delivered is no protection); a listing that takes more than one read can
+  skip an entry while threads exit under it, so the kernel's own count
+  (`Threads:`) has the last word. What cannot take the request — a zombie, or
+  a thread that keeps `SIGSYS` blocked: qemu-user's own, or a guest that
+  edited its signal frame — is given up on after a second as before, kept
+  apart in a small table that grows, and looked at again once a second; a
+  blocked thread is sampled ten times a millisecond apart first, so a writer
+  of ours holding every signal off for a moment is not mistaken for one. The
+  status fields are read by streaming the file: a `Groups:` line of a process
+  with many supplementary groups runs past any one buffer, and every field
+  wanted comes after it. `tests/guests/spawnexec.c` execs from 4500 parked
+  threads and from sixteen chains that clone their successor at birth; the old
   binary reports 407 and ~20 threads after the exec, the kernel and the fix
   report 2 (qemu-user's own thread included) — the `m6` legs.
 
@@ -3970,6 +3971,41 @@ vfork/`posix_spawn` child-stack handling.
     kernel: waitpid and waitid interrupted with and without SA_RESTART, and
     uninterrupted. The previous build returns the child, 5 s later, where the
     kernel returns EINTR.
+
+- [x] **M89 — an exec's de_thread stacked its requests on a thread that had not run**
+  M6's chain shape (sixteen chains of short-lived detached threads, then an
+  exec) died of a SIGSEGV in a few runs in a hundred on Android 8 (Galaxy S7,
+  kernel 3.18). Traced, it was two races, both ending in a signal frame the
+  kernel had nowhere to put, which kills the whole process (`SI_KERNEL`).
+  - Told every round: M52 sent the die request to every listed sibling each
+    100 µs round, trusting that a pending request is not queued twice. A
+    request already delivered is no longer pending, so the next is
+    delivered on top of it. A thread the scheduler left at the handler's first
+    instruction took a frame a round, 4.6 KiB each on the alternate stack the
+    handler runs on (bionic's is 16 KiB), and the fourth did not fit. Each
+    sibling is now told once, in a bitmap by tid that is forgotten once a
+    second (a tid a new thread took over), and only looked for with a
+    signal-0 `tgkill` in between. A request lost to a SIGSYS already pending
+    (a trap's) is not lost any more: while an exec kills its siblings, any
+    SIGSYS a sibling takes is taken for the request
+    (`cng_dethread_doomed`).
+  - Told during the unmap: a thread on its way out blocks every signal, unmaps
+    its own stack and exits, and is left alone while its mask says so (the
+    grace of 79e5c2a). The exec read the mask, the thread then set it and
+    entered the unmap, and the request sent microseconds after the read was
+    delivered as the unmap returned. The mask is now stored before the thread
+    looks for an exec in progress, and the exec says it is one before it reads
+    any mask, all four sequentially consistent: a thread whose mask was read
+    too early sees the exec and exits in `cng_sig_note_mask`. Past the 100-round
+    grace such a thread is still left alone while it is running or runnable
+    (not asleep in a syscall), for up to a second.
+  - Test: `tests/guests/dtstall.c` runs the chain shape under ptrace and holds
+    each request at its delivery for 2 ms, as a loaded scheduler does. The
+    previous build died 10 runs in 10 on the S7 and 5 in 5 on the arm64 VM,
+    and this one passes every run. It needs a host that runs the guest's
+    binaries itself, so it is skipped under qemu-user. The plain chain leg
+    crashed 2 runs in 30 on the S7 before (9 in 100 with the first half of
+    this alone) and none in 400 after.
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 

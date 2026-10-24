@@ -618,6 +618,42 @@ else
             printf '       kernel: %s\n       guest : %s\n' "$se_k" "$se_g"
         fi
     done
+    # ...and with each request held at its delivery for a few milliseconds,
+    # as the scheduler holds a thread on a loaded device. A request that has
+    # been delivered is no longer pending, so another one is delivered on top
+    # of it: told every round, a held thread collected a signal frame a round
+    # until there was no room for the next, and the kernel killed the whole
+    # process with a SIGSEGV (a few chain runs in a hundred on Android 8,
+    # where bionic's alternate stack is 16 KiB). The tracer that holds them is
+    # a native program (dtstall.c), so a host that runs the guest's binaries
+    # through qemu-user, whose host tracer would see the emulator's signals,
+    # has no such run.
+    if [ -n "$QEMU" ]; then
+        skip "de_thread with each request held at delivery: a host tracer under qemu-user sees the emulator's signals, not the guest's"
+    elif ! guest_cc "$SED/dtstall" tests/guests/dtstall.c; then
+        skip "de_thread with each request held at delivery: could not build tests/guests/dtstall.c"
+    else
+        se_k=$(cd "$SED/bin" && emu_t 180 ./spawnexec chain 16 2>/dev/null | grep '^report:')
+        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+        se_g=$(emu_t 240 "$SED/dtstall" 2 "$BIN" -R $GUEST_BINDS "$SED" /bin/spawnexec chain 16 2>/dev/null)
+        se_rc=$?
+        case "$se_g" in
+        SKIP:*)
+            skip "de_thread with each request held at delivery: ${se_g#SKIP: }"
+            ;;
+        *)
+            se_g=$(printf '%s\n' "$se_g" | grep '^report:')
+            if [ -n "$se_k" ] && [ "$se_k" = "$se_g" ]; then
+                pass=$((pass + 1))
+                printf '  ok   execve reaches every sibling with each request held at delivery (%s)\n' "$se_g"
+            else
+                fail=$((fail + 1))
+                printf '  FAIL execve with each request held at delivery (rc %s)\n' "$se_rc"
+                printf '       kernel: %s\n       guest : %s\n' "$se_k" "$se_g"
+            fi
+            ;;
+        esac
+    fi
 fi
 rm -rf "$SED"
 
