@@ -4019,6 +4019,35 @@ vfork/`posix_spawn` child-stack handling.
   now. `unmapself.c` wrote bionic's sequence with x8, which is how it passed;
   it writes w8 now, and the previous rewriter fails it.
 
+- [x] **M91 — a fake identity's own credentials were refused over AF_UNIX**
+  GLib's GDBus client sends an `SCM_CREDENTIALS` record before it
+  authenticates, claiming its `getpid()`, `geteuid()` and `getegid()`. Under
+  `-u` those are the fake ids, and the kernel holds a sender to the ids it
+  claims (`scm_check_creds`, against the real ones), so it answered EPERM: an
+  XFCE session started with `dbus-launch` on Termux showed "Unable to contact
+  settings server" ("Error sending credentials: Error sending message:
+  Operation not permitted"). proot rewrites the claim to the real ids; a
+  receiver there still sees the real ones.
+  - Going out (`sendmsg`, and `sendmmsg` per message), the claim is judged
+    against the fake set by the kernel's rule (the real, effective or saved id;
+    any id while fake root) and spelled in the host's ids. A claim the rule
+    refuses is sent with pid 0, so the kernel refuses it with its own EPERM, in
+    its own order among the records. An id of -1 and a record of the wrong
+    length go through as they are, for the kernel's EINVAL.
+  - Coming in (`recvmsg`, `recvmmsg`), the ids are remapped as `SO_PEERCRED`'s
+    are, in the monitor's bounce buffer before the copy to the guest, and so is
+    a record cut short as far as its whole ids go. AF_NETLINK's control data
+    is bounced for this too under `-u`.
+  - What cannot be done: the host's ids do not say which fake id a claim named,
+    so a receiver sees the run's identity for every claim the rule allowed (as
+    `SO_PEERCRED` does). A fake root cannot name another pid, since the host
+    grants it no CAP_SYS_ADMIN. Where chroot-ng itself runs as root, a refused
+    claim is ESRCH instead of EPERM.
+  - Test: m7, `tests/guests/scmcred.c`, on both tiers as fake root, as fake
+    1234 and without `-u`, against the kernel's own answers. The previous build
+    fails the 15 rows a claim or a remap decides. qemu-user drops MSG_CTRUNC
+    from a cut record, so the flag is checked natively only.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

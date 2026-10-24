@@ -205,6 +205,8 @@ struct cng_open_how {
 #define CNG_SO_SNDBUF    7
 #define CNG_SO_DOMAIN    39 /* the socket's own address family, in one call */
 #define CNG_SCM_RIGHTS   1
+#define CNG_SCM_CREDENTIALS 2 /* payload: struct ucred, pid uid gid (u32 each) */
+#define CNG_AF_NETLINK   16 /* the other family whose sendmsg judges SCM_* */
 #define CNG_MSG_NOSIGNAL 0x4000
 #define CNG_MSG_DONTWAIT 0x40
 #define CNG_MSG_OOB      0x1  /* msg_flags: out-of-band data, which ends a batch */

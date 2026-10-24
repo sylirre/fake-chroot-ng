@@ -3498,6 +3498,100 @@ static void scm_rights_close_one(int fd) {
         sys_close(fd);
 }
 
+/* ---- SCM_CREDENTIALS under a fake identity ------------------------------
+ *
+ * A credentials record names its sender by pid, uid and gid, and the kernel
+ * holds a sender to the ids it claims (scm_check_creds): the uid must be its
+ * real, effective or saved one unless CAP_SETUID says any will do, the gid
+ * likewise by CAP_SETGID. Under --fake-id a guest claims its fake ids — GLib's
+ * g_unix_connection_send_credentials sends getpid(), geteuid(), getegid(),
+ * and every GDBus client does that before it authenticates — and the kernel,
+ * judging them against the real ones, answered EPERM: a fake root's session
+ * reached no D-Bus service at all ("Error sending credentials: ... Operation
+ * not permitted", and XFCE's "Unable to contact settings server"). Going out,
+ * the claim is judged here by the same rule against the fake set and, when it
+ * holds, spelled in the host's own ids, which the kernel accepts; coming in,
+ * the ids the kernel reports are remapped as SO_PEERCRED's are.
+ *
+ * What the host's ids cannot carry is which of the fake ids was claimed: a
+ * receiver sees every claim the rule allowed as the identity the run was
+ * started with — the answer SO_PEERCRED gives about a peer that has changed
+ * its ids since. The pid is the kernel's to judge, a guest's pids being the
+ * host's: the CAP_SYS_ADMIN that would let a fake root name another process
+ * is not one the host grants it. */
+
+/* Each SOL_SOCKET SCM_CREDENTIALS record in a control buffer of ours, walked
+ * as __scm_send walks one (and scm_rights_walk above): a record that is not
+ * CMSG_OK ends it, which is where the kernel stops with EINVAL. `fn` gets the
+ * payload's ids and its length — a received record cut short (MSG_CTRUNC)
+ * carries less than a whole struct ucred, a sent one may carry more — and
+ * what it leaves in the ids goes back into the buffer. Returns how many
+ * records it handed over. */
+static int scm_creds_walk(char *control, unsigned long len,
+                          void (*fn)(unsigned uc[3], unsigned long n)) {
+    int seen = 0;
+    unsigned long off = 0;
+    while (off + sizeof(struct cng_cmsghdr) <= len) {
+        struct cng_cmsghdr ch;
+        memcpy(&ch, control + off, sizeof ch);
+        if (ch.len < sizeof ch || ch.len > len - off)
+            break;
+        if (ch.level == CNG_SOL_SOCKET && ch.type == CNG_SCM_CREDENTIALS) {
+            unsigned uc[3] = {0, 0, 0}; /* struct ucred: pid, uid, gid */
+            unsigned long n = ch.len - sizeof ch;
+            unsigned long k = n < sizeof uc ? n : sizeof uc;
+            char *p = control + off + sizeof ch;
+            memcpy(uc, p, k);
+            fn(uc, n);
+            memcpy(p, uc, k);
+            seen++;
+        }
+        off += (ch.len + 7) & ~7UL; /* CMSG_ALIGN */
+    }
+    return seen;
+}
+
+/* Going out: a claim the fake set allows by scm_check_creds's rule is spelled
+ * in the host's ids. One it refuses gets pid 0, which no task has, so the
+ * kernel refuses the record in its own place among the others and with its
+ * own EPERM (ESRCH, where the host really is privileged and lets any pid be
+ * named). A record of the wrong length is left for the kernel's EINVAL, and
+ * so is an id of -1, which no namespace maps — that EINVAL comes before the
+ * EPERM in the kernel's order, so the record must reach it as it was. */
+static void scm_creds_claim(unsigned uc[3], unsigned long n) {
+    if (n != 3 * sizeof(unsigned) || uc[1] == ~0u || uc[2] == ~0u)
+        return;
+    struct cng_cred_ids id;
+    cng_cred_ids(&id);
+    int priv = id.euid == 0; /* the full capability set (cred.c) */
+    if ((priv || uc[1] == id.ruid || uc[1] == id.euid || uc[1] == id.suid) &&
+        (priv || uc[2] == id.rgid || uc[2] == id.egid || uc[2] == id.sgid)) {
+        uc[1] = cng_g_host_uid;
+        uc[2] = cng_g_host_gid;
+    } else {
+        uc[0] = 0;
+    }
+}
+
+/* Coming in: the kernel names the sender by its real ids (its own claim made
+ * good, or the ids SO_PASSCRED attaches to a message that carried none), and
+ * the guest gets them remapped. An id the record was cut short inside is left
+ * as the kernel cut it: the rest of it is not in the buffer to be judged. */
+static void scm_creds_seen(unsigned uc[3], unsigned long n) {
+    if (n >= 2 * sizeof(unsigned))
+        uc[1] = cng_remap_uid(uc[1]);
+    if (n >= 3 * sizeof(unsigned))
+        uc[2] = cng_remap_gid(uc[2]);
+}
+
+/* Is this a sendmsg header whose control data has room for a credentials
+ * record that has to be judged here? Shorter than one, any such record is
+ * the kernel's EINVAL whatever it claims. */
+static int ctl_may_carry_creds(const struct cng_msghdr *h) {
+    return cng_g_fake_id && h->control &&
+           h->controllen >= sizeof(struct cng_cmsghdr) + 3 * sizeof(unsigned);
+}
+
 /* Does a recvmsg header ask for control data that could carry descriptors? A
  * buffer shorter than one SCM_RIGHTS record with a single descriptor in it
  * receives none: scm_detach_fds installs nothing into it and reports
@@ -3517,6 +3611,8 @@ static int ctl_may_carry_fds(const struct cng_msghdr *h) {
  * out of the numbers the kernel wrote rather than out of the guest's buffer
  * a syscall later, where another thread of the guest could have rewritten
  * them into numbers of its choosing and kept the one that was to be closed.
+ * A credentials record's ids are remapped in that buffer too, under a fake
+ * identity (scm_creds_seen), so the real ones never reach the guest's memory.
  * The records then go out to the guest in one copy.
  *
  * The control bounce is exact: a buffer up to CTL_BOUNCE is taken at its own
@@ -3525,9 +3621,12 @@ static int ctl_may_carry_fds(const struct cng_msghdr *h) {
  * and only then): AF_UNIX is the one family that can deliver descriptors,
  * and it never produces more than an SCM_RIGHTS record of SCM_MAX_FD (253)
  * descriptors, a credentials record and a security label — well under the
- * bound — so its buffer is taken at CTL_BOUNCE with nothing lost; any other
- * family's stays the guest's own, since nothing arriving on it needs
- * admitting and a raw IPv6 socket's extension headers can run past the bound.
+ * bound — so its buffer is taken at CTL_BOUNCE with nothing lost. So is
+ * AF_NETLINK's under a fake identity, the other family that delivers a
+ * credentials record (with nothing else but a group number and a namespace
+ * id beside it). Any other family's stays the guest's own, since nothing
+ * arriving on it needs admitting or remapping, and a raw IPv6 socket's
+ * extension headers can run past the bound.
  *
  * A guest control buffer that will not take the records is answered as the
  * kernel answers a control buffer it cannot write: no descriptor is left
@@ -3555,7 +3654,8 @@ recvmsg_bounced(long fd, struct cng_msghdr *g, const struct cng_msghdr *snap,
             unsigned dlen = sizeof dom;
             if (CNG_SYS(__NR_getsockopt, fd, CNG_SOL_SOCKET, CNG_SO_DOMAIN,
                         &dom, &dlen, 0) == 0 &&
-                dom != CNG_AF_UNIX)
+                dom != CNG_AF_UNIX &&
+                !(cng_g_fake_id && dom == CNG_AF_NETLINK))
                 bctl = 0;
             else
                 cl = sizeof cb;
@@ -3572,6 +3672,8 @@ recvmsg_bounced(long fd, struct cng_msghdr *g, const struct cng_msghdr *snap,
         unsigned long cl = mh.controllen;
         if (cl > sizeof cb)
             cl = sizeof cb; /* not a length the kernel reports; bounded anyway */
+        if (cng_g_fake_id)
+            scm_creds_walk(cb, cl, scm_creds_seen);
         /* Handed over before it is judged: a record the guest could not be
          * given is taken back whole, and every number in it is still the
          * kernel's fresh install at that point — judged first, a number the
@@ -3603,6 +3705,28 @@ recvmsg_bounced(long fd, struct cng_msghdr *g, const struct cng_msghdr *snap,
     if (flags_out)
         *flags_out = mh.flags;
     return r;
+}
+
+/* One sendmsg whose control data may carry a credentials record under a fake
+ * identity (ctl_may_carry_creds): the data is taken into a buffer of ours,
+ * each record's claim is judged and spelled for the kernel there
+ * (scm_creds_claim), and the kernel is handed our copy when there was one —
+ * the guest's own buffer is never written, and what the kernel reads is what
+ * was judged. `mh` is our copy of the header, its name already translated.
+ * A buffer the copy cannot take is sent as it stands, for the kernel to
+ * answer: one that will not come across is its EFAULT, and one longer than
+ * CTL_BOUNCE is past anything a sender builds — a message carries SCM_MAX_FD
+ * (253) descriptors at most, which with a credentials record is a little over
+ * a kilobyte. A function of its own for the buffer, as recvmsg_bounced is. */
+__attribute__((noinline)) static long sendmsg_creds(long fd,
+                                                    struct cng_msghdr *mh,
+                                                    long flags) {
+    char cb[CTL_BOUNCE];
+    unsigned long cl = mh->controllen;
+    if (cl <= sizeof cb && cng_user_copyin(cb, mh->control, cl) == 0 &&
+        scm_creds_walk(cb, cl, scm_creds_claim))
+        mh->control = cb;
+    return reissue(fd, (long)mh, flags, 0, 0, 0, __NR_sendmsg);
 }
 
 /* Run the readback translation over an address the kernel just wrote into our
@@ -5186,12 +5310,15 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         if (sx > 0) {
             mh.name = x.buf;
             mh.namelen = (unsigned)x.len;
-            r = reissue(a0, (long)&mh, a2, a3, a4, a5, nr);
-        } else if (sx < 0) {
-            r = sx;
-        } else {
-            r = reissue(a0, a1, a2, a3, a4, a5, nr);
         }
+        if (sx < 0)
+            r = sx;
+        else if (a1 && ctl_may_carry_creds(&mh))
+            r = sendmsg_creds(a0, &mh, a2); /* the fake ids a claim names */
+        else if (sx > 0)
+            r = reissue(a0, (long)&mh, a2, a3, a4, a5, nr);
+        else
+            r = reissue(a0, a1, a2, a3, a4, a5, nr);
         cng_sun_done(&x, r);
         return r;
     }
@@ -5199,7 +5326,10 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     /* sendmmsg: sendmsg's array form, and one msg_name per message is the whole
      * of what it adds. The call exists to spend one syscall on a batch — UDP is
      * what it is for — so a batch carrying no AF_UNIX address is re-issued
-     * whole and costs a scan. Only when a message really does carry one is the
+     * whole and costs a scan. Only when a message really does carry one (or,
+     * under a fake identity, control data with room for a credentials record
+     * on AF_UNIX or AF_NETLINK, the families whose sendmsg judges one: see
+     * sendmsg_creds) is the
      * array taken apart into per-message sendmsg calls, which is what the
      * kernel's own loop does anyway: send until one fails, write each msg_len
      * back as it goes, report the count if any went out and the error only if
@@ -5226,7 +5356,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         unsigned dlen = sizeof dom;
         if (CNG_SYS(__NR_getsockopt, a0, CNG_SOL_SOCKET, CNG_SO_DOMAIN, &dom,
                     &dlen, 0) == 0 &&
-            dom != CNG_AF_UNIX)
+            dom != CNG_AF_UNIX && !(cng_g_fake_id && dom == CNG_AF_NETLINK))
             return reissue(a0, a1, a2, a3, a4, a5, nr);
         /* A window of the array at a time (mmsg_take), so the scan costs a
          * syscall per MMSG_WIN messages rather than one per message — and every
@@ -5237,7 +5367,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             unsigned long k = vlen - i < MMSG_WIN ? vlen - i : MMSG_WIN;
             unsigned long got = mmsg_take(win, v + i, k);
             for (unsigned long j = 0; j < got; j++)
-                if (cng_sun_needed(win[j].hdr.name, (long)win[j].hdr.namelen)) {
+                if (cng_sun_needed(win[j].hdr.name, (long)win[j].hdr.namelen) ||
+                    ctl_may_carry_creds(&win[j].hdr)) {
                     any = 1;
                     break;
                 }
@@ -5264,6 +5395,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 }
                 if (sx < 0)
                     r = sx;
+                else if (ctl_may_carry_creds(&mh))
+                    r = sendmsg_creds(a0, &mh, a3);
                 else
                     r = reissue(a0, (long)&mh, a3, 0, 0, 0, __NR_sendmsg);
                 cng_sun_done(&x, r);
@@ -5437,13 +5570,15 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
 
         /* One question to the socket instead of a scan of the array: a family
          * other than AF_UNIX has no sun_path to map back, and a UDP batch is
-         * what this call exists for. (The same shortcut sendmmsg takes.) */
+         * what this call exists for — nor, but for AF_NETLINK under a fake
+         * identity, a credentials record to remap (recvmsg_bounced). (The same
+         * shortcut sendmmsg takes.) */
         int dom = 0;
         unsigned dlen = sizeof dom;
         if (!v || !vlen ||
             (CNG_SYS(__NR_getsockopt, a0, CNG_SOL_SOCKET, CNG_SO_DOMAIN, &dom,
                      &dlen, 0) == 0 &&
-             dom != CNG_AF_UNIX))
+             dom != CNG_AF_UNIX && !(cng_g_fake_id && dom == CNG_AF_NETLINK)))
             return reissue(a0, a1, a2, a3, a4, a5, nr);
 
         /* Per message from here. A loop of recvmsg calls has no timeout to give,

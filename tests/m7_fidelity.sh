@@ -291,6 +291,80 @@ elif guest_cc_report "$PCD/peercred" tests/guests/peercred.c; then
 fi
 rm -rf "$PCD"
 
+# --- SCM_CREDENTIALS under the fake identity ----------------------------------
+# A credentials record is a claim the kernel holds its sender to
+# (scm_check_creds): the uid must be the real, effective or saved one unless
+# CAP_SETUID lets any through, the gid likewise. GLib claims its own pid and
+# effective ids before every D-Bus authentication, and under --fake-id those
+# are the fake ones, which the kernel refused with EPERM — a fake root's GDBus
+# client reached no bus ("Error sending credentials", XFCE's "Unable to
+# contact settings server"). The claim is judged against the fake set now and
+# spelled in the host's ids, and a received record is remapped as SO_PEERCRED
+# is, cut short or not. A refused claim is the kernel's EPERM only where the
+# suite does not run as root (a privileged kernel lets any claim through), so
+# those rows are judged there alone; qemu-user drops MSG_CTRUNC from a cut
+# record, so that flag is asserted natively only.
+SCD=$(mktemp -d)
+scm_rows() { # tier-desc, -R or "", id spec or "", self uid, self gid
+    _d=$1 _t=$2 _u=$3 _su=$4 _sg=$5
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+    out=$(run_t 60 $_t $GUEST_BINDS $_u "$SCD/rootfs" /bin/scmcred 2>/dev/null)
+    _me="uid=$_su gid=$_sg self=$_su:$_sg"
+    check_contains "$_d: an own claim goes out and comes back as the identity" \
+        "own pid_ok=1 $_me" "$out"
+    check_contains "$_d: ...so does the real uid's" "real pid_ok=1 $_me" "$out"
+    check_contains "$_d: SO_PASSCRED's own record is the identity too" \
+        "implicit pid_ok=1 $_me" "$out"
+    check_contains "$_d: ...beside a descriptor, which still arrives" \
+        "rights pid_ok=1 uid=$_su gid=$_sg fifo=1 self=$_su:$_sg" "$out"
+    check_contains "$_d: sendmmsg's claims go out and recvmmsg remaps them" \
+        "mmsg got=2 uid=$_su gid=$_sg uid=$_su gid=$_sg self=$_su:$_sg" "$out"
+    check_contains "$_d: a receive cut inside the record remaps the uid it has" \
+        "short pid_ok=1 uid=$_su" "$out"
+    [ -n "$QEMU" ] || check_contains "$_d: ...and reports the cut" \
+        "short pid_ok=1 uid=$_su ctrunc self=$_su:$_sg" "$out"
+    check_contains "$_d: an id of -1 is the kernel's EINVAL" "uid-1 send=22" "$out"
+    check_contains "$_d: ...and so is a record of the wrong length" \
+        "badlen send=22" "$out"
+    [ "$(id -u)" = 0 ] && return 0
+    check_contains "$_d: a pid not the sender's is refused" \
+        "other-pid send=1" "$out"
+}
+if ! guest_xlate_ready "SCM_CREDENTIALS legs"; then
+    :
+elif guest_cc_report "$SCD/scmcred" tests/guests/scmcred.c; then
+    mkdir -p "$SCD/rootfs/bin"; cp "$SCD/scmcred" "$SCD/rootfs/bin/"
+    tiers=-R
+    [ "$CNG_SECCOMP_LIVE" = 1 ] && tiers="-R none"
+    for tier in $tiers; do
+        t=$tier; [ "$t" = none ] && t=
+        scm_rows "fake root ($tier)" "$t" "-u 0:0" 0 0
+        # Root's CAP_SETUID and CAP_SETGID let any id be claimed; the host's
+        # ids cannot say which, so a receiver sees the run's identity.
+        check_contains "fake root ($tier): any uid may be claimed" \
+            "other-uid pid_ok=1 uid=0 gid=0 self=0:0" "$out"
+        check_contains "fake root ($tier): ...and any gid" \
+            "other-gid pid_ok=1 uid=0 gid=0 self=0:0" "$out"
+        check_contains "fake root ($tier): a dropped root may claim its saved ids" \
+            "saved pid_ok=1 uid=0 gid=0 self=1234:1234" "$out"
+        if [ "$(id -u)" != 0 ]; then
+            check_contains "fake root ($tier): ...but not an id it never had" \
+                "dropped-other send=1" "$out"
+        fi
+        scm_rows "fake 1234 ($tier)" "$t" "-u 1234:1234" 1234 1234
+        if [ "$(id -u)" != 0 ]; then
+            check_contains "fake 1234 ($tier): an id not its own is refused" \
+                "other-uid send=1" "$out"
+            check_contains "fake 1234 ($tier): ...a gid as much as a uid" \
+                "other-gid send=1" "$out"
+        fi
+    done
+    # Without a fake identity nothing is judged here and the kernel's own
+    # answer is what comes back.
+    scm_rows "real ids" -R "" "$(id -u)" "$(id -g)"
+fi
+rm -rf "$SCD"
+
 # --- the initial program's own /proc/self/exe ------------------------------
 # Every program after the first gets its exe link from the emulated execve; the
 # first one is the one nothing republishes, and it used to report <program>
