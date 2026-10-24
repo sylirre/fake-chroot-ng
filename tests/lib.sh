@@ -258,11 +258,20 @@ cng_try_guest_ld() {
 # Expose the host directories the loader needs at the same guest paths. (Only for
 # rootfs the suite builds itself — never for a real Alpine/Debian tree, which
 # ships its own.) Preset GUEST_BINDS in the environment for an unusual layout.
+#
+# Bionic's linker reads nothing under /lib, and binding it anyway is not
+# harmless: an Android ramdisk may carry a /lib of its own (/lib/modules on
+# Android 8), and the bind then hides the test rootfs's /lib — M19's
+# lib/apk/exec among it. So an Android host binds Android's directories only.
 cng_guest_binds() {
     [ -z "${GUEST_BINDS:-}" ] || return 0
     GUEST_BINDS=
-    for _d in /system /apex /linkerconfig /vendor /lib /lib64 /usr/lib \
-        /usr/lib64 ${PREFIX:+"$PREFIX"}; do
+    if [ -e /system/bin/linker64 ]; then
+        set -- /system /apex /linkerconfig /vendor
+    else
+        set -- /lib /lib64 /usr/lib /usr/lib64
+    fi
+    for _d in "$@" ${PREFIX:+"$PREFIX"}; do
         [ -d "$_d" ] || continue
         GUEST_BINDS="$GUEST_BINDS -b $_d:$_d"
     done
