@@ -322,7 +322,14 @@ long cng_pin_fstatat(const char *host, void *st, int atflags) {
     return r;
 }
 
+/* statx is the one call here a filter is known to refuse: a kernel before 4.11
+ * has none, and Android's filter of that era traps the number rather than
+ * leave it to the kernel's ENOSYS. Answered as reissue() answers it, since
+ * this is issued from inside the handler too (an l2s name's statx), where a
+ * trap would need the gate-net, and from the -t drivers, where it kills. */
 long cng_pin_statx(const char *host, int atflags, unsigned mask, void *sx) {
+    if (cng_blocked[__NR_statx])
+        return -ENOSYS;
     struct cng_pin p;
     long dfd;
     const char *name;
