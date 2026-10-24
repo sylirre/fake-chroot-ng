@@ -18,10 +18,11 @@
  * session too (the child's pid -- a master answers whoever asks) and still gets
  * ENOTTY of the slave it does not control; once the session leader has exited,
  * which takes the terminal from the session, the master is ENOTTY again; and a
- * pipe and /dev/null are ENOTTY and a closed descriptor EBADF. The pipe is
- * where a host that refuses the ioctl differs from a kernel (EACCES against
- * ENOTTY), so a native run on such a host is no oracle for it; the expected
- * text is a kernel's.
+ * pipe, /dev/null and a directory are ENOTTY and a closed descriptor EBADF.
+ * The pipe and the directory are where a host that refuses the ioctl differs
+ * from a kernel (EACCES against ENOTTY; Android 15's refuses even TCGETS on
+ * the directory), so a native run on such a host is no oracle for them; the
+ * expected text is a kernel's.
  *
  * One more case, on a pty of its own: the foreground group's leader has gone
  * (reaped) and the group lives on in a member, so the master's answer cannot
@@ -164,6 +165,7 @@ int main(int argc, char **argv) {
     if (pipe(p) || pipe(up) || pipe(down))
         return 1;
     int nul = open("/dev/null", O_RDWR);
+    int dir = open("/", O_RDONLY);
     int closed = dup(p[0]);
     close(closed);
 
@@ -230,6 +232,7 @@ int main(int argc, char **argv) {
     row("master_gone", m);
     row("pipe", p[0]);
     row("null", nul);
+    row("dir", dir);
     row("closed", closed);
     orphan_group();
     puts("done");

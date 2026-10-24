@@ -46,10 +46,10 @@
  * which TCSETSF2 above falls back to. The kernel's TCSETSF is TCSETSW's wait
  * for the output to drain, then an input flush, then the change; on a pty
  * slave, the only terminal such a policy is about, there is no output queue
- * to wait for, and it is served as TCFLSH(TCIFLUSH) and then TCSETSW. A
- * descriptor that is no terminal is ENOTTY to both, as it is to TCSETSF. The
- * host is asked first, and the refusal remembered once the pair has proved
- * it is about TCSETSF; CNG_TCSETSF_DENY=1 forces the tier on any host.
+ * to wait for, and it is served as TCFLSH(TCIFLUSH) and then TCSETSW, on a
+ * descriptor that TCGETS has shown to be a terminal (see the end). The host
+ * is asked first, and the refusal remembered once the pair has proved it is
+ * about TCSETSF; CNG_TCSETSF_DENY=1 forces the tier on any host.
  *
  * ---- TIOCGSID: the session a terminal belongs to ----
  *
@@ -59,10 +59,10 @@
  * session, or ENOTTY for a descriptor that is no terminal of the caller's.
  * The host is asked first; on that refusal it is served from the commands
  * that are allowed -- TCGETS to know a terminal from a pipe (ENOTTY, as a
- * kernel says), TIOCGPGRP for the kernel's own reach check (a slave answers
- * only the process whose controlling terminal it is, a master always: ENOTTY
- * otherwise) -- and the session is then worked out the way the kernel holds
- * it:
+ * kernel says; see the end), TIOCGPGRP for the kernel's own reach check (a
+ * slave answers only the process whose controlling terminal it is, a master
+ * always: ENOTTY otherwise) -- and the session is then worked out the way the
+ * kernel holds it:
  *   - a slave the caller controls belongs to the caller's session: getsid(0).
  *     A terminal is a session's only while it is that session's controlling
  *     terminal, and a process controls it only from inside that session;
@@ -72,6 +72,18 @@
  * no pid namespace here. As with termios2 above, the first refusal that the
  * allowed commands prove to be about TIOCGSID is remembered, and
  * CNG_TIOCGSID_DENY=1 forces the tier on any host.
+ *
+ * ---- A descriptor that is no terminal ----
+ *
+ * A kernel answers each of these ENOTTY on a descriptor that is no terminal,
+ * before it looks at the pointer, and every fallback above asks TCGETS first
+ * to tell (tc_probe): the command that serves the refused one may be refused
+ * there as well, by the same policy. Android 15's lets TCGETS alone through on
+ * a pipe or a socket (ENOTTY), where it refuses TCSETS, TCSETSW, TCSETSF and
+ * TCFLSH, and refuses every terminal command on a directory, a named FIFO or a
+ * /proc file, TCGETS included (all measured). Only a character device can be
+ * a terminal, so a refused TCGETS on anything else is a kernel's ENOTTY too; a
+ * character device the policy will not ask keeps the refusal.
  */
 #include "cng/monitor.h"
 #include "cng/rt.h"
@@ -181,6 +193,17 @@ static u64 tc_key(int fd) {
     return rd | (1ull << 63);
 }
 
+/* TCGETS into t: whether fd is a terminal at all, the policy's refusal of
+ * TCGETS on what cannot be one taken for the kernel's ENOTTY (see the top). */
+static long tc_probe(int fd, void *t) {
+    long r = sys_ioctl(fd, TC_GETS, t);
+    char st[144];
+    if (r == -EACCES && sys_fstat(fd, st) == 0 &&
+        (*(unsigned *)(st + ST_MODE_OFF) & 0170000) != 0020000)
+        return -ENOTTY;
+    return r;
+}
+
 static int tc_shadow_get(u64 key, u32 *ispeed, u32 *ospeed) {
     for (unsigned i = 0; i < sizeof tc_shadow / sizeof tc_shadow[0]; i++) {
         if (__atomic_load_n(&tc_shadow[i].key, __ATOMIC_ACQUIRE) != key)
@@ -216,7 +239,7 @@ static int tcsf_refused(void) {
            __atomic_load_n(&tcsf_host_lacks, __ATOMIC_RELAXED);
 }
 
-/* TCSETSF without TCSETSF, from a termios in our own memory. */
+/* TCSETSF without TCSETSF, from a termios in our own memory, on a terminal. */
 static long tc_flush_set(int fd, void *t) {
     long r = sys_ioctl(fd, TC_FLSH, (void *)TC_IFLUSH);
     if (r == 0)
@@ -233,14 +256,17 @@ static long tc_setsf(int fd, void *t) {
 }
 
 /* The guest's own TCSETSF: the host handed the guest's pointer, as termios2's
- * are, so an unmapped one is the kernel's EFAULT; on the refusal, the termios
- * is copied in and set by the pair. */
+ * are, so an unmapped one is the kernel's EFAULT; on the refusal, a terminal's
+ * termios is copied in and set by the pair. */
 static long tty_setsf(long fd, long argp) {
     long r = tcsf_refused() ? -EACCES
                             : CNG_SYS(__NR_ioctl, fd, TC_SETSF, argp, 0, 0, 0);
     if (r != -EACCES)
         return r;
     u8 buf[TC_TERMIOS_SZ];
+    r = tc_probe((int)fd, buf);
+    if (r < 0)
+        return r;
     if (cng_user_copyin(buf, (const void *)argp, sizeof buf) < 0)
         return -EFAULT;
     return tc_flush_set((int)fd, buf);
@@ -262,20 +288,21 @@ static long tty_termios2(long fd, unsigned req, long argp) {
     if (r != -EACCES && r != -ENOTTY)
         return r;
 
-    /* Not served by the host: the classic command answers for it (and says
-     * ENOTTY itself where the descriptor is no terminal). Zeroed first: only
-     * what is written is copied out. */
+    /* Not served by the host: the classic command answers for it, on a
+     * terminal -- TCGETS first, which a getter's answer is, and a setter's
+     * ENOTTY before its pointer is looked at. Zeroed first: only what is
+     * written is copied out. */
     u8 buf[TC_TERMIOS2_SZ];
     memset(buf, 0, sizeof buf);
+    r = tc_probe((int)fd, buf);
+    if (r < 0)
+        return r;
     int set = req != TC_GETS2;
     if (set && cng_user_copyin(buf, (const void *)argp, sizeof buf) < 0)
         return -EFAULT;
     u32 cflag, ispeed = 0, ospeed = 0;
     u64 key = 0;
     if (!set) {
-        r = sys_ioctl((int)fd, TC_GETS, buf);
-        if (r < 0)
-            return r;
         memcpy(&cflag, buf + TC_CFLAG_OFF, 4);
         u32 ib = (cflag >> TC_IBSHIFT) & TC_CBAUD, ob = cflag & TC_CBAUD;
         u32 hi = 38400, ho = 38400; /* a BOTHER nobody told us the number of */
@@ -403,7 +430,7 @@ static long tty_tiocgsid(long fd, long argp) {
     u8 probe[TC_TERMIOS_SZ];
     char st[144];
     s32 pg = 0, sid;
-    r = sys_ioctl((int)fd, TC_GETS, probe); /* no terminal */
+    r = tc_probe((int)fd, probe); /* no terminal */
     if (r < 0)
         return r;
     r = sys_ioctl((int)fd, TC_GPGRP, &pg); /* not the caller's */

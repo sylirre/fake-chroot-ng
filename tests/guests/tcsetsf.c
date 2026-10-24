@@ -12,7 +12,10 @@
  * What is asked, over a real pty: a line waiting on the slave is gone after a
  * TCSETSF and the change has been made (VMIN/VTIME read back), the same line
  * survives a TCSETSW (so the first answer is the flush, not the line never
- * having arrived), an unmapped termios is EFAULT and a pipe is ENOTTY.
+ * having arrived), an unmapped termios is EFAULT, and a pipe and a directory
+ * are ENOTTY. Android 15's policy refuses TCSETSF and the pair alike on both
+ * (EACCES) and TCGETS too on the directory, so those two are where a native
+ * run there is no oracle.
  *
  * The termios is the kernel's 36-byte one, set by the raw command, so no libc
  * gets to choose the command for it. The expected output is what this program
@@ -111,6 +114,11 @@ int main(void) {
     errno = 0;
     r = ioctl(p[0], T_SETSF, &t);
     printf("pipe=%d errno=%d\n", r, r < 0 ? errno : 0);
+
+    int d = open("/", O_RDONLY);
+    errno = 0;
+    r = ioctl(d, T_SETSF, &t);
+    printf("dir=%d errno=%d\n", r, r < 0 ? errno : 0);
 
     puts("done");
     return 0;

@@ -18,7 +18,9 @@
  * included, a different rate each: a copy that stopped at 36 would leave it 0)
  * and the next TCGETS2 returns the rate and the VMIN/VTIME it was given, an
  * unmapped buffer is EFAULT both ways, and a descriptor that is no tty is
- * ENOTTY.
+ * ENOTTY: a pipe, to a getter and to a setter, and a directory. Android 15's
+ * policy refuses the classic setters on a pipe and TCGETS too on a directory,
+ * so the answer has to come from somewhere else there.
  *
  * The master's termios is the slave's, so a rate set through one end is read
  * back through the other and through the same end (a BOTHER rate that a host
@@ -188,6 +190,14 @@ int main(void) {
     errno = 0;
     r = ioctl(p[0], T_GETS2, &g.t);
     printf("pipe=%d errno=%d\n", r, r < 0 ? errno : 0);
+    errno = 0;
+    r = ioctl(p[0], T_SETS2, &g.t);
+    printf("pipe_set2=%d errno=%d\n", r, r < 0 ? errno : 0);
+
+    int d = open("/", O_RDONLY);
+    errno = 0;
+    r = ioctl(d, T_GETS2, &g.t);
+    printf("dir=%d errno=%d\n", r, r < 0 ? errno : 0);
 
     puts("done");
     return 0;

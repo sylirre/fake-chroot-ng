@@ -5,9 +5,10 @@
  *
  * The policy whitelists, per object class, the ioctls an app domain may issue,
  * and the list is short for a pty: TCGETS, TCSETS*, TIOCGWINSZ and a few more
- * are on it (Android 8's has no TCSETSF yet), the rest answer EACCES -- on a
- * terminal and on a pipe alike. A
- * guest runs its ioctls natively, so it met the refusal itself. The requests
+ * are on it (Android 8's has no TCSETSF yet), the rest answer EACCES. It is
+ * shorter still for a descriptor that is no terminal, where a kernel says
+ * ENOTTY: Android 15's has TCGETS alone on a pipe and nothing on a directory.
+ * A guest runs its ioctls natively, so it met the refusal itself. The requests
  * below are the ones a libc turns into a verdict about the terminal, and the
  * filter traps exactly these (seccomp.c) so that the dispatcher can answer
  * them when the host will not.

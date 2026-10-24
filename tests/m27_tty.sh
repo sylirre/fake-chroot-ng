@@ -71,9 +71,10 @@ tty_check() {
 # back whole and no further, agrees with TCGETS on the first 36 bytes, each
 # setter carries all of it in (c_ospeed too -- a copy that stopped at 36 reads
 # back rate 0), a rate set through the master is read through the slave, an
-# unmapped buffer is EFAULT both ways and a pipe is ENOTTY. A glibc since 2.42
-# builds isatty on them: on a device the original build answered EACCES here,
-# and bash in an Ubuntu 26.04 rootfs printed no prompt. Forced, TCSETSF is
+# unmapped buffer is EFAULT both ways, and a pipe (to a getter and to a setter)
+# and a directory are ENOTTY. A glibc since 2.42 builds isatty on them: on a
+# device the original build answered EACCES here, and bash in an Ubuntu 26.04
+# rootfs printed no prompt. Forced, TCSETSF is
 # refused as well, as Android 8's policy refuses it, so TCSETSF2 reaches the
 # pair that serves it (below) through the classic command's own fallback.
 if guest_xlate_ready "termios2 ioctls" &&
@@ -89,14 +90,18 @@ master_get2=0 speed=1
 get2_fault=-1 errno=14
 set2_fault=-1 errno=14
 pipe=-1 errno=25
+pipe_set2=-1 errno=25
+dir=-1 errno=25
 done"
 fi
 
 # TCSETSF (tcsetattr(TCSAFLUSH): getpass, su, ssh's prompt) over a real pty:
 # a line already typed is gone and the change made, the same line outlives a
-# TCSETSW, an unmapped termios is EFAULT and a pipe ENOTTY. Android 8's policy
-# lets TCSETS, TCSETSW and TCFLSH through on a pty and answers this one
-# EACCES; the forced tier serves it from TCFLSH and TCSETSW.
+# TCSETSW, an unmapped termios is EFAULT, and a pipe and a directory ENOTTY.
+# Android 8's policy lets TCSETS, TCSETSW and TCFLSH through on a pty and
+# answers this one EACCES; the forced tier serves it from TCFLSH and TCSETSW.
+# Android 15's refuses all three on a pipe and TCGETS too on a directory, where
+# what serves it must still tell a kernel's ENOTTY.
 if guest_xlate_ready "TCSETSF" &&
     guest_cc_report "$TTY_DIR/tcsetsf" tests/guests/tcsetsf.c; then
     tty_check "TCSETSF agrees with a kernel's" tcsetsf CNG_TCSETSF_DENY \
@@ -104,6 +109,7 @@ if guest_xlate_ready "TCSETSF" &&
 setsw=0 typed=1 left=6
 setsf_fault=-1 errno=14
 pipe=-1 errno=25
+dir=-1 errno=25
 done"
 fi
 
@@ -111,13 +117,14 @@ fi
 # session, a child that setsid()s and takes the pty reads its own pid from the
 # slave and from the master, the parent reads it from the master and is ENOTTY
 # of the slave it does not control, the leader's exit takes the session away, a
-# pipe and /dev/null are ENOTTY, a null buffer is EFAULT, and a foreground group
-# whose leader is gone still names its session (the members have to be looked
-# through for it). Android's policy answers EACCES to it on a slave and on a
-# pipe; the forced tier serves it from TCGETS, TIOCGPGRP and getsid and must
-# say the same. The guest's own probe, run outside the monitor, says whether
-# the host can be believed with the unforced rows: qemu-user's table lists the
-# request as input only, so it answers success and writes no session.
+# pipe, /dev/null and a directory are ENOTTY, a null buffer is EFAULT, and a
+# foreground group whose leader is gone still names its session (the members
+# have to be looked through for it). Android's policy answers EACCES to it on a
+# slave and on a pipe; the forced tier serves it from TCGETS, TIOCGPGRP and
+# getsid and must say the same. The guest's own probe, run outside the monitor,
+# says whether the host can be believed with the unforced rows: qemu-user's
+# table lists the request as input only, so it answers success and writes no
+# session.
 if guest_xlate_ready "TIOCGSID" &&
     guest_cc_report "$TTY_DIR/tiocgsid" tests/guests/tiocgsid.c; then
     _host=$(emu_t 30 "$TTY_DIR/tiocgsid" probe 2>/dev/null)
@@ -135,6 +142,7 @@ master_parent=0 kid=1
 master_gone=-1 errno=25
 pipe=-1 errno=25
 null=-1 errno=25
+dir=-1 errno=25
 closed=-1 errno=9
 master_orphan=0 sess=1
 done" "$_why"

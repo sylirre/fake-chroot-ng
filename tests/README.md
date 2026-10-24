@@ -65,6 +65,11 @@ expected failure:
   session, so m27 asks the host once, outside the monitor, and judges only the
   forced rows there. Android 8's list lacks `TCSETSF` too (`tcsetattr` with
   `TCSAFLUSH`), answered from `TCFLSH` and `TCSETSW` (`CNG_TCSETSF_DENY=1`).
+  Android 15's is shorter still for what is no terminal, where a kernel says
+  `ENOTTY` to all of them: on a pipe `TCGETS` alone, on a directory none at
+  all. The monitor's fallbacks take a refused `TCGETS` on what is no
+  character device for `ENOTTY`, and m27's pipe and directory rows are where
+  a native run on the device differs from the expected text.
 * **The kernel is built without checkpoint/restore support**: no
   `/proc/self/timers`, and `PTRACE_O_SUSPEND_SECCOMP` is `EINVAL`.
 * **`$TMPDIR` is inside `$PREFIX`, which the harness binds** for a guest's
