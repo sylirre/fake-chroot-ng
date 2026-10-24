@@ -111,7 +111,7 @@ if guest_cc_report "$ER/hello" tests/guests/hello.c; then
     chmod 755 "$ER"/d? 2>/dev/null || :
 
     NREF=$(mktemp -d)
-    printf '#!/bin/sh\nexit 0\n' >"$NREF/d1"
+    printf '#!%s\nexit 0\n' "$HOST_SH" >"$NREF/d1"
     _d=1
     while [ $_d -lt 8 ]; do
         printf '#!%s/d%d\n' "$NREF" $_d >"$NREF/d$((_d + 1))"

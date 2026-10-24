@@ -62,7 +62,7 @@ chmod 755 "$M19/real/short.sh" "$M19/real/empty.bin" "$M19/real/noargv.sh" \
 # a script whose interpreter is itself a script prints the argument it was
 # handed, and the same trailing blank goes in.
 KREF=$(mktemp -d)
-printf '#!/bin/sh\nprintf "[%%s]" "$1"\n' >"$KREF/showarg"
+printf '#!%s\nprintf "[%%s]" "$1"\n' "$HOST_SH" >"$KREF/showarg"
 printf '#!%s/showarg argok \n' "$KREF" >"$KREF/t.sh"
 chmod 755 "$KREF/showarg" "$KREF/t.sh"
 M19_KERN=$("$KREF/t.sh" 2>/dev/null)

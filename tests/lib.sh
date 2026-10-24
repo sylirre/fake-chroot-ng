@@ -41,6 +41,11 @@ BIN="${BIN:-build/chroot-ng}"
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# The host's sh by a name the host kernel can follow from a #! line. Not
+# /bin/sh: Android had no /bin before 10, and termux-exec's rewrite of the name
+# reaches only the first level of a script whose interpreter is a script.
+HOST_SH=$(command -v sh)
+
 # skip DESC — a leg that cannot be exercised on this host. Counted so the
 # summary never reads like full coverage when half the suite sat out.
 skip() {
