@@ -133,14 +133,27 @@ else
 
         # --- 2. against the kernel, where there is a kernel to compare to ---
         if [ "$m16_raw" = 1 ]; then
-            if [ "$em" = "$base" ]; then
+            # A policy may refuse accept on a netlink socket before the family
+            # answers it (Android 8's SELinux: EACCES). That is the host's
+            # policy, not the kernel the emulation answers as; the leg above
+            # holds the emulation to the family's answer. (Copies: the
+            # passthrough leg below wants the host's whole answer.)
+            kb=$base
+            ke=$em
+            case "$base" in
+            *"accept: rc=-1 errno=13"*)
+                skip "m16 accept against the real kernel: the host's policy refuses it first (EACCES)"
+                kb=$(printf '%s\n' "$base" | grep -v '^accept: ')
+                ke=$(printf '%s\n' "$em" | grep -v '^accept: ') ;;
+            esac
+            if [ "$ke" = "$kb" ]; then
                 pass=$((pass + 1))
                 echo "  ok   m16 emulated rtnetlink matches the real kernel"
             else
                 fail=$((fail + 1))
                 echo "  FAIL m16 emulated rtnetlink matches the real kernel"
-                echo "    want: $base"
-                echo "    got:  $em"
+                echo "    want: $kb"
+                echo "    got:  $ke"
             fi
 
             # Without forcing, rtnetlink works here, so the emulation must stay
@@ -453,7 +466,16 @@ recvmmsg: r=2 namelen=12 family=16 pid=0 namelen0=12 b=aa'
         fi
         if [ "$m16_raw" = 1 ]; then
             kst=$(emu_t 60 "$M16D/nladdr" 2>/dev/null)
-            check "m16 ...and the kernel here says the same" "$nladdr_want" "$kst"
+            # An older kernel dropped the name of a recvmsg whose msg_namelen
+            # is 0 before the family saw it, and the length came back 0
+            # (Android 8's 3.18, measured); the text above is what a current
+            # kernel says, and what the emulation answers as.
+            case "$kst" in
+            *"recvmsg 0: got=1 namelen=0 "*)
+                skip "m16 address writeback against the kernel: the host kernel drops a zero-length recvmsg name (an older kernel), so it is no reference" ;;
+            *)
+                check "m16 ...and the kernel here says the same" "$nladdr_want" "$kst" ;;
+            esac
         fi
     else
         skip "address writeback leg: could not build tests/guests/nladdr.c"

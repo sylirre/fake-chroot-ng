@@ -217,6 +217,15 @@ elif guest_cc_report "$EPD/emptypath" tests/guests/emptypath.c; then
     fi
     # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
     ep_g=$(run_t 60 -R $GUEST_BINDS "$EPD" /emptypath 2>/dev/null)
+    # A kernel before 3.19 has no execveat and answers every exec_ line ENOSYS:
+    # no reference for that half, which the emulation answers as the 6.1 it
+    # advertises. The rest is still the kernel's to judge.
+    case "$ep_k" in
+    *"exec_cwd=38"*)
+        skip "AT_EMPTY_PATH execveat differential: the host kernel predates execveat (3.19), so it is no reference"
+        ep_k=$(printf '%s\n' "$ep_k" | grep -v '^exec_')
+        ep_g=$(printf '%s\n' "$ep_g" | grep -v '^exec_') ;;
+    esac
     if [ -z "$ep_k" ]; then
         skip "AT_EMPTY_PATH differential: no host compiler for the oracle"
     elif [ "$ep_k" = "$ep_g" ]; then

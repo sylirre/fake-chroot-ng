@@ -75,6 +75,23 @@ expected failure:
 * **`LD_PRELOAD` carries `libtermux-exec`**, which answers some `execve`
   failures itself. A host-built reference that stands for "the kernel" is run
   through `kref`, which drops it.
+* **An older Android is older all the way down** (Android 8 on a 3.18
+  kernel). There is no `/bin`, so a script the host kernel runs names the
+  host's own `sh` (`$HOST_SH`); the ramdisk may carry a `/lib` of its own, so
+  a guest's binds there are only the directories bionic's linker reads; its
+  libc has no `posix_spawn` (API 28). The filter traps every syscall newer
+  than itself — `statx`, the pidfd calls — and a leg that needs one skips on
+  the `ENOSYS` (`-1 = not issuable here` in a driver's line). The kernel
+  predates what some references are compared for — `execveat` (3.19), the
+  `NoNewPrivs` status line (4.10), `PTRACE_O_SUSPEND_SECCOMP` (4.3, which the
+  emulation then refuses as that kernel does), a recvmsg name of length 0
+  and an iovec count past `UIO_MAXIOV` read as newer kernels read them — and
+  those comparisons skip, the emulation answering as the 6.1 it advertises.
+  SELinux refuses `accept` on a netlink socket before the family answers it.
+  Termux ships `<sys/sem.h>` in a package of its own
+  (`libandroid-sysv-semaphore`) and `libandroid-shmem` turns the shm calls
+  into macros for an in-process emulation; `tests/guests/sysvipc.h` builds
+  the SysV guests on raw syscalls either way.
 
 ## Environment knobs
 

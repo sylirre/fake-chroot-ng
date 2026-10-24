@@ -199,8 +199,10 @@ else
     # multi-entry leg walks both lists past their first entry, with the two
     # sides' boundaries deliberately not lining up — the emulation reads each
     # entry out of a copy of its own, so this is what moves it from one to the
-    # next.
-    pt_case vmrw
+    # next. A kernel from before import_iovec refuses the count whole, EINVAL
+    # (Android 8's 3.18), and is no reference for an emulation answering as 6.1.
+    pt_case vmrw "vmrw wrapcnt EINVAL" \
+        "the host kernel refuses an iovec count it does not narrow first (pre-import_iovec), so it is no reference"
     # Signals the emulation does not take over must still reach the kernel while
     # the task is traced. It hooks every catchable signal to route delivery
     # through the stop machinery, but SIGKILL and SIGSTOP are not among them —
