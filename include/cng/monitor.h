@@ -306,7 +306,9 @@ extern char **cng_g_host_envp;
  * namespace has nothing to add under that directory. Where it does — a bind
  * mount, the /proc or /dev zone — the kernel would resolve in the host's view
  * of that subtree, so the walk happens here and the scope is applied with it
- * (see cng_scope_needs_walk and the openat2 case in dispatch.c). `scope` is the
+ * (see cng_scope_needs_walk and the openat2 case in dispatch.c) — as it is for
+ * every scoped call where the host cannot issue openat2 and the call is
+ * emulated. `scope` is the
  * dirfd's own guest path: with IN_ROOT it is the root an absolute name, an
  * absolute symlink target and a `..` run are all measured against; with
  * BENEATH each of those is -EXDEV instead. */
@@ -360,9 +362,11 @@ int cng_proc_self_fd(const char *host);
  * same branch — so the resolution must be walked here with the scope applied;
  * 0 when the kernel's scoped resolution of the guest's own name is exactly
  * right, which is what it is then handed. `gdir` comes back with the dirfd's
- * guest path (the scope) whenever the answer is 1. -1 when the dirfd names a
- * directory the guest has no name for at all — one from outside the view —
- * which the caller refuses. Exposed for `-t o2test`. */
+ * guest path (the scope) whenever there is one — always when the answer is 1 —
+ * and empty where there is none (no descriptor, or one on no directory), which
+ * an emulated openat2, walking every scope, has to tell apart. -1 when the
+ * dirfd names a directory the guest has no name for at all — one from outside
+ * the view — which the caller refuses. Exposed for `-t o2test`. */
 int cng_scope_needs_walk(long dirfd, char *gdir, size_t sz);
 
 /* Descriptors and the guest view. A descriptor that names a directory the
@@ -468,6 +472,11 @@ void cng_probe_blocked(void);
 extern int cng_g_setid_deny;
 extern const int cng_setid_deny_nrs[];
 extern const int cng_setid_deny_n;
+/* CNG_OPENAT2_DENY=1: take openat2 as refused by an ambient filter, as
+ * Android's refuses it — marked blocked after the probe, so chroot-ng never
+ * issues it on its own behalf and a guest's openat2 is emulated (dispatch.c).
+ * Our own filter traps the number already: it is a path syscall. */
+extern int cng_g_openat2_deny;
 
 /* Is a signal pending that the guest would take delivery of, judged against the
  * mask of the frame `uc` will restore (NULL on the -R tier, which has no frame

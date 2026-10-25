@@ -45,7 +45,11 @@ expected failure:
   `faccessat2`, `name_to_handle_at`, `fchmodat2`, `rseq`, `set_robust_list`, the
   6.13 `*xattrat` family). The emulation answers `ENOSYS` as an older kernel
   would; a leg that needs the real call, or a host-built reference that issues
-  it, skips. The uid and gid setters are refused too (all but `setresuid`), and
+  it, skips. `openat2` is the exception: libc no longer falls back from it, so
+  it is emulated, here and on any kernel without it, and m24 holds the
+  emulation to the kernel's recorded answers (`CNG_OPENAT2_DENY=1` takes it as
+  refused anywhere, so a native host diffs it against its own kernel). The uid
+  and gid setters are refused too (all but `setresuid`), and
   answered from the real ids as the kernel would answer an app's process (m9;
   `CNG_SETID_DENY=1` takes them as refused anywhere, and
   `tests/guests/ambtrap.c` installs such a filter where seccomp is live).

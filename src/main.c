@@ -567,6 +567,11 @@ static void help(char **envp) {
                       "and capabilities the way the kernel would answer "
                       "them. Test aid: a host that allows them never takes "
                       "that path."},
+        {"CNG_OPENAT2_DENY", "Take openat2 as refused by the host, as "
+                      "Android's app filter refuses it, so chroot-ng never "
+                      "issues it itself and a guest's openat2 is emulated "
+                      "-- as it is on a kernel without one. Test aid: a host "
+                      "that allows it never takes that path."},
         {"CNG_BROKER_NO_PEERCRED", "Behave as if the kernel would not say who "
                       "is on the other end of the IPC broker's rendezvous "
                       "socket, which refuses the connection. Test aid: a "

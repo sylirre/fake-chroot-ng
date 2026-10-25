@@ -90,10 +90,17 @@ const int cng_setid_deny_nrs[] = {
 const int cng_setid_deny_n =
     (int)(sizeof cng_setid_deny_nrs / sizeof cng_setid_deny_nrs[0]);
 
-static void setid_deny(void) {
+/* What CNG_OPENAT2_DENY takes as refused: openat2 alone, which Android's
+ * filter refuses from 13 on. */
+int cng_g_openat2_deny = 0;
+
+/* The knobs' marks, on top of whatever the probe measured. */
+static void knob_deny(void) {
     if (cng_g_setid_deny)
         for (int i = 0; i < cng_setid_deny_n; i++)
             cng_blocked[cng_setid_deny_nrs[i]] = 1;
+    if (cng_g_openat2_deny)
+        cng_blocked[__NR_openat2] = 1;
 }
 
 static unsigned char *g_probe_map; /* MAP_SHARED page: child marks, parent reads */
@@ -113,7 +120,7 @@ void cng_probe_blocked(void) {
                            CNG_MAP_SHARED | CNG_MAP_ANONYMOUS, -1, 0);
     if (g_probe_map == CNG_MAP_FAILED || cng_is_err((long)g_probe_map)) {
         g_probe_map = 0;
-        setid_deny();
+        knob_deny();
         return; /* no probe -> nothing blocked; gate-net remains the backstop */
     }
     memset(g_probe_map, 0, CNG_NR_MAX);
@@ -139,5 +146,5 @@ void cng_probe_blocked(void) {
     }
     sys_munmap(g_probe_map, 4096);
     g_probe_map = 0;
-    setid_deny();
+    knob_deny();
 }

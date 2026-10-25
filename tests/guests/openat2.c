@@ -12,6 +12,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -30,23 +31,41 @@
 #define RESOLVE_IN_ROOT       0x10
 #endif
 
+#ifndef O_TMPFILE
+#define O_TMPFILE (020000000 | O_DIRECTORY)
+#endif
+
 struct how {
     unsigned long long flags, mode, resolve;
 };
 
-/* The raw syscall: glibc has no wrapper, which is the whole reason the flag set
- * is worth testing — every user builds the struct itself. */
+/* An ambient filter that refuses the number (Android's) traps it rather than
+ * failing it, and the run that is meant to ask the kernel would die of the
+ * SIGSYS: the handler turns that into the ENOSYS a kernel without the call
+ * gives, which is the same "nothing to compare against" here. */
+static volatile sig_atomic_t trapped;
+
+static void on_sigsys(int sig) {
+    (void)sig;
+    trapped = 1;
+}
+
+/* The raw syscall: every user builds the struct itself, which is the whole
+ * reason the flag set is worth testing. */
 static long o2(int dfd, const char *path, struct how *h, unsigned long size) {
+    trapped = 0;
     long r = syscall(__NR_openat2, dfd, path, h, size);
+    if (trapped)
+        return -ENOSYS;
     return r < 0 ? -errno : r;
 }
 
 /* Run one case and print its outcome. A successful open is closed and reported
  * as "ok", so no descriptor number ever reaches the output. */
-static void one(const char *name, int dfd, const char *path,
-                unsigned long long flags, unsigned long long resolve,
-                unsigned long size) {
-    struct how h = {flags, 0, resolve};
+static void one_m(const char *name, int dfd, const char *path,
+                  unsigned long long flags, unsigned long long mode,
+                  unsigned long long resolve, unsigned long size) {
+    struct how h = {flags, mode, resolve};
     long r = o2(dfd, path, &h, size ? size : sizeof h);
     if (r >= 0) {
         close((int)r);
@@ -54,6 +73,12 @@ static void one(const char *name, int dfd, const char *path,
     } else {
         printf("%s=%ld\n", name, r);
     }
+}
+
+static void one(const char *name, int dfd, const char *path,
+                unsigned long long flags, unsigned long long resolve,
+                unsigned long size) {
+    one_m(name, dfd, path, flags, 0, resolve, size);
 }
 
 static int mkfile(int dfd, const char *name) {
@@ -75,9 +100,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "openat2: open %s: %s\n", argv[1], strerror(errno));
         return 3;
     }
+    signal(SIGSYS, on_sigsys);
 
     /* Is openat2 here at all? Every host below 5.6 (and qemu-user builds that
-     * do not implement it) answers ENOSYS, and there is nothing to compare. */
+     * do not implement it) answers ENOSYS, an Android filter traps it, and
+     * there is nothing to compare. Under chroot-ng every one of those is
+     * emulated, so the run it is compared with always gets past here. */
     struct how probe = {O_RDONLY, 0, 0};
     if (o2(d, "..", &probe, sizeof probe) == -ENOSYS) {
         printf("openat2=unsupported\n");
@@ -170,6 +198,71 @@ int main(int argc, char **argv) {
         } else {
             printf("size_big_tail=%ld\n", r);
         }
+    }
+
+    /* What openat2 refuses that openat strips or ignores: a mode where nothing
+     * is created, a mode outside 07777, O_PATH with anything but its
+     * companions, a flag bit no kernel defines; and O_TMPFILE's own rules,
+     * which the two calls share. Where the host cannot issue openat2 these are
+     * chroot-ng's to judge, with no kernel to ask. */
+    one_m("mode_nocreat", d, "file", O_RDONLY, 0644, 0, 0);
+    one_m("mode_toobig", d, "newf", O_WRONLY | O_CREAT, 010644, 0, 0);
+    one("path_extra", d, "file", O_PATH | O_APPEND, 0, 0);
+    one("flag_high", d, "file", O_RDONLY | (1ULL << 40), 0, 0);
+    one("tmpfile_rdonly", d, ".", O_TMPFILE | O_RDONLY, 0, 0);
+    one_m("tmpfile_creat", d, ".", O_TMPFILE | O_CREAT | O_RDWR, 0600, 0, 0);
+
+    /* The scope's own errors, in path_init()'s order: an absolute name under
+     * BENEATH is EXDEV before the descriptor is looked at; then a number that
+     * is no descriptor is EBADF, and one on a file ENOTDIR. IN_ROOT takes the
+     * absolute name as relative to the descriptor, so it gets the EBADF. */
+    {
+        int f = openat(d, "file", O_RDONLY);
+        int bad = dup(d); /* a number that was a descriptor a moment ago */
+        close(bad);
+        one("scope_badfd", bad, "file", O_RDONLY, RESOLVE_BENEATH, 0);
+        one("scope_badfd_abs", bad, "/file", O_RDONLY, RESOLVE_BENEATH, 0);
+        one("scope_badfd_inroot", bad, "/file", O_RDONLY, RESOLVE_IN_ROOT, 0);
+        one("scope_notdir", f, "x", O_RDONLY, RESOLVE_BENEATH, 0);
+        if (f >= 0)
+            close(f);
+    }
+
+    /* What tar (1.35 with the CVE-2025-45582 backport, through glibc 2.43's
+     * openat2) does for every member: the parent directory, opened O_PATH
+     * under BENEATH with a trailing slash; then files created and directories
+     * reached through it. A symlink the archive planted on the way is refused
+     * — absolute, or climbing out with "..". O_NOFOLLOW still refuses a final
+     * link (ELOOP), and O_PATH|O_NOFOLLOW opens the link itself. */
+    {
+        unlinkat(d, "uplink", 0);
+        unlinkat(d, "sub/new", 0);
+        if (symlinkat("../escaped", d, "uplink")) {
+            fprintf(stderr, "openat2: cannot create uplink\n");
+            return 3;
+        }
+        const unsigned long long dirf =
+            O_RDONLY | O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+        one("tar_parent", d, "sub/", dirf, RESOLVE_BENEATH, 0);
+        one("tar_parent_link", d, "abslink/", dirf, RESOLVE_BENEATH, 0);
+        one("tar_parent_up", d, "uplink/", dirf, RESOLVE_BENEATH, 0);
+        one_m("tar_create", d, "sub/new",
+              O_WRONLY | O_CREAT | O_EXCL | O_NOCTTY | O_NONBLOCK | O_CLOEXEC,
+              0600, RESOLVE_BENEATH, 0);
+        one_m("tar_create_again", d, "sub/new", O_WRONLY | O_CREAT | O_EXCL,
+              0600, RESOLVE_BENEATH, 0);
+        one_m("tar_create_up", d, "uplink/new", O_WRONLY | O_CREAT, 0600,
+              RESOLVE_BENEATH, 0);
+        one("beneath_inside_dotdot", d, "sub/../file", O_RDONLY,
+            RESOLVE_BENEATH, 0);
+        one("beneath_nofollow", d, "link", O_RDONLY | O_NOFOLLOW,
+            RESOLVE_BENEATH, 0);
+        one("beneath_pathlink", d, "link", O_PATH | O_NOFOLLOW,
+            RESOLVE_BENEATH, 0);
+        one("beneath_missing", d, "sub/nope", O_RDONLY, RESOLVE_BENEATH, 0);
+        one("beneath_notdir", d, "file/", O_RDONLY, RESOLVE_BENEATH, 0);
+        unlinkat(d, "sub/new", 0);
+        unlinkat(d, "uplink", 0);
     }
 
     close(d);

@@ -6438,30 +6438,14 @@ int cng_cmd_o2test(int argc, char **argv, char **envp, unsigned long *auxv) {
 
     /* End to end, through the dispatcher: a scoped openat2 whose name lands on
      * a file chroot-ng synthesizes. The kernel cannot produce that answer — the
-     * pass-through route would hand it the HOST's /proc/mounts, or, on a host
-     * without openat2 at all, ENOSYS — so an fd holding the guest's own mount
-     * table (the bind at /mnt is in it, and the device column is ours) is the
-     * walked route's answer and nothing else's. */
+     * pass-through route would hand it the HOST's /proc/mounts — so an fd
+     * holding the guest's own mount table (the bind at /mnt is in it, and the
+     * device column is ours) is the walked route's answer and nothing else's.
+     * The same on a host that cannot issue openat2 at all (a pre-5.6 kernel,
+     * qemu-user, or Android's filter refusing it), where the call is emulated
+     * and every scope is walked: it used to be ENOSYS there. */
     {
         struct cng_open_how h = {CNG_O_RDONLY, 0, CNG_RESOLVE_IN_ROOT};
-        /* Whether this host has the syscall at all. Without it ENOSYS is the
-         * right answer to every openat2, and it is the answer the how
-         * precheck brings back before any judgement of ours is applied — so
-         * that is what the leg demands there.
-         *
-         * An ambient filter that refuses the number is the same answer and
-         * must be read from the probe map rather than by asking: Android 13
-         * blocks openat2, and the raw call below trapped to a SIGSYS nothing
-         * in this driver catches, killing the run five legs early. */
-        int have_o2 = !cng_blocked[__NR_openat2];
-        if (have_o2) {
-            struct cng_open_how h0 = {CNG_O_RDONLY, 0, 0};
-            long probe = cng_syscall6(CNG_AT_FDCWD, (long)"", (long)&h0,
-                                      (long)sizeof h0, 0, 0, __NR_openat2);
-            if (probe >= 0)
-                sys_close((int)probe);
-            have_o2 = probe != -ENOSYS;
-        }
         long dfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/",
                                 CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
         long mfd = dfd < 0 ? dfd
@@ -6485,10 +6469,9 @@ int cng_cmd_o2test(int argc, char **argv, char **envp, unsigned long *auxv) {
             sys_close((int)mfd);
         if (dfd >= 0)
             sys_close((int)dfd);
-        int ok = have_o2 ? guest_table : mfd == -ENOSYS;
-        cng_dprintf(1, "o2test scope synth %s -> %s\n",
-                    have_o2 ? "table" : "enosys", ok ? "OK" : "FAIL");
-        fails += !ok;
+        cng_dprintf(1, "o2test scope synth table -> %s\n",
+                    guest_table ? "OK" : "FAIL");
+        fails += !guest_table;
     }
 
     /* The size/pointer rules, through the dispatcher. Each is answered before
@@ -6525,11 +6508,10 @@ int cng_cmd_o2test(int argc, char **argv, char **envp, unsigned long *auxv) {
             sys_munmap(hm, 2 * pg);
         }
         /* A zero tail is the same call as a sized one, so it must NOT be
-         * refused by either rule; whether it then opens depends on the host
-         * (qemu-user has no openat2 and answers ENOSYS). */
+         * refused by either rule: it opens, on a host with openat2 and on one
+         * where the call is emulated alike. */
         int ok = small == -EINVAL && e2big == -E2BIG && bad == -EFAULT &&
-                 over == -E2BIG && zero != -EINVAL && zero != -E2BIG &&
-                 zero != -EFAULT;
+                 over == -E2BIG && zero >= 0;
         if (zero >= 0)
             sys_close((int)zero);
         cng_dprintf(1,

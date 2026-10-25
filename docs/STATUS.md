@@ -4208,6 +4208,56 @@ vfork/`posix_spawn` child-stack handling.
     relayed and with CNG_NETLINK_DENY_GETLINK (synthesized), against the
     kernel where rtnetlink works. The previous build: `acks=0` on both gets.
 
+- [x] **M97 — `openat2` is emulated where the host cannot issue it**
+  Ubuntu 26.04's tar (1.35 with the CVE-2025-45582 backport) opens the
+  parent of every member it extracts with `openat2(…, "dir/",
+  O_PATH|O_DIRECTORY|O_NOFOLLOW, RESOLVE_BENEATH)`. Android's filter refuses
+  `openat2`, and the dispatcher answered `ENOSYS` as an older kernel would —
+  so every directory came back "Cannot mkdir: Function not implemented" and
+  every file in one "Cannot open", on any archive with a subdirectory.
+  That answer used to be enough: gnulib's `openat2` falls back to its own
+  emulation on `ENOSYS`. But glibc 2.43 put an `openat2` wrapper in front of
+  the raw call, gnulib is no longer built where libc has one, and the tar
+  binary imports `openat2@GLIBC_2.43` — so it would fail the same way natively
+  on any pre-5.6 kernel (the 3.18 and 4.19 devices).
+  - Most of the call was already ours: M24 answers `NO_SYMLINKS`,
+    `NO_MAGICLINKS` and `NO_XDEV` in the walk, and walks `BENEATH` /
+    `IN_ROOT` wherever a bind or zone sits under the dirfd. The kernel was
+    left three things: judging the `open_how`, the scoped resolution where
+    nothing sits under the dirfd, and the open itself.
+  - Where `openat2` cannot be issued — refused by the filter (`cng_blocked`),
+    or `ENOSYS` from a pre-5.6 kernel or qemu-user, asked once and remembered
+    (`openat2_absent`) — those three are done here: `how_validate` is
+    `build_open_flags()` as `openat2` runs it (unknown flag or resolve bits, a
+    mode without `O_CREAT`/`O_TMPFILE` or outside 07777, `O_PATH` with anything
+    but its companions, `BENEATH` with `IN_ROOT`, O_TMPFILE's own rules, and
+    `EAGAIN` for a create, truncate or O_TMPFILE under `RESOLVE_CACHED`); every
+    scope is walked; and what is left is re-issued as the `openat` it then is
+    — pinned, like every other re-issue. Any other `RESOLVE_CACHED` lookup is
+    made the ordinary way, which is what a warm cache answers.
+  - A scope whose dirfd has no guest name is answered as `path_init()`
+    answers it: `EXDEV` for an absolute name under `BENEATH` before the
+    descriptor is looked at, then `EBADF` / `ENOTDIR`, and `EACCES` for a
+    directory from outside the view, as every other route refuses it.
+  - `CNG_OPENAT2_DENY=1` takes `openat2` as refused on any host.
+  - Test: `tests/guests/openat2.c` gained 21 cases — the validation, the
+    scope's own errors, and tar's opens (the parent with a trailing slash, a
+    create under it, and a planted absolute or climbing symlink, both
+    `EXDEV`) — and turns a filter's SIGSYS into the "unsupported" a kernel
+    without the call gives. In m24 it is diffed against the live kernel
+    under `CNG_OPENAT2_DENY` on both tiers where the host has `openat2`, and
+    against the kernel's answers recorded on 6.8 where it does not. The
+    previous build answered the first `openat2` there with `ENOSYS`, so the
+    run printed `openat2=unsupported` and none of the 42 cases. `-t o2test`'s
+    end-to-end leg now demands the synthesized `/proc` through the walk
+    everywhere, and m17's NULL-pathname differential holds an `openat2` the
+    reference cannot issue (qemu-user) to the `EFAULT` a kernel with the call
+    gives, where both sides used to read "unavailable".
+  - Not this: under `-u`, tar creates a directory with its final mode (0500)
+    and relies on root's DAC bypass to fill it, which the real uid does not
+    have — `touch` into a 0500 directory fails the same way, with or without
+    this change.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

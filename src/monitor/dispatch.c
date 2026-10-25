@@ -259,6 +259,79 @@ static int g_no_faccessat2, g_no_fchmodat2, g_no_openat2;
      CNG___O_TMPFILE)
 #define OPEN_FLAGS_PATH (CNG_O_DIRECTORY | CNG_O_NOFOLLOW | CNG_O_PATH | CNG_O_CLOEXEC)
 
+/* Can openat2 be issued here at all? Not where the ambient filter refuses it
+ * (cng_blocked: Android's does), nor on a kernel older than 5.6 or
+ * under qemu-user, which answer ENOSYS. That last one is asked once, with a how
+ * every kernel that has the call accepts and a name that resolves to nothing,
+ * and remembered either way — as is the ENOSYS a pinned re-issue runs into.
+ *
+ * Where it cannot, a guest's own openat2 is emulated (see the openat2 case)
+ * rather than answered with that ENOSYS. glibc 2.43 put an openat2 wrapper in
+ * front of the raw call, and gnulib's own replacement — which falls back on
+ * ENOSYS — is no longer built where libc has one: Ubuntu 26.04's tar opens
+ * every directory it extracts into with RESOLVE_BENEATH that way, and each one
+ * came back "Cannot mkdir: Function not implemented". */
+static int g_have_openat2;
+
+static int openat2_absent(void) {
+    if (g_no_openat2 || cng_blocked[__NR_openat2])
+        return 1;
+    if (!g_have_openat2) {
+        struct cng_open_how h = {CNG_O_RDONLY, 0, 0};
+        long r = cng_syscall6(CNG_AT_FDCWD, (long)"", (long)&h, (long)sizeof h,
+                              0, 0, __NR_openat2);
+        if (r >= 0)
+            sys_close((int)r); /* an empty name cannot open, but never leak one */
+        if (r == -ENOSYS)
+            g_no_openat2 = 1;
+        else
+            g_have_openat2 = 1;
+    }
+    return g_no_openat2;
+}
+
+/* build_open_flags() as openat2 runs it, for where there is no kernel to ask
+ * (how_precheck asks it everywhere else). openat2 checks every argument that
+ * openat silently strips or ignores — a flag outside the set, an unknown
+ * resolve bit, a mode where nothing is created, O_PATH with anything but its
+ * companions — and refuses BENEATH with IN_ROOT; O_TMPFILE's own rules come
+ * from the same function and are shared with openat, in the kernel's order.
+ * Last, RESOLVE_CACHED: a create, a truncate or an O_TMPFILE is never even
+ * tried from the cache. Any other cached lookup is let through and made the
+ * ordinary way, which is what a warm cache answers. Returns 0 or the errno. */
+static long how_validate(const struct cng_open_how *how) {
+    unsigned long f = how->flags & ~(unsigned long)CNG_O_CLOEXEC;
+    if (f & ~(unsigned long)OPEN_FLAGS_KNOWN)
+        return -EINVAL;
+    if (how->resolve &
+        ~(unsigned long)(CNG_RESOLVE_NO_XDEV | CNG_RESOLVE_NO_MAGICLINKS |
+                         CNG_RESOLVE_NO_SYMLINKS | CNG_RESOLVE_BENEATH |
+                         CNG_RESOLVE_IN_ROOT | CNG_RESOLVE_CACHED))
+        return -EINVAL;
+    if ((how->resolve & CNG_RESOLVE_BENEATH) &&
+        (how->resolve & CNG_RESOLVE_IN_ROOT))
+        return -EINVAL;
+    if (f & (CNG_O_CREAT | CNG___O_TMPFILE)) {
+        if (how->mode & ~07777ul)
+            return -EINVAL;
+    } else if (how->mode) {
+        return -EINVAL;
+    }
+    /* O_TMPFILE carries O_DIRECTORY and takes write access; O_CREAT with it
+     * is refused, by the O_TMPFILE mask before 6.4 and by the O_DIRECTORY |
+     * O_CREAT rule after. */
+    if ((f & CNG___O_TMPFILE) &&
+        ((f & (CNG_O_TMPFILE | CNG_O_CREAT)) != CNG_O_TMPFILE ||
+         (f & CNG_O_ACCMODE) == CNG_O_RDONLY))
+        return -EINVAL;
+    if ((f & CNG_O_PATH) && (f & ~(unsigned long)OPEN_FLAGS_PATH))
+        return -EINVAL;
+    if ((how->resolve & CNG_RESOLVE_CACHED) &&
+        (f & (CNG_O_TRUNC | CNG_O_CREAT | CNG___O_TMPFILE)))
+        return -EAGAIN;
+    return 0;
+}
+
 static int open_as_openat2(long flags, long mode, struct cng_open_how *how) {
     if (g_no_openat2 || cng_blocked[__NR_openat2] ||
         (flags & ~(long)OPEN_FLAGS_KNOWN))
@@ -1859,22 +1932,50 @@ int cng_scope_needs_walk(long dirfd, char *gdir, size_t sz) {
     if (dfd == CNG_AT_FDCWD) {
         /* The virtual cwd, which is the guest's own answer — the host cwd is
          * only its translation and would have to be mapped back. */
-        if (cng_fs_cwd(gdir, sz) >= sz)
+        if (cng_fs_cwd(gdir, sz) >= sz) {
+            gdir[0] = '\0';
             return 0;
+        }
     } else {
         char hdir[CNG_PATH_MAX];
-        if (dirfd_host(dfd, hdir, sizeof hdir) != 0)
+        if (dirfd_host(dfd, hdir, sizeof hdir) != 0) {
+            gdir[0] = '\0';
             return 0;
+        }
         /* The zones are named too (the synthesized /proc files and the
          * hidden-process view live under a dirfd like that, and they are
          * exactly what the kernel's own resolution would miss). A directory
          * the guest has no name for is refused, not handed to the kernel to
          * scope a resolution under: the scoping keeps the answer beneath that
          * directory, and beneath it is still outside the view. */
-        if (host_dir_guest(hdir, gdir, sz) != 0)
+        if (host_dir_guest(hdir, gdir, sz) != 0) {
+            gdir[0] = '\0';
             return fd_is_dir(dfd) ? -1 : 0;
+        }
     }
     return scope_overlay(gdir);
+}
+
+/* A scoped openat2 that has to be walked, against a dirfd cng_scope_needs_walk
+ * could not name (`gdir` came back empty): there is no scope to walk from.
+ * What the kernel answers there instead, in path_init()'s order — an absolute
+ * name under BENEATH is EXDEV before the descriptor is looked at, then a number
+ * that is no descriptor is EBADF and one on anything but a directory ENOTDIR.
+ * What is left is a directory with no name the guest could have used, which
+ * is refused as every other route refuses it. */
+static long scope_unnamed(long dirfd, const char *gp, unsigned long resolve) {
+    int dfd = (int)dirfd;
+    if (gp && gp[0] == '/' && (resolve & CNG_RESOLVE_BENEATH))
+        return -EXDEV;
+    if (dfd != CNG_AT_FDCWD) {
+        char st[STAT_BUF_SIZE];
+        long e = sys_fstat(dfd, st);
+        if (e < 0)
+            return e;
+        if ((*(unsigned *)(st + STAT_MODE_OFF) & CNG_S_IFMT) != CNG_S_IFDIR)
+            return -ENOTDIR;
+    }
+    return -EACCES;
 }
 
 /* at_canon() for a scoped openat2: the same lexical canonicalization the
@@ -2945,9 +3046,9 @@ static long openat2_scoped(long dirfd, long path,
         /* O_PATH so nothing is opened for real, and the caller's own
          * O_NOFOLLOW carried over — ro_refusal() passes AT_SYMLINK_NOFOLLOW the
          * same way, or a write-open of a dangling link reads as absent. Raw,
-         * not reissue(): the precheck above has already answered ENOSYS for a
-         * blocked openat2, so nothing reaches this line where the number would
-         * trap. */
+         * not reissue(): where openat2 cannot be issued the call is emulated
+         * by the walk and never comes here, so nothing reaches this line where
+         * the number would trap. */
         probe.flags = CNG_O_PATH | CNG_O_CLOEXEC | (oflags & CNG_O_NOFOLLOW);
         probe.mode = 0;
         long e = cng_syscall6(dirfd, path, (long)&probe, (long)sizeof probe, 0,
@@ -2970,7 +3071,9 @@ static long openat2_scoped(long dirfd, long path,
      * an absolute one at the HOST root, where BENEATH had nothing left to
      * refuse and IN_ROOT nothing to re-root (ENOENT for both) — and
      * RESOLVE_NO_SYMLINKS was added, which turned every link the scope would
-     * have followed or refused into ELOOP. */
+     * have followed or refused into ELOOP. The caller walks a scoped call
+     * itself wherever openat2 cannot be issued; the check stays so that a
+     * blocked number can never trap from inside the handler. */
     if (cng_blocked[__NR_openat2]) {
         cng_note_blocked(__NR_openat2);
         return -ENOSYS;
@@ -3037,17 +3140,15 @@ static long read_open_how(long a2, unsigned long size, struct cng_open_how *out)
  * validates the struct, then fails the empty path. Returns 0 when the how is
  * good, else the errno the kernel gave it.
  *
- * Where the ambient filter refuses openat2 there is no kernel to ask: this runs
+ * Where openat2 cannot be issued there is no kernel to ask, and the call is
+ * being emulated: the rules are applied here instead (how_validate). Asking
+ * anyway is no option where the ambient filter refuses the number — this runs
  * inside the SIGSYS handler, so a raw re-issue of a blocked number is the
- * nested trap the whole design avoids — measured on an Android 13 device,
- * which blocks openat2 outright and killed the process here. ENOSYS is the
- * answer reissue() already gives every other blocked syscall, and it is what
- * the guest would see from a kernel that has no openat2 at all. */
+ * nested trap the whole design avoids (measured on an Android 13 device, which
+ * blocks openat2 outright and killed the process here). */
 static long how_precheck(const struct cng_open_how *how) {
-    if (cng_blocked[__NR_openat2]) {
-        cng_note_blocked(__NR_openat2);
-        return -ENOSYS;
-    }
+    if (openat2_absent())
+        return how_validate(how);
     long r = cng_syscall6(CNG_AT_FDCWD, (long)"", (long)how, (long)sizeof *how,
                           0, 0, __NR_openat2);
     if (r >= 0) {
@@ -4130,6 +4231,12 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         unsigned long resolve = 0;
         char sdir[CNG_PATH_MAX]; /* a scoped openat2's scope, as a guest path */
         int scoped = 0;          /* ...and whether this is one */
+        /* An openat2 the host cannot issue (see openat2_absent) is emulated:
+         * judged here as build_open_flags() would, every resolve bit answered
+         * by the walk — the scoped pair included, wherever the kernel would
+         * otherwise have been handed it — and made as the openat that is
+         * left once they are all stripped. */
+        int emul = 0;
         if (is_open) {
             oflags = a2;
             /* openat2's flags live in the open_how it points at, so reading
@@ -4142,6 +4249,12 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                     return e;
                 oflags = (long)how.flags;
                 resolve = how.resolve;
+                if ((emul = openat2_absent())) {
+                    if (cng_blocked[__NR_openat2])
+                        cng_note_blocked(__NR_openat2);
+                    if ((e = how_validate(&how)))
+                        return e;
+                }
             }
         }
         /* RESOLVE_BENEATH / RESOLVE_IN_ROOT scope the whole resolution to
@@ -4160,11 +4273,20 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * bound over it, and a scoped name in /proc missed the synthesized
          * files entirely. Those are walked here instead, with the scope
          * applied by the walk (cng_resolve_lim) and then stripped from the
-         * re-issue, exactly as the other resolve bits already are. */
+         * re-issue, exactly as the other resolve bits already are — and so is
+         * every scoped call where openat2 is emulated, there being no kernel
+         * to hand the other kind to. */
         if (resolve & (CNG_RESOLVE_BENEATH | CNG_RESOLVE_IN_ROOT)) {
             int walk = cng_scope_needs_walk(a0, sdir, sizeof sdir);
             if (walk < 0)
                 return -EACCES; /* a directory the guest has no name for */
+            /* Emulated, there is no kernel to apply the scope, so the walk
+             * applies it everywhere — which needs the scope's name. */
+            if (!walk && emul) {
+                if (!sdir[0])
+                    return scope_unnamed(a0, (const char *)a1, resolve);
+                walk = 1;
+            }
             if (!walk)
                 return openat2_scoped(a0, a1, &how);
             /* From here we answer in place of the kernel, so the how has to be
@@ -4283,8 +4405,17 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                     return ro;
             }
         }
-        long ha2 = a2, ha3 = a3;
-        if (nr == __NR_openat2) {
+        long ha2 = a2, ha3 = a3, rnr = nr;
+        if (emul) {
+            /* Every resolve bit is answered — RESOLVE_CACHED by how_validate,
+             * the rest by the walk — and how_validate has refused whatever
+             * openat would have stripped, so what is left IS an openat: the
+             * same flags and mode, and the same O_LARGEFILE the kernel adds to
+             * both forms (and O_PATH drops from both). */
+            rnr = __NR_openat;
+            ha2 = (long)how.flags;
+            ha3 = (long)how.mode;
+        } else if (nr == __NR_openat2) {
             /* Our copy, never the guest's struct: the constraints we answered
              * are cleared for the re-issue, and editing guest memory would
              * change what the caller believes it asked for. `size` becomes our
@@ -4315,23 +4446,24 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                    (nr == __NR_name_to_handle_at && !deref);
         if (l2nf && l2s_nofollow_data(rkd, rkp, 0, 0, l2d, sizeof l2d))
             p = l2d;
-        long r = reissue(a0, (long)p, ha2, ha3, a4, a5, nr);
+        long r = reissue(a0, (long)p, ha2, ha3, a4, a5, rnr);
         /* O_NOFOLLOW through a real dirfd lands on the l2s symlink and draws
          * ELOOP where a real hardlink would open. Retry on the backing file —
          * never a symlink itself, so O_NOFOLLOW stays honored for real
          * guest symlinks. openat2 carries the flag in its open_how and drew
          * the same ELOOP; the retry re-issues our copy of that struct, its
-         * resolve constraints already answered and stripped. */
+         * resolve constraints already answered and stripped (or, emulated,
+         * the openat it became). */
         if (r == -ELOOP && is_open && (oflags & CNG_O_NOFOLLOW) &&
             l2s_nofollow_data(rkd, rkp, 0, 0, l2d, sizeof l2d))
-            r = reissue(CNG_AT_FDCWD, (long)l2d, ha2, ha3, a4, a5, nr);
+            r = reissue(CNG_AT_FDCWD, (long)l2d, ha2, ha3, a4, a5, rnr);
         /* A followed open draws it too, where the name the walk took for a file
          * became an l2s link before the kernel was handed it: a first link of
          * that file, made at the same moment (the pin refuses a final link the
          * walk never saw). Following the link is opening its backing file. */
         else if (r == -ELOOP && is_open && deref && cng_g_l2s &&
                  cng_l2s_resolve(p, l2d, sizeof l2d, 0) == 1)
-            r = reissue(CNG_AT_FDCWD, (long)l2d, ha2, ha3, a4, a5, nr);
+            r = reissue(CNG_AT_FDCWD, (long)l2d, ha2, ha3, a4, a5, rnr);
         if ((r == -EACCES || r == -EPERM) && nr == __NR_openat)
             r = cng_fd_reopen(p, a2, a3, r);
         return r;

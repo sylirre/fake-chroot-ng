@@ -15,8 +15,10 @@
  * Output is protocol only, so the same source built for the host is the oracle.
  * A number this host does not implement, or refuses outright, says nothing
  * about pathnames — ENOSYS and EPERM print as "unavailable" so that a kernel
- * without fchmodat2, or an Android policy that denies openat2, compares equal
- * on both sides instead of asserting an errno that was never about the name.
+ * without fchmodat2 compares equal on both sides instead of asserting an errno
+ * that was never about the name. openat2 is the exception: chroot-ng emulates
+ * it where the host cannot issue it, so m17 holds an "unavailable" reference
+ * to the EFAULT a kernel with the call gives.
  */
 #define _GNU_SOURCE
 #include <errno.h>

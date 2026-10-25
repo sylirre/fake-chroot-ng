@@ -154,6 +154,10 @@ NULD=$(mktemp -d)
 if guest_xlate_ready "NULL-pathname leg" &&
     guest_cc_report "$NULD/nullpath" tests/guests/nullpath.c; then
     nul_k=$(emu "$NULD/nullpath" "$NULD" 2>/dev/null)
+    # Where the reference has no openat2 (qemu-user, a pre-5.6 kernel) the
+    # emulation still answers it (M97), and a kernel that has the call faults
+    # a NULL name before anything else: EFAULT is the answer to hold it to.
+    nul_k=$(printf '%s\n' "$nul_k" | sed 's/^openat2=unavailable$/openat2=14/')
     # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
     nul_g=$(run_t 60 -R $GUEST_BINDS "$NULD" /nullpath 2>/dev/null)
     if [ -z "$nul_k" ]; then
