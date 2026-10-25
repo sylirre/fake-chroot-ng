@@ -576,7 +576,9 @@ sendmmsg: sent=1 route=24 oif=1'
     # alone: a relayed get left the kernel's ACK on the relay socket it then
     # closed, and a synthesized one never had any, so a client waiting for the
     # ACK (libnl's nl_wait_for_ack) waited for good. Both paths: relayed, and
-    # with the link refused as Android refuses it (synthesized).
+    # with the link refused as Android refuses it (synthesized). A kernel
+    # older than the flag relayed its ACK unflagged, so one socket answered a
+    # synthesized link flagged and a relayed route not.
     nlack_want='getlink ack: objects=1 errors=0 acks=1 dones=0 more=0 ack=0 flags=0x100 len=36 echo=18/32/0x5/1
 getlink: objects=1 errors=0 acks=0 dones=0 more=0
 getroute ack: objects=1 errors=0 acks=1 dones=0 more=0 ack=0 flags=0x100 len=36 echo=26/36/0x5/3
@@ -591,7 +593,19 @@ dump ack: objects>0=1 errors=0 acks=0 dones=1 more=0'
         check "m16 ...and so does a synthesized one" "$nlack_want" "$st"
         if [ "$m16_raw" = 1 ]; then
             kst=$(emu_t 60 "$M16D/nlack" 2>/dev/null)
-            check "m16 ...and the kernel here answers the same" "$nlack_want" "$kst"
+            # A kernel before 4.12 (extended ACK reporting) sends its ACK with
+            # no flags (Android 8's 3.18, measured): no reference for
+            # NLM_F_CAPPED, which the emulation sets as the 6.1 it advertises,
+            # relayed ACKs included. The rest is still the kernel's to judge.
+            case "$kst" in
+            *" ack=0 flags=0 len="*)
+                skip "m16 NLM_F_CAPPED against the kernel: the host kernel predates it (4.12), so it is no reference"
+                check "m16 ...and the kernel here answers the same, the flag aside" \
+                    "$(printf '%s\n' "$nlack_want" | sed 's/ flags=0x100 / flags=0 /')" \
+                    "$kst" ;;
+            *)
+                check "m16 ...and the kernel here answers the same" "$nlack_want" "$kst" ;;
+            esac
         fi
     else
         skip "ACK leg: could not build tests/guests/nlack.c"

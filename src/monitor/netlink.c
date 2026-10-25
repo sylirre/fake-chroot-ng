@@ -599,8 +599,9 @@ static long put_error(unsigned char *buf, long off, long max, unsigned seq,
 
 /* Append the ACK the kernel sends after a request that asked for one and was
  * not refused (netlink_ack with an error of 0): an NLMSG_ERROR of error 0,
- * flagged NLM_F_CAPPED, carrying the request's own header as it was sent — and
- * nothing of its payload, which only an error report echoes. */
+ * flagged NLM_F_CAPPED (4.12's extended ACK reporting on), carrying the
+ * request's own header as it was sent — and nothing of its payload, which only
+ * an error report echoes. */
 static long put_ack(unsigned char *buf, long off, long max, unsigned seq,
                     unsigned pid, const unsigned char *req) {
     long need = 16 + 4 + 16;
@@ -615,6 +616,17 @@ static long put_ack(unsigned char *buf, long off, long max, unsigned seq,
     *(int *)(buf + off + 16) = 0;
     memcpy(buf + off + 20, req, 16);
     return off + need;
+}
+
+/* Flag a relayed ACK the way put_ack's are. A kernel before 4.12 sends the same
+ * message with no flags at all (Android 8's 3.18, measured), and the
+ * emulation answers as the 6.1 uname advertises: unflagged, a relayed route's
+ * ACK would sit beside a synthesized link's flagged one on the same socket. */
+static void cap_ack(unsigned char *buf, long len) {
+    struct nlmsghdr_ *h = (struct nlmsghdr_ *)buf;
+    if (len >= (long)sizeof *h + 4 && h->type == NLMSG_ERROR_ &&
+        *(const int *)(buf + sizeof *h) == 0)
+        h->flags |= NLM_F_CAPPED_;
 }
 
 /* Is the first message of a buffer of `len` an NLMSG_ERROR — a refusal, where
@@ -916,9 +928,10 @@ static void push_msgs(struct nl_peer *p, const unsigned char *b, long len) {
  * datagram. A dump runs until its NLMSG_DONE, and is never acked, whatever it
  * asked. A single get is answered by one message — the object, or the error
  * that refuses it — and then, when the request asked for one (NLM_F_ACK) and
- * was not refused, by the kernel's ACK, a datagram of its own. That ACK used to
- * be left unread on the relay socket and closed with it, so a client waiting
- * for it (libnl's nl_wait_for_ack) waited for good. If the host goes quiet
+ * was not refused, by the kernel's ACK, a datagram of its own (flagged as a
+ * current kernel flags it, cap_ack). That ACK used to be left unread on the
+ * relay socket and closed with it, so a client waiting for it (libnl's
+ * nl_wait_for_ack) waited for good. If the host goes quiet
  * (SO_RCVTIMEO) the guest still gets a terminator — a dump that simply stops
  * mid-stream would hang every netlink client ever written. */
 static void pump(struct nl_peer *p, int hostfd, const unsigned char *req,
@@ -937,10 +950,12 @@ static void pump(struct nl_peer *p, int hostfd, const unsigned char *req,
             if ((rh->flags & NLM_F_ACK_) && !is_error(scratch, r)) {
                 long a = CNG_SYS(__NR_recvfrom, hostfd, (long)scratch,
                                  NL_REPLY_MAX, 0, 0, 0);
-                if (a > 0)
+                if (a > 0) {
                     fix_pid(scratch, a, p->port);
-                else
+                    cap_ack(scratch, a);
+                } else {
                     a = put_ack(scratch, 0, NL_REPLY_MAX, seq, p->port, req);
+                }
                 push(p, scratch, a);
             }
             return;

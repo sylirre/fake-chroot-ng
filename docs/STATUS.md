@@ -4200,6 +4200,11 @@ vfork/`posix_spawn` child-stack handling.
   - The relay reads the ACK too when the request asked and the answer was not
     an error, and synthesizes one if the host goes quiet; a synthesized answer
     is followed by one built the kernel's way (`put_ack`).
+  - A kernel before 4.12 sends its ACK with no flags (Android 8's 3.18,
+    measured), so with the emulation forced there a relayed ACK came through
+    unflagged and a synthesized one flagged, both on one socket. The relay
+    now flags a success ACK as the 6.1 the emulation advertises
+    (`cap_ack`). Only the kernel comparison skips there.
   - Left as it was: a request the emulation does not model (RTM_NEWADDR, …) is
     still acked whether or not it asked, and a non-dump RTM_GETROUTE with no
     relay still gets that ACK alone, the oracle's answers both.
