@@ -70,15 +70,17 @@ static void statx_remap(void *st) {
 
 /* Fake-root turns a privilege-denied ownership/mode change into success — the
  * real process is unprivileged, but the guest believes it is root. Denied
- * (EPERM/EACCES/EINVAL) and Android-blocked (ENOSYS) results are faked; genuine
- * errors (ENOENT, EROFS, ...) still propagate, as do all results when the
- * identity is unprivileged or inactive. fchmodat2 goes through
- * fchmodat2_result instead, whose ENOSYS asks for a fallback. */
+ * (EPERM/EINVAL) and Android-blocked (ENOSYS) results are faked; genuine errors
+ * (ENOENT, EROFS, ...) still propagate, as do all results when the identity is
+ * unprivileged or inactive. EACCES is left to dac_bypass: on a path it is a
+ * search refused on the way to the name, which is lent first so that the
+ * change is made for real, and it is faked there (dac_faked) only where nothing
+ * could be lent. fchmodat2 goes through fchmodat2_result instead, whose ENOSYS
+ * asks for a fallback. */
 static long chattr_result(long r) {
     if (r == 0)
         return 0;
-    if (cng_fake_root() &&
-        (r == -EPERM || r == -EACCES || r == -EINVAL || r == -ENOSYS))
+    if (cng_fake_root() && (r == -EPERM || r == -EINVAL || r == -ENOSYS))
         return 0;
     return r;
 }
@@ -4114,8 +4116,10 @@ void cng_clone_convert(struct cng_uregs *ur) {
     CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, &mask, 0, 8, 0, 0);
 }
 
-long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
-                  int trapped) {
+/* One syscall, as cng_dispatch makes it the first time: see there for the
+ * second. */
+static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
+                       long a5, int trapped) {
     char b1[CNG_PATH_MAX], b2[CNG_PATH_MAX];
 
     /* The address space an emulated execve retired, given back at the first
@@ -4629,7 +4633,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * link2symlink entries, redirect to its backing file (the guest thinks it's
      * a regular file, so a set-then-lstat-verify — as apk does to preserve mtime
      * — must land on the backing, not the link). Setting an explicit time needs
-     * ownership; under fake-root fake success on EPERM. */
+     * ownership; under fake-root fake success on EPERM, and on the EACCES of a
+     * file not ours to write once nothing could be lent (dac_faked). */
     case __NR_utimensat: {
         /* A NULL path names the dirfd (futimens). The flags have to be zero
          * for that, and the kernel says so before it looks at the descriptor,
@@ -4651,7 +4656,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                     return -EROFS;
                 long r = reissue(CNG_AT_FDCWD, (long)data, a2, 0, 0, 0,
                                  __NR_utimensat);
-                if (cng_fake_root() && (r == -EPERM || r == -EACCES))
+                if (cng_fake_root() && r == -EPERM)
                     return 0;
                 return r;
             }
@@ -4665,8 +4670,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         if (ro)
             return ro;
         long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_utimensat);
-        if (cng_fake_root() && (r == -EPERM || r == -EACCES))
-            return 0;
+        if (cng_fake_root() && r == -EPERM)
+            return 0; /* and EACCES once dac_bypass has had it (dac_faked) */
         return r;
     }
 
@@ -6577,6 +6582,336 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         }
         return reissue(a0, a1, a2, a3, a4, a5, nr);
     }
+}
+
+/* --- fake root's DAC bypass, lent -----------------------------------------
+ *
+ * Root is not held back by permission bits. CAP_DAC_OVERRIDE lets it create and
+ * remove names in a directory whose mode forbids writing it, and open a file
+ * for an access its mode refuses. CAP_DAC_READ_SEARCH lets it search a
+ * directory that has no x bit. A fake root is the real uid underneath and has
+ * none of that. So under -u, tar could not fill a directory it had just made
+ * 0500. GNU tar as root creates a directory with the owner bits it will end up
+ * with, counting on exactly this; only a non-root user's directories start
+ * out writable. `rm -rf` could not empty such a directory either, and a 0400
+ * file could not be appended to.
+ *
+ * No syscall gives an unprivileged process that override. But every inode in
+ * the guest's own tree belongs to the real uid, and an owner may change its
+ * mode. So when the host refuses a path call with EACCES under fake root, the
+ * first inode on the call's way that the real uid owns and whose owner bits
+ * fall short of what the call needs (cng_pin_dac_find) is lent those bits.
+ * The call is then made again and the mode put back. That goes one inode at a
+ * time, since the next one short of its bits may only be reachable once the
+ * first is searchable. proot's fake root lends eagerly, to every directory of
+ * every path. This only ever touches an inode the host has just refused, so a
+ * call the host allows costs nothing.
+ *
+ * The call is made again whole — the walk, the l2s probes, the re-issue — and
+ * not only its last syscall. A walk through a directory it may not search reads
+ * every name past it as a plain one, so a symlink there was never followed.
+ * Only a second walk, with the search bit lent, finds it.
+ *
+ * Lends take turns across the session, under an flock on the rootfs
+ * directory. A process whose call was refused while another had the same
+ * directory lent saw the lent mode, found nothing short, and kept its EACCES;
+ * and one whose lend was restored by the other in the middle of its retry was
+ * refused again. Four processes creating 25 files each in one 0500 directory
+ * lost a third of them. Under the lock every mode read is the real one.
+ *
+ * What it cannot do: lend anything on an inode that belongs to someone else (a
+ * host directory bound in, the host's /proc and /dev). There the refusal stands
+ * as the real uid's. And the lent mode is a real mode for as long as the call
+ * takes: a process outside the session can see it in that window, and a
+ * SIGKILL in it leaves the mode lent. The restore gives way to a mode someone
+ * else set meanwhile, so a concurrent chmod is never undone. */
+
+/* One name a refused call carries, and what root's bypass would have let it
+ * have on the way there. */
+struct dac_arg {
+    long dirfd;
+    const char *path;
+    int deref; /* the last component is followed */
+    struct cng_dac_need need;
+};
+
+#define DAC_ENTRY 0300u /* a name made or removed: write and search */
+#define DAC_LENDS 16    /* inodes lent for one call, at most */
+
+/* The names `nr` carries in a[], and what each needs. 0 for a call this does
+ * not retry: one with no name, and execve, which does not come back when it
+ * succeeds — nothing lent for it could ever be given back. */
+static int dac_args(long nr, const long *a, struct dac_arg *v) {
+    memset(v, 0, 2 * sizeof *v);
+    v[0].dirfd = v[1].dirfd = CNG_AT_FDCWD;
+    v[0].path = (const char *)a[1];
+    switch (nr) {
+    case __NR_openat:
+    case __NR_openat2: {
+        long fl = a[2];
+        if (nr == __NR_openat2) {
+            struct cng_open_how how;
+            if (read_open_how(a[2], (unsigned long)a[3], &how))
+                return 0;
+            fl = (long)how.flags;
+        }
+        v[0].dirfd = a[0];
+        /* O_CREAT|O_EXCL does not follow a final link either: the name has
+         * to be new. */
+        v[0].deref = !(fl & CNG_O_NOFOLLOW) &&
+                     (fl & (CNG_O_CREAT | CNG_O_EXCL)) !=
+                         (CNG_O_CREAT | CNG_O_EXCL);
+        if ((fl & CNG_O_TMPFILE) == CNG_O_TMPFILE) {
+            /* The name is the directory the unnamed file is made in. */
+            v[0].need.leaf = DAC_ENTRY;
+            v[0].need.leaf_dir = 1;
+        } else if (!(fl & CNG_O_PATH)) {
+            int acc = (int)fl & 3;
+            v[0].need.leaf = acc == CNG_O_RDONLY   ? 0400u
+                             : acc == CNG_O_WRONLY ? 0200u
+                                                   : 0600u;
+            if (fl & CNG_O_TRUNC)
+                v[0].need.leaf |= 0200u;
+            if (fl & CNG_O_CREAT)
+                v[0].need.parent_new = DAC_ENTRY;
+        }
+        return 1;
+    }
+    case __NR_mkdirat:
+    case __NR_mknodat:
+    case __NR_unlinkat:
+        v[0].dirfd = a[0];
+        v[0].need.parent = v[0].need.parent_new = DAC_ENTRY;
+        return 1;
+    case __NR_symlinkat:
+        v[0].dirfd = a[1];
+        v[0].path = (const char *)a[2];
+        v[0].need.parent = v[0].need.parent_new = DAC_ENTRY;
+        return 1;
+    case __NR_renameat:
+    case __NR_renameat2:
+        /* A directory moved to another parent has its ".." rewritten, which
+         * takes write on the directory itself — and under RENAME_EXCHANGE on
+         * the one moving the other way too. Asked last, so a rename within
+         * one directory never gets that far. */
+        v[0].dirfd = a[0];
+        v[0].need.parent = v[0].need.parent_new = DAC_ENTRY;
+        v[0].need.leaf = 0200u;
+        v[0].need.leaf_dir = 1;
+        v[1].dirfd = a[2];
+        v[1].path = (const char *)a[3];
+        v[1].need.parent = v[1].need.parent_new = DAC_ENTRY;
+        if (nr == __NR_renameat2 && ((unsigned)a[4] & CNG_RENAME_EXCHANGE)) {
+            v[1].need.leaf = 0200u;
+            v[1].need.leaf_dir = 1;
+        }
+        return 2;
+    case __NR_linkat:
+        /* The source is only looked up — except under -l, whose first link
+         * of a file moves it into the store and leaves a symlink in its
+         * place, which writes the source's directory. A source named by its
+         * descriptor (an empty name) is not looked up at all. */
+        v[0].dirfd = a[0];
+        v[0].deref = ((int)a[4] & CNG_AT_SYMLINK_FOLLOW) != 0;
+        if (cng_g_l2s)
+            v[0].need.parent = DAC_ENTRY;
+        v[1].dirfd = a[2];
+        v[1].path = (const char *)a[3];
+        v[1].need.parent = v[1].need.parent_new = DAC_ENTRY;
+        return 2;
+    case __NR_truncate:
+        v[0].path = (const char *)a[0];
+        v[0].deref = 1;
+        v[0].need.leaf = 0200u;
+        return 1;
+    case __NR_chdir:
+    case __NR_chroot:
+        v[0].path = (const char *)a[0];
+        v[0].deref = 1;
+        v[0].need.leaf = 0100u;
+        v[0].need.leaf_dir = 1;
+        return 1;
+
+    /* The rest only look their name up: search on the way is all they need
+     * of a mode. Followed or not as the call says, since what is followed
+     * decides which directories the way runs through. */
+    case __NR_newfstatat:
+    case __NR_faccessat2:
+    case __NR_fchmodat2:
+    case __NR_utimensat:
+        v[0].dirfd = a[0];
+        v[0].deref = !((int)a[3] & CNG_AT_SYMLINK_NOFOLLOW);
+        return 1;
+    case __NR_statx:
+    case __NR_setxattrat:
+    case __NR_getxattrat:
+    case __NR_listxattrat:
+    case __NR_removexattrat:
+        v[0].dirfd = a[0];
+        v[0].deref = !((int)a[2] & CNG_AT_SYMLINK_NOFOLLOW);
+        return 1;
+    case __NR_fchownat:
+    case __NR_file_getattr:
+    case __NR_file_setattr:
+        v[0].dirfd = a[0];
+        v[0].deref = !((int)a[4] & CNG_AT_SYMLINK_NOFOLLOW);
+        return 1;
+    case __NR_faccessat:
+    case __NR_fchmodat:
+        v[0].dirfd = a[0];
+        v[0].deref = 1;
+        return 1;
+    case __NR_readlinkat:
+        v[0].dirfd = a[0];
+        return 1;
+    case __NR_name_to_handle_at:
+        v[0].dirfd = a[0];
+        v[0].deref = ((int)a[4] & CNG_AT_SYMLINK_FOLLOW) != 0;
+        return 1;
+    case __NR_inotify_add_watch:
+        v[0].deref = !((unsigned)a[2] & CNG_IN_DONT_FOLLOW);
+        return 1;
+    case __NR_statfs:
+    case __NR_getxattr:
+    case __NR_listxattr:
+    case __NR_setxattr:
+    case __NR_removexattr:
+        v[0].path = (const char *)a[0];
+        v[0].deref = 1;
+        return 1;
+    case __NR_lgetxattr:
+    case __NR_llistxattr:
+    case __NR_lsetxattr:
+    case __NR_lremovexattr:
+        v[0].path = (const char *)a[0];
+        return 1;
+    }
+    return 0;
+}
+
+/* The calls fake root has always answered success when the host refused them
+ * — the ownership and mode changes and the times, which root may make on any
+ * file (chattr_result). An EACCES among those is a search the way refused, so
+ * it is lent first like any other, and the change happens for real wherever
+ * the inodes are ours. Only what is left is faked as before. */
+static int dac_faked(long nr) {
+    return nr == __NR_fchmodat || nr == __NR_fchmodat2 ||
+           nr == __NR_fchownat || nr == __NR_fchown || nr == __NR_fchmod ||
+           nr == __NR_utimensat;
+}
+
+/* The next inode to lend for the call in a[]: an O_PATH descriptor on it, with
+ * its mode and the mode to lend it, or -1 for none. Its own frame, so the
+ * buffer below is gone again before the call is made once more. */
+__attribute__((noinline)) static int dac_next(long nr, const long *a,
+                                              unsigned *orig, unsigned *lent) {
+    struct dac_arg v[2];
+    int n = dac_args(nr, a, v);
+    for (int i = 0; i < n; i++) {
+        if (!v[i].path || !v[i].path[0])
+            continue;
+        char buf[CNG_PATH_MAX];
+        const char *p =
+            xlate(v[i].dirfd, v[i].path, buf, sizeof buf, v[i].deref);
+        if (xlate_bad(p))
+            continue;
+        unsigned mode, lack;
+        int fd = cng_pin_dac_find((int)v[i].dirfd, p, &v[i].need, &mode, &lack);
+        if (fd < 0)
+            continue;
+        *orig = mode;
+        *lent = mode | lack;
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] fake-root lend nr=%ld %s: %o -> %o\n", nr, p,
+                        mode, mode | lack);
+        return fd;
+    }
+    return -1;
+}
+
+/* A refused call made again with root's bypass lent, inode by inode, until
+ * the host answers anything but EACCES or nothing is left to lend. */
+__attribute__((noinline)) static long dac_bypass(long nr, long a0, long a1,
+                                                 long a2, long a3, long a4,
+                                                 long a5, int trapped) {
+    long a[6] = {a0, a1, a2, a3, a4, a5};
+    long r = -EACCES;
+    struct dac_arg v[2];
+    if (!dac_args(nr, a, v))
+        goto out;
+    /* The names, copied in once: what is lent and what is then made has to
+     * be the same name, whatever another thread writes into the guest's
+     * buffer meanwhile. Put back where the guest's pointers were, as the
+     * dispatcher does with its own copies. */
+    struct path_args pa;
+    path_args_of(nr, a0, a1, a2, a3, &pa);
+    char pb1[CNG_PATH_MAX], pb2[CNG_PATH_MAX];
+    if ((pa.p1 && cng_user_strcopyin(pb1, pa.p1, sizeof pb1) < 0) ||
+        (pa.p2 && cng_user_strcopyin(pb2, pa.p2, sizeof pb2) < 0))
+        goto out;
+    if (pa.p1)
+        a[pa.i1] = (long)pb1;
+    if (pa.p2)
+        a[pa.i2] = (long)pb2;
+    /* Every signal but SIGSYS held from the lock to the unlock — which is the
+     * mask the SIGSYS tier runs all of this under anyway. On the -R tier a
+     * handler of the guest's would otherwise run inside the window, and one
+     * that longjmp'd out of it left the mode lent for good. */
+    unsigned long hold = ~0UL & ~(1UL << (CNG_SIGSYS - 1)), mask = 0;
+    CNG_SYS(__NR_rt_sigprocmask, 0 /*SIG_BLOCK*/, &hold, &mask, 8, 0, 0);
+    /* The turn (see above). Where none can be had the lend goes ahead
+     * unlocked: a refusal that might have been answered is not given up for
+     * a lock. Given back with LOCK_UN before the close, as l2s_lock gives its
+     * own back, so a duplicate a fork on another thread made meanwhile does
+     * not hold it on. */
+    char root[CNG_PATH_MAX];
+    long lk = -1;
+    if (cng_fs_rootfs(root, sizeof root) < sizeof root)
+        lk = sys_openat(CNG_AT_FDCWD, root[0] ? root : "/",
+                        CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
+    if (lk >= 0)
+        while (CNG_SYS(__NR_flock, (int)lk, 2 /* LOCK_EX */, 0, 0, 0, 0) ==
+               -EINTR)
+            ;
+    struct {
+        int fd;
+        unsigned orig, lent;
+    } led[DAC_LENDS];
+    int nl = 0;
+    while (nl < DAC_LENDS) {
+        unsigned orig, lent;
+        int fd = dac_next(nr, a, &orig, &lent);
+        if (fd < 0 || cng_pin_dac_lend(fd, lent) != 0)
+            break;
+        led[nl].fd = fd;
+        led[nl].orig = orig;
+        led[nl].lent = lent;
+        nl++;
+        r = dispatch_1(nr, a[0], a[1], a[2], a[3], a[4], a[5], trapped);
+        if (r != -EACCES)
+            break;
+    }
+    while (nl > 0) {
+        nl--;
+        cng_pin_dac_restore(led[nl].fd, led[nl].orig, led[nl].lent);
+    }
+    if (lk >= 0) {
+        CNG_SYS(__NR_flock, (int)lk, 8 /* LOCK_UN */, 0, 0, 0, 0);
+        sys_close((int)lk);
+    }
+    CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, &mask, 0, 8, 0, 0);
+out:
+    if (r == -EACCES && dac_faked(nr))
+        return 0;
+    return r;
+}
+
+long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
+                  int trapped) {
+    long r = dispatch_1(nr, a0, a1, a2, a3, a4, a5, trapped);
+    if (r == -EACCES && cng_fake_root())
+        r = dac_bypass(nr, a0, a1, a2, a3, a4, a5, trapped);
+    return r;
 }
 
 /* The -R trampoline's entry point: one rewritten `svc` site, with a full

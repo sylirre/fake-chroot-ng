@@ -45,7 +45,9 @@ extern unsigned long *cng_host_auxv;
  * mutate this set following real POSIX privilege rules (so a privilege drop
  * actually changes what getuid() reports, and a non-root fake id cannot regain
  * uid 0); ownership/mode changes and denied access() checks are faked as
- * succeeding while the effective uid is 0 (cng_fake_root); and stat ownership is
+ * succeeding while the effective uid is 0 (cng_fake_root), and a path call the
+ * host refuses for a mode is made again with the owner bits lent (dac_bypass in
+ * dispatch.c), which is root's DAC bypass; and stat ownership is
  * remapped so files owned by the real invoking user (cng_g_host_uid/gid) appear
  * owned by the fake id. The set is process-wide and, because the guest forks for
  * real, is inherited across fork() exactly as the kernel would. cng_g_exe_guest
@@ -164,8 +166,9 @@ long cng_cred_handle(long nr, long a0, long a1, long a2, long a3, long a4,
                      long a5);
 
 /* True when a fake identity is active AND its effective uid is 0: root's DAC
- * bypass applies (ownership/mode changes and denied access() checks are faked).
- * Reads the published set (cred.c). */
+ * bypass applies (ownership/mode changes and denied access() checks are faked,
+ * and a refused path call is retried with the owner bits lent). Reads the
+ * published set (cred.c). */
 int cng_fake_root(void);
 
 /* Remap a host-side owner for stat results: a file owned by the real invoking
@@ -254,8 +257,10 @@ void cng_close_cloexec(void);
 /* Emulate one syscall: translate path args, re-issue via the gate, return the
  * kernel result. `trapped` = 1 when invoked from the SIGSYS handler (a syscall
  * reaching `default` was trapped by Android => emulate ENOSYS), 0 from an M8
- * trampoline (an unhandled syscall is ordinary => re-issue it). Directly
- * callable for testing (no seccomp needed). */
+ * trampoline (an unhandled syscall is ordinary => re-issue it). Under fake
+ * root, a path call the host refuses with EACCES is made again with root's DAC
+ * bypass lent to the inode that refused it (dac_bypass in dispatch.c).
+ * Directly callable for testing (no seccomp needed). */
 long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                   int trapped);
 

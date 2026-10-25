@@ -12,6 +12,7 @@
 #include <asm-generic/errno.h>
 
 #define ST_MODE_OFF 16
+#define ST_UID_OFF  24
 #define S_IFLNK_    0120000u
 
 #define PIN_DIR_FLAGS (CNG_O_PATH | CNG_O_DIRECTORY | CNG_O_CLOEXEC)
@@ -391,4 +392,137 @@ long cng_pin_mkdir(const char *host, int mode) {
         r = CNG_SYS(__NR_mkdirat, p.dfd, (long)p.name, mode, 0, 0, 0);
     cng_unpin(&p);
     return r;
+}
+
+/* ---- fake root's DAC bypass --------------------------------------------- */
+
+/* Is what `fd` holds ours, and short of `want` in its owner bits? Only then is
+ * there anything to lend: once the uid matches, the owner bits are the only
+ * ones the kernel asks about, and an inode of anyone else's cannot have its
+ * mode changed by us at all. An inode whose owner bits already grant `want`
+ * and was refused anyway was refused by something no mode answers (SELinux).
+ * `dir_only` asks it of a directory alone; otherwise a regular file is asked
+ * too, and nothing else — a device, a FIFO or a socket is not this. */
+static int dac_short(int fd, unsigned want, int dir_only, unsigned *mode,
+                     unsigned *lack) {
+    char st[128];
+    if (!want || sys_fstat(fd, st) != 0)
+        return 0;
+    unsigned m = *(unsigned *)(st + ST_MODE_OFF);
+    unsigned t = m & CNG_S_IFMT;
+    if (t != CNG_S_IFDIR && (dir_only || t != CNG_S_IFREG))
+        return 0;
+    if (*(unsigned *)(st + ST_UID_OFF) != (unsigned)sys_getuid())
+        return 0;
+    unsigned l = want & ~m & 0700u;
+    if (!l)
+        return 0;
+    *mode = m & 07777u;
+    *lack = l;
+    return 1;
+}
+
+int cng_pin_dac_find(int dirfd, const char *host,
+                     const struct cng_dac_need *need, unsigned *mode,
+                     unsigned *lack) {
+    long cur;
+    const char *rest = host;
+    if (host[0] == '/') {
+        if (under_proc(host))
+            return -1;
+        char pfx[CNG_PATH_MAX];
+        size_t pl = prefix_of(host, pfx, sizeof pfx);
+        cur = sys_openat(CNG_AT_FDCWD, pl ? pfx : "/", PIN_DIR_FLAGS, 0);
+        rest = host + pl;
+    } else {
+        /* The caller's own descriptor, which is where the kernel starts:
+         * nothing above it is looked at. A duplicate, so the walk can let go
+         * of what it holds without touching the guest's. */
+        if (dirfd < 0)
+            return -1;
+        cur = sys_fcntl(dirfd, CNG_F_DUPFD_CLOEXEC, 0);
+    }
+    if (cur < 0)
+        return -1;
+    for (;;) {
+        while (*rest == '/')
+            rest++;
+        if (!*rest) {
+            /* The name is the place the walk started (the guest's "/", or
+             * its dirfd with nothing after it): the leaf, whose parent is not
+             * the guest's to have lent anything. */
+            if (dac_short((int)cur, need->leaf, need->leaf_dir, mode, lack))
+                return (int)cur;
+            break;
+        }
+        const char *end = rest;
+        while (*end && *end != '/')
+            end++;
+        int last = 1;
+        for (const char *q = end; *q; q++)
+            if (*q != '/') {
+                last = 0;
+                break;
+            }
+        char comp[256]; /* NAME_MAX + 1, as walk_dir */
+        size_t cl = (size_t)(end - rest);
+        if (cl >= sizeof comp)
+            break;
+        memcpy(comp, rest, cl);
+        comp[cl] = '\0';
+        /* An O_PATH lookup asks nothing of the name itself, only search on
+         * the directory it is in — so EACCES here is that directory's. */
+        long nx = sys_openat((int)cur, comp,
+                             last ? CNG_O_PATH | CNG_O_NOFOLLOW | CNG_O_CLOEXEC
+                                  : PIN_DIR_FLAGS | CNG_O_NOFOLLOW,
+                             0);
+        if (nx == -EACCES) {
+            if (dac_short((int)cur, 0100u, 1, mode, lack))
+                return (int)cur;
+            break;
+        }
+        if (!last) {
+            if (nx < 0)
+                break; /* the name does not lead where the walk said */
+            sys_close((int)cur);
+            cur = nx;
+            rest = end;
+            continue;
+        }
+        if (nx < 0 && nx != -ENOENT)
+            break;
+        if (dac_short((int)cur, nx < 0 ? need->parent_new : need->parent, 1,
+                      mode, lack)) {
+            if (nx >= 0)
+                sys_close((int)nx);
+            return (int)cur;
+        }
+        if (nx >= 0 && dac_short((int)nx, need->leaf, need->leaf_dir, mode,
+                                 lack)) {
+            sys_close((int)cur);
+            return (int)nx;
+        }
+        if (nx >= 0)
+            sys_close((int)nx);
+        break;
+    }
+    sys_close((int)cur);
+    return -1;
+}
+
+long cng_pin_dac_lend(int fd, unsigned lent) {
+    char lk[32];
+    fd_link(fd, lk, sizeof lk);
+    long r = CNG_SYS(__NR_fchmodat, CNG_AT_FDCWD, (long)lk, lent, 0, 0, 0);
+    if (r != 0)
+        sys_close(fd);
+    return r;
+}
+
+void cng_pin_dac_restore(int fd, unsigned orig, unsigned lent) {
+    char lk[32];
+    fd_link(fd, lk, sizeof lk);
+    if ((fd_mode(fd) & 07777u) == lent)
+        CNG_SYS(__NR_fchmodat, CNG_AT_FDCWD, (long)lk, orig, 0, 0, 0);
+    sys_close(fd);
 }

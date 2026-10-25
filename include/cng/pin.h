@@ -93,4 +93,35 @@ long cng_pin_rename(const char *from, const char *to, unsigned flags);
 long cng_pin_unlink(const char *host, int flags);
 long cng_pin_mkdir(const char *host, int mode);
 
+/* Fake root's DAC bypass, lent rather than had (see dac_bypass in dispatch.c).
+ * What a call needs of the owner bits on the way to its name, spelled as the
+ * mode spells them: search (0100) on every directory it passes through, which
+ * is always asked; `parent` on the directory the name is in, or `parent_new`
+ * there when the name does not exist yet; and `leaf` on the name itself, when
+ * that is a regular file or a directory — a directory only, with `leaf_dir`. */
+struct cng_dac_need {
+    unsigned parent, parent_new, leaf;
+    int leaf_dir;
+};
+
+/* The first inode on the way to `host` that the real uid owns and whose owner
+ * bits lack what `need` asks of it: an O_PATH descriptor on it (the caller's
+ * to close), with its mode in *mode and the missing bits in *lack. -1 where
+ * nothing on the way is short of them, and the refusal was someone else's to
+ * make. An absolute `host` is walked from the mount prefix it lies under (the
+ * rootfs, a bind's source), a relative one from `dirfd`, each component opened
+ * O_NOFOLLOW — the walk only ever reaches what the kernel would, and never
+ * leaves the view. The host's /proc is never lent anything. */
+int cng_pin_dac_find(int dirfd, const char *host,
+                     const struct cng_dac_need *need, unsigned *mode,
+                     unsigned *lack);
+
+/* One inode's owner bits, lent and given back. `lend` sets the mode of what
+ * `fd` (from cng_pin_dac_find) holds to `lent`, through its own fd link: 0, or
+ * -errno with the fd closed. `restore` puts `orig` back — unless the mode is no
+ * longer the one lent, which means someone changed it meanwhile and theirs is
+ * the newer word — and closes the fd. Both modes are the 07777 bits. */
+long cng_pin_dac_lend(int fd, unsigned lent);
+void cng_pin_dac_restore(int fd, unsigned orig, unsigned lent);
+
 #endif /* CNG_PIN_H */

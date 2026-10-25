@@ -4256,7 +4256,75 @@ vfork/`posix_spawn` child-stack handling.
   - Not this: under `-u`, tar creates a directory with its final mode (0500)
     and relies on root's DAC bypass to fill it, which the real uid does not
     have — `touch` into a 0500 directory fails the same way, with or without
-    this change.
+    this change. Fixed by M98.
+
+- [x] **M98 — fake root's DAC bypass, lent**
+  Root is not held back by permission bits: `CAP_DAC_OVERRIDE` lets it create
+  and remove names in a directory whose mode forbids writing it and open a
+  file for an access its mode refuses, and `CAP_DAC_READ_SEARCH` lets it
+  search a directory with no x bit. `-u` is the real uid underneath and had
+  none of it. Under `-u`, tar could not fill a directory it had just made
+  0500 ("Cannot open: Permission denied" for every file in it) — GNU tar and
+  busybox tar both create a directory with its final owner bits when they
+  run as root, counting on exactly this. `rm -rf` could not empty such a
+  directory, a 0400 file could not be appended to, and a `chmod` through a
+  directory with no x bit was faked to success and changed nothing.
+  - No syscall gives an unprivileged process that override, but every inode
+    in the guest's tree is the real uid's, and an owner may change its mode.
+    So when the host refuses a path call with `EACCES` under fake root,
+    `cng_dispatch` (now a wrapper around the old body, `dispatch_1`) finds the
+    first inode on the call's way that the real uid owns and whose owner bits
+    fall short of what the call needs. `cng_pin_dac_find` walks it
+    descriptor by descriptor from the mount prefix, `O_NOFOLLOW` per
+    component. That inode is lent the bits through its own fd link, the call
+    is made again whole, and the mode is put back. This goes one inode at a
+    time, up to 16, since the next one short of its bits may only be
+    reachable once the first is searchable. A call the host allows costs
+    nothing; proot's fake root lends eagerly, to every directory of every
+    path.
+  - Whole, because a walk through a directory it may not search reads every
+    name past it as a plain one: a symlink there is only found by a second
+    walk, with the search bit lent.
+  - What each call needs (`dac_args`): write and search on the parent for a
+    name made or removed (`mkdirat`, `mknodat`, `symlinkat`, `unlinkat`,
+    `renameat*`, `linkat`'s new name, an `O_CREAT` open of a new name); the
+    open's access on an existing regular file or directory (with `O_TRUNC`
+    as write, and `O_TMPFILE` as write and search on the directory it
+    names); write for `truncate`; search for `chdir`/`chroot`'s directory;
+    write on a directory moved to another parent, whose `..` is rewritten
+    (and on the other one under `RENAME_EXCHANGE`); write on `linkat`'s
+    source directory under `-l`, whose first link moves the file into the
+    store. Every other path call only looks its name up, and is lent search
+    on the way. `execve` is not retried: it does not come back when it
+    succeeds, so nothing lent for it could be given back.
+  - Lends take turns across the session under an `flock` on the rootfs
+    directory, with every signal but SIGSYS blocked (the SIGSYS tier's mask
+    anyway; on `-R` a guest handler that longjmp'd out of the window would
+    have left the mode lent). Without the lock, a process refused while
+    another had the directory lent read the lent mode, found nothing short
+    and kept its `EACCES`. Four processes creating 25 files each in one
+    0500 directory lost a third of them. The restore gives way to a mode
+    someone else set meanwhile, so a concurrent `chmod` is never undone.
+  - `chattr_result` and `utimensat` no longer fake `EACCES` themselves:
+    that is a search the way refused, which is lent first, so the change is
+    made for real. Only what is left is faked as before (`dac_faked`).
+  - What it cannot do: lend anything on an inode of someone else's (a host
+    directory bound in, the host's `/proc` and `/dev`), where the refusal
+    stands. And the lent mode is a real mode for as long as the call takes:
+    a process outside the session can see it, and a SIGKILL in that window
+    leaves it lent.
+  - Test: `tests/guests/dacroot.c` runs 44 cases — names made, moved and
+    removed in a 0500 directory (relative to a dirfd too, as tar names its
+    members), files opened for what their mode refuses, a walk through two
+    levels of directories with no x bit with a symlink in one, four
+    processes creating in one directory at once, and the modes everything
+    was left with. m28 holds it to real root's output, recorded natively
+    with sudo on 6.8, on both tiers and with `CNG_L2S_FORCE`, and checks
+    the modes from the host's side as well; the previous build failed 75 of
+    the legs. busybox tar extracting a tree with 0555 directories in it,
+    then `rm -r` of the result, is the reported scenario end to end. GNU
+    tar 1.35 does the same on the VM (exit 0, `tar df` clean), where the
+    previous build failed it with "Cannot mkdir: Permission denied".
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
