@@ -142,6 +142,21 @@ struct cng_open_how {
  * can reach the loader's fall back from the anonymous strategy. */
 #define CNG_PR_SET_MDWE             65
 #define CNG_PR_MDWE_REFUSE_EXEC_GAIN 1
+/* PR_SET_MM_MAP (3.18+, CONFIG_CHECKPOINT_RESTORE): rewrite the kernel's whole
+ * record of where a process's code, data, brk, stack, argv and environment
+ * lie in one call, unprivileged as long as the exe link is left alone
+ * (exe_fd -1) and auxv_size is 0. The _SIZE form answers the struct's size.
+ * A kernel built without the option refuses both with EPERM. */
+#define CNG_PR_SET_MM               35
+#define CNG_PR_SET_MM_MAP           14
+#define CNG_PR_SET_MM_MAP_SIZE      15
+struct cng_prctl_mm_map {
+    unsigned long start_code, end_code, start_data, end_data;
+    unsigned long start_brk, brk, start_stack;
+    unsigned long arg_start, arg_end, env_start, env_end;
+    unsigned long *auxv;
+    unsigned auxv_size, exe_fd;
+};
 
 /* seccomp */
 #define CNG_SECCOMP_MODE_FILTER      2

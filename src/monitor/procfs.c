@@ -3,6 +3,7 @@
 /* Synthesized /proc files (see include/cng/procfs.h). Freestanding: raw
  * syscalls, cng_dprintf for formatting, no allocator. Every entry point runs
  * inside the SIGSYS handler, so nothing here may block on a lock. */
+#include "cng/loader.h"
 #include "cng/monitor.h"
 #include "cng/path.h"
 #include "cng/pin.h"
@@ -1326,9 +1327,11 @@ static int per_pid_kind(const char *leaf) {
 
 /* The guest stack of the program running here, kept so our own cmdline/environ/
  * auxv can be answered from live state when the registry cannot answer (see
- * self_snapshot). Re-recorded at every emulated execve, which is where a real
- * kernel moves its own arg_start/env_start too. */
+ * self_snapshot), and where on it the loader put the argv and environment
+ * strings. Re-recorded at every emulated execve, which is where a real kernel
+ * moves its own arg_start/env_start too. */
 static unsigned long g_self_sp;
+static struct cng_procargs g_self_args;
 
 /* Flatten a NUL-terminated vector into NUL-joined bytes, the way the kernel
  * stores cmdline and environ. Nothing here is dereferenced unchecked: this reads
@@ -1338,8 +1341,9 @@ static unsigned long g_self_sp;
  * the slot and the string it names are taken with the copy-in pair, so the
  * bytes that are measured are the bytes that are stored; a strlen followed by a
  * memcpy reads the same string twice, and between the two reads it can change.
- * Whatever will not come across ends the vector where it stands, which is also
- * what the kernel shows for a process rewriting its own argv. */
+ * Whatever will not come across ends the vector where it stands. These copies
+ * are the fallback for cmdline and environ: the stack's own string ranges, read
+ * as the kernel reads them (put_live), answer first wherever they are known. */
 static unsigned flatten_vec(char *dst, unsigned cap, char **v) {
     unsigned n = 0;
     long cnt = cng_user_veclen(v, 4096);
@@ -1377,6 +1381,7 @@ static int self_snapshot(struct cng_procsnap *out) {
      * probes now, and what will not come across shortens the answer instead of
      * ending the process. */
     memset(out, 0, sizeof *out);
+    out->args = g_self_args;
     long argc;
     if (cng_user_copyin(&argc, (void *)g_self_sp, sizeof argc) < 0)
         return 0;
@@ -1421,6 +1426,142 @@ static int self_snapshot(struct cng_procsnap *out) {
     return 1;
 }
 
+/* ---- cmdline and environ out of live memory ------------------------------ */
+
+/* The kernel reads both files out of the process's memory at read time, from
+ * the ranges its exec recorded — not through argv and envp, which are the
+ * program's to repoint — so whatever a program writes over its own strings is
+ * what they say from then on: setproctitle(3), node's process.title, the
+ * status lines nginx and postgres keep in argv. The registry's copies date from
+ * the exec, and served on their own they answered every `ps` with the command
+ * line the process started with. These read the ranges instead, under the
+ * kernel's rules, and leave the copies for when the memory cannot be read. */
+
+#define LIVE_CHUNK 4096u
+
+/* Up to `n` bytes of `pid`'s memory at `addr`, as many as read from the start —
+ * what access_remote_vm hands procfs. Our own come through the copy-in pair one
+ * 4 KiB piece at a time, so a hole ends the read where it starts instead of
+ * voiding all of it; another process's come in one process_vm_readv, which
+ * stops at a hole by itself. Returns the count, or -1 when another process's
+ * memory cannot be asked for at all: the call is filtered (the block-list says
+ * so), missing (qemu-user), or refused, as Yama's ptrace_scope 1 — the Ubuntu
+ * default — refuses it for any process that is not our descendant and the
+ * kernel does for one that made itself undumpable. A process that has exited
+ * holds no memory, which the kernel answers with an empty file: 0, not -1. */
+static long live_read(int pid, unsigned long addr, char *dst, unsigned long n) {
+    if (pid == (int)sys_getpid()) {
+        unsigned long got = 0;
+        while (got < n) {
+            unsigned long k = LIVE_CHUNK - ((addr + got) & (LIVE_CHUNK - 1));
+            if (k > n - got)
+                k = n - got;
+            if (cng_user_copyin(dst + got, (const void *)(addr + got), k) < 0)
+                break;
+            got += k;
+        }
+        return (long)got;
+    }
+    if (cng_blocked[__NR_process_vm_readv])
+        return -1;
+    struct cng_iovec local = {dst, n};
+    struct cng_iovec remote = {(void *)addr, n};
+    long r = CNG_SYS(__NR_process_vm_readv, pid, &local, 1, &remote, 1, 0);
+    if (r >= 0)
+        return r;
+    return r == -EFAULT || r == -ESRCH ? 0 : -1;
+}
+
+/* [from, to) of `pid`'s memory into `fd`, up to the first byte that will not
+ * read. 0, or -1 when not even the first piece could be asked for. */
+static int live_span(int fd, int pid, unsigned long from, unsigned long to,
+                     char *buf) {
+    for (unsigned long at = from; at < to;) {
+        unsigned long k = LIVE_CHUNK - (at & (LIVE_CHUNK - 1));
+        if (k > to - at)
+            k = to - at;
+        long got = live_read(pid, at, buf, k);
+        if (got < 0)
+            return at == from ? -1 : 0;
+        cng_write_all(fd, buf, (size_t)got);
+        if ((unsigned long)got < k)
+            break;
+        at += k;
+    }
+    return 0;
+}
+
+/* /proc/<pid>/cmdline as get_mm_cmdline() (fs/proc/base.c, 5.2+) makes it. The
+ * argv range as it stands, embedded NULs and all: a title written over
+ * argv[0] and padded with zeros, which is how libuv and nginx do it, reads back
+ * as the title and then the zeros. Unless the range's last byte is no longer a
+ * NUL — then the program has run a longer title past the end of argv into the
+ * environment, setproctitle(3)'s way, and the file is the string at arg_start
+ * up to its NUL: one page at most, never past env_end, and the overflow
+ * allowed only into an environment that starts where argv ends. Returns 0 when
+ * the file is written, -1 to fall back on the copy. */
+static int live_cmdline(int fd, int pid, const struct cng_procargs *a,
+                        char *buf) {
+    unsigned long as = a->arg_start, ae = a->arg_end;
+    unsigned long es = a->env_start, ee = a->env_end;
+    if (as >= ae)
+        return 0; /* argc 0: the kernel's file is empty */
+    if (es != ae || ee < es)
+        es = ee = ae;
+    char last;
+    long r = live_read(pid, ae - 1, &last, 1);
+    if (r < 0)
+        return -1;
+    if (r == 0 || !last)
+        return live_span(fd, pid, as, ae, buf);
+    unsigned long lim = ee - as;
+    if (lim > cng_page_size)
+        lim = cng_page_size;
+    for (unsigned long at = as; at < as + lim;) {
+        unsigned long k = LIVE_CHUNK - (at & (LIVE_CHUNK - 1));
+        if (k > as + lim - at)
+            k = as + lim - at;
+        long got = live_read(pid, at, buf, k);
+        if (got <= 0)
+            break;
+        long n = 0;
+        while (n < got && buf[n])
+            n++;
+        if (n < got) {
+            cng_write_all(fd, buf, (size_t)n + 1); /* the NUL is the file's */
+            break;
+        }
+        cng_write_all(fd, buf, (size_t)got);
+        if (got < (long)k)
+            break;
+        at += k;
+    }
+    return 0;
+}
+
+/* cmdline (PF_CMDLINE) or environ — environ_read()'s file is simply the
+ * environment range as it stands — out of `pid`'s memory. 0 when written, -1
+ * when the copies have to answer: the ranges are not known (a stack the loader
+ * did not lay out) or the memory cannot be asked for. */
+static int put_live(int fd, int pid, int kind, const struct cng_procargs *a) {
+    if (!a->arg_end)
+        return -1;
+    char buf[LIVE_CHUNK];
+    if (kind == PF_ENVIRON)
+        return live_span(fd, pid, a->env_start, a->env_end, buf);
+    return live_cmdline(fd, pid, a, buf);
+}
+
+/* Has `pid` pointed the kernel's own record at its strings (see
+ * point_kernel_record)? Then the host's cmdline and environ are the guest's,
+ * and nothing about them is ours to answer. */
+static int kernel_record(int pid) {
+    if (pid == (int)sys_getpid())
+        return g_self_args.kernel != 0;
+    struct cng_procargs a;
+    return cng_procreg_args(pid, &a) && a.kernel;
+}
+
 /* ---- the open hook ------------------------------------------------------- */
 
 /* What the canonical guest name `canon` is as far as synthesis goes: the PF_*
@@ -1455,6 +1596,24 @@ static int synth_kind(const char *canon, char *host, size_t hsz, int *pid,
         /* Another process is describable only if it is a guest process; a host
          * one is already hidden by the path layer. */
         if (kind && !cng_procreg_has(*pid))
+            return 0;
+        /* Where the kernel's own record was pointed at the guest's strings, its
+         * cmdline and environ are the guest's — read at read time, under its
+         * own rules and permission checks — and nothing synthesized from the
+         * same memory could be closer to them.
+         *
+         * Except our own environ. The kernel binds an environ fd to the mm it
+         * was opened on, and a real execve leaves that mm behind, so an fd the
+         * process carries into its next program reads empty there (bash's
+         * `tr '\0' '\n' < /proc/self/environ`: the redirect is opened before
+         * the exec). Ours keeps the mm, and the host fd would follow the
+         * record into the next program's environment. A memfd filled at open
+         * keeps the opener's instead, which is what this has always answered.
+         * cmdline is bound to the task and read at read time, so after an
+         * exec the kernel's is the new program's, as the host file is. */
+        if ((kind == PF_CMDLINE ||
+             (kind == PF_ENVIRON && *pid != (int)sys_getpid())) &&
+            kernel_record(*pid))
             return 0;
     } else if (!strcmp(canon, "/proc/mounts")) {
         kind = PF_MOUNTS; /* where the /etc/mtab symlink usually lands */
@@ -1569,10 +1728,18 @@ int cng_procfs_open(const char *canon, long gflags, long *ret) {
     int rc = 0;
     switch (kind) {
     case PF_CMDLINE:
-        cng_write_all((int)fd, snap.cmd, snap.cmd_len);
-        break;
     case PF_ENVIRON:
-        cng_write_all((int)fd, snap.env, snap.env_len);
+        if (put_live((int)fd, pid, kind, &snap.args) < 0) {
+            if (kind == PF_CMDLINE)
+                cng_write_all((int)fd, snap.cmd, snap.cmd_len);
+            else
+                cng_write_all((int)fd, snap.env, snap.env_len);
+        } else if (pid != (int)sys_getpid() && !cng_procreg_has(pid)) {
+            /* The pid was reaped and handed to a host process between the
+             * registry's check and the read: what came across may be that
+             * process's. A gone process's file is empty. */
+            sys_ftruncate((int)fd, 0);
+        }
         break;
     case PF_AUXV:
         cng_write_all((int)fd, snap.auxv, snap.auxv_len);
@@ -2013,10 +2180,118 @@ static void set_comm(const char *exe_guest) {
     sys_prctl(CNG_PR_SET_NAME, (unsigned long)nm, 0, 0, 0);
 }
 
+/* -1 not asked yet, 0 the kernel will not take PR_SET_MM_MAP, 1 it will. A
+ * fork inherits the answer, and every later exec of the process reuses it. */
+static int g_mm_map = -1;
+int cng_g_mm_map_deny = 0;
+
+/* Our own /proc/self/stat: f[i] is field i as proc(5) numbers them, for the
+ * fields that are numbers (the state letter and comm come out as 0). Returns 1
+ * when fields 1..nf-1 were all there — 45 onwards arrived in 3.5. */
+static int self_stat(unsigned long *f, int nf) {
+    char b[1024];
+    long fd = sys_openat(CNG_AT_FDCWD, "/proc/self/stat",
+                         CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    if (fd < 0)
+        return 0;
+    long n = sys_read((int)fd, b, sizeof b - 1);
+    sys_close((int)fd);
+    if (n <= 0)
+        return 0;
+    b[n] = '\0';
+    const char *p = strrchr(b, ')'); /* comm may hold spaces and parens */
+    if (!p)
+        return 0;
+    memset(f, 0, (size_t)nf * sizeof *f);
+    int i = 2;
+    for (p++; *p == ' ' && i + 1 < nf;) {
+        p++;
+        f[++i] = parse_ul(&p); /* stops at once on a letter or a '-' */
+        while (*p && *p != ' ' && *p != '\n')
+            p++;
+    }
+    return i == nf - 1;
+}
+
+/* cmdline and environ, made right the way comm is: in the kernel's own record.
+ * The kernel's /proc/<pid>/cmdline and environ read mm->arg_start..env_end,
+ * which still name the strings of the chroot-ng invocation; PR_SET_MM_MAP
+ * points them at the guest's. Nothing of ours can match that: the kernel reads
+ * the memory at read time, under its own rules, for every reader — including
+ * another process's `ps`, which under Yama's ptrace_scope 1 may not read the
+ * guest's memory itself — and host-side tools see the guest's command line
+ * rather than ours, as they already see its comm.
+ *
+ * The call replaces the whole record, so everything but the four fields being
+ * moved goes back as it is: code, data, start_brk and start_stack from
+ * /proc/self/stat (start_stack is also what SELinux's execstack check keys
+ * on), brk from brk(0). Nothing can move them in between: this runs before the
+ * program does, at load or at an emulated execve once its other threads are
+ * gone. auxv_size 0 and exe_fd -1 leave those two alone, and are what keeps
+ * the call unprivileged.
+ *
+ * Android's kernels are built without CONFIG_CHECKPOINT_RESTORE, which the
+ * call lives under, and answer EPERM (measured on 5.15, Android 15), and
+ * qemu-user refuses PR_SET_MM outright. There the record stays ours and procfs
+ * reads the guest's memory instead (put_live). Returns 1 if the record now
+ * names `a`. */
+static int point_kernel_record(const struct cng_procargs *a) {
+    int v = __atomic_load_n(&g_mm_map, __ATOMIC_RELAXED);
+    if (!v)
+        return 0;
+    if (v < 0) {
+        unsigned sz = 0;
+        v = !cng_g_mm_map_deny &&
+            sys_prctl(CNG_PR_SET_MM, CNG_PR_SET_MM_MAP_SIZE, (unsigned long)&sz,
+                      0, 0) == 0 &&
+            sz == sizeof(struct cng_prctl_mm_map);
+        __atomic_store_n(&g_mm_map, v, __ATOMIC_RELAXED);
+        if (!v)
+            return 0;
+    }
+    unsigned long f[48];
+    if (!self_stat(f, 48))
+        return 0;
+    long brk = CNG_SYS(__NR_brk, 0, 0, 0, 0, 0, 0);
+    if (brk <= 0)
+        return 0;
+    struct cng_prctl_mm_map m;
+    memset(&m, 0, sizeof m);
+    m.start_code = f[26];
+    m.end_code = f[27];
+    m.start_stack = f[28];
+    m.start_data = f[45];
+    m.end_data = f[46];
+    m.start_brk = f[47];
+    m.brk = (unsigned long)brk;
+    m.arg_start = a->arg_start;
+    m.arg_end = a->arg_end;
+    m.env_start = a->env_start;
+    m.env_end = a->env_end;
+    m.exe_fd = (unsigned)-1;
+    long r = sys_prctl(CNG_PR_SET_MM, CNG_PR_SET_MM_MAP, (unsigned long)&m,
+                       sizeof m, 0);
+    if (r != 0 && cng_g_debug)
+        cng_dprintf(2, "[cng] PR_SET_MM_MAP: %ld\n", r);
+    return r == 0;
+}
+
 void cng_procfs_publish_stack(unsigned long guest_sp) {
     if (!guest_sp)
         return;
     g_self_sp = guest_sp;
+    /* Where the strings are is known for a stack the loader just built, and
+     * only for that one: its region is the one holding this sp. */
+    struct cng_procargs args;
+    memset(&args, 0, sizeof args);
+    if (guest_sp - cng_g_stack_lo < cng_g_stack_len) {
+        args.arg_start = cng_g_arg_start;
+        args.arg_end = cng_g_arg_end;
+        args.env_start = cng_g_env_start;
+        args.env_end = cng_g_env_end;
+        args.kernel = (u32)point_kernel_record(&args);
+    }
+    g_self_args = args;
     long argc = *(long *)guest_sp;
     if (argc < 0 || argc > 4096)
         return;
@@ -2039,6 +2314,6 @@ void cng_procfs_publish_stack(unsigned long guest_sp) {
         cng_fs_cwd(cwd, sizeof cwd);
     else
         cng_strlcpy(cwd, "/", sizeof cwd);
-    cng_procreg_publish(argv, envp, auxv, alen, cng_g_exe_guest, cwd);
+    cng_procreg_publish(argv, envp, auxv, alen, &args, cng_g_exe_guest, cwd);
     set_comm(cng_g_exe_guest);
 }

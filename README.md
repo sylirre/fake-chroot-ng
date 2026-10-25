@@ -77,7 +77,10 @@ emulating it).
 than chroot-ng: host processes are hidden from it (by path and from listings,
 including under an explicit `-b /proc:/proc`), `cmdline`/`environ`/`auxv`
 report the guest program (no real `execve` ever happens, so the kernel's copies
-would name the chroot-ng invocation), `mounts`/`mountinfo` describe the rootfs
+would name the chroot-ng invocation; `cmdline` and `environ` are the live
+strings, so a title written over argv shows, and where the kernel accepts
+`PR_SET_MM_MAP` its own record is pointed at them, which host-side `ps` sees
+too), `mounts`/`mountinfo` describe the rootfs
 and its binds instead of the host's mount namespace, `maps` and the `fd` links
 are mapped back to guest paths, and `loadavg`/`uptime`/`stat` (and the
 `sys/kernel/overflow{u,g}id` sysctls, which bubblewrap insists on reading) are

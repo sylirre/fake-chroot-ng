@@ -403,6 +403,68 @@ if guest_xlate_ready "synthesized /proc stat leg" &&
 fi
 rm -rf "$PS_ROOT"
 
+# cmdline and environ are the process's memory, read when the file is: a title
+# written over argv is what `ps` prints from then on (node's process.title,
+# setproctitle, nginx's and postgres's status lines). They were the registry's
+# exec-time copies, so every one of those read back as the command line the
+# process started with. Now the kernel's own record is pointed at the guest's
+# strings where it takes PR_SET_MM_MAP (a desktop kernel: "record: kernel"),
+# and where it does not (Android, or CNG_MM_MAP_DENY=1) the ranges are read
+# out of the guest's memory under the kernel's rules — ours directly, a child's
+# with process_vm_readv. The guest checks its own files and a forked child's
+# against those rules, which a native host first confirms against the kernel
+# itself. qemu-user has no process_vm_readv for anyone, so on the cross host a
+# child's files are still the copies and only the guest's own are asserted.
+PT_ROOT=$(mktemp -d)
+pt_check() { # desc, want, got
+    if [ "$2" = "$3" ]; then
+        pass=$((pass + 1)); echo "  ok   $1"
+    else
+        fail=$((fail + 1)); echo "  FAIL $1"
+        printf '%s\n' "$2" >"$CNG_TMP/pt.want"
+        printf '%s\n' "$3" >"$CNG_TMP/pt.got"
+        diff "$CNG_TMP/pt.want" "$CNG_TMP/pt.got" | sed 's/^/    /'
+    fi
+}
+if guest_xlate_ready "live cmdline/environ leg" &&
+    guest_cc_report "$PT_ROOT/proctitle" tests/guests/proctitle.c; then
+    pt_legs="start: ok
+start environ: ok
+environ: ok
+kid cmdline: ok
+kid environ: ok
+title: ok
+overflow: ok
+overflow environ: ok"
+    pt_record=ours
+    if [ -n "$QEMU" ]; then
+        pt_legs=$(printf '%s\n' "$pt_legs" | grep -v '^kid ')
+        pt_cut() { grep -v -e '^kid ' -e '^mm_map: '; }
+        skip "a child's live cmdline/environ: qemu-user has no process_vm_readv"
+    else
+        pt_cut() { grep -v '^mm_map: '; }
+        pt_got=$(kref "$PT_ROOT/proctitle" 2>&1)
+        case "$pt_got" in
+        "mm_map: yes"*) pt_record=kernel ;;
+        esac
+        pt_check "the kernel's own cmdline and environ follow the rules the guest checks" \
+            "record: kernel
+$pt_legs" "$(printf '%s\n' "$pt_got" | pt_cut)"
+    fi
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
+    pt_got=$(run_t 60 -R $GUEST_BINDS "$PT_ROOT" /proctitle 2>/dev/null)
+    pt_check "cmdline and environ are the guest's live strings" \
+        "record: $pt_record
+$pt_legs" "$(printf '%s\n' "$pt_got" | pt_cut)"
+    # shellcheck disable=SC2086
+    pt_got=$(CNG_MM_MAP_DENY=1 run_t 60 -R $GUEST_BINDS "$PT_ROOT" /proctitle \
+        2>/dev/null)
+    pt_check "...and read out of guest memory where the kernel's record stays ours" \
+        "record: ours
+$pt_legs" "$(printf '%s\n' "$pt_got" | pt_cut)"
+fi
+rm -rf "$PT_ROOT"
+
 # --- guest-shell scenarios -------------------------------------------------
 m11_ready=0
 if [ -n "$M11_ALPINE" ] && [ -x "$M11_ALPINE/bin/busybox" ]; then

@@ -9,7 +9,12 @@
  * /proc/<pid>/cmdline is our argv, its environ is our exec-time environment,
  * and its exe/cwd links name host paths. Each process therefore publishes the
  * guest view of itself here (argv, environ, auxv, exe, cwd) and procfs.c serves
- * that process's /proc entries from it. Membership doubles as the visibility
+ * that process's /proc entries from it. cmdline and environ are published as
+ * where they live, too (struct cng_procargs): the kernel reads both out of the
+ * process's memory at read time, so a title written over argv shows, and the
+ * copies here are what is left when that memory cannot be read. Where the
+ * kernel lets its own record be pointed at the guest's strings, that record
+ * answers instead (procfs.c). Membership doubles as the visibility
  * rule: a numeric
  * /proc/<pid> that is not registered is not a guest process, so the path layer
  * hides it (see cng_procreg_has), and the calls that name a process by pid —
@@ -51,6 +56,17 @@
 #define CNG_PROCREG_AUXV     512
 #define CNG_PROCREG_PATH     512
 
+/* Where a process's argv and environment strings are in its own memory: the
+ * kernel's mm->arg_start..arg_end and env_start..env_end, which its
+ * /proc/<pid>/cmdline and environ read at read time. All zero when the stack
+ * was not one the loader laid out, which leaves only the copies. `kernel` says
+ * the kernel's own record has been pointed at these ranges (PR_SET_MM_MAP), so
+ * the host's files already are the guest's. */
+struct cng_procargs {
+    u64 arg_start, arg_end, env_start, env_end;
+    u32 kernel;
+};
+
 /* One seqlock-consistent read of an entry's payload. Byte counts, not
  * NUL-terminated (callers append a terminator where they need one). */
 struct cng_procsnap {
@@ -61,6 +77,7 @@ struct cng_procsnap {
     char cwd[CNG_PROCREG_PATH];
     u32 cmd_len, env_len, auxv_len;
     u16 exe_len, cwd_len;
+    struct cng_procargs args;
 };
 
 /* --shared-proc: back the registry per-rootfs so independent invocations share
@@ -84,11 +101,12 @@ void cng_procreg_init(const char *shared_key);
 
 /* Publish (or update) this process's own entry. `argv`/`envp` are NULL-
  * terminated vectors, `auxv` the raw tag/value block built for the guest stack
- * (auxv_len bytes, 0 if none). Called at startup and after every emulated
- * execve — the two points a real kernel would rewrite the same fields. */
+ * (auxv_len bytes, 0 if none), `args` where the strings of both vectors lie.
+ * Called at startup and after every emulated execve — the two points a real
+ * kernel would rewrite the same fields. */
 void cng_procreg_publish(char **argv, char **envp, const void *auxv,
-                         unsigned auxv_len, const char *exe_guest,
-                         const char *cwd_guest);
+                         unsigned auxv_len, const struct cng_procargs *args,
+                         const char *exe_guest, const char *cwd_guest);
 
 /* Copy this process's entry to `child`, at fork. Run by the parent (which knows
  * the child pid and holds the identical payload) rather than the child, because
@@ -131,6 +149,12 @@ int cng_procreg_pid_at(int i);
  * entry is stale (the pid was recycled by the host — detected by comparing the
  * recorded /proc/<pid>/stat starttime). */
 int cng_procreg_get(int pid, struct cng_procsnap *out);
+
+/* Just `pid`'s cng_procargs, without the copy of everything else: asked for
+ * every open and stat of a cmdline or environ, to learn whether the host file
+ * already answers. No starttime check of its own, so a caller asks
+ * cng_procreg_has first. Returns 1 with *out filled, 0 on a miss. */
+int cng_procreg_args(int pid, struct cng_procargs *out);
 
 /* `pid`'s incarnation: its /proc/<pid>/stat starttime, or 0 if it is gone or
  * /proc is unreadable. `zombie_out`, when non-NULL, reports whether the process

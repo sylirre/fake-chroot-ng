@@ -21,6 +21,7 @@ struct proc_ent {
     char auxv[CNG_PROCREG_AUXV];    /* raw guest auxv block */
     char exe[CNG_PROCREG_PATH];     /* canonical guest exe path */
     char cwd[CNG_PROCREG_PATH];     /* canonical guest cwd */
+    struct cng_procargs args;       /* where cmd/env live in its memory */
 };
 
 /* The claim array is kept apart from the payload, because it is what every
@@ -585,8 +586,8 @@ static u16 copy_path(char *dst, u32 cap, const char *s) {
 }
 
 void cng_procreg_publish(char **argv, char **envp, const void *auxv,
-                         unsigned auxv_len, const char *exe_guest,
-                         const char *cwd_guest) {
+                         unsigned auxv_len, const struct cng_procargs *args,
+                         const char *exe_guest, const char *cwd_guest) {
     /* Sampled before the write window so the critical section is syscall-free
      * (a smaller kill-safe window, and nothing slow under the odd count). */
     u64 start = cng_proc_starttime((int)sys_getpid(), 0);
@@ -615,6 +616,10 @@ void cng_procreg_publish(char **argv, char **envp, const void *auxv,
         memcpy(e->auxv, auxv, auxv_len);
     e->exe_len = copy_path(e->exe, CNG_PROCREG_PATH, exe_guest);
     e->cwd_len = copy_path(e->cwd, CNG_PROCREG_PATH, cwd_guest);
+    if (args)
+        e->args = *args;
+    else
+        memset(&e->args, 0, sizeof e->args);
     seq_release(e, s);
 }
 
@@ -662,6 +667,9 @@ static void fork_copy(int forker, int child) {
     memcpy(e->auxv, snap.auxv, snap.auxv_len);
     memcpy(e->exe, snap.exe, snap.exe_len);
     memcpy(e->cwd, snap.cwd, snap.cwd_len);
+    /* The child's memory is a copy of ours, the strings at the same addresses,
+     * and the kernel's record of them is inherited with it. */
+    e->args = snap.args;
     seq_release(e, s);
 }
 
@@ -815,6 +823,7 @@ int cng_procreg_get(int pid, struct cng_procsnap *out) {
         memcpy(out->auxv, e->auxv, al);
         memcpy(out->exe, e->exe, xl);
         memcpy(out->cwd, e->cwd, wl);
+        out->args = e->args;
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
         if (__atomic_load_n(&e->seq, __ATOMIC_RELAXED) != s1)
             continue; /* torn read: retry */
@@ -832,6 +841,26 @@ int cng_procreg_get(int pid, struct cng_procsnap *out) {
         out->exe_len = (u16)xl;
         out->cwd_len = (u16)wl;
         return 1;
+    }
+    return 0;
+}
+
+int cng_procreg_args(int pid, struct cng_procargs *out) {
+    int slot = slot_of(pid);
+    if (slot < 0)
+        return 0;
+    struct proc_ent *e = &g_tab->ent[slot];
+    for (int tries = 0; tries < 100; tries++) {
+        u32 s1 = __atomic_load_n(&e->seq, __ATOMIC_RELAXED);
+        if (s1 & 1)
+            continue; /* writer active */
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&g_tab->pid[slot], __ATOMIC_RELAXED) != pid)
+            return 0; /* slot recycled under us */
+        *out = e->args;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&e->seq, __ATOMIC_RELAXED) == s1)
+            return 1;
     }
     return 0;
 }

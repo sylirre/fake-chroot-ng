@@ -34,6 +34,8 @@
 #define GUEST_STACK_GUARD (256 * cng_page_size)
 
 unsigned long cng_g_stack_lo, cng_g_stack_len;
+unsigned long cng_g_arg_start, cng_g_arg_end;
+unsigned long cng_g_env_start, cng_g_env_end;
 
 static unsigned long auxval(unsigned long *av, unsigned long t) {
     if (!av)
@@ -67,6 +69,7 @@ unsigned long cng_build_stack(int argc, char **argv, char **envp,
      * succeeded — the one failure path here unmaps it again. */
     cng_g_stack_lo = 0;
     cng_g_stack_len = 0;
+    cng_g_arg_start = cng_g_arg_end = cng_g_env_start = cng_g_env_end = 0;
     unsigned long bottom = (unsigned long)stk + GUEST_STACK_GUARD;
     unsigned long top = bottom + GUEST_STACK_SIZE;
 
@@ -137,10 +140,13 @@ unsigned long cng_build_stack(int argc, char **argv, char **envp,
         _at;                                                                   \
     })
 
+    unsigned long arg_start = put;
     for (int i = 0; i < argc; i++)
         argv_addr[i] = PUT_STR(argv[i]);
+    unsigned long arg_end = put;
     for (int i = 0; i < envc; i++)
         env_addr[i] = PUT_STR(envp[i]);
+    unsigned long env_end = put;
     unsigned long execfn_addr = PUT_STR(execfn_str);
     *(unsigned long *)put = 0; /* fresh anonymous memory, but say it */
 
@@ -260,5 +266,8 @@ unsigned long cng_build_stack(int argc, char **argv, char **envp,
 
     cng_g_stack_lo = (unsigned long)stk;
     cng_g_stack_len = region;
+    cng_g_arg_start = arg_start;
+    cng_g_arg_end = cng_g_env_start = arg_end;
+    cng_g_env_end = env_end;
     return sp;
 }

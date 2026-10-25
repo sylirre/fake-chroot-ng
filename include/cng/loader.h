@@ -91,6 +91,13 @@ struct cng_loaded {
  * single thing there is to give. */
 extern unsigned long cng_g_stack_lo, cng_g_stack_len;
 
+/* ...and where in it that build put the strings, as the kernel records them in
+ * mm->arg_start..arg_end (argv, NUL-joined) and env_start..env_end (envp, the
+ * same; AT_EXECFN follows outside both). /proc/<pid>/cmdline and environ read
+ * those ranges of live memory, not the vectors that point into them. */
+extern unsigned long cng_g_arg_start, cng_g_arg_end;
+extern unsigned long cng_g_env_start, cng_g_env_end;
+
 /* Force file-backed segment mapping (mmap PROT_EXEC from the file) instead of
  * anon copy+mprotect. Set automatically after the first anon-exec denial (e.g.
  * NO_NEW_PRIVS revoking execmem on Android), or via `run -F`. Requires an

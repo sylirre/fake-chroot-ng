@@ -572,6 +572,12 @@ static void help(char **envp) {
                       "issues it itself and a guest's openat2 is emulated "
                       "-- as it is on a kernel without one. Test aid: a host "
                       "that allows it never takes that path."},
+        {"CNG_MM_MAP_DENY", "Take PR_SET_MM_MAP as refused by the host, as "
+                      "Android's kernels refuse it, so the kernel's own record "
+                      "of a guest process's argv and environment is left alone "
+                      "and /proc/<pid>/cmdline and environ are read out of "
+                      "guest memory instead. Test aid: a host that allows it "
+                      "never takes that path."},
         {"CNG_BROKER_NO_PEERCRED", "Behave as if the kernel would not say who "
                       "is on the other end of the IPC broker's rendezvous "
                       "socket, which refuses the connection. Test aid: a "

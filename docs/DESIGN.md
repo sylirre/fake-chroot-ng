@@ -133,6 +133,11 @@ answer `stat` and `access` as well as `open`: a refused call on a name we serve
 gets the attributes of a `/proc` regular file). Because
 we run the guest in this process and never `execve`, those files are the kernel's
 record of *our* invocation, so this is a correctness requirement, not polish.
+`cmdline` and `environ` are the exception that can be fixed at the source, as
+comm is with `PR_SET_NAME`: where the kernel accepts `PR_SET_MM_MAP` its record
+is pointed at the guest's strings, and where it does not (Android) the ranges
+the loader recorded are read out of guest memory under the kernel's rules, so a
+title written over argv shows either way (M100).
 See `src/monitor/procfs.c` (synthesis) and `src/monitor/procreg.c` (the
 fork-inherited registry that tells a guest pid from a host one). The calls that
 name a process by pid rather than by path follow the same rule: a hidden pid

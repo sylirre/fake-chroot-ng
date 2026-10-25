@@ -7276,7 +7276,7 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
     cng_g_procfs_reopen_deny = rdeny && rdeny[0] != '0';
     cng_g_shared_proc = 1;
     cng_procfs_init();
-    cng_procreg_publish(gargv, genvp, 0, 0, cng_g_exe_guest, "/");
+    cng_procreg_publish(gargv, genvp, 0, 0, 0, cng_g_exe_guest, "/");
 
     /* 0) the --shared-proc backing actually engaged: the broker daemon must
      *    have spawned and handed us its memfd (a degrade to the file or
@@ -7443,7 +7443,7 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
         if (kid == 0) { /* the "exec": publish an identity of our own */
             static char *kargv[] = {"/bin/kid-prog", 0};
             static char *kenvp[] = {"K=1", 0};
-            cng_procreg_publish(kargv, kenvp, 0, 0, "/bin/kid-prog", "/");
+            cng_procreg_publish(kargv, kenvp, 0, 0, 0, "/bin/kid-prog", "/");
             sys_close(pfd[0]);
             cng_write_all(pfd[1], "x", 1);
             struct cng_timespec nap = {5, 0};
@@ -9394,7 +9394,7 @@ static int pt_sim_forkkick(void) {
     /* The attach is refused for a pid the registry does not know, and the
      * converted clone publishes the child only for a parent it knows. */
     cng_procreg_init(0);
-    cng_procreg_publish(argv, envp, 0, 0, argv[0], "/");
+    cng_procreg_publish(argv, envp, 0, 0, 0, argv[0], "/");
     int rdy[2], go[2];
     if (CNG_SYS(__NR_pipe2, rdy, 0, 0, 0, 0, 0) < 0 ||
         CNG_SYS(__NR_pipe2, go, 0, 0, 0, 0, 0) < 0) {

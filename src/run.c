@@ -285,6 +285,11 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
         if (!strncmp(*e, "CNG_OPENAT2_DENY=", 17) && (*e)[17] != '\0' &&
             (*e)[17] != '0')
             cng_g_openat2_deny = 1;
+        /* CNG_MM_MAP_DENY=1 takes PR_SET_MM_MAP as refused, as Android's
+         * kernels refuse it, so cmdline/environ come from guest memory. */
+        if (!strncmp(*e, "CNG_MM_MAP_DENY=", 16) && (*e)[16] != '\0' &&
+            (*e)[16] != '0')
+            cng_g_mm_map_deny = 1;
     }
     /* Stamp the build: this tree is copied to test devices by hand, so a trace
      * has to be able to say whether it came from the build you just made. */

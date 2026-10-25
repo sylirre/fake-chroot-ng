@@ -62,6 +62,13 @@ extern int cng_g_procstat_synth;
  * even where the host files are readable (Android denies them to apps). */
 extern int cng_g_overflowid_synth;
 
+/* CNG_MM_MAP_DENY=1: take PR_SET_MM_MAP as refused, which Android's kernels do
+ * and a desktop one does not, so the kernel's own record of argv and environ
+ * stays the chroot-ng invocation and cmdline/environ are read out of guest
+ * memory by procfs.c instead. This is how that path gets exercised off a
+ * device. Settled before the first stack is published, read-only after. */
+extern int cng_g_mm_map_deny;
+
 /* Bring up the registry and choose the reserved fd range. Called once from
  * cng_run, before the seccomp filter is built. */
 void cng_procfs_init(void);
@@ -71,7 +78,10 @@ void cng_procfs_init(void);
  * execve would have laid down) plus the current exe and cwd. Called after every
  * stack build — the initial run and each emulated execve — because those are
  * the points a real kernel rewrites cmdline, environ and auxv. Also sets the
- * process name (comm), which the kernel would take from the exec'd file. */
+ * process name (comm), which the kernel would take from the exec'd file, and
+ * where the kernel allows it points its record of argv and environ at the
+ * guest's strings (PR_SET_MM_MAP), so its own cmdline and environ are the
+ * guest's. */
 void cng_procfs_publish_stack(unsigned long guest_sp);
 
 /* If `canon` (a canonical guest path) names a synthesized file, open the guest

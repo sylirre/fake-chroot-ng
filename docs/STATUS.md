@@ -4350,9 +4350,9 @@ vfork/`posix_spawn` child-stack handling.
     every emulated `execve`. postgres, nginx and perl's `$0`, which check
     that the strings are adjacent before reusing them, now get the room a
     kernel gives them, where before they settled for argv[0] alone.
-  - Not this: `/proc/<pid>/cmdline` is the registry's copy from exec time,
-    so a title written over argv does not show there, as it would under
-    the kernel.
+  - Not this (M100 fixed it): `/proc/<pid>/cmdline` is the registry's
+    copy from exec time, so a title written over argv does not show there,
+    as it would under the kernel.
   - Test: `tests/guests/argvlayout.c` checks every adjacency (each argv
     string right after the one before it, envp right after argv, AT_EXECFN
     right after envp, then a zero word) and libuv's arithmetic, then
@@ -4361,6 +4361,73 @@ vfork/`posix_spawn` child-stack handling.
     under `-R`, so the emulated `execve` is reached on every host. The
     previous build failed both chroot-ng legs. On the device the fixed
     binary runs `npm -v`, `npm help` and `npm config get prefix`.
+
+- [x] **M100 — cmdline and environ are the guest's live strings**
+  The kernel reads `/proc/<pid>/cmdline` and `environ` out of the
+  process's memory when the file is read, from the ranges its exec
+  recorded (`mm->arg_start..arg_end`, `env_start..env_end`), so a title a
+  program writes over its argv is what `ps` and `top` print from then on.
+  node's `process.title`, `setproctitle(3)`, and nginx's and postgres's
+  status lines all work that way. chroot-ng served both files from the
+  registry's copies, taken at exec time, so all of those read back as the
+  command line the process started with.
+  - `cng_build_stack` records where it put the strings
+    (`cng_g_arg_start..cng_g_env_end`), and the registry publishes those
+    ranges with each process (`struct cng_procargs`), inherited at fork.
+  - Where the kernel takes `PR_SET_MM_MAP`, the stack publish points the
+    kernel's own record at those ranges, the way `set_comm` already fixes
+    comm. Every other field of the record goes back unchanged: code, data,
+    `start_brk` and `start_stack` from `/proc/self/stat`, `brk` from
+    `brk(0)`. With `auxv_size` 0 and `exe_fd` -1 the call needs no
+    privilege. The host's files then are the guest's, read live under the
+    kernel's own rules and permission checks, and `synth_kind` leaves
+    cmdline and environ to them. That covers readers the next bullet
+    can't serve, too: under Yama's `ptrace_scope` 1, the Ubuntu default,
+    a sibling `ps` may not read another process's memory. Host-side tools
+    now show the guest's command line, as they already show its comm.
+    The exception is a process's own environ. The kernel binds an environ
+    fd to the mm it was opened on, and a real exec leaves that mm behind:
+    measured with bash's `tr '\0' '\n' < /proc/self/environ`, whose
+    redirect is opened before the exec, the read comes back empty. Our
+    exec keeps the mm, so the host fd would follow the record into the
+    next program's environment instead (the VM run of m17 caught it). A
+    memfd filled at open from live memory keeps the opener's environment,
+    as before. cmdline is bound to the task and read at read time, and
+    after an exec the kernel's is the new program's, as the host file is.
+  - Android's kernels lack `CONFIG_CHECKPOINT_RESTORE` and refuse the call
+    with EPERM (measured: 5.15, Android 15), and qemu-user refuses
+    `PR_SET_MM` outright. There procfs reads the ranges itself
+    (`put_live`): its own through the copy-in pair, another process's with
+    `process_vm_readv`, under `get_mm_cmdline`'s rules (5.2+). The argv
+    range is served as it stands, embedded NULs and all. If its last byte
+    is no longer a NUL, the title ran on into the environment, and the
+    file is the string at `arg_start` up to its NUL: one page at most,
+    never past `env_end`. environ is its range as it stands. When the
+    memory can't be asked for (Yama, an undumpable process, qemu-user),
+    the copies answer as before. A stack the loader didn't lay out has no
+    ranges and keeps the copies too. Reading the ranges also lifts the
+    copies' 1 KiB and 4 KiB truncation.
+  - Not this: the synthesized file is still filled at open time, while
+    the kernel's is read at read time. A reader that holds the fd open
+    and seeks back sees the bytes from its open. Readers that open the
+    file for each sample, which is what `ps` and `top` do, are not affected.
+    For the same reason, an environ fd carried across an exec reads the
+    opener's environment, where the kernel's reads empty. On the
+    memory-reading path a cmdline fd carried across an exec also reads
+    the opener's, not the new program's.
+  - `CNG_MM_MAP_DENY=1` takes the call as refused, so the memory-reading
+    path can be run on a host that allows it.
+  - Test: `tests/guests/proctitle.c` re-execs itself with a known argv and
+    environment and checks its own files and a forked child's: as exec'd,
+    after an environment byte is rewritten, a short title padded with
+    zeros, and a title run past argv into the environment.
+    `record: kernel|ours` reports whether `/proc/self/stat`'s `arg_start`
+    names its argv[0]. m11 runs it under the host kernel first (native
+    hosts only: qemu-user fakes these files), then under `-R` with and
+    without `CNG_MM_MAP_DENY`. On the cross host a child's legs are not
+    asserted. The kernel reference agrees on the Termux device (Android
+    15, where chroot-ng reads memory) and on the VM (where the kernel's
+    record moves).
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
