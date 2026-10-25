@@ -13,6 +13,12 @@
  * queued for it read without waiting: a missing ACK reads as ack=0, an extra
  * message as more>0. Prints protocol only, byte-comparable against the same
  * program on a kernel whose rtnetlink works.
+ *
+ * With the argument `unmodelled` it sends instead a request the emulation does
+ * not model, bubblewrap's RTM_NEWADDR of 127.0.0.1/8 on loopback, which the
+ * emulation acks as a success. That one is for the emulation alone: a kernel
+ * answers an unprivileged caller EPERM (Android's policy refuses the send
+ * itself, EACCES), and finds the address there for root.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -169,11 +175,46 @@ static void dump(const char *name, unsigned seq) {
            s.objects > 0, s.errors, s.acks, s.dones, s.more);
 }
 
-int main(void) {
+/* bubblewrap's loopback_setup(), first request: 127.0.0.1/8 on loopback. */
+static void newaddr(const char *name, unsigned seq) {
+    struct {
+        struct nlmsghdr h;
+        struct ifaddrmsg i;
+        struct rtattr a;
+        unsigned char addr[4];
+    } q;
+    memset(&q, 0, sizeof q);
+    q.h.nlmsg_len = sizeof q;
+    q.h.nlmsg_type = RTM_NEWADDR;
+    q.h.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_EXCL | NLM_F_CREATE;
+    q.h.nlmsg_seq = seq;
+    q.i.ifa_family = AF_INET;
+    q.i.ifa_prefixlen = 8;
+    q.i.ifa_flags = IFA_F_PERMANENT;
+    q.i.ifa_scope = RT_SCOPE_HOST;
+    q.i.ifa_index = 1;
+    q.a.rta_len = sizeof q.a + sizeof q.addr;
+    q.a.rta_type = IFA_LOCAL;
+    q.addr[0] = 127;
+    q.addr[3] = 1;
+    struct seen s;
+    if (send(fd, &q, sizeof q, 0) != (ssize_t)sizeof q ||
+        collect(seq, RTM_NEWADDR, &s) != 0) {
+        printf("%s: no answer\n", name);
+        return;
+    }
+    report(name, &s);
+}
+
+int main(int argc, char **argv) {
     fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
     if (fd < 0) {
         printf("socket: errno=%d\n", errno);
         return 1;
+    }
+    if (argc > 1 && !strcmp(argv[1], "unmodelled")) {
+        newaddr("newaddr ack", 6);
+        return 0;
     }
     getlink("getlink ack", 1, NLM_F_ACK);
     getlink("getlink", 2, 0);

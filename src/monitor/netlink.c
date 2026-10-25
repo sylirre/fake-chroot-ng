@@ -1034,16 +1034,10 @@ static void process_request(struct nl_peer *p, const unsigned char *req,
         return;
     }
     /* Anything else gets a success ack, which is what lets bubblewrap's
-     * loopback_setup() (RTM_NEWADDR/RTM_NEWLINK) proceed instead of aborting. */
-    struct nlmsghdr_ *o = (struct nlmsghdr_ *)scratch;
-    o->len = (unsigned)(sizeof *o + 4 + sizeof *o);
-    o->type = NLMSG_ERROR_;
-    o->flags = 0;
-    o->seq = seq;
-    o->pid = pid;
-    *(int *)(scratch + sizeof *o) = 0; /* error == 0 => ack */
-    memcpy(scratch + sizeof *o + 4, req, sizeof *o);
-    push(p, scratch, (long)o->len);
+     * loopback_setup() (RTM_NEWADDR/RTM_NEWLINK) proceed instead of aborting.
+     * It is the ack a get's is, flagged as the 6.1 the emulation advertises
+     * flags it: unflagged, it was a pre-4.12 kernel's on every host. */
+    push(p, scratch, put_ack(scratch, 0, NL_REPLY_MAX, seq, pid, req));
 }
 
 /* Serve the requests queued on a peer's end, at most `max` of them — every

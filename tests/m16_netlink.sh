@@ -591,6 +591,17 @@ dump ack: objects>0=1 errors=0 acks=0 dones=1 more=0'
             "$nlack_want" "$st"
         st=$(CNG_NETLINK_DENY_GETLINK=1 m16run -R "$R" /bin/nlack 2>/dev/null)
         check "m16 ...and so does a synthesized one" "$nlack_want" "$st"
+        # A request the emulation does not model (bubblewrap's RTM_NEWADDR of
+        # 127.0.0.1 on lo) is acked as a success, with the same ACK a get gets.
+        # It was the one ACK still sent unflagged, a pre-4.12 kernel's on every
+        # host. A kernel is no reference here: it answers an unprivileged
+        # caller EPERM (Android's policy refuses the send, EACCES), and root
+        # finds the address already there.
+        st=$(CNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nlack unmodelled \
+            2>/dev/null)
+        check "m16 a request it does not model is acked as a current kernel acks" \
+            'newaddr ack: objects=0 errors=0 acks=1 dones=0 more=0 ack=0 flags=0x100 len=36 echo=20/32/0x605/6' \
+            "$st"
         if [ "$m16_raw" = 1 ]; then
             kst=$(emu_t 60 "$M16D/nlack" 2>/dev/null)
             # A kernel before 4.12 (extended ACK reporting) sends its ACK with

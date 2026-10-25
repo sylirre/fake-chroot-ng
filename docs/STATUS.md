@@ -4207,11 +4207,16 @@ vfork/`posix_spawn` child-stack handling.
     (`cap_ack`). Only the kernel comparison skips there.
   - Left as it was: a request the emulation does not model (RTM_NEWADDR, …) is
     still acked whether or not it asked, and a non-dump RTM_GETROUTE with no
-    relay still gets that ACK alone, the oracle's answers both.
+    relay still gets that ACK alone, the oracle's answers both. That ACK was
+    built unflagged, a pre-4.12 kernel's, on every host. It is `put_ack`'s
+    now, NLM_F_CAPPED and all.
   - Test: `tests/guests/nlack.c` — getlink and getroute with and without
     NLM_F_ACK, and a dump asking for one, every message counted; in m16
     relayed and with CNG_NETLINK_DENY_GETLINK (synthesized), against the
     kernel where rtnetlink works. The previous build: `acks=0` on both gets.
+    `nlack unmodelled` sends bubblewrap's RTM_NEWADDR, under the emulation
+    only (unprivileged, a kernel answers EPERM and Android refuses the send);
+    the build before had `flags=0`.
 
 - [x] **M97 — `openat2` is emulated where the host cannot issue it**
   Ubuntu 26.04's tar (1.35 with the CVE-2025-45582 backport) opens the
