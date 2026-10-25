@@ -373,11 +373,22 @@ else
     # slot with its number also stopped there. Eight threads open, bind, name
     # and close sockets in a loop: every one must stay the emulation's. The
     # previous build had about twenty go wrong a run.
+    #
+    # The other end of each is the broker daemon's, which holds at most
+    # CNG_NL_SOCK_MAX (1024) and gives one up when the guest's last close of
+    # its own end hangs up the pair. 3600 sockets are past that bound threefold,
+    # so all of them can be emulated only if every close was noticed. Where the
+    # host's rtnetlink works a socket the daemon refused falls through to a
+    # real one and the guest's own counts cannot tell; the debug log names
+    # every socket the emulation stands in for.
     if guest_cc "$M16D/nlchurn" tests/guests/nlchurn.c -pthread; then
         cp "$M16D/nlchurn" "$R/bin/nlchurn"
-        st=$(CNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nlchurn 2>/dev/null)
+        st=$(CNG_DEBUG=1 CNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nlchurn \
+            2>"$M16D/nlchurn.err")
         check_contains "m16 sockets opened and closed by eight threads stay emulated" \
             "nlchurn: sockets=3600 bad=0" "$st"
+        check "m16 ...every one of the 3600, past what the daemon holds at once" \
+            3600 "$(grep -c 'netlink: emulating fd' "$M16D/nlchurn.err")"
     else
         skip "slot-churn leg: could not build tests/guests/nlchurn.c with -pthread"
     fi
@@ -390,7 +401,8 @@ else
     # relay socket was close-on-exec while a netlink socket without SOCK_CLOEXEC
     # is not: after an exec the inherited socket's dump went through, and read
     # from, whatever the new program had opened on the relay's number. (The
-    # relay is a socket per request now; the legs stand for what they check.)
+    # other end and the relays are the broker daemon's now, in a table of its
+    # own; the legs stand for what they check.)
     if guest_cc "$M16D/nlstale" tests/guests/nlstale.c; then
         cp "$M16D/nlstale" "$R/bin/nlstale"
         st=$(CNG_DEBUG=1 CNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nlstale \
@@ -401,9 +413,11 @@ else
             "exec: inherited_open=1 dump=1 files=16 kept=16" "$st"
         if [ "$m16_raw" = 1 ]; then
             # The dump after the exec is relayed like the two before it, not
-            # synthesized through the guest's file on an old number.
+            # synthesized through the guest's file on an old number. Each
+            # send waits for the daemon to have served it, and the wait
+            # reports what was done (the daemon's own stderr is /dev/null).
             check "m16 ...and its dump is still relayed, on a relay socket of ours" \
-                3 "$(grep -c -- '-> relayed' "$M16D/nlstale.err")"
+                3 "$(grep -c -- '-> 1 relayed' "$M16D/nlstale.err")"
         fi
     else
         skip "hidden-descriptor leg: could not build tests/guests/nlstale.c"
@@ -515,6 +529,44 @@ recvmmsg: r=1 len=32 second=1 flags=0x20 controllen=0'
         fi
     else
         skip "recvmsg header leg: could not build tests/guests/nlhdr.c"
+    fi
+
+    # --- 9. requests the monitor never sees ---------------------------------
+    # Mozilla's mtu crate, which Firefox's HTTP/3 stack asks for the path MTU
+    # of every connection, write(2)s an RTM_GETROUTE and read(2)s the reply,
+    # then the same for RTM_GETLINK. The seccomp tier traps neither, and a
+    # request was served only at the next trapped call on its socket: the
+    # read slept for good, and Firefox's socket thread with it. A poll(2)
+    # between them slept under either tier, and a sendmmsg naming the kernel
+    # was refused by the datagram stand-in (EINVAL). The daemon that holds the
+    # other end serves a request whichever way it came. Each leg runs under
+    # its own alarm in the guest, so a request nobody answers is a timeout
+    # line, not a wedged suite.
+    nlrw_want='write: route=24 oif=1 link=16 name=lo mtu=65536
+poll: ready=1 route=24 oif=1
+writev: route=24 oif=1
+sendmmsg: sent=1 route=24 oif=1'
+    if guest_cc "$M16D/nlrw" tests/guests/nlrw.c; then
+        cp "$M16D/nlrw" "$R/bin/nlrw"
+        for _tier in -R plain; do
+            if [ "$_tier" = plain ] && [ "$CNG_SECCOMP_LIVE" != 1 ]; then
+                skip "m16 netlink requests by write(2), seccomp tier: the filter is inert here"
+                continue
+            fi
+            _opt=""
+            [ "$_tier" = -R ] && _opt=-R
+            # shellcheck disable=SC2086  # $_opt is a flag or deliberately empty
+            st=$(CNG_NETLINK_FORCE_BLOCK=1 m16run $_opt "$R" /bin/nlrw \
+                2>/dev/null)
+            check "m16 requests by write(2), poll(2), writev(2), sendmmsg(2) are served ($_tier)" \
+                "$nlrw_want" "$st"
+        done
+        if [ "$m16_raw" = 1 ]; then
+            kst=$(emu_t 60 "$M16D/nlrw" 2>/dev/null)
+            check "m16 ...and the kernel here answers the same" "$nlrw_want" "$kst"
+        fi
+    else
+        skip "requests-by-write leg: could not build tests/guests/nlrw.c"
     fi
 
     # The interface-query band is all cng_nl_ioctl answers for. Every other

@@ -4137,6 +4137,55 @@ vfork/`posix_spawn` child-stack handling.
   With M92–M94, `google-chrome --no-sandbox` starts under `-u` on Termux
   (headless: `--dump-dom` of a page, exit 0).
 
+- [x] **M95 — a netlink request written with write(2) was never answered**
+  Firefox 158 on Termux loaded pages over HTTP/1 and HTTP/2 and hung for good
+  on the first site offering HTTP/3 (example.com: Cloudflare). Its socket thread
+  sat in `read(2)` on an emulated rtnetlink socket: Mozilla's `mtu` crate, which
+  neqo asks for the path MTU of each connection, `write(2)`s an RTM_GETROUTE and
+  `read(2)`s the reply, then the same for RTM_GETLINK. The seccomp tier traps
+  neither, and a request was served only at the next *trapped* call on its socket
+  — M16 listed a `write()`+`poll()` client as a known limitation; under `-R`
+  dispatch's read case drained the queue, which is why the suite (every M16 leg
+  runs under `-R`) never saw the plain read.
+  - The far end of each emulated socket is now the **broker daemon's** (owner's
+    choice over a reserved high-fd range with read/write trapped, an async
+    signal, and the status quo): the daemon polls it and serves each request the
+    moment it arrives, by whatever route — the kernel's netlink answers inside the
+    `sendmsg`. `socket(2)` registers the daemon's end (`CNG_REQ_NLSOCK`, the fd
+    over SCM_RIGHTS, the opener's test aids as flags); a trapped send
+    (send/sendto/sendmsg/sendmmsg) is re-issued into the pair with MSG_NOSIGNAL
+    and then waits for the daemon (`CNG_REQ_NLSYNC`), so its replies are queued
+    when it returns; a receive, or an `-R` read, that would not wait and finds
+    nothing asks the daemon to finish and looks once more. The port id is the
+    opener's pid, fixed for the socket's life (a fork child is told its
+    parent's), as the daemon stamps it on replies.
+  - The pair is **SOCK_SEQPACKET**, not SOCK_DGRAM: the guest's last close hangs
+    it up, which is how the daemon knows to let go (close is not trapped, and a
+    datagram pair tells its survivor nothing), and it ignores a destination
+    address where the datagram one refused a `sendmmsg` naming the kernel
+    (EINVAL). sendmsg goes in whole — every iovec, where only the first was read
+    — without the address or the control data.
+  - The guest's process holds one descriptor per socket now: the monitor's pair
+    end and the per-request relays (M16's hidden-descriptor history) live in the
+    daemon's table. The daemon holds `CNG_NL_SOCK_MAX` (1024) at once per
+    namespace; past that, and where no daemon can be reached, `socket(2)` gets
+    the host's own answer. Its stderr is /dev/null, so the relayed/synthesized
+    trace comes back in the sync reply and is printed by the guest's side
+    (`nl served fd=N: …`). Broker protocol `cng-ipc.v4`.
+  - Test: `tests/guests/nlrw.c` — `write`+`read` (the crate's whole
+    conversation), `write`+`poll`+`read`, `writev`, `sendmmsg` naming the
+    kernel, each under its own alarm — in m16 under `-R` and, where the filter is
+    live, the seccomp tier, against the kernel where rtnetlink works. The
+    previous build, on the VM: `write: timeout`, `poll: ready=0`,
+    `writev: timeout`, `sendmmsg: sent=-1 err=22` in the seccomp tier. nlchurn's
+    3600 sockets must now each appear in the emulation's trace — past the
+    daemon's 1024 only if every close was noticed (mutation: 1024).
+  Firefox's other failure on the device is not ours: since Bug 2045119
+  (Firefox 158) a child process demands a sealed memfd for every shared-memory
+  handle when it can make one, while the parent, whose read-only reopen of a
+  memfd Android refuses (M92), hands it `/dev/shm` files. proot fails the same
+  way. `MOZ_SHM_NO_SEALS=1` in the guest's environment is the workaround.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

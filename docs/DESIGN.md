@@ -218,6 +218,17 @@ and is answered when it can proceed, when its deadline passes, when the object i
 removed, or when the caller cancels it — which is how a blocking `semop` stays
 interruptible even though our SIGSYS handler runs with every other signal masked.
 
+It is also the far end of every **emulated rtnetlink socket**
+(`src/monitor/netlink.c`). The guest's socket is one end of an AF_UNIX
+sequenced-packet pair and the daemon holds the other, polls it, and answers each
+request the moment it arrives — the kernel answers inside the `sendmsg` that
+carries one, and a client may `write(2)` a request and `read(2)` the reply with no
+call in between that the seccomp tier traps, which is what Mozilla's `mtu` crate
+does for Firefox's HTTP/3. A send the monitor does trap waits for the daemon to
+have served it, so its replies are queued when the call returns. The pair's
+hang-up tells the daemon when the guest has closed its socket, since `close(2)` is
+not trapped.
+
 The daemon uses those registries as its own liveness signal and exits once
 nothing is left, leaving no file and no socket name.
 

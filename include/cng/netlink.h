@@ -1,16 +1,21 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
 /* NETLINK_ROUTE emulation for hosts that deny app domains rtnetlink (Android).
- * A guest netlink socket is stood in for by one end of an AF_UNIX datagram
- * socketpair whose peer the monitor holds: replies are pushed into the pair,
- * so untrapped read()/write()/poll() behave like the real fd they are. Dumps
- * are relayed through an UNBOUND host netlink socket, which works because the
- * SELinux denial is on bind(2), not on the query — except RTM_GETLINK, which
- * Android refuses outright (nlmsg_readpriv) and which is synthesized from the
- * address dump plus SIOCGIF* ioctls instead. See src/monitor/netlink.c.
+ * A guest netlink socket is stood in for by one end of an AF_UNIX
+ * SOCK_SEQPACKET socketpair whose other end the namespace's broker daemon
+ * holds: the daemon serves each request the moment it arrives, by whatever
+ * route it came, and pushes the replies into the pair, so untrapped
+ * read()/write()/poll() behave like the real fd they are. Dumps are relayed
+ * through an UNBOUND host netlink socket, which works because the SELinux
+ * denial is on bind(2), not on the query — except RTM_GETLINK, which Android
+ * refuses outright (nlmsg_readpriv) and which is synthesized from the address
+ * dump plus SIOCGIF* ioctls instead. See src/monitor/netlink.c.
  */
 #ifndef CNG_NETLINK_H
 #define CNG_NETLINK_H
+
+struct cng_bresp;
+struct cng_pollfd;
 
 /* CNG_NETLINK_FORCE_BLOCK=1: pretend the host denies rtnetlink, so the
  * emulation can be exercised on a host where it actually works (mirrors
@@ -42,7 +47,8 @@ int cng_nl_is_fake(int fd);
 /* socket(2) hook. Returns the new guest fd; the negative errno the emulated
  * interface answers a request no kernel would grant (a socket type netlink does
  * not take); or -1 when this is not an emulated case (wrong family/protocol,
- * host rtnetlink works, or the table is full) and the real syscall should run.
+ * host rtnetlink works, no memory for the record, or no broker daemon would
+ * take the socket) and the real syscall should run.
  *
  * -1 is the sentinel and never an answer: EPERM is not something this interface
  * says, and the refusals it does give have to reach the guest rather than fall
@@ -59,13 +65,18 @@ long cng_nl_socket(long domain, long type, long protocol);
  * audit socket the host refused on permission grounds. */
 long cng_nl_audit_refusal(long domain, long protocol, long r);
 
-/* send/recv hooks. Return 1 when the call was handled (result in *out), 0 when
- * `fd` is not ours and the real syscall should run. A send builds the reply; the
- * matching recv drains it. */
-int cng_nl_send(int fd, const void *buf, long len, long *out);
-/* `flags` must carry the caller's MSG_* bits: MSG_PEEK must not consume and
- * MSG_TRUNC must report the whole pending length, which is how glibc's
- * getifaddrs(3) sizes its buffer before reading. */
+/* After a send on `fd` went into the pair, or where a receive on it found
+ * nothing yet: if `fd` is an emulated socket, wait until the daemon has served
+ * every request sent on it so far, so their replies are queued — the kernel
+ * answers inside the sendmsg itself. Returns 1 when `fd` is ours, 0 when it is
+ * not (nothing was asked). */
+int cng_nl_sync(int fd);
+
+/* recv hooks. Return 1 when the call was handled (result in *out), 0 when `fd`
+ * is not ours and the real syscall should run. `flags` must carry the caller's
+ * MSG_* bits: MSG_PEEK must not consume and MSG_TRUNC must report the whole
+ * pending length, which is how glibc's getifaddrs(3) sizes its buffer before
+ * reading. */
 int cng_nl_recv(int fd, void *buf, long len, long flags, long *out);
 /* The same for recvmsg: `msg` is a struct cng_msghdr of the caller's, handed
  * to the kernel's recvmsg on the stand-in whole — its iovecs are received
@@ -98,9 +109,38 @@ int cng_nl_bind(int fd);
  * real ioctl is the right answer. */
 int cng_nl_ioctl(int fd, unsigned long req, void *arg, long *out);
 
-/* Serve any requests the guest submitted with untrapped write(2)/send(2), so
- * their replies are in the pair before a passthrough read runs. No-op unless
- * `fd` is an emulated netlink socket. */
-void cng_nl_poke(int fd);
+/* ---- the broker daemon's side (broker.c) ---------------------------------
+ * The daemon owns the other end of every emulated socket in its namespace and
+ * is where requests are answered. These run in the daemon only. */
+
+/* Emulated sockets one namespace's daemon holds at once. A registration past
+ * it is refused, and the guest's socket(2) gets the host's own answer. */
+#define CNG_NL_SOCK_MAX 1024
+
+/* CNG_REQ_NLSOCK's cng_breq.arg: the test aids the registering process runs
+ * with, which are its own and not the daemon's (one --shared-proc daemon may
+ * serve invocations started with different ones). */
+#define CNG_NL_F_NO_RELAY     1 /* CNG_NETLINK_NO_RELAY */
+#define CNG_NL_F_DENY_GETLINK 2 /* CNG_NETLINK_DENY_GETLINK */
+
+/* CNG_REQ_NLSOCK: take `fd`, the daemon's end of a new pair, for a socket
+ * whose replies carry `port`. Returns its id (> 0), or a negative errno with
+ * `fd` closed. */
+long cng_nl_serve_register(int fd, unsigned port, int flags);
+/* CNG_REQ_NLSYNC: serve everything queued on socket `id`, then report what
+ * was served on it since the last sync — the count is the return value, and
+ * r->size / r->nattch carry how many of those were relayed / synthesized.
+ * -ENOENT for an id the daemon does not hold. */
+long cng_nl_serve_sync(unsigned id, struct cng_bresp *r);
+/* The daemon's ends, appended to its poll set from index `n` (up to `cap`);
+ * returns the new count. cng_nl_poll_ready then serves what the poll found in
+ * [from, n): requests on a readable end, and the end given up once the guest
+ * has closed its own. */
+int cng_nl_poll_add(struct cng_pollfd *pf, int n, int cap);
+void cng_nl_poll_ready(struct cng_pollfd *pf, int from, int n);
+/* Does any guest still hold an emulated socket? Anchors the namespace. */
+int cng_nl_any_live(void);
+/* Close every end the daemon holds, on its way out. */
+void cng_nl_free_all(void);
 
 #endif /* CNG_NETLINK_H */

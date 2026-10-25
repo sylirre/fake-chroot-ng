@@ -4927,14 +4927,22 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * carry their offset in a3 (LP64: the full offset in pos_l; -1 means the
      * current position, which pre_read resolves with an lseek). */
     case __NR_read:
-    case __NR_readv:
-        /* A netlink stand-in is a socketpair end, so the read itself works —
-         * but a request the guest submitted with untrapped write(2) must be
-         * served first or this read blocks on an empty queue (busybox ip under
-         * the -R tier; the seccomp tier never traps read on ordinary fds). */
-        cng_nl_poke((int)a0);
+    case __NR_readv: {
         cng_procfs_pre_read((int)a0, -1);
-        return cng_syscall6(a0, a1, a2, a3, a4, a5, nr);
+        long r = cng_syscall6(a0, a1, a2, a3, a4, a5, nr);
+        /* A netlink stand-in is a socketpair end, so the read itself works,
+         * and a blocking one waits for the daemon's reply like any other (an
+         * EAGAIN from it is its SO_RCVTIMEO, already waited out). One that
+         * would not wait can be ahead of the daemon, as a receive can
+         * (cng_nl_recv): the daemon is asked to finish, and the read made
+         * once more. The seccomp tier never traps a read on an ordinary fd;
+         * this is the -R tier's, at a site the rewriter patched. */
+        if (r == -EAGAIN &&
+            (sys_fcntl((int)a0, CNG_F_GETFL, 0) & CNG_O_NONBLOCK) &&
+            cng_nl_sync((int)a0))
+            r = cng_syscall6(a0, a1, a2, a3, a4, a5, nr);
+        return r;
+    }
     case __NR_pread64:
     case __NR_preadv:
     case __NR_preadv2:
@@ -5275,15 +5283,21 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_connect:
     case __NR_sendto: {
         /* An emulated netlink socket: bind is a silent success (the guest is
-         * binding a netlink address we do not really have), and a send is the
-         * request whose reply the matching recv will drain. */
+         * binding a netlink address we do not really have), and a send goes
+         * into the stand-in pair as the guest made it — the kernel checks the
+         * buffer, and copies the address in as it would for any family before
+         * the sequenced-packet pair ignores it — and is then waited for: the
+         * daemon serves it, and the replies are queued when the call returns,
+         * as the kernel's would be.
+         * MSG_NOSIGNAL: a netlink send never raises SIGPIPE, and a pair whose
+         * daemon has gone would. */
         if (cng_nl_is_fake((int)a0)) {
             if (nr == __NR_bind || nr == __NR_connect)
                 return 0;
-            long out = 0;
-            if (cng_nl_send((int)a0, (const void *)a1, a2, &out))
-                return out;
-            return 0;
+            long r = reissue(a0, a1, a2, a3 | CNG_MSG_NOSIGNAL, a4, a5, nr);
+            if (r >= 0)
+                cng_nl_sync((int)a0);
+            return r;
         }
         int is_send = (nr == __NR_sendto);
         long aa = is_send ? a4 : a1;   /* sockaddr */
@@ -5317,16 +5331,27 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         if (a1 && cng_user_copyin(&mh, (void *)a1, sizeof mh) < 0)
             return -EFAULT;
         if (cng_nl_is_fake((int)a0)) {
-            /* The payload is the first iovec; netlink requests are single-iov
-             * in every library that builds them. */
-            long out = 0;
-            if (a1 && mh.iov && mh.iovlen > 0) {
-                struct cng_iovec io0;
-                if (cng_user_copyin(&io0, mh.iov, sizeof io0) < 0)
-                    return -EFAULT;
-                cng_nl_send((int)a0, io0.base, (long)io0.len, &out);
+            /* Into the pair as sendto's request goes, every iovec of it one
+             * record, as the kernel's netlink takes the whole message. The
+             * header is our copy without the address the pair would ignore
+             * anyway, or the control data, which the emulation has never read
+             * and which a sequenced-packet pair would judge by AF_UNIX's
+             * rules (SCM_CREDENTIALS against the real ids, under a fake
+             * one) rather than netlink's. */
+            long r;
+            if (!a1) {
+                r = reissue(a0, a1, a2 | CNG_MSG_NOSIGNAL, a3, a4, a5, nr);
+            } else {
+                mh.name = 0;
+                mh.namelen = 0;
+                mh.control = 0;
+                mh.controllen = 0;
+                r = reissue(a0, (long)&mh, a2 | CNG_MSG_NOSIGNAL, a3, a4, a5,
+                            nr);
             }
-            return out;
+            if (r >= 0)
+                cng_nl_sync((int)a0);
+            return r;
         }
         struct cng_sun_xlate x;
         long r;
@@ -5363,14 +5388,22 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * none did. The guest's array is never rewritten — each translated header is
      * a copy, exactly as in sendmsg above.
      *
-     * (An emulated netlink socket needs nothing here: a native sendmmsg puts the
-     * request datagrams into the stand-in socketpair, which is the same route an
-     * untrapped write(2) takes, and the matching receive serves them.) */
+     * An emulated netlink socket is re-issued whole as well: the batch goes
+     * into the stand-in pair, whose sequenced-packet end ignores the addresses
+     * naming the kernel, the daemon serves each request the way it serves one
+     * sent with write(2), and the call then waits for it to have done so, as
+     * a send does (see sendto). */
     case __NR_sendmmsg: {
         struct cng_mmsghdr *v = (struct cng_mmsghdr *)a1;
         unsigned long vlen = (unsigned)a2;
         if (vlen > CNG_UIO_MAXIOV) /* as the kernel clamps it */
             vlen = CNG_UIO_MAXIOV;
+        if (cng_nl_is_fake((int)a0)) {
+            long r = reissue(a0, a1, a2, a3 | CNG_MSG_NOSIGNAL, a4, a5, nr);
+            if (r > 0)
+                cng_nl_sync((int)a0);
+            return r;
+        }
         if (!v || !vlen)
             return reissue(a0, a1, a2, a3, a4, a5, nr);
         /* A socket that is not AF_UNIX cannot carry a sun_path at all, and a UDP

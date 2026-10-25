@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
 /* Unified IPC broker: one per-namespace daemon serving the guest-PID registry
- * table AND the whole of System V IPC — shared memory, semaphores and message
- * queues.
+ * table, the whole of System V IPC — shared memory, semaphores and message
+ * queues — and the emulated rtnetlink sockets (netlink.c), whose requests it
+ * answers the moment they arrive.
  *
  * Ported from arm64chroot's proctab.c, whose daemon multiplexes both over a
  * single abstract-socket rendezvous. chroot-ng grew the daemon first for
@@ -34,8 +35,9 @@
  *
  * Clients keep no persistent broker fd: every exchange connects, asks, and
  * closes. The daemon uses the registries themselves as its liveness signal and
- * exits once neither a live guest nor a live segment has anchored the namespace
- * for a grace window — leaving no file, no socket name and no stray fd.
+ * exits once neither a live guest, a live segment nor an open emulated netlink
+ * socket has anchored the namespace for a grace window — leaving no file, no
+ * socket name and no stray fd.
  */
 #ifndef CNG_BROKER_H
 #define CNG_BROKER_H
@@ -66,6 +68,9 @@ enum {
     CNG_REQ_MSGRCV,  /* a grant streams ret payload bytes after the reply */
     CNG_REQ_MSGCTL,
     CNG_REQ_CANCEL,  /* on a parked connection: abandon the wait (-> EINTR) */
+    CNG_REQ_NLSOCK,  /* an emulated netlink socket: the daemon's end of its
+                      * pair rides as SCM_RIGHTS, arg = CNG_NL_F_*; ret = id */
+    CNG_REQ_NLSYNC,  /* id = a netlink socket: serve what is queued on it */
 };
 
 /* One fixed-size request; small enough to be delivered atomically on a local
@@ -122,6 +127,12 @@ void cng_broker_seed_session(void);
  * non-NULL, receives an SCM_RIGHTS fd or -1. Returns 0 on a completed exchange,
  * -1 if no daemon could be reached (the caller then fails the syscall). */
 int cng_broker_rpc(struct cng_breq *q, struct cng_bresp *r, int *fd_out);
+
+/* The same exchange with `fd_in` riding alongside the request as SCM_RIGHTS
+ * (fd_in < 0: none). The caller's copy stays the caller's to close: the
+ * daemon gets a descriptor of its own. */
+int cng_broker_rpc_fd(struct cng_breq *q, int fd_in, struct cng_bresp *r,
+                      int *fd_out);
 
 /* The same connection, handed over instead of driven: for the exchanges that
  * connect-ask-close cannot express — a payload streaming behind the request, a

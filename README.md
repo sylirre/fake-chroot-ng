@@ -133,7 +133,10 @@ namespace.
 domains — and everything that asks the kernel about interfaces goes through it:
 `getifaddrs(3)`, iproute2, bubblewrap's `loopback_setup()`, glibc's
 source-address selection. The guest's `socket(AF_NETLINK, …, NETLINK_ROUTE)` is
-served by a stand-in fd whose dumps are relayed through an **unbound** host
+served by a stand-in fd whose far end the per-namespace broker daemon holds (the
+one System V IPC uses, below), answering each request as it arrives however it was
+sent — `write(2)` and `read(2)` included, which is how Firefox asks for the path
+MTU of its HTTP/3 connections. Dumps are relayed through an **unbound** host
 netlink socket, which works because the denial is on `bind(2)`, not on the query.
 Where even the socket is refused, dumps degrade to an empty result so
 `getifaddrs` succeeds with no interfaces rather than failing outright. Nothing

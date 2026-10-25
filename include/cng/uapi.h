@@ -202,6 +202,7 @@ struct cng_open_how {
 /* AF_UNIX sockets + ppoll — the --shared-proc registry broker (procreg.c). */
 #define CNG_AF_UNIX      1
 #define CNG_SOCK_STREAM  1
+#define CNG_SOCK_SEQPACKET 5
 #define CNG_SOCK_CLOEXEC CNG_O_CLOEXEC
 #define CNG_SOL_SOCKET   1
 #define CNG_SO_RCVTIMEO  20 /* SO_RCVTIMEO_OLD: takes the 64-bit timeval */
@@ -218,6 +219,10 @@ struct cng_open_how {
 #define CNG_MSG_CTRUNC   0x8  /* msg_flags: control data was cut */
 #define CNG_MSG_WAITFORONE 0x10000 /* recvmmsg: return once one message is in */
 #define CNG_POLLIN       1
+#define CNG_POLLERR      0x8
+#define CNG_POLLHUP      0x10
+#define CNG_POLLNVAL     0x20
+#define CNG_POLLRDHUP    0x2000 /* the peer will send no more */
 
 /* The kernel clamps sendmmsg/recvmmsg's vlen to this (UIO_MAXIOV) before it
  * loops, so the array forms bound their own walk the same way. */

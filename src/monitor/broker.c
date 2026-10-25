@@ -18,6 +18,7 @@
 #include "cng/ipcreg.h"
 #include "cng/loader.h"
 #include "cng/monitor.h"
+#include "cng/netlink.h"
 #include "cng/ownmap.h"
 #include "cng/path.h"
 #include "cng/procreg.h"
@@ -88,7 +89,8 @@ u64 cng_broker_hash(const void *p, unsigned long n) {
  * The version tag covers the request protocol AND struct proc_ent's layout:
  * bump it if either changes, so a differently versioned build never joins an
  * incompatible daemon. (v2 added the semaphore and message-queue operations,
- * which widened struct cng_breq; v3 added the hello, and widened the hash.) */
+ * which widened struct cng_breq; v3 added the hello, and widened the hash; v4
+ * the netlink sockets, and a descriptor riding with a request.) */
 struct broker_ns {
     struct cng_sockaddr_un addr;
     unsigned alen;
@@ -103,13 +105,13 @@ static void broker_ns(struct broker_ns *ns, const char *rootfs, u64 sess) {
     size_t n;
     if (sess) {
         n = cng_snprintf(a->path + 1, sizeof a->path - 1,
-                         "cng-ipc.v3.%u.s%016llx", (unsigned)sys_getuid(),
+                         "cng-ipc.v4.%u.s%016llx", (unsigned)sys_getuid(),
                          (unsigned long long)sess);
         cng_snprintf(ns->key, sizeof ns->key, "%016llx",
                      (unsigned long long)sess);
     } else {
         n = cng_snprintf(a->path + 1, sizeof a->path - 1,
-                         "cng-ipc.v3.%u.%016llx", (unsigned)sys_getuid(),
+                         "cng-ipc.v4.%u.%016llx", (unsigned)sys_getuid(),
                          (unsigned long long)cng_broker_key_hash(rootfs));
         cng_strlcpy(ns->key, rootfs, sizeof ns->key);
     }
@@ -906,11 +908,30 @@ static int tab_memfd(void **tab_out) {
 
 /* Serve one connected client: dispatch the request and reply. Returns 1 when the
  * connection has been parked in a waiter slot (a blocking semop/msgsnd/msgrcv),
- * in which case the caller must not close it. */
-static int ipc_serve(int cfd, const struct cng_breq *q, void **tab) {
+ * in which case the caller must not close it. `infd` is a descriptor that came
+ * with the request, or -1: only a netlink registration has a use for one, and
+ * every other request has it closed here. */
+static int ipc_serve(int cfd, const struct cng_breq *q, void **tab, int infd) {
     struct cng_bresp r;
     memset(&r, 0, sizeof r);
     int outfd = -1;
+    if (q->op == CNG_REQ_NLSOCK) {
+        /* The port id is the registering process's pid, as the kernel tells
+         * it (q->pid is the SO_PEERCRED answer by now): the guest side reports
+         * the same from its getpid() in getsockname. */
+        r.ret = infd < 0 ? -EBADF
+                         : (s32)cng_nl_serve_register(infd, (unsigned)q->pid,
+                                                      q->arg);
+        cng_broker_send(cfd, &r, sizeof r, -1);
+        return 0;
+    }
+    if (infd >= 0)
+        sys_close(infd);
+    if (q->op == CNG_REQ_NLSYNC) {
+        r.ret = (s32)cng_nl_serve_sync((unsigned)q->id, &r);
+        cng_broker_send(cfd, &r, sizeof r, -1);
+        return 0;
+    }
     if (q->op == CNG_REQ_TAB) {
         outfd = tab_memfd(tab);
         r.ret = outfd < 0 ? -ENOSYS : 0;
@@ -942,22 +963,28 @@ static int ipc_serve(int cfd, const struct cng_breq *q, void **tab) {
     return 0;
 }
 
-/* How many fds the poll array holds: the listener plus one per parked waiter. */
-#define BROKER_POLL_MAX (1 + CNG_IPC_WAITER_MAX)
+/* How many fds the poll array holds: the listener, one per parked waiter, and
+ * the daemon's end of every emulated netlink socket. */
+#define BROKER_POLL_IPC (1 + CNG_IPC_WAITER_MAX)
+#define BROKER_POLL_MAX (BROKER_POLL_IPC + CNG_NL_SOCK_MAX)
 
 #define BROKER_GRACE_MS 10000 /* linger this long past the last user's exit */
 #define BROKER_TICK_MS  1000  /* reclaim cadence while waiters or undo exist */
 
 /* Daemon main loop; never returns. Owns the rendezvous socket, the table memfd
- * (once asked for), every segment backing and all semaphore / message-queue
- * state, and exits once nothing — a live guest, segment, set, queue, undo row or
- * parked waiter — has anchored the namespace for the grace window.
+ * (once asked for), every segment backing, all semaphore / message-queue state
+ * and its end of every emulated netlink socket, and exits once nothing — a live
+ * guest, segment, set, queue, undo row, parked waiter or netlink socket — has
+ * anchored the namespace for the grace window.
  *
- * The loop watches the listener and every parked waiter's connection at once,
- * which is what lets a blocking semop sleep without wedging the daemon for
- * everyone else. A timed wait's deadline bounds the poll directly, so it expires
- * on time rather than at tick granularity; the tick is only for the /proc reads
- * that notice a dead waiter or apply a dead process's SEM_UNDO. */
+ * The loop watches the listener, every parked waiter's connection and every
+ * netlink end at once, which is what lets a blocking semop sleep without
+ * wedging the daemon for everyone else, and what answers a netlink request
+ * written with a plain write(2) — no call of the guest's that the monitor sees
+ * follows it before the read that waits for the reply. A timed wait's deadline
+ * bounds the poll directly, so it expires on time rather than at tick
+ * granularity; the tick is only for the /proc reads that notice a dead waiter
+ * or apply a dead process's SEM_UNDO. */
 static _Noreturn void broker_main(const struct broker_ns *ns) {
     long ls = CNG_SYS(__NR_socket, CNG_AF_UNIX,
                       CNG_SOCK_STREAM | CNG_SOCK_CLOEXEC, 0, 0, 0, 0);
@@ -993,7 +1020,8 @@ static _Noreturn void broker_main(const struct broker_ns *ns) {
         s64 next = last_active + BROKER_GRACE_MS - now; /* the idle-exit check */
         if (cng_ipc_pending() && next > BROKER_TICK_MS)
             next = BROKER_TICK_MS;
-        int nfds = cng_ipc_poll_add(pf, 1, BROKER_POLL_MAX, now, &next);
+        int nlfrom = cng_ipc_poll_add(pf, 1, BROKER_POLL_IPC, now, &next);
+        int nfds = cng_nl_poll_add(pf, nlfrom, BROKER_POLL_MAX);
         if (next < 0)
             next = 0;
         struct cng_timespec to = {next / 1000, (next % 1000) * 1000000};
@@ -1007,7 +1035,9 @@ static _Noreturn void broker_main(const struct broker_ns *ns) {
         if (r > 0) {
             last_active = now;
             /* Parked connections first: cancels, deaths, protocol garbage. */
-            cng_ipc_poll_ready(pf, 1, nfds);
+            cng_ipc_poll_ready(pf, 1, nlfrom);
+            /* Requests on the netlink ends, and the ends whose guests left. */
+            cng_nl_poll_ready(pf, nlfrom, nfds);
             if (pf[0].revents & CNG_POLLIN) {
                 long c = CNG_SYS(__NR_accept4, ls, 0, 0, CNG_SOCK_CLOEXEC, 0, 0);
                 int cpid = c >= 0 ? peer_pid((int)c) : -1;
@@ -1020,10 +1050,13 @@ static _Noreturn void broker_main(const struct broker_ns *ns) {
                     CNG_SYS(__NR_setsockopt, c, CNG_SOL_SOCKET, CNG_SO_RCVTIMEO,
                             &tv, sizeof tv, 0);
                     struct cng_breq q;
-                    int parked = 0;
-                    /* Ours by uid; now ours by namespace, or not answered. */
+                    int parked = 0, infd = -1;
+                    /* Ours by uid; now ours by namespace, or not answered. A
+                     * descriptor that came with the request is ipc_serve's to
+                     * keep or close (cng_broker_recv closes one that came
+                     * with less than a whole request). */
                     if (broker_hello_check((int)c, ns) == 0 &&
-                        cng_broker_recv((int)c, &q, sizeof q, 0) == 0) {
+                        cng_broker_recv((int)c, &q, sizeof q, &infd) == 0) {
                         /* The kernel's answer replaces the client's claim. Every
                          * legitimate client stamps exactly this (cng_broker_open
                          * calls getpid), and it is the field the registries key
@@ -1033,7 +1066,7 @@ static _Noreturn void broker_main(const struct broker_ns *ns) {
                          * could name another and detach its segments, inherit
                          * its undo, or have its own rows reclaimed under it. */
                         q.pid = (s32)cpid;
-                        parked = ipc_serve((int)c, &q, &tab);
+                        parked = ipc_serve((int)c, &q, &tab, infd);
                     }
                     if (!parked)
                         sys_close((int)c);
@@ -1051,7 +1084,7 @@ static _Noreturn void broker_main(const struct broker_ns *ns) {
             shm_reclaim_all();
             cng_ipc_reclaim();
             if (!(tab && cng_procreg_table_live(tab)) && !shm_any_live() &&
-                !cng_ipc_any_live()) {
+                !cng_ipc_any_live() && !cng_nl_any_live()) {
                 /* Those two scans read /proc once per tracked attacher, waiter
                  * and undo row, and the teardown below closes and unlinks a
                  * file per segment. A client that connected across any of it
@@ -1081,6 +1114,7 @@ static _Noreturn void broker_main(const struct broker_ns *ns) {
     }
     shm_free_all();
     cng_ipc_free_all();
+    cng_nl_free_all();
     sys_exit_group(0);
 }
 
@@ -1259,6 +1293,11 @@ int cng_broker_open(struct cng_breq *q) {
 }
 
 int cng_broker_rpc(struct cng_breq *q, struct cng_bresp *r, int *fd_out) {
+    return cng_broker_rpc_fd(q, -1, r, fd_out);
+}
+
+int cng_broker_rpc_fd(struct cng_breq *q, int fd_in, struct cng_bresp *r,
+                      int *fd_out) {
     /* Twice, because a successful connect is not proof of a daemon that will
      * answer. The listener stays bound while the daemon decides to leave, so a
      * connect landing in that window is queued on the backlog and succeeds, the
@@ -1272,12 +1311,14 @@ int cng_broker_rpc(struct cng_breq *q, struct cng_bresp *r, int *fd_out) {
      * same thing seen from the other end: a request the daemon never received
      * whole is a request cng_broker_recv refuses to serve. One retry is enough
      * because the daemon now closes its listener before tearing anything down,
-     * so the connect that follows is refused and spawns a fresh one. */
+     * so the connect that follows is refused and spawns a fresh one. A
+     * descriptor riding with the request goes again with the retry: whatever
+     * copy the departed daemon took was gone with it. */
     for (int attempt = 0; attempt < 2; attempt++) {
         int s = cng_broker_open(q);
         if (s < 0)
             return -1;
-        int rc = cng_broker_send(s, q, sizeof *q, -1) == 0
+        int rc = cng_broker_send(s, q, sizeof *q, fd_in) == 0
                      ? cng_broker_recv(s, r, sizeof *r, fd_out)
                      : CNG_BROKER_GONE;
         sys_close(s); /* transient: keep no persistent broker fd */
