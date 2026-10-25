@@ -4403,7 +4403,7 @@ vfork/`posix_spawn` child-stack handling.
     with EPERM (measured: 5.15, Android 15), and qemu-user refuses
     `PR_SET_MM` outright. There procfs reads the ranges itself
     (`put_live`): its own through the copy-in pair, another process's with
-    `process_vm_readv`, under `get_mm_cmdline`'s rules (5.2+). The argv
+    `process_vm_readv`, under `get_mm_cmdline`'s rules (5.3+). The argv
     range is served as it stands, embedded NULs and all. If its last byte
     is no longer a NUL, the title ran on into the environment, and the
     file is the string at `arg_start` up to its NUL: one page at most,
@@ -4432,7 +4432,9 @@ vfork/`posix_spawn` child-stack handling.
     without `CNG_MM_MAP_DENY`. On the cross host a child's legs are not
     asserted. The kernel reference agrees on the Termux device (Android
     15, where chroot-ng reads memory) and on the VM (where the kernel's
-    record moves).
+    record moves). A kernel before 4.18 leaves out the NUL that ends an
+    overflowing title (Android 8's 3.18, measured). Its overflow line is
+    skipped as no reference, and the rest is still compared.
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 

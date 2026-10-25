@@ -1491,7 +1491,7 @@ static int live_span(int fd, int pid, unsigned long from, unsigned long to,
     return 0;
 }
 
-/* /proc/<pid>/cmdline as get_mm_cmdline() (fs/proc/base.c, 5.2+) makes it. The
+/* /proc/<pid>/cmdline as get_mm_cmdline() (fs/proc/base.c, 5.3+) makes it. The
  * argv range as it stands, embedded NULs and all: a title written over
  * argv[0] and padded with zeros, which is how libuv and nginx do it, reads back
  * as the title and then the zeros. Unless the range's last byte is no longer a

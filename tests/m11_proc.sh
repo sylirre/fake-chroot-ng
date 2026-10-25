@@ -447,9 +447,20 @@ overflow environ: ok"
         case "$pt_got" in
         "mm_map: yes"*) pt_record=kernel ;;
         esac
+        # A kernel before 4.18 ended a title run into the environment at its
+        # NUL and left the NUL out (Android 8's 3.18, measured): no reference
+        # for that leg, which the emulation answers as the 6.1 it advertises.
+        # The rest is still the kernel's to judge.
+        pt_kwant=$pt_legs
+        if printf '%s\n' "$pt_got" |
+            grep -q '^overflow: FAIL got [0-9]* \[\([^]]*\)\] want [0-9]* \[\1|\]$'; then
+            skip "the kernel's cmdline of an overflowing title: the host kernel predates its NUL (4.18), so it is no reference"
+            pt_kwant=$(printf '%s\n' "$pt_legs" | grep -v '^overflow: ')
+            pt_got=$(printf '%s\n' "$pt_got" | grep -v '^overflow: ')
+        fi
         pt_check "the kernel's own cmdline and environ follow the rules the guest checks" \
             "record: kernel
-$pt_legs" "$(printf '%s\n' "$pt_got" | pt_cut)"
+$pt_kwant" "$(printf '%s\n' "$pt_got" | pt_cut)"
     fi
     # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
     pt_got=$(run_t 60 -R $GUEST_BINDS "$PT_ROOT" /proctitle 2>/dev/null)

@@ -97,8 +97,9 @@ expected failure:
   predates what some references are compared for — `execveat` (3.19), the
   `NoNewPrivs` status line (4.10), `PTRACE_O_SUSPEND_SECCOMP` (4.3, which the
   emulation then refuses as that kernel does), the `NLM_F_CAPPED` flag on a
-  netlink ACK (4.12), a recvmsg name of length 0 and an iovec count past
-  `UIO_MAXIOV` read as newer kernels read them — and those comparisons
+  netlink ACK (4.12), the NUL ending a title run past argv in
+  `/proc/<pid>/cmdline` (4.18), a recvmsg name of length 0 and an iovec count
+  past `UIO_MAXIOV` read as newer kernels read them — and those comparisons
   skip, the emulation answering as the 6.1 it advertises.
   SELinux refuses `accept` on a netlink socket before the family answers it.
   Termux ships `<sys/sem.h>` in a package of its own
