@@ -4186,6 +4186,28 @@ vfork/`posix_spawn` child-stack handling.
   memfd Android refuses (M92), hands it `/dev/shm` files. proot fails the same
   way. `MOZ_SHM_NO_SEALS=1` in the guest's environment is the workaround.
 
+- [x] **M96 — the ACK a netlink get asked for never came**
+  The kernel answers a non-dump get with the object — or the error refusing it
+  — and then, when the request carried NLM_F_ACK and was not refused, with an
+  ACK of its own (`netlink_ack`, error 0): an NLMSG_ERROR flagged NLM_F_CAPPED
+  echoing the request's header, its own datagram. A dump is never acked,
+  whatever it asked. The emulation sent the object alone: a relayed get read
+  one datagram off the relay socket and closed it with the kernel's ACK still
+  queued, and a synthesized one (the link Android refuses) never built any. A
+  client that waits for the ACK — libnl's `nl_wait_for_ack` — waited for good.
+  Found reading the relay while moving it into the daemon (M95); the mtu
+  crate sets NLM_F_ACK but stops at the object.
+  - The relay reads the ACK too when the request asked and the answer was not
+    an error, and synthesizes one if the host goes quiet; a synthesized answer
+    is followed by one built the kernel's way (`put_ack`).
+  - Left as it was: a request the emulation does not model (RTM_NEWADDR, …) is
+    still acked whether or not it asked, and a non-dump RTM_GETROUTE with no
+    relay still gets that ACK alone, the oracle's answers both.
+  - Test: `tests/guests/nlack.c` — getlink and getroute with and without
+    NLM_F_ACK, and a dump asking for one, every message counted; in m16
+    relayed and with CNG_NETLINK_DENY_GETLINK (synthesized), against the
+    kernel where rtnetlink works. The previous build: `acks=0` on both gets.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

@@ -89,6 +89,8 @@ int cng_nl_deny_audit = 0;
 #define NLMSG_DONE_    3
 #define NLM_F_REQUEST_ 1
 #define NLM_F_MULTI_   2
+#define NLM_F_ACK_     4
+#define NLM_F_CAPPED_  0x100 /* an ACK carrying the request's header alone */
 #define NLM_F_DUMP_    0x300
 #define MSG_PEEK_      2
 #define MSG_TRUNC_     0x20
@@ -595,6 +597,33 @@ static long put_error(unsigned char *buf, long off, long max, unsigned seq,
     return off + need;
 }
 
+/* Append the ACK the kernel sends after a request that asked for one and was
+ * not refused (netlink_ack with an error of 0): an NLMSG_ERROR of error 0,
+ * flagged NLM_F_CAPPED, carrying the request's own header as it was sent — and
+ * nothing of its payload, which only an error report echoes. */
+static long put_ack(unsigned char *buf, long off, long max, unsigned seq,
+                    unsigned pid, const unsigned char *req) {
+    long need = 16 + 4 + 16;
+    if (off + need > max)
+        return off;
+    struct nlmsghdr_ *h = (struct nlmsghdr_ *)(buf + off);
+    h->len = (unsigned)need;
+    h->type = NLMSG_ERROR_;
+    h->flags = NLM_F_CAPPED_;
+    h->seq = seq;
+    h->pid = pid;
+    *(int *)(buf + off + 16) = 0;
+    memcpy(buf + off + 20, req, 16);
+    return off + need;
+}
+
+/* Is the first message of a buffer of `len` an NLMSG_ERROR — a refusal, where
+ * it answers a get? */
+static int is_error(const unsigned char *buf, long len) {
+    return len >= (long)sizeof(struct nlmsghdr_) &&
+           ((const struct nlmsghdr_ *)buf)->type == NLMSG_ERROR_;
+}
+
 /* Enumerate interface indices from our own RTM_GETADDR dump on a throwaway
  * unbound socket — the one enumeration Android's policy leaves open, and the
  * same one Bionic's getifaddrs falls back to when RTM_GETLINK is refused. So
@@ -883,12 +912,19 @@ static void push_msgs(struct nl_peer *p, const unsigned char *b, long len) {
     }
 }
 
-/* Relay the host kernel's answer into the pair, datagram for datagram. A dump
- * runs until its NLMSG_DONE; a single get expects exactly one reply. If the
- * host goes quiet (SO_RCVTIMEO) the guest still gets a terminator — a dump
- * that simply stops mid-stream would hang every netlink client ever written. */
-static void pump(struct nl_peer *p, int hostfd, unsigned seq, int is_dump,
-                 unsigned char *scratch) {
+/* Relay the host kernel's answer to `req` into the pair, datagram for
+ * datagram. A dump runs until its NLMSG_DONE, and is never acked, whatever it
+ * asked. A single get is answered by one message — the object, or the error
+ * that refuses it — and then, when the request asked for one (NLM_F_ACK) and
+ * was not refused, by the kernel's ACK, a datagram of its own. That ACK used to
+ * be left unread on the relay socket and closed with it, so a client waiting
+ * for it (libnl's nl_wait_for_ack) waited for good. If the host goes quiet
+ * (SO_RCVTIMEO) the guest still gets a terminator — a dump that simply stops
+ * mid-stream would hang every netlink client ever written. */
+static void pump(struct nl_peer *p, int hostfd, const unsigned char *req,
+                 int is_dump, unsigned char *scratch) {
+    const struct nlmsghdr_ *rh = (const struct nlmsghdr_ *)req;
+    unsigned seq = rh->seq;
     int done = 0;
     for (int rounds = 0; !done && rounds < 256; rounds++) {
         long r = CNG_SYS(__NR_recvfrom, hostfd, (long)scratch, NL_REPLY_MAX,
@@ -897,8 +933,18 @@ static void pump(struct nl_peer *p, int hostfd, unsigned seq, int is_dump,
             break;
         done = fix_pid(scratch, r, p->port);
         push(p, scratch, r);
-        if (!is_dump)
+        if (!is_dump) {
+            if ((rh->flags & NLM_F_ACK_) && !is_error(scratch, r)) {
+                long a = CNG_SYS(__NR_recvfrom, hostfd, (long)scratch,
+                                 NL_REPLY_MAX, 0, 0, 0);
+                if (a > 0)
+                    fix_pid(scratch, a, p->port);
+                else
+                    a = put_ack(scratch, 0, NL_REPLY_MAX, seq, p->port, req);
+                push(p, scratch, a);
+            }
             return;
+        }
     }
     if (!done) {
         long n = is_dump
@@ -934,7 +980,7 @@ static void process_request(struct nl_peer *p, const unsigned char *req,
                      : relay_request(hostfd, req, rl, is_dump);
         if (sr >= 0) {
             p->relayed++;
-            pump(p, hostfd, seq, is_dump, scratch);
+            pump(p, hostfd, req, is_dump, scratch);
             relay_close(hostfd, &rid);
             return;
         }
@@ -954,6 +1000,11 @@ static void process_request(struct nl_peer *p, const unsigned char *req,
         /* RTM_GETROUTE with no relay: an empty dump, as the oracle serves. */
         if (is_dump)
             off += put_done(scratch + off, seq, pid);
+        /* A get answered rather than refused (ENODEV) is acked after its
+         * reply when it asked, as the kernel acks it. */
+        if (off > 0 && !is_dump && (rh->flags & NLM_F_ACK_) &&
+            !is_error(scratch, off))
+            off = put_ack(scratch, off, NL_REPLY_MAX, seq, pid, req);
         if (off > 0) {
             p->synthesized++;
             push_msgs(p, scratch, off);

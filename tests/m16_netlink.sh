@@ -569,6 +569,34 @@ sendmmsg: sent=1 route=24 oif=1'
         skip "requests-by-write leg: could not build tests/guests/nlrw.c"
     fi
 
+    # --- 10. the ACK a get asks for ---------------------------------------
+    # A non-dump get with NLM_F_ACK is answered by the object and then by an
+    # ACK — error 0, NLM_F_CAPPED, the request's header echoed — and a dump by
+    # NLMSG_DONE alone, whatever it asked. The emulation sent the object
+    # alone: a relayed get left the kernel's ACK on the relay socket it then
+    # closed, and a synthesized one never had any, so a client waiting for the
+    # ACK (libnl's nl_wait_for_ack) waited for good. Both paths: relayed, and
+    # with the link refused as Android refuses it (synthesized).
+    nlack_want='getlink ack: objects=1 errors=0 acks=1 dones=0 more=0 ack=0 flags=0x100 len=36 echo=18/32/0x5/1
+getlink: objects=1 errors=0 acks=0 dones=0 more=0
+getroute ack: objects=1 errors=0 acks=1 dones=0 more=0 ack=0 flags=0x100 len=36 echo=26/36/0x5/3
+getroute: objects=1 errors=0 acks=0 dones=0 more=0
+dump ack: objects>0=1 errors=0 acks=0 dones=1 more=0'
+    if guest_cc "$M16D/nlack" tests/guests/nlack.c; then
+        cp "$M16D/nlack" "$R/bin/nlack"
+        st=$(CNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nlack 2>/dev/null)
+        check "m16 a get that asks for an ACK gets one after its answer, a dump none" \
+            "$nlack_want" "$st"
+        st=$(CNG_NETLINK_DENY_GETLINK=1 m16run -R "$R" /bin/nlack 2>/dev/null)
+        check "m16 ...and so does a synthesized one" "$nlack_want" "$st"
+        if [ "$m16_raw" = 1 ]; then
+            kst=$(emu_t 60 "$M16D/nlack" 2>/dev/null)
+            check "m16 ...and the kernel here answers the same" "$nlack_want" "$kst"
+        fi
+    else
+        skip "ACK leg: could not build tests/guests/nlack.c"
+    fi
+
     # The interface-query band is all cng_nl_ioctl answers for. Every other
     # request used to be taken for an ifreq as well wherever the dispatcher saw
     # it (all of them under -R, and every request at a patched site), so a NULL
