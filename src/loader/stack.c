@@ -1,7 +1,9 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
 /* Build the initial process stack the way the kernel would for execve:
- *   [argc][argv..][NULL][envp..][NULL][auxv pairs..][AT_NULL] + string data.
+ *   [argc][argv..][NULL][envp..][NULL][auxv pairs..][AT_NULL]
+ *   [AT_RANDOM bytes]["aarch64"][argv strings..][envp strings..][execfn][0]
+ * with the strings one contiguous ascending run, as fs/exec.c leaves them.
  * We synthesize the loader-controlled auxv entries (AT_PHDR/ENTRY/BASE/...) and
  * carry through the host's hardware/identity/vDSO entries so glibc/musl/Go all
  * see a faithful environment.
@@ -91,11 +93,12 @@ unsigned long cng_build_stack(int argc, char **argv, char **envp,
      * size (exec_arg_max), so exceeding it means a caller that did not — the
      * pushes below would run off the end of the mapping. Answering 0 lets the
      * caller report -E2BIG, which is what the kernel says to the same input. */
-    unsigned long strbytes = strlen(execfn_str) + 1 + sizeof "aarch64" + 16;
+    unsigned long areabytes = strlen(execfn_str) + 1;
     for (int i = 0; i < argc; i++)
-        strbytes += strlen(argv[i]) + 1;
+        areabytes += strlen(argv[i]) + 1;
     for (int i = 0; i < envc; i++)
-        strbytes += strlen(envp[i]) + 1;
+        areabytes += strlen(envp[i]) + 1;
+    unsigned long strbytes = 8 + areabytes + sizeof "aarch64" + 16;
     unsigned long need = 2 * ((unsigned long)argc + (unsigned long)envc) * 8 +
                          strbytes + (3 + 64 * 2) * 8 + 64 /* auxv + alignment */;
     if (need > GUEST_STACK_SIZE) {
@@ -103,24 +106,49 @@ unsigned long cng_build_stack(int argc, char **argv, char **envp,
         return 0;
     }
 
-    /* String pool grows down from the top of the stack region. */
-    unsigned long sp_str = top;
-#define PUSH_STR(s)                                                            \
+    /* The strings, in the order and the shape the kernel leaves them: one
+     * contiguous run, argv[0] lowest, every argv string followed by the next,
+     * the environment straight after the last of them, and the exec'd path
+     * last, under a zero word at the very top (fs/exec.c copies them down from
+     * there in reverse, which comes out ascending). Programs depend on that
+     * shape and not only on the pointers: setproctitle-style code reuses the
+     * argv strings as one buffer. postgres, nginx and perl's $0 check that the
+     * strings are adjacent and settle for less when they are not; libuv's
+     * uv_setup_args, which every node process runs, does not check, and takes
+     * argv[argc-1] + its length - argv[0] as the room it may overwrite. These
+     * used to be pushed down one at a time in argv order, which left argv
+     * descending — that sum came out negative as soon as a program had three
+     * arguments, and libuv's memset over the "remaining" title room ran off
+     * through the address space: `npm -v` was a SIGSEGV on its first
+     * process.title assignment.
+     *
+     * The lengths are the ones measured above: argv and envp are the caller's
+     * own copies (the emulated execve takes them before anything is mapped),
+     * so the second strlen reads the same bytes. */
+    unsigned long sp_str = top - 8 - areabytes;
+    unsigned long put = sp_str;
+#define PUT_STR(s)                                                             \
     ({                                                                         \
         const char *_s = (s);                                                  \
         size_t _n = strlen(_s) + 1;                                            \
-        sp_str -= _n;                                                          \
-        memcpy((void *)sp_str, _s, _n);                                        \
-        (unsigned long)sp_str;                                                 \
+        unsigned long _at = put;                                               \
+        memcpy((void *)_at, _s, _n);                                           \
+        put += _n;                                                             \
+        _at;                                                                   \
     })
 
     for (int i = 0; i < argc; i++)
-        argv_addr[i] = PUSH_STR(argv[i]);
+        argv_addr[i] = PUT_STR(argv[i]);
     for (int i = 0; i < envc; i++)
-        env_addr[i] = PUSH_STR(envp[i]);
+        env_addr[i] = PUT_STR(envp[i]);
+    unsigned long execfn_addr = PUT_STR(execfn_str);
+    *(unsigned long *)put = 0; /* fresh anonymous memory, but say it */
 
-    unsigned long execfn_addr = PUSH_STR(execfn_str);
-    unsigned long platform_addr = PUSH_STR("aarch64");
+    /* Below the run, as create_elf_tables puts them: the platform string, then
+     * the AT_RANDOM bytes, then the vectors. */
+    sp_str -= sizeof "aarch64";
+    memcpy((void *)sp_str, "aarch64", sizeof "aarch64");
+    unsigned long platform_addr = sp_str;
 
     /* AT_RANDOM: 16 bytes, 16-aligned. glibc and musl take the stack canary and
      * pointer guard from here, and a real execve re-randomizes it per exec —

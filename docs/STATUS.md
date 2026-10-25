@@ -4326,6 +4326,42 @@ vfork/`posix_spawn` child-stack handling.
     tar 1.35 does the same on the VM (exit 0, `tar df` clean), where the
     previous build failed it with "Cannot mkdir: Permission denied".
 
+- [x] **M99 — the initial stack's strings, in the kernel's order**
+  `npm -v` was a SIGSEGV on the Termux device (node 24, Ubuntu 26.04
+  rootfs), while a bare `npm` printed its usage. The fault was a store to
+  the first page of the guest's `ld.so`, from inside the `memset` that
+  libuv's `uv_set_process_title` runs on npm's first `process.title`
+  assignment, with a length of -73.
+  - libuv's `uv_setup_args` treats the argv strings as one buffer it may
+    reuse for the title. It measures that room as `argv[argc-1] + its
+    length + 1 - argv[0]`, and doesn't check that the strings really are
+    adjacent. The kernel leaves them so: `fs/exec.c` copies the exec'd
+    path, then envp, then argv down from a zero word at the top of the
+    stack, so the result reads ascending: argv[0] lowest, then the rest of
+    argv, the environment, and AT_EXECFN last. `cng_build_stack` pushed
+    each string down in argv order instead, which left argv descending.
+    With two arguments the room came out exactly 0 (an empty title, no
+    harm), which is why plain `npm` worked. From three on it is negative:
+    `node npm-cli.js -v` measured -70 for a 3-byte title.
+  - The strings are now laid out in the kernel's shape: one contiguous
+    run of argv, envp and the exec'd path under a zero word at the top,
+    and below that, as `create_elf_tables` puts them, the platform string
+    and the AT_RANDOM bytes. Both stack builds get it, the first load and
+    every emulated `execve`. postgres, nginx and perl's `$0`, which check
+    that the strings are adjacent before reusing them, now get the room a
+    kernel gives them, where before they settled for argv[0] alone.
+  - Not this: `/proc/<pid>/cmdline` is the registry's copy from exec time,
+    so a title written over argv does not show there, as it would under
+    the kernel.
+  - Test: `tests/guests/argvlayout.c` checks every adjacency (each argv
+    string right after the one before it, envp right after argv, AT_EXECFN
+    right after envp, then a zero word) and libuv's arithmetic, then
+    re-execs itself with more arguments and a fresh environment. m3 runs it
+    under the host's own loader first (qemu-user, or the kernel), then
+    under `-R`, so the emulated `execve` is reached on every host. The
+    previous build failed both chroot-ng legs. On the device the fixed
+    binary runs `npm -v`, `npm help` and `npm config get prefix`.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

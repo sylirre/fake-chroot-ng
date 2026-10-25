@@ -41,6 +41,30 @@ if guest_cc_report "$GDIR/hello" tests/guests/hello.c; then
     check_contains "file-backed argv forwarded" "argv1=FB" "$out"
 fi
 
+# The initial stack's strings are one ascending run, argv then envp then the
+# AT_EXECFN path, the way the kernel leaves them: libuv sizes the room for a
+# process title from that shape, and the builder's old reversed argv made it
+# negative (`npm -v` died in the memset). The guest checks every adjacency
+# itself, then re-execs itself, so the stack an emulated execve builds is held
+# to the same shape — under -R, since the rewrite tier is what reaches the
+# guest's own execve on every host, qemu-user's inert filter included. The
+# guest is run without chroot-ng first, so its idea of the layout is the host
+# loader's.
+if guest_cc_report "$GDIR/argvlayout" tests/guests/argvlayout.c; then
+    al="$PWD/$GDIR/argvlayout"
+    if [ -n "$QEMU" ]; then out=$("$QEMU" "$al" a bb ccc 2>&1)
+    else out=$(kref "$al" a bb ccc 2>&1)
+    fi
+    check_contains "argv layout guest agrees with the host's own loader" \
+        "layout: ok argc=5 envc=2" "$out"
+    out=$(run -R / "$al" a bb ccc 2>&1); rc=$?
+    check "argv layout guest exit 0" 0 $rc
+    check_contains "initial stack: argv, envp and execfn strings ascending" \
+        "layout: ok argc=4" "$out"
+    check_contains "...and the same from an emulated execve" \
+        "layout: ok argc=5 envc=2" "$out"
+fi
+
 # Fixed-address non-PIE guest (ET_EXEC @ 0x400000, e.g. gcc's cc1). chroot-ng is
 # linked high (0x1000000000) precisely so MAP_FIXED-loading such a guest at
 # 0x400000 doesn't overwrite our own monitor; verify it loads and runs (both the
