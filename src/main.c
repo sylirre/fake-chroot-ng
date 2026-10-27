@@ -497,7 +497,8 @@ static void help(char **envp) {
                       "TIOCGWINSZ (a redirected run). Clamped to 32..92; a "
                       "value that is not a positive number is ignored."},
         {"CNG_DEBUG", "When set to a non-empty, non-zero value, log verbose "
-                      "syscall-error diagnostics to stderr."},
+                      "syscall-error diagnostics to stderr, including each "
+                      "syscall the host refuses and chroot-ng emulates."},
         {"CNG_L2S_FORCE", "With -l: route every linkat through the emulation "
                       "without trying the real hardlink first. Test aid for "
                       "hosts whose filesystem allows link(2)."},

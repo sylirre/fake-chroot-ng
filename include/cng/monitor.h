@@ -283,7 +283,7 @@ extern void (*cng_g_fork_child_probe)(void);
  * since its clone, with the child already going (-t proctest). */
 extern void (*cng_g_fork_parent_probe)(long kid);
 
-/* One-shot-per-number diagnostic for a syscall we emulate away. */
+/* One-shot-per-number diagnostic for a syscall we emulate away (CNG_DEBUG). */
 void cng_note_blocked(int nr);
 
 /* Verbose diagnostic (set by CNG_DEBUG=1): log intercepted syscalls whose

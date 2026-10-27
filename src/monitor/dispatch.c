@@ -199,13 +199,20 @@ static long ro_refusal(const char *host, int atflags) {
 
 /* One-shot-per-number diagnostic that a syscall was emulated away (blocked by
  * Android's seccomp filter, or a credential change we can't perform). Shared
- * with the SIGSYS gate-net. Async-signal-safe. */
+ * with the SIGSYS gate-net. Async-signal-safe.
+ *
+ * CNG_DEBUG only: it is a note, not an error — the guest gets the emulated
+ * answer either way — and it goes to the guest's own stderr, which is the
+ * program's output as far as a pipe, a terminal or a package manager's log
+ * can tell. On Android, whose filter refuses numbers a libc reaches for
+ * routinely (openat2, the uid and gid setters, close_range on the older
+ * releases), an ordinary run printed one in the middle of its output. */
 void cng_note_blocked(int nr) {
     static unsigned char warned[600];
-    if (nr < 0 || nr >= (int)sizeof warned || warned[nr])
+    if (!cng_g_debug || nr < 0 || nr >= (int)sizeof warned || warned[nr])
         return;
     warned[nr] = 1;
-    cng_dprintf(2, "chroot-ng: syscall %d not permitted here -> emulated\n", nr);
+    cng_dprintf(2, "[cng] syscall %d not permitted here -> emulated\n", nr);
 }
 
 /* Re-issue the guest's (translated) syscall through the gate — but if Android's

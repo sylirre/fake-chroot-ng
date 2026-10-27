@@ -183,5 +183,21 @@ else
         done
         ;;
     esac
+    # A number the host refuses is emulated without a word on the guest's
+    # stderr, which is the program's output to whoever reads it: the one-shot
+    # "not permitted here" note is CNG_DEBUG's. It used to be printed on every
+    # run, into the middle of whatever the guest wrote, on Android.
+    if [ -n "$want" ]; then
+        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
+        err=$(CNG_OPENAT2_DENY=1 run -R $GUEST_BINDS "$O2D" /openat2 /d \
+            2>&1 >/dev/null)
+        check_absent "an emulated syscall is not announced on the guest's stderr" \
+            "not permitted here" "$err"
+        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
+        err=$(CNG_DEBUG=1 CNG_OPENAT2_DENY=1 run -R $GUEST_BINDS "$O2D" \
+            /openat2 /d 2>&1 >/dev/null)
+        check_contains "...and CNG_DEBUG=1 does announce it" \
+            "[cng] syscall 437 not permitted here -> emulated" "$err"
+    fi
 fi
 rm -rf "$O2D" "$O2N"
