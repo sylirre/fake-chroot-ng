@@ -13,12 +13,16 @@
  *
  * Why a daemon owns the segments at all: Android denies shmget/shmat/shmdt/
  * shmctl outright and has no ownerless tmpfs, so a segment must be an ordinary
- * mappable fd — an anonymous memfd, or a file in a writable dir where
- * memfd_create is unavailable. Somebody has to hold that fd for the lifetime of
- * the segment, and it cannot be a guest process: host fd == guest fd here, so a
- * held fd would be visible to (and closable by) the guest. The daemon holds it
+ * mappable fd — an ashmem region where /dev/ashmem opens, else an anonymous
+ * memfd, or a file in a writable dir where memfd_create is unavailable.
+ * Somebody has to hold that fd for the lifetime of the segment, and it cannot
+ * be a guest process: host fd == guest fd here, so a held fd would be visible
+ * to (and closable by) the guest. The daemon holds it
  * and hands out duplicates over SCM_RIGHTS; an attacher maps the fd it is given
- * and closes it, so a process holds a segment only as a mapping.
+ * and closes it, so a process holds a segment only as a mapping. A host process
+ * gets one the same way, through the libandroid-shmem protocol Termux's X
+ * servers speak: every shmid names a "/dev/shm/%08x" socket the daemon answers
+ * on (broker.c, the libandroid-shmem door).
  *
  * The rendezvous name scopes the namespace:
  *   --shared-proc  per rootfs+uid — every invocation over one rootfs meets at

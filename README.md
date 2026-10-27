@@ -162,18 +162,21 @@ alone; `CNG_NETLINK_DENY_AUDIT=1` forces the refusal for testing.
 **System V IPC** works too — shared memory, semaphores and message queues.
 Android denies the whole family outright, so chroot-ng serves it itself from a
 per-namespace broker daemon, with no host SysV IPC and no `/dev/shm` anywhere in
-the path. A shared-memory segment is an anonymous `memfd` (or a private file
-where `memfd_create` is unavailable) that the daemon owns and hands to attachers
-over `SCM_RIGHTS`; semaphore sets and message queues live entirely in the daemon,
-so a multi-operation `semop` is atomic and a guest that dies mid-call cannot
-corrupt anything. Blocking operations really block: a `semop`, `msgsnd` or
+the path. A shared-memory segment is an ashmem region where `/dev/ashmem` opens,
+else an anonymous `memfd` (or a private file where `memfd_create` is
+unavailable), that the daemon owns and hands to attachers over `SCM_RIGHTS`. Its
+ids are libandroid-shmem's, so a Termux X server (termux-x11, Xvfb, Xvnc) can
+attach what a guest's MIT-SHM client hands it: `mpv --vo=x11`, GTK and cairo
+get XShm instead of `BadAccess`. Semaphore sets and message queues live entirely
+in the daemon, so a multi-operation `semop` is atomic and a guest that dies
+mid-call cannot corrupt anything. Blocking operations really block: a `semop`, `msgsnd` or
 `msgrcv` that must sleep parks in the daemon and is answered when it can proceed,
 when its `semtimedop` deadline passes, when the object is removed (`EIDRM`), or
 when a signal the guest would take delivery of arrives (`EINTR`). `SEM_UNDO` is
 honored even for a `SIGKILL`ed process. Objects are shared by every process of one
 invocation and isolated between invocations, unless `--shared-proc` widens the
-namespace to the rootfs — and in no configuration do they reach the host's, where
-`ipcs` never sees them.
+namespace to the rootfs — and in no configuration do they reach the host
+kernel's, where `ipcs` never sees them.
 
 POSIX message queues (`mq_open` and friends) are the one IPC namespace with no
 emulation behind it: an mq name is not a filesystem path, so nothing can scope it

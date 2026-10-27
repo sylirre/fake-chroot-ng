@@ -103,6 +103,15 @@ struct cng_open_how {
 /* memfd_create flags */
 #define CNG_MFD_CLOEXEC 1
 
+/* Android's ashmem (/dev/ashmem), the backing a libandroid-shmem peer can size
+ * (broker.c). SET_NAME copies up to the whole ASHMEM_NAME_LEN buffer from the
+ * caller; SET_SIZE takes the size by value and must come before the first
+ * mmap. */
+#define CNG_ASHMEM_NAME_LEN 256
+#define CNG_ASHMEM_SET_NAME 0x41007701u /* _IOW(0x77, 1, char[256]) */
+#define CNG_ASHMEM_SET_SIZE 0x40087703u /* _IOW(0x77, 3, size_t) */
+#define CNG_ASHMEM_GET_SIZE 0x00007704u /* _IO(0x77, 4) */
+
 /* clock_gettime clocks. BOOTTIME counts suspend, which is what /proc/uptime
  * reports (CLOCK_MONOTONIC does not). */
 #define CNG_CLOCK_REALTIME  0

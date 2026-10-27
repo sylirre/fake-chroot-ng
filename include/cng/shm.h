@@ -11,6 +11,11 @@
  * each segment's backing fd, and shmat maps that fd MAP_SHARED into this
  * process, which is also the guest's address space.
  *
+ * The ids are libandroid-shmem's, so a Termux X server (termux-x11, Xvfb,
+ * Xvnc) can attach what a guest X client hands it in XShmAttach: the high half
+ * names the daemon's "/dev/shm/%08x" socket, which serves the backing to host
+ * processes of our uid.
+ *
  * Ported from arm64chroot's src/sys_ipc.c. The emulator there had to map into a
  * synthetic guest address space; here the mapping is an ordinary host mmap, so
  * the attach-address rules (SHM_RND/SHM_REMAP/an occupied range) are expressed

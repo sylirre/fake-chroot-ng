@@ -78,6 +78,14 @@ check_contains "execve detaches every attachment" \
     "shmtest execve detach-all -> OK" "$out"
 check_contains "bad ids, zero size and a stray address are refused" \
     "shmtest error cases -> OK" "$out"
+# Termux's X servers attach a guest client's segment through libandroid-shmem:
+# the id's high half names a socket of ours, which hands the backing over. Its
+# size probe is ashmem's ioctl, so on Termux the backing has to be ashmem.
+check_contains "a libandroid-shmem client attaches a guest segment" \
+    "shmtest a libandroid-shmem client attaches a guest segment shape=1 keys=1 shared=1 uncounted=1 removed=1 gone=1 unknown=1 -> OK" "$out"
+if [ "$CNG_TERMUX" = 1 ]; then m12_ashmem=1; else m12_ashmem=0; fi
+check_contains "segments are ashmem where /dev/ashmem opens ($m12_ashmem here)" \
+    "shmtest segment backing is ashmem where /dev/ashmem opens: ashmem=$m12_ashmem -> OK" "$out"
 
 # The file-backed tier: what the broker falls back to where memfd_create is
 # unavailable (pre-3.17 kernel, or a seccomp filter blocking it).
@@ -85,6 +93,10 @@ out=$(CNG_SHM_FORCE_FILE=1 run -t shmtest 2>&1); rc=$?
 check "shmtest over the file-backed backing tier" 0 "$rc"
 check_contains "file-backed segments still share across a fork" \
     "shmtest fork share=1 nattch-after-exit=1 -> OK" "$out"
+check_contains "file-backed segments still reach a libandroid-shmem client" \
+    "shmtest a libandroid-shmem client attaches a guest segment shape=1 keys=1 shared=1 uncounted=1 removed=1 gone=1 unknown=1 -> OK" "$out"
+check_contains "a forced file tier takes precedence over ashmem" \
+    "shmtest segment backing is ashmem where /dev/ashmem opens: ashmem=0 -> OK" "$out"
 # That file lands in /dev/shm or /tmp, where every user on the machine may
 # create names — and it used to be named after the shmid, so anyone could
 # predict it, leave a symlink on it and have O_TRUNC destroy what it pointed at,
@@ -180,6 +192,49 @@ posix: done"
         find "$M12T" | sed 's/^/    /' | head -5
     fi
     rm -rf "$M12T"
+fi
+
+# --- a Termux process attaches a guest's segment ----------------------------
+# Termux's X servers (termux-x11, Xvfb, Xvnc) carry libandroid-shmem, and an
+# XShmAttach makes them shmat the client's id through it: the id's high half
+# names the creator's "/dev/shm/%08x" socket, which hands the backing over. The
+# guest's ids used to be 1, 2, 3..., which libandroid-shmem takes for its own
+# and refuses, so every MIT-SHM client in the guest (mpv --vo=x11, GTK, cairo)
+# got BadAccess. The oracle is the consumer itself: a host program linked
+# against Termux's libandroid-shmem attaches what the guest made, reads it, and
+# writes back. Termux only, where that library is; -t shmtest speaks the
+# protocol itself everywhere else.
+if [ "$CNG_TERMUX" != 1 ]; then
+    skip "m12 libandroid-shmem attach: not a Termux host"
+elif ! guest_xlate_ready "libandroid-shmem attach"; then
+    :
+elif ! guest_cc_report "$SG/shm_ashv" tests/guests/shm_ashv.c; then
+    :
+elif ! guest_cc "$SG/ashv_attach" tests/guests/ashv_attach.c -landroid-shmem
+then
+    skip "m12 libandroid-shmem attach: it does not link here ($(head -1 "$GUEST_CC_LOG" 2>/dev/null))"
+else
+    AD=$SG/ashv
+    mkdir -p "$AD"
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
+    run_t 60 $GUEST_BINDS -R "$SG" /shm_ashv /ashv >"$AD/guest.out" 2>&1 &
+    AJ=$!
+    _n=0
+    until [ -s "$AD/id" ] || [ $_n -ge 300 ]; do
+        sleep 0.1
+        _n=$((_n + 1))
+    done
+    if [ -s "$AD/id" ]; then
+        ah_out=$(emu_t 30 "$SG/ashv_attach" "$(cat "$AD/id")" 2>&1)
+    else
+        ah_out="no id published"
+    fi
+    : >"$AD/done"
+    wait "$AJ"
+    check_contains "m12 a Termux process attaches a guest segment through libandroid-shmem" \
+        "host: saw=guest-wrote-this stat=0 size-ok=1" "$ah_out"
+    check_contains "m12 ...and the guest sees what it wrote back" \
+        "guest: id-positive=1 back=host-wrote-this" "$(cat "$AD/guest.out")"
 fi
 
 m12_kbase=

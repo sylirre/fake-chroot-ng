@@ -4441,6 +4441,49 @@ vfork/`posix_spawn` child-stack handling.
     overflowing title (Android 8's 3.18, measured). Its overflow line is
     skipped as no reference, and the rest is still compared.
 
+- [x] **M101 — a Termux X server attaches a guest's SysV segment**
+  `mpv --vo=x11` under termux-x11 got `BadAccess` for every `XShmAttach`
+  (request 82/1), then `BadShmSeg` for every `XShmPutImage`, and hung
+  waiting for completion events that never came. GTK and cairo hit the same
+  thing, since every MIT-SHM client does. Android has no SysV shm, so
+  Termux's X servers attach segments through libandroid-shmem: Xvfb and Xvnc
+  link it, termux-x11 embeds a copy (read from its `libXlorie.so`), and
+  proot's `--sysvipc` allocates through it, which is why the same rootfs
+  works under proot. libandroid-shmem's shmid is an address. Its high 16 bits
+  name the creator's abstract socket `"/dev/shm/%08x"`. An `shmat` of an id
+  the caller did not make connects there, sends the id, reads back the key,
+  receives the descriptor over `SCM_RIGHTS` and sizes it with
+  `ASHMEM_GET_SIZE`. The broker numbered segments 1, 2, 3..., and their high
+  half is 0, the socket id a process that made nothing takes for its own. So
+  the X server answered EINVAL without asking anyone.
+  - The broker speaks the protocol. The first segment a daemon creates binds
+    a socket id (1..0x7fff from its pid on, so every shmid stays positive),
+    and every id carries it over a 16-bit sequence. A host request there is
+    answered with the key and the backing. Only a peer of our uid is
+    answered, as on the rendezvous. The segment's mode is not checked: the X
+    server checks the client's credentials itself, and GTK's and cairo's
+    segments are 0600.
+  - Backing is ashmem wherever `/dev/ashmem` opens, since the size probe is
+    ashmem's ioctl, and memfd or the file tier elsewhere. Both tiers keep the
+    protocol, so it is covered off-device too.
+  - Not counted: a host attachment does not show in `nattch`. The protocol
+    has no detach to drop it again, and an attachment that is never dropped
+    would pin the segment for the namespace's lifetime. The host's own
+    descriptor keeps the memory alive past the guest's `IPC_RMID` and last
+    detach, as a kernel attachment would.
+  - Not this: export only, which is all `XShmAttach` needs. A guest `shmat`
+    of an id a Termux process made is still EINVAL, so an X server inside the
+    rootfs serving Termux-native clients gets no XShm. Keyed segments are not
+    shared with Termux's `$PREFIX/tmp/ashv_key_*` either. Ids now come round
+    after 65535 segments rather than 2^31.
+  - Test: `-t shmtest` group 11 is a libandroid-shmem client spelled out
+    (id shape, keys, stores in both directions, no `nattch`, a removed
+    segment served until its last detach, an unknown id unanswered) plus the
+    backing check, over both tiers. On Termux, m12 builds
+    `tests/guests/ashv_attach.c` against Termux's own libandroid-shmem and
+    runs it outside chroot-ng against `tests/guests/shm_ashv.c`. Verified on
+    the Pixel 5 with mpv under termux-x11.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

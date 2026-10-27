@@ -9796,6 +9796,51 @@ static long shm_call(long nr, long a0, long a1, long a2) {
     return cng_dispatch(nr, a0, a1, a2, 0, 0, 0, /*trapped=*/0);
 }
 
+/* A libandroid-shmem client's fetch of a segment it did not create, as
+ * termux-x11's embedded copy and Termux's own library both make it
+ * (ashv_read_remote_segment): connect to the "/dev/shm/%08x" the id's high half
+ * names, send the id, read the key, then receive the descriptor on a one-byte
+ * message of its own. Returns the descriptor, or -1 when nobody answered. */
+static int shmt_ashv_fetch(s32 shmid, s32 *key) {
+    struct cng_sockaddr_un a;
+    memset(&a, 0, sizeof a);
+    a.family = CNG_AF_UNIX;
+    size_t n = cng_snprintf(a.path + 1, sizeof a.path - 1, "/dev/shm/%08x",
+                            (unsigned)(shmid / 0x10000));
+    long s = CNG_SYS(__NR_socket, CNG_AF_UNIX,
+                     CNG_SOCK_STREAM | CNG_SOCK_CLOEXEC, 0, 0, 0, 0);
+    if (s < 0)
+        return -1;
+    struct cng_timeval tv = {5, 0};
+    CNG_SYS(__NR_setsockopt, s, CNG_SOL_SOCKET, CNG_SO_RCVTIMEO, &tv,
+            sizeof tv, 0);
+    int fd = -1;
+    char bang = 0;
+    if (CNG_SYS(__NR_connect, s, &a, sizeof a.family + 1 + n, 0, 0, 0) != 0 ||
+        cng_broker_write_full((int)s, &shmid, sizeof shmid) != 0 ||
+        cng_broker_read_full((int)s, key, sizeof *key) != 0 ||
+        cng_broker_recv((int)s, &bang, 1, &fd) != 0 || bang != '!') {
+        if (fd >= 0)
+            sys_close(fd);
+        fd = -1;
+    }
+    sys_close((int)s);
+    return fd;
+}
+
+/* The size the client learns: ashmem's ioctl, which is all libandroid-shmem
+ * asks, or fstat's for the memfd and file tiers. *ashmem says which answered. */
+static long shmt_backing_size(int fd, int *ashmem) {
+    long sz = sys_ioctl(fd, CNG_ASHMEM_GET_SIZE, 0);
+    *ashmem = sz > 0;
+    if (sz > 0)
+        return sz;
+    char st[144];
+    if (sys_fstat(fd, st) != 0)
+        return -1;
+    return *(long *)(st + 48); /* st_size */
+}
+
 static long shmt_stat(long id, struct cng_shmid64_ds *ds) {
     return shm_call(__NR_shmctl, id, CNG_IPC_STAT | 0x100 /*IPC_64*/,
                     (long)ds);
@@ -10259,6 +10304,105 @@ int cng_cmd_shmtest(int argc, char **argv, char **envp, unsigned long *auxv) {
                  shm_call(__NR_shmget, 0, 0, CNG_IPC_CREAT | 0600) == -EINVAL &&
                  shm_call(__NR_shmdt, 0, 0, 0) == -EINVAL;
         cng_dprintf(1, "shmtest error cases -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 11) a host process attaches a segment the way libandroid-shmem does.
+     *
+     *     Termux's X servers (termux-x11, Xvfb, Xvnc) carry libandroid-shmem,
+     *     whose shmat of an id it did not make takes the id's high half for
+     *     the creator's socket id and fetches the backing from there. Our ids
+     *     were 1, 2, 3..., whose high half is the one a process that made
+     *     nothing takes for its own, so it asked nobody and a guest's
+     *     XShmAttach was BadAccess. Here the client side, spelled out: the
+     *     id's shape (a socket id of ours, and still positive), the key and
+     *     the memory for a private and a keyed segment, stores crossing in
+     *     both directions, no nattch for the host (the protocol has no detach
+     *     to drop it again), a removed segment served while the guest still
+     *     holds it and not once it is gone, and an id of ours that names
+     *     nothing left unanswered. Over the memfd and file tiers the size is
+     *     fstat's; m12 runs the real library on Termux. */
+    {
+        s32 key0 = (s32)(0x52000000 + (self & 0xffffff));
+        long ida = shm_call(__NR_shmget, 0, SHMT_SZ, CNG_IPC_CREAT | 0600);
+        long idk = shm_call(__NR_shmget, key0, SHMT_SZ, CNG_IPC_CREAT | 0600);
+        long pa = ida > 0 ? shm_call(__NR_shmat, ida, 0, 0) : -EINVAL;
+        long sock = ida > 0 ? ida >> 16 : 0;
+        int shape = !cng_is_err(pa) && idk > 0 && sock >= 1 &&
+                    sock <= 0x7fff && idk >> 16 == sock;
+        if (!cng_is_err(pa))
+            cng_strlcpy((char *)pa, "guest-wrote-this", 32);
+
+        s32 key = -1, keyk = -1, junk;
+        int fd = shape ? shmt_ashv_fetch((s32)ida, &key) : -1;
+        int fdk = shape ? shmt_ashv_fetch((s32)idk, &keyk) : -1;
+        int keys = fd >= 0 && key == 0 && fdk >= 0 && keyk == key0;
+        if (fdk >= 0)
+            sys_close(fdk);
+
+        int ashmem = 0, shared = 0;
+        long sz = fd >= 0 ? shmt_backing_size(fd, &ashmem) : -1;
+        if (sz == (long)cng_page_up(SHMT_SZ)) {
+            void *m = sys_mmap(0, (unsigned long)sz,
+                               CNG_PROT_READ | CNG_PROT_WRITE, CNG_MAP_SHARED,
+                               fd, 0);
+            if (!cng_is_err((long)m)) {
+                shared = !strcmp((char *)m, "guest-wrote-this");
+                cng_strlcpy((char *)m, "host-wrote-this", 32);
+                shared = shared && !strcmp((char *)pa, "host-wrote-this");
+                sys_munmap(m, (unsigned long)sz);
+            }
+        }
+        if (fd >= 0)
+            sys_close(fd);
+
+        struct cng_shmid64_ds ds;
+        int uncounted = shape && shmt_stat(ida, &ds) == 0 && ds.shm_nattch == 1;
+
+        /* IPC_RMID with the guest still attached keeps it fetchable (an X
+         * client may remove before it attaches); the last detach ends it. */
+        int removed = 0, gone = 0;
+        if (shape && shm_call(__NR_shmctl, ida, CNG_IPC_RMID, 0) == 0) {
+            int f = shmt_ashv_fetch((s32)ida, &junk);
+            removed = f >= 0;
+            if (f >= 0)
+                sys_close(f);
+            shm_call(__NR_shmdt, pa, 0, 0);
+            f = shmt_ashv_fetch((s32)ida, &junk);
+            gone = f < 0;
+            if (f >= 0)
+                sys_close(f);
+        }
+        int f = shape ? shmt_ashv_fetch((s32)(sock << 16 | 0xffff), &junk) : 0;
+        int unknown = f < 0;
+        if (f >= 0)
+            sys_close(f);
+        if (idk > 0)
+            shm_call(__NR_shmctl, idk, CNG_IPC_RMID, 0);
+
+        int ok = shape && keys && shared && uncounted && removed && gone &&
+                 unknown;
+        cng_dprintf(1,
+                    "shmtest a libandroid-shmem client attaches a guest segment"
+                    " shape=%d keys=%d shared=%d uncounted=%d removed=%d"
+                    " gone=%d unknown=%d -> %s\n",
+                    shape, keys, shared, uncounted, removed, gone, unknown,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+
+        /* ...and the backing is ashmem exactly where the host can open it,
+         * since that ioctl is the size probe. The file tier, when forced,
+         * takes precedence. */
+        long probe = sys_openat(CNG_AT_FDCWD, "/dev/ashmem",
+                                CNG_O_RDWR | CNG_O_CLOEXEC, 0);
+        if (probe >= 0)
+            sys_close((int)probe);
+        int want = probe >= 0 && !cng_broker_env("CNG_SHM_FORCE_FILE");
+        ok = fd >= 0 && ashmem == want;
+        cng_dprintf(1,
+                    "shmtest segment backing is ashmem where /dev/ashmem opens:"
+                    " ashmem=%d -> %s\n",
+                    ashmem, ok ? "OK" : "FAIL");
         fails += !ok;
     }
 

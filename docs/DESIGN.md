@@ -210,11 +210,14 @@ rendezvous it serves the `--shared-proc` PID table (as a memfd) and the whole of
 **System V IPC**, which Android leaves us no choice but to emulate: every syscall
 in the family is denied, and there is no writable tmpfs for `/dev/shm`.
 
-Shared memory needs only an owner for the pages: each segment is an anonymous
-memfd the daemon holds and hands to attachers over `SCM_RIGHTS`, and `shmat` maps
-it `MAP_SHARED` — into our own address space, which is also the guest's — then
-closes the fd at once, so a process holds a segment only as a mapping
-(`src/monitor/shm.c`). Semaphore sets and message queues instead live *entirely*
+Shared memory needs only an owner for the pages: each segment is an ashmem
+region (where `/dev/ashmem` opens) or an anonymous memfd the daemon holds and
+hands to attachers over `SCM_RIGHTS`, and `shmat` maps it `MAP_SHARED` — into our
+own address space, which is also the guest's — then closes the fd at once, so a
+process holds a segment only as a mapping (`src/monitor/shm.c`). Host processes
+reach it too, through libandroid-shmem's protocol: a shmid's high half names a
+`"/dev/shm/%08x"` socket the daemon answers on, which is how a Termux X server
+attaches the segment a guest X client hands it in `XShmAttach`. Semaphore sets and message queues instead live *entirely*
 in the daemon (`src/monitor/ipcreg.c`), because they need an arbiter rather than
 a landlord: with every operation an RPC, all mutation is single-threaded, a
 multi-operation `semop` is atomic for free, and a guest that dies mid-call cannot
