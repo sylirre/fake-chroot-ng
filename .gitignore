@@ -9,3 +9,8 @@ tests/artifacts/
 
 # Rootfs images and their tarballs, provisioned by the test harness (tests/lib.sh).
 /tests/.cache/
+
+# Dev custom
+*.key
+TODO.txt
+TODO.md
