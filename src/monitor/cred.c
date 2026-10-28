@@ -120,6 +120,9 @@ void cng_cred_write_end(struct cng_cred_write *w, int commit) {
     if (commit) {
         __atomic_store_n(&cng_g_cred, w->dst, __ATOMIC_RELEASE);
         __atomic_fetch_add(&g_cred_seq, 1, __ATOMIC_RELEASE);
+        /* What a socket peer is told about us (procreg.h), published while
+         * the lock is still ours, so a later change cannot land first. */
+        cng_procreg_set_ids();
     }
     __atomic_store_n(&g_cred_owner, 0, __ATOMIC_RELEASE);
     CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, &w->mask, 0, 8, 0, 0);
@@ -450,18 +453,23 @@ static long do_capget(struct cap_header *hdr, struct cap_data *data) {
      * nothing was described as fully capable (measured: ESRCH, with a pid that
      * exists answered and a bad data pointer only then EFAULT). Our own
      * threads are told apart with tgkill(sig 0), which is ESRCH unless the tid
-     * is ours. Another guest process is described the way its status file is:
-     * as running under the configured identity, so fully capable when that is
-     * root (the registry carries no live credential set). Anything else —
-     * a host process, or a pid that is not there — is the kernel's to answer,
-     * and it answers from the guest's own pointers exactly as it would have. */
+     * is ours. Another guest process is fully capable when the ids it has
+     * published (procreg.h) are a fake root's, a thread by its group's; one
+     * whose ids are not there is taken to run under the configured identity,
+     * as its status file is. Anything else — a host process, or a pid that is
+     * not there — is the kernel's to answer, and it answers from the guest's
+     * own pointers exactly as it would have. */
     unsigned all;
     if (h.pid == 0 ||
         CNG_SYS(__NR_tgkill, sys_getpid(), h.pid, 0, 0, 0, 0) == 0)
         all = cng_fake_root() ? 0xffffffffu : 0u;
-    else if (cng_procreg_has_task(h.pid))
-        all = cng_g_fake_uid == 0 ? 0xffffffffu : 0u;
-    else
+    else if (cng_procreg_has_task(h.pid)) {
+        struct cng_procids p;
+        int tg = cng_procreg_has(h.pid) ? h.pid : cng_proc_tgid(h.pid);
+        unsigned eu = cng_procreg_ids(tg, &p) && p.fake ? p.euid
+                                                         : cng_g_fake_uid;
+        all = eu == 0 ? 0xffffffffu : 0u;
+    } else
         return reissue_cred(__NR_capget, (long)hdr, (long)data, 0, 0, 0, 0);
     struct cap_data blocks[2];
     for (int i = 0; i < n; i++) {

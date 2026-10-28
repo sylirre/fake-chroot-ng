@@ -3648,14 +3648,49 @@ static void scm_rights_close_one(int fd) {
  * not permitted", and XFCE's "Unable to contact settings server"). Going out,
  * the claim is judged here by the same rule against the fake set and, when it
  * holds, spelled in the host's own ids, which the kernel accepts; coming in,
- * the ids the kernel reports are remapped as SO_PEERCRED's are.
+ * the sender is named as SO_PEERCRED names a peer (peer_ids).
  *
- * What the host's ids cannot carry is which of the fake ids was claimed: a
- * receiver sees every claim the rule allowed as the identity the run was
- * started with — the answer SO_PEERCRED gives about a peer that has changed
- * its ids since. The pid is the kernel's to judge, a guest's pids being the
+ * What the host's ids cannot carry is which of the fake ids was claimed, so
+ * the sender records its claim beside the ids it publishes (procreg.h), and
+ * the receiver looks the sender up by the record's pid. That is a claim per
+ * process, not per message: a record that claimed nothing (SO_PASSCRED's own)
+ * from a process that claimed before reads as that claim, which matters only
+ * when the two differ, its real ids not being the ones it claimed. Records
+ * still queued when the sender claims again, or changes its ids, read as the
+ * newer state. The pid is the kernel's to judge, a guest's pids being the
  * host's: the CAP_SYS_ADMIN that would let a fake root name another process
  * is not one the host grants it. */
+
+/* The ids a socket peer goes by in the guest view, from what the kernel named
+ * it by: its pid, and the host ids it had. The kernel takes those out of the
+ * peer's struct cred, and under --fake-id every guest process has the host's
+ * ids there, so the peer's fake set is asked for instead, in the registry it
+ * publishes it into. That is its set now, not the one the kernel recorded at
+ * connect(), listen() or socketpair(): a peer that changed its ids since then
+ * is named by the new ones. SO_PEERCRED names the effective ids; a
+ * credentials record (`scm`) the claim the sender's last record made, else
+ * the real ids SO_PASSCRED attaches to a message that carried no record. Any
+ * other peer — a host process, one that is gone or whose pid was reused,
+ * another invocation's — is remapped as a file's owner is, to the identity the
+ * run was started with. `n` is how many bytes of the triple are there: an id
+ * the kernel's copy was cut inside is left as it was. */
+static void peer_ids(unsigned uc[3], unsigned long n, int scm) {
+    struct cng_procids p;
+    int have = n >= sizeof(unsigned) && cng_procreg_ids((int)uc[0], &p) &&
+               p.fake;
+    if (n >= 2 * sizeof(unsigned)) {
+        if (have && uc[1] == cng_g_host_uid)
+            uc[1] = !scm ? p.euid : p.claim ? p.claim_uid : p.ruid;
+        else
+            uc[1] = cng_remap_uid(uc[1]);
+    }
+    if (n >= 3 * sizeof(unsigned)) {
+        if (have && uc[2] == cng_g_host_gid)
+            uc[2] = !scm ? p.egid : p.claim ? p.claim_gid : p.rgid;
+        else
+            uc[2] = cng_remap_gid(uc[2]);
+    }
+}
 
 /* Each SOL_SOCKET SCM_CREDENTIALS record in a control buffer of ours, walked
  * as __scm_send walks one (and scm_rights_walk above): a record that is not
@@ -3703,6 +3738,7 @@ static void scm_creds_claim(unsigned uc[3], unsigned long n) {
     int priv = id.euid == 0; /* the full capability set (cred.c) */
     if ((priv || uc[1] == id.ruid || uc[1] == id.euid || uc[1] == id.suid) &&
         (priv || uc[2] == id.rgid || uc[2] == id.egid || uc[2] == id.sgid)) {
+        cng_procreg_claim(uc[1], uc[2]); /* for the receiver (peer_ids) */
         uc[1] = cng_g_host_uid;
         uc[2] = cng_g_host_gid;
     } else {
@@ -3712,13 +3748,11 @@ static void scm_creds_claim(unsigned uc[3], unsigned long n) {
 
 /* Coming in: the kernel names the sender by its real ids (its own claim made
  * good, or the ids SO_PASSCRED attaches to a message that carried none), and
- * the guest gets them remapped. An id the record was cut short inside is left
- * as the kernel cut it: the rest of it is not in the buffer to be judged. */
+ * the guest gets the ones the sender goes by. An id the record was cut short
+ * inside is left as the kernel cut it: the rest of it is not in the buffer to
+ * be judged. */
 static void scm_creds_seen(unsigned uc[3], unsigned long n) {
-    if (n >= 2 * sizeof(unsigned))
-        uc[1] = cng_remap_uid(uc[1]);
-    if (n >= 3 * sizeof(unsigned))
-        uc[2] = cng_remap_gid(uc[2]);
+    peer_ids(uc, n, 1);
 }
 
 /* Is this a sendmsg header whose control data has room for a credentials
@@ -5837,10 +5871,11 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
 
     /* getsockopt(SOL_SOCKET, SO_PEERCRED): the kernel reports the real invoking
      * uid/gid for the peer, but a guest daemon compares it against its own
-     * getuid(), which under --fake-id is the fake identity. Remap the pair
-     * through the same rule stat uses. The pid is deliberately left alone: guest
-     * pid == host pid here, so it is already correct. Trapped only under
-     * --fake-id.
+     * getuid(), which under --fake-id is the fake identity. The pair is the
+     * one the peer goes by (peer_ids): a session bus that `su - user` started
+     * must find its client to be that user, not the root the run began as.
+     * The pid is deliberately left alone: guest pid == host pid here, so it is
+     * already correct. Trapped only under --fake-id.
      *
      * The kernel fills a ucred of ours and the guest gets the remapped one in
      * one copy. It used to fill the guest's own buffer and be corrected there
@@ -5865,8 +5900,7 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
             return r;
         if (got < 0 || (unsigned)got > sizeof uc)
             got = sizeof uc; /* not a length the kernel reports; bounded anyway */
-        uc[1] = cng_remap_uid(uc[1]);
-        uc[2] = cng_remap_gid(uc[2]);
+        peer_ids(uc, (unsigned long)got, 0);
         if ((got && cng_user_copyout((void *)a3, uc, (unsigned long)got) < 0) ||
             cng_user_copyout((void *)a4, &got, sizeof got) < 0)
             return -EFAULT;

@@ -344,18 +344,27 @@ elif guest_cc_report "$SCD/scmcred" tests/guests/scmcred.c; then
     for tier in $tiers; do
         t=$tier; [ "$t" = none ] && t=
         scm_rows "fake root ($tier)" "$t" "-u 0:0" 0 0
-        # Root's CAP_SETUID and CAP_SETGID let any id be claimed; the host's
-        # ids cannot say which, so a receiver sees the run's identity.
+        # Root's CAP_SETUID and CAP_SETGID let any id be claimed. The host's
+        # ids cannot say which, so the sender records its claim where the
+        # receiver looks it up, and the receiver is told the claim, as the
+        # kernel tells it.
         check_contains "fake root ($tier): any uid may be claimed" \
-            "other-uid pid_ok=1 uid=0 gid=0 self=0:0" "$out"
+            "other-uid pid_ok=1 uid=1 gid=0 self=0:0" "$out"
         check_contains "fake root ($tier): ...and any gid" \
-            "other-gid pid_ok=1 uid=0 gid=0 self=0:0" "$out"
+            "other-gid pid_ok=1 uid=0 gid=1 self=0:0" "$out"
         check_contains "fake root ($tier): a dropped root may claim its saved ids" \
             "saved pid_ok=1 uid=0 gid=0 self=1234:1234" "$out"
         if [ "$(id -u)" != 0 ]; then
             check_contains "fake root ($tier): ...but not an id it never had" \
                 "dropped-other send=1" "$out"
         fi
+        # Dropping the saved ids as well drops the claim made under them, so
+        # SO_PASSCRED's record names the real ids it attaches, and an own
+        # claim names the new ones.
+        check_contains "fake root ($tier): a full drop's implicit record is its real ids" \
+            "dropped-implicit pid_ok=1 uid=1234 gid=1234 self=1234:1234" "$out"
+        check_contains "fake root ($tier): ...and its own claim the new ids" \
+            "dropped-own pid_ok=1 uid=1234 gid=1234 self=1234:1234" "$out"
         scm_rows "fake 1234 ($tier)" "$t" "-u 1234:1234" 1234 1234
         if [ "$(id -u)" != 0 ]; then
             check_contains "fake 1234 ($tier): an id not its own is refused" \
@@ -369,6 +378,45 @@ elif guest_cc_report "$SCD/scmcred" tests/guests/scmcred.c; then
     scm_rows "real ids" -R "" "$(id -u)" "$(id -g)"
 fi
 rm -rf "$SCD"
+
+# --- a socket peer that has changed its ids -----------------------------------
+# Under -u every guest process has the host's ids, which are what the kernel
+# names a peer by, so a peer was always the identity the run began as. After
+# `su - user`, the session bus dbus-launch started ran as the user and was told
+# each client was root: it closed every connection, and XFCE said "Unable to
+# contact settings server: The connection is closed". A process publishes its
+# fake ids now, and SO_PEERCRED and a received credentials record name a guest
+# peer by them. tests/guests/peerid.c: a server takes one identity and listens,
+# a client takes another and connects, and each says what it was told of the
+# other (the client by SO_PEERCRED, an own claim and SO_PASSCRED's record).
+PRD=$(mktemp -d)
+if ! guest_xlate_ready "socket peer id legs"; then
+    :
+elif guest_cc_report "$PRD/peerid" tests/guests/peerid.c; then
+    mkdir -p "$PRD/rootfs/bin" "$PRD/rootfs/tmp"
+    cp "$PRD/peerid" "$PRD/rootfs/bin/"
+    tiers=-R
+    [ "$CNG_SECCOMP_LIVE" = 1 ] && tiers="-R none"
+    for tier in $tiers; do
+        t=$tier; [ "$t" = none ] && t=
+        for pair in 1234:1234 0:1234 1234:0; do
+            _s=${pair%:*} _c=${pair#*:}
+            # shellcheck disable=SC2086  # $t and $GUEST_BINDS split on purpose
+            out=$(run_t 60 $t $GUEST_BINDS -u 0:0 "$PRD/rootfs" /bin/peerid \
+                "$_s" "$_c" 2>/dev/null)
+            _d="server $_s, client $_c ($tier)"
+            check_contains "$_d: the server is told the client's ids" \
+                "server peer pid_ok=1 uid=$_c gid=$_c self=$_s:$_s" "$out"
+            check_contains "$_d: ...the client the server's" \
+                "client peer pid_ok=1 uid=$_s gid=$_s self=$_c:$_c" "$out"
+            check_contains "$_d: ...a received claim names the client's" \
+                "claim pid_ok=1 uid=$_c gid=$_c" "$out"
+            check_contains "$_d: ...and so does SO_PASSCRED's own record" \
+                "implicit pid_ok=1 uid=$_c gid=$_c" "$out"
+        done
+    done
+fi
+rm -rf "$PRD"
 
 # A memfd reopened through its own /proc link. memfd_create only makes O_RDWR
 # files, and that open is the one way to a read-only description of one —

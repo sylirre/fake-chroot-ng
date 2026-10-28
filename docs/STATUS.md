@@ -4040,7 +4040,8 @@ vfork/`posix_spawn` child-stack handling.
     is bounced for this too under `-u`.
   - What cannot be done: the host's ids do not say which fake id a claim named,
     so a receiver sees the run's identity for every claim the rule allowed (as
-    `SO_PEERCRED` does). A fake root cannot name another pid, since the host
+    `SO_PEERCRED` does; superseded by M102, where the sender records its claim
+    in the registry). A fake root cannot name another pid, since the host
     grants it no CAP_SYS_ADMIN. Where chroot-ng itself runs as root, a refused
     claim is ESRCH instead of EPERM.
   - Test: m7, `tests/guests/scmcred.c`, on both tiers as fake root, as fake
@@ -4483,6 +4484,48 @@ vfork/`posix_spawn` child-stack handling.
     `tests/guests/ashv_attach.c` against Termux's own libandroid-shmem and
     runs it outside chroot-ng against `tests/guests/shm_ashv.c`. Verified on
     the Pixel 5 with mpv under termux-x11.
+
+- [x] **M102 — a socket peer was the run's identity whatever ids it had**
+  XFCE worked as the fake root of `chroot-ng -l -u ... /bin/su - sylirre` and
+  failed as the user: "Unable to contact settings server: The connection is
+  closed". `dbus-send` got no reply either. Under `-u` every guest process has
+  the host's ids, which are what the kernel names a peer by, and `SO_PEERCRED`
+  remapped them to the identity the run began as, root. The session bus
+  `dbus-launch` started ran as sylirre, was told each client was root, and
+  closed the connection: libdbus lets only its own uid in unless told
+  otherwise. A received `SCM_CREDENTIALS` record went the same way, which is
+  what GLib's `g_unix_connection_receive_credentials` reads.
+  - Each process publishes its fake ids in the guest registry (`struct
+    cng_procids`): its real and effective uid and gid, written at every
+    committed change of the set (under the writer's lock, so they land in
+    order), at publish, at fork (copied by the parent, then rewritten by the
+    child from the set it inherited). `SO_PEERCRED` names a guest peer by its
+    effective ids. Any other peer is remapped as before: a host process, one
+    whose pid was reused, another invocation without `--shared-proc`.
+  - A credentials record names the sender's ids by its last claim: an allowed
+    claim is recorded with the ids before it goes out in the host's. With no
+    claim, the record names the sender's real ids, which is what SO_PASSCRED
+    attaches. A change of ids drops the claim. This lifts M91's limitation: a
+    fake root's claim of uid 1 now reads as uid 1, as the kernel delivers it.
+  - `capget` of another guest takes its published effective uid too, rather
+    than the configured identity.
+  - Not exact: the ids are the peer's now, not those the kernel recorded at
+    `connect()`, `listen()` or `socketpair()`. The claim is the process's,
+    not the message's, so an implicit record after a claim reads as that
+    claim. Both differ only when the ids differ. `SO_PEERGROUPS` still
+    reports the host's groups, and another process's `/proc/<pid>/status`
+    still shows the startup identity.
+  - The broker namespace tag is now `cng-ipc.v5` and the registry file
+    `chroot-ng-procreg.v3`, since `struct proc_ent` changed (M100 had changed
+    it without a bump).
+  - Test: m7, `tests/guests/peerid.c`, on both tiers: a server and a client
+    take their ids (1234/1234, 0/1234, 1234/0) and each prints what
+    `SO_PEERCRED` and both kinds of record say of the other. The old build
+    reports 0 in each row where the peer is 1234. `tests/guests/scmcred.c`
+    adds a full drop (implicit record and own claim after it), and fake
+    root's claims of another uid or gid are now asserted as the kernel's.
+    On the Pixel 5, as sylirre, `xfconf-query` reaches xfconfd and `gdbus`
+    and `dbus-send` reach the session bus.
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 

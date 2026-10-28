@@ -5,7 +5,8 @@
  * --fake-id the claim is the fake ids — GLib sends getpid(), geteuid(),
  * getegid() before every D-Bus authentication — so the emulation judges it
  * against the fake set by the kernel's rule and spells it in the host's ids,
- * and remaps a received record as SO_PEERCRED's answer is remapped.
+ * and a received record names the sender as SO_PEERCRED names a peer: by
+ * the ids the sender publishes, and the claim it made under them.
  *
  * Every row sends one datagram over a socketpair whose receiving end has
  * SO_PASSCRED set, and prints what the send answered and, when it went out,
@@ -192,6 +193,16 @@ int main(void) {
         setresuid(1234, 1234, 0) == 0) {
         row("saved", me, 0, 0, cl);
         row("dropped-other", me, 5678, 1234, cl);
+        /* Giving the saved ids up as well: what SO_PASSCRED attaches is the
+         * real ids, not the saved ones claimed a moment ago, and an own claim
+         * is the new ids. */
+        if (setresuid(1234, 1234, 1234) == 0 &&
+            setresgid(1234, 1234, 1234) == 0) {
+            printf("dropped-implicit send=%d\n",
+                   send(sv[0], &b, 1, 0) == 1 ? 0 : errno);
+            recvone("dropped-implicit", 128);
+            row("dropped-own", me, 1234, 1234, cl);
+        }
     }
     return 0;
 }

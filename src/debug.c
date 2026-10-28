@@ -6560,7 +6560,7 @@ int cng_cmd_sharedtest(int argc, char **argv, char **envp, unsigned long *auxv) 
     /* A key nobody else can be using: the scratch directory mktemp made. */
     char path[CNG_PATH_MAX];
     size_t n = cng_snprintf(path, sizeof path,
-                            "%s/chroot-ng-procreg.v2.%u.%016llx", dir,
+                            "%s/chroot-ng-procreg.v3.%u.%016llx", dir,
                             (unsigned)sys_getuid(),
                             (unsigned long long)cng_broker_key_hash(scratch));
     if (n >= sizeof path) {
@@ -8368,6 +8368,72 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
                     "dead=%ld host=%ld neg=%ld none=%ld -> %s\n",
                     self_r, self_e, tid_r, tid_e, kid_r, kid_e, dead_r, host_r,
                     neg_r, none_r, ok ? "OK" : "FAIL");
+        fails += !ok;
+
+        /* 8d) What a guest publishes of its ids (procreg.h): a forked child
+         *     that drops them is read by them — its effective uid is what
+         *     capget judges another guest by now, so a dropped one has no
+         *     capabilities — a claim is recorded with them, and the next
+         *     change of the set drops the claim. The child goes through the
+         *     dispatcher's own fork-child step first, as a guest does. */
+        int up[2] = {-1, -1}, dn[2] = {-1, -1};
+        ok = CNG_SYS(__NR_pipe2, up, 0, 0, 0, 0, 0) == 0 &&
+             CNG_SYS(__NR_pipe2, dn, 0, 0, 0, 0, 0) == 0;
+        int forker = (int)sys_getpid();
+        kid = ok ? sys_fork() : -1;
+        if (kid == 0) {
+            cng_procreg_fork_child(forker);
+            struct cng_cred_write w;
+            struct cng_cred *c = cng_cred_write_begin(&w);
+            c->ruid = c->euid = c->suid = c->fsuid = 1234;
+            c->rgid = c->egid = c->sgid = c->fsgid = 1234;
+            cng_cred_write_end(&w, 1);
+            cng_procreg_claim(0, 1234);
+            char b = 'a';
+            sys_write(up[1], &b, 1);
+            sys_read(dn[0], &b, 1);
+            c = cng_cred_write_begin(&w);
+            c->suid = c->fsuid = 1234; /* a commit, whatever it changes */
+            cng_cred_write_end(&w, 1);
+            sys_write(up[1], &b, 1);
+            sys_read(dn[0], &b, 1);
+            sys_exit_group(0);
+        }
+        struct cng_procids d1, d2;
+        memset(&d1, 0, sizeof d1);
+        memset(&d2, 0, sizeof d2);
+        long cap_r = -1;
+        unsigned cap_e = ~0u;
+        int got1 = 0, got2 = 0;
+        if (kid > 0) {
+            cng_procreg_fork((int)kid);
+            char b;
+            if (sys_read(up[0], &b, 1) == 1) {
+                got1 = cng_procreg_ids((int)kid, &d1);
+                cap_e = dbg_capget((int)kid, &cap_r);
+            }
+            sys_write(dn[1], &b, 1);
+            if (sys_read(up[0], &b, 1) == 1)
+                got2 = cng_procreg_ids((int)kid, &d2);
+            sys_write(dn[1], &b, 1);
+            sys_wait4((int)kid, 0, 0, 0);
+        }
+        for (int i = 0; i < 2; i++) {
+            if (up[i] >= 0)
+                sys_close(up[i]);
+            if (dn[i] >= 0)
+                sys_close(dn[i]);
+        }
+        ok = got1 && d1.fake && d1.ruid == 1234 && d1.euid == 1234 &&
+             d1.rgid == 1234 && d1.egid == 1234 && d1.claim &&
+             d1.claim_uid == 0 && d1.claim_gid == 1234 && cap_r == 0 &&
+             cap_e == 0 && got2 && d2.euid == 1234 && !d2.claim;
+        cng_dprintf(1,
+                    "proctest ids by pid: dropped=%d fake=%u %u/%u:%u/%u "
+                    "claim=%u %u:%u capget=%ld/%x changed=%d claim=%u -> %s\n",
+                    got1, d1.fake, d1.ruid, d1.euid, d1.rgid, d1.egid, d1.claim,
+                    d1.claim_uid, d1.claim_gid, cap_r, cap_e, got2, d2.claim,
+                    ok ? "OK" : "FAIL");
         fails += !ok;
         cng_g_fake_id = 0;
         cng_cred_seed();

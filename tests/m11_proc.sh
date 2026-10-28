@@ -202,10 +202,17 @@ check_contains "status carries the live credential set, not the startup one" \
 # are the caller, any other pid is found — any thread, not only a leader — or
 # is ESRCH. The fake set used to be synthesized for every non-negative pid, so a
 # pid that named nothing was described as fully capable. Another guest process
-# is described as its status file describes it, under the configured identity;
-# a host process is whatever the kernel says of it.
+# is judged by the ids it publishes, a fake root's being the full set; a host
+# process is whatever the kernel says of it.
 check_contains "capget by pid: ourselves and a guest faked, the rest the kernel's" \
     "proctest capget by pid: self=0/ffffffff tid=0/ffffffff guest=0/ffffffff dead=-3 host=0 neg=-22 none=-3 -> OK" \
+    "$out"
+# What a guest publishes of its ids, which is what a socket peer is told of it
+# (SO_PEERCRED, SCM_CREDENTIALS): a forked child that drops them is read by
+# them, and has no capabilities to capget; its claim is recorded beside them,
+# and the next change of its set drops the claim.
+check_contains "a guest's published ids follow its drop, and capget with them" \
+    "proctest ids by pid: dropped=1 fake=1 1234/1234:1234/1234 claim=1 0:1234 capget=0/0 changed=1 claim=0 -> OK" \
     "$out"
 check_contains "--no-proc disables passthrough and synthesis" \
     "proctest no-proc -> OK" "$out"

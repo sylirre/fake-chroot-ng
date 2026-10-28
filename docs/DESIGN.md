@@ -343,7 +343,12 @@ disposition: the default action kills, SIG_IGN drops, a handler runs under its
 For a real container you want `-u`/`--fake-id` (fake user identity, default
 `0:0` root), which emulates the credential syscalls against a synthetic
 credential set instead of returning ENOSYS — mirroring proot's `-0`/`-i` and the
-way the reference emulator recommends `--fake-id` for apt/dpkg.
+way the reference emulator recommends `--fake-id` for apt/dpkg. Each process's
+set is its own, inherited across fork, and every guest process still has the
+host's ids in the kernel, which is what it tells a socket peer about. So a
+process also publishes its set in the guest-PID registry, and `SO_PEERCRED` and
+a received `SCM_CREDENTIALS` record name a guest peer by it. After `su - user`,
+a session bus is then told its clients are that user (M102).
 
 ### Guest ptrace
 
