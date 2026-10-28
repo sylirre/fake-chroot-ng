@@ -23,7 +23,11 @@ struct proc_ent {
     char cwd[CNG_PROCREG_PATH];     /* canonical guest cwd */
     struct cng_procargs args;       /* where cmd/env live in its memory */
     struct cng_procids ids;         /* who it is to a socket peer */
+    u32 ngroups;                    /* ...and its supplementary groups */
+    u32 groups[CNG_PROCREG_GROUPS];
 };
+_Static_assert(CNG_PROCREG_GROUPS == CNG_NGROUPS_MAX,
+               "the registry holds every group the fake set can");
 
 /* The claim array is kept apart from the payload, because it is what every
  * lookup walks. "Is this pid a guest?" is asked for each numeric name in a
@@ -407,7 +411,7 @@ static int open_shared_file(const char *key, unsigned long size) {
         return 0;
     char path[CNG_PATH_MAX + 64];
     size_t n = cng_snprintf(path, sizeof path,
-                            "%s/chroot-ng-procreg.v3.%u.%016llx", dir,
+                            "%s/chroot-ng-procreg.v4.%u.%016llx", dir,
                             (unsigned)sys_getuid(),
                             (unsigned long long)cng_broker_key_hash(key));
     if (n >= sizeof path)
@@ -576,16 +580,26 @@ static u32 join_vec(char *dst, u32 cap, char **vec) {
     return n;
 }
 
-/* Our ids as the live fake set has them, with no claim made under them. */
-static void ids_live(struct cng_procids *p) {
+/* Our ids as the live fake set has them, with no claim made under them, and
+ * with them, when `groups` is not NULL, its groups: their count is returned. */
+static u32 ids_live(struct cng_procids *p, u32 *groups) {
     struct cng_cred_ids id;
-    cng_cred_ids(&id);
+    int n = 0;
+    if (groups)
+        n = cng_cred_groups(groups, &id);
+    else
+        cng_cred_ids(&id);
     memset(p, 0, sizeof *p);
     p->fake = cng_g_fake_id ? 1 : 0;
     p->ruid = id.ruid;
     p->euid = id.euid;
+    p->suid = id.suid;
+    p->fsuid = id.fsuid;
     p->rgid = id.rgid;
     p->egid = id.egid;
+    p->sgid = id.sgid;
+    p->fsgid = id.fsgid;
+    return (u32)n;
 }
 
 static u16 copy_path(char *dst, u32 cap, const char *s) {
@@ -604,8 +618,6 @@ void cng_procreg_publish(char **argv, char **envp, const void *auxv,
     /* Sampled before the write window so the critical section is syscall-free
      * (a smaller kill-safe window, and nothing slow under the odd count). */
     u64 start = cng_proc_starttime((int)sys_getpid(), 0);
-    struct cng_procids ids;
-    ids_live(&ids);
     struct proc_ent *e = slot_for((int)sys_getpid());
     if (!e)
         return;
@@ -635,7 +647,9 @@ void cng_procreg_publish(char **argv, char **envp, const void *auxv,
         e->args = *args;
     else
         memset(&e->args, 0, sizeof e->args);
-    e->ids = ids;
+    /* The ids and groups go straight into the slot: the set is read without
+     * a syscall. */
+    e->ngroups = ids_live(&e->ids, e->groups);
     seq_release(e, s);
 }
 
@@ -689,6 +703,8 @@ static void fork_copy(int forker, int child) {
     /* So are its credentials. A claim is the sender's own. */
     e->ids = snap.ids;
     e->ids.claim = 0;
+    e->ngroups = snap.ngroups;
+    memcpy(e->groups, snap.groups, snap.ngroups * sizeof *e->groups);
     seq_release(e, s);
 }
 
@@ -755,9 +771,10 @@ static void fork_wait(int forker) {
 
 void cng_procreg_fork_child(int forker) {
     fork_wait(forker);
-    /* The copy names the ids the forker had when it made it, and they are
-     * the child's only if no other thread of the forker changed them after
-     * the clone: the child's are the set it inherited, which it has here. */
+    /* The copy names the ids and groups the forker had when it made it, and
+     * they are the child's only if no other thread of the forker changed them
+     * after the clone: the child's are the set it inherited, which it has
+     * here. */
     cng_procreg_set_ids();
 }
 
@@ -792,13 +809,12 @@ static struct proc_ent *own_write(u32 *s) {
 }
 
 void cng_procreg_set_ids(void) {
-    struct cng_procids ids;
-    ids_live(&ids);
     u32 s;
     struct proc_ent *e = own_write(&s);
     if (!e)
         return;
-    e->ids = ids;
+    /* Read into the slot under its lock, as publish() does: syscall-free. */
+    e->ngroups = ids_live(&e->ids, e->groups);
     seq_release(e, s);
 }
 
@@ -901,6 +917,11 @@ int cng_procreg_get(int pid, struct cng_procsnap *out) {
         memcpy(out->cwd, e->cwd, wl);
         out->args = e->args;
         out->ids = e->ids;
+        u32 ng = e->ngroups;
+        if (ng > CNG_PROCREG_GROUPS)
+            ng = CNG_PROCREG_GROUPS;
+        memcpy(out->groups, e->groups, ng * sizeof *out->groups);
+        out->ngroups = ng;
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
         if (__atomic_load_n(&e->seq, __ATOMIC_RELAXED) != s1)
             continue; /* torn read: retry */
@@ -943,6 +964,11 @@ int cng_procreg_args(int pid, struct cng_procargs *out) {
 }
 
 int cng_procreg_ids(int pid, struct cng_procids *out) {
+    return cng_procreg_cred(pid, out, 0, 0);
+}
+
+int cng_procreg_cred(int pid, struct cng_procids *out, u32 *groups,
+                     u32 *ngroups) {
     int self = pid == (int)sys_getpid();
     int slot = slot_of(pid);
     if (slot >= 0) {
@@ -956,6 +982,13 @@ int cng_procreg_ids(int pid, struct cng_procids *out) {
                 break; /* slot recycled under us */
             u64 start = e->start;
             *out = e->ids;
+            if (groups) {
+                u32 ng = e->ngroups;
+                if (ng > CNG_PROCREG_GROUPS)
+                    ng = CNG_PROCREG_GROUPS;
+                memcpy(groups, e->groups, ng * sizeof *groups);
+                *ngroups = ng;
+            }
             __atomic_thread_fence(__ATOMIC_ACQUIRE);
             if (__atomic_load_n(&e->seq, __ATOMIC_RELAXED) != s1)
                 continue; /* torn read: retry */
@@ -967,6 +1000,9 @@ int cng_procreg_ids(int pid, struct cng_procids *out) {
     }
     if (!self)
         return 0;
-    ids_live(out); /* no registry, or no entry of ours in it */
+    /* No registry, or no entry of ours in it. */
+    u32 ng = ids_live(out, groups);
+    if (groups)
+        *ngroups = ng;
     return 1;
 }

@@ -9,10 +9,15 @@
  * connection is closed").
  *
  * Usage: peerid SID CID. A server process takes SID as its every id and
- * listens; a client process takes CID and connects. The server prints the
- * client as SO_PEERCRED names it and as two credentials records do, one the
- * client claims its own effective ids in and one SO_PASSCRED attaches by
- * itself; the client prints the server as SO_PEERCRED names it.
+ * SID+1, SID+2 as its groups, and listens; a client process takes CID the
+ * same way and connects. The server prints the client as SO_PEERCRED names it
+ * and as two credentials records do, one the client claims its own effective
+ * ids in and one SO_PASSCRED attaches by itself; the client prints the server
+ * as SO_PEERCRED names it. Each prints the other's groups as SO_PEERGROUPS
+ * names them, its ids and groups as its status file and its thread's have
+ * them, and the owner of its /proc directory, which is how `ps` names a
+ * process's user (a stat by name, by descriptor, relative to /proc, and
+ * statx).
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -20,14 +25,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#ifndef SO_PEERGROUPS
+#define SO_PEERGROUPS 59
+#endif
+
 static void become(const char *who, unsigned id) {
-    if (setgroups(0, NULL) || setresgid(id, id, id) || setresuid(id, id, id)) {
+    gid_t g[2] = {id + 1, id + 2};
+    if (setgroups(2, g) || setresgid(id, id, id) || setresuid(id, id, id)) {
         printf("%s become %u errno=%d\n", who, id, errno);
         exit(1);
     }
@@ -42,6 +54,92 @@ static void peer(const char *who, int fd, pid_t want) {
     }
     printf("%s peer pid_ok=%d uid=%u gid=%u self=%u:%u\n", who, uc.pid == want,
            uc.uid, uc.gid, (unsigned)geteuid(), (unsigned)getegid());
+}
+
+/* The Uid:, Gid: and Groups: lines of the status file at `path`. */
+static void status(const char *who, const char *tag, const char *path) {
+    char buf[4096];
+    int f = open(path, O_RDONLY);
+    ssize_t n = f < 0 ? -1 : read(f, buf, sizeof buf - 1);
+    if (f >= 0)
+        close(f);
+    if (n <= 0) {
+        printf("%s %s errno=%d\n", who, tag, errno);
+        return;
+    }
+    buf[n] = 0;
+    printf("%s %s", who, tag);
+    static const char *const keys[] = {"Uid:", "Gid:", "Groups:"};
+    for (int k = 0; k < 3; k++) {
+        char *p = strstr(buf, keys[k]);
+        printf(" %s", keys[k]);
+        if (!p)
+            continue;
+        p += strlen(keys[k]);
+        int first = 1;
+        for (;;) {
+            while (*p == ' ' || *p == '\t')
+                p++;
+            if (*p < '0' || *p > '9')
+                break;
+            printf("%s%lu", first ? "" : ",", strtoul(p, &p, 10));
+            first = 0;
+        }
+    }
+    printf("\n");
+}
+
+/* The rest of what is said of the peer `pid` at the other end of `fd`: its
+ * status file, the one of its (only) thread too, which `ps -L` reads. */
+static void ident(const char *who, int fd, pid_t pid) {
+    gid_t g[16];
+    socklen_t l = sizeof g;
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERGROUPS, g, &l) != 0) {
+        printf("%s groups errno=%d\n", who, errno);
+    } else {
+        printf("%s groups=", who);
+        for (unsigned i = 0; i < l / sizeof *g; i++)
+            printf("%s%u", i ? "," : "", (unsigned)g[i]);
+        printf("\n");
+        l = sizeof *g; /* room for one: ERANGE, and the length they need */
+        errno = 0;
+        int r = getsockopt(fd, SOL_SOCKET, SO_PEERGROUPS, g, &l);
+        printf("%s groups-short r=%d errno=%d len=%u\n", who, r, errno,
+               (unsigned)l);
+    }
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/status", (int)pid);
+    status(who, "status", path);
+    snprintf(path, sizeof path, "/proc/%d/task/%d/status", (int)pid, (int)pid);
+    status(who, "task-status", path);
+    struct stat sb, fb, ab;
+    snprintf(path, sizeof path, "/proc/%d", (int)pid);
+    int dirok = stat(path, &sb) == 0;
+    int d = open(path, O_RDONLY | O_DIRECTORY);
+    int fdok = d >= 0 && fstat(d, &fb) == 0;
+    if (d >= 0)
+        close(d);
+    int pr = open("/proc", O_RDONLY | O_DIRECTORY);
+    snprintf(path, sizeof path, "%d/task", (int)pid);
+    int atok = pr >= 0 && fstatat(pr, path, &ab, 0) == 0;
+    if (pr >= 0)
+        close(pr);
+    if (!dirok || !fdok || !atok)
+        printf("%s procdir errno=%d (%d%d%d)\n", who, errno, dirok, fdok, atok);
+    else
+        printf("%s procdir %u:%u fd=%u:%u task=%u:%u\n", who,
+               (unsigned)sb.st_uid, (unsigned)sb.st_gid, (unsigned)fb.st_uid,
+               (unsigned)fb.st_gid, (unsigned)ab.st_uid, (unsigned)ab.st_gid);
+    unsigned char sx[256]; /* struct statx: stx_uid at 20, stx_gid at 24 */
+    snprintf(path, sizeof path, "/proc/%d", (int)pid);
+    if (syscall(SYS_statx, AT_FDCWD, path, 0, 0x18 /* UID|GID */, sx) != 0) {
+        printf("%s procdir-statx errno=%d\n", who, errno);
+        return;
+    }
+    unsigned xu, xg;
+    memcpy(&xu, sx + 20, 4);
+    memcpy(&xg, sx + 24, 4);
+    printf("%s procdir-statx %u:%u\n", who, xu, xg);
 }
 
 /* One byte, and the credentials record that came with it. */
@@ -102,6 +200,11 @@ int main(int argc, char **argv) {
             return 1;
         }
         peer("client", s, srv);
+        ident("client", s, srv);
+        struct stat me;
+        if (stat("/proc/self", &me) == 0)
+            printf("client self %u:%u\n", (unsigned)me.st_uid,
+                   (unsigned)me.st_gid);
         /* What GLib sends before it authenticates: the caller's own pid and
          * effective ids. */
         char b = 'c';
@@ -151,6 +254,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         peer("server", c, cli);
+        ident("server", c, cli);
         record("claim", c, cli);
         record("implicit", c, cli);
         unlink(a.sun_path);

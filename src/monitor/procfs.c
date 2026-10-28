@@ -561,53 +561,60 @@ static void put_stat(int fd) {
  * the Uid: line, which otherwise carries our real host uid). Returns 0, or -1 if
  * the host file cannot be read (caller falls back to passthrough).
  *
- * `self` picks where that identity comes from. For this process it is the live
- * set in cng_g_cred — the one every credential syscall reads and writes, and the
- * one getresuid/getresgid/getgroups answer from. Remapping the host's numbers
- * instead described the identity the process STARTED with: a guest that dropped
- * privilege was still Uid: 0 here while `id` said otherwise, and its Groups:
- * line was the invoking user's supplementary groups, which getgroups() has never
- * reported (the synthetic set starts empty). One process cannot have two
- * answers; the kernel reads both out of the same struct cred.
+ * For this process that identity is the live set in cng_g_cred — the one every
+ * credential syscall reads and writes, and the one getresuid/getresgid/
+ * getgroups answer from. Remapping the host's numbers instead described the
+ * identity the process STARTED with: a guest that dropped privilege was still
+ * Uid: 0 here while `id` said otherwise, and its Groups: line was the invoking
+ * user's supplementary groups, which getgroups() has never reported (the
+ * synthetic set starts empty). One process cannot have two answers; the kernel
+ * reads both out of the same struct cred.
  *
- * Another guest process is a different matter: its set is its own copy, forked
- * for real and changed since, and nothing publishes it. There the host line
- * remapped is the closest thing available — that process's startup identity,
- * which is right until it changes its own credentials. */
-static int put_status(int fd, const char *host, int self) {
+ * Another guest process's set is its own copy, forked for real and changed
+ * since, and it publishes that copy (procreg.h), the ids and the groups as one
+ * read. A shell after `su - user` was listed as root, the identity the run
+ * began as, because the host's line was all there was to remap. Where nothing
+ * is published — the registry is unavailable or full, or the process is
+ * another invocation's — the host line remapped is still the closest thing:
+ * that process's startup identity. */
+static int put_status(int fd, const char *host, int pid) {
     long hf = open_host_ro(host);
     if (hf < 0)
         return -1;
+    struct cng_procids p;
+    u32 groups[CNG_PROCREG_GROUPS], ng = 0;
+    int known;
+    if (pid == (int)sys_getpid()) {
+        struct cng_cred_ids id;
+        ng = (u32)cng_cred_groups(groups, &id);
+        p.ruid = id.ruid, p.euid = id.euid, p.suid = id.suid;
+        p.fsuid = id.fsuid, p.rgid = id.rgid, p.egid = id.egid;
+        p.sgid = id.sgid, p.fsgid = id.fsgid;
+        known = 1;
+    } else {
+        known = cng_procreg_cred(pid, &p, groups, &ng) && p.fake;
+    }
     struct lrd r; /* 8.5 KiB — the dispatcher runs on its own 256 KiB stack */
     lrd_init(&r, (int)hf);
     const char *line;
     while ((line = lrd_next(&r)) != 0) {
         int is_uid = !strncmp(line, "Uid:", 4);
         if (is_uid || !strncmp(line, "Gid:", 4)) {
-            if (self) {
-                const struct cng_cred *c;
-                unsigned id[4];
-                do {
-                    unsigned s = cng_cred_read_begin(&c);
-                    id[0] = is_uid ? c->ruid : c->rgid;
-                    id[1] = is_uid ? c->euid : c->egid;
-                    id[2] = is_uid ? c->suid : c->sgid;
-                    id[3] = is_uid ? c->fsuid : c->fsgid;
-                    if (!cng_cred_read_retry(s))
-                        break;
-                } while (1);
-                cng_dprintf(fd, "%s\t%u\t%u\t%u\t%u\n", is_uid ? "Uid:" : "Gid:",
-                            id[0], id[1], id[2], id[3]);
+            if (known) {
+                cng_dprintf(fd, "%s\t%u\t%u\t%u\t%u\n",
+                            is_uid ? "Uid:" : "Gid:", is_uid ? p.ruid : p.rgid,
+                            is_uid ? p.euid : p.egid, is_uid ? p.suid : p.sgid,
+                            is_uid ? p.fsuid : p.fsgid);
                 continue;
             }
-            const char *p = line + 4;
+            const char *q = line + 4;
             unsigned id[4];
             int got = 0;
             while (got < 4) {
-                skip_ws(&p);
-                if (*p < '0' || *p > '9')
+                skip_ws(&q);
+                if (*q < '0' || *q > '9')
                     break;
-                id[got++] = (unsigned)parse_ul(&p);
+                id[got++] = (unsigned)parse_ul(&q);
             }
             if (got == 4) {
                 for (int i = 0; i < 4; i++)
@@ -624,29 +631,16 @@ static int put_status(int fd, const char *host, int self) {
              * used to print a leading space and no tab, so the line did not read
              * like the one every other status file has. Measured on the host. */
             cng_dprintf(fd, "Groups:\t");
-            if (self) {
-                /* The count and the list as one thing: a setgroups on another
-                 * thread publishes a whole new set, never edits this one. */
-                unsigned got[CNG_NGROUPS_MAX];
-                int n;
-                const struct cng_cred *c;
-                do {
-                    unsigned s = cng_cred_read_begin(&c);
-                    n = c->ngroups;
-                    for (int i = 0; i < n; i++)
-                        got[i] = c->groups[i];
-                    if (!cng_cred_read_retry(s))
-                        break;
-                } while (1);
-                for (int i = 0; i < n; i++)
-                    cng_dprintf(fd, "%u ", got[i]);
+            if (known) {
+                for (u32 i = 0; i < ng; i++)
+                    cng_dprintf(fd, "%u ", groups[i]);
             } else {
-                const char *p = line + 7;
+                const char *q = line + 7;
                 for (;;) {
-                    skip_ws(&p);
-                    if (*p < '0' || *p > '9')
+                    skip_ws(&q);
+                    if (*q < '0' || *q > '9')
                         break;
-                    cng_dprintf(fd, "%u ", cng_remap_gid((unsigned)parse_ul(&p)));
+                    cng_dprintf(fd, "%u ", cng_remap_gid((unsigned)parse_ul(&q)));
                 }
             }
             cng_dprintf(fd, "\n");
@@ -1325,6 +1319,18 @@ static int per_pid_kind(const char *leaf) {
     return 0;
 }
 
+/* "task/<tid>/status": a thread's status, whose ids are its process's (the
+ * fake set is process-wide). `ps -L` and `top -H` name a thread's user by it,
+ * the group leader's own task entry included. */
+static int task_status(const char *leaf) {
+    if (strncmp(leaf, "task/", 5) || leaf[5] < '1' || leaf[5] > '9')
+        return 0;
+    const char *q = leaf + 5;
+    while (*q >= '0' && *q <= '9')
+        q++;
+    return !strcmp(q, "/status");
+}
+
 /* The guest stack of the program running here, kept so our own cmdline/environ/
  * auxv can be answered from live state when the registry cannot answer (see
  * self_snapshot), and where on it the loader put the argv and environment
@@ -1589,6 +1595,8 @@ static int synth_kind(const char *canon, char *host, size_t hsz, int *pid,
     const char *leaf = pid_tail(canon, pid);
     if (leaf) {
         kind = per_pid_kind(leaf);
+        if (!kind && task_status(leaf) && strncmp(canon + 6, "thread-self/", 12))
+            kind = PF_STATUS;
         /* status only diverges under a fake identity; everything else about a
          * guest process's status is already true. */
         if (kind == PF_STATUS && !cng_g_fake_id)
@@ -1769,7 +1777,7 @@ int cng_procfs_open(const char *canon, long gflags, long *ret) {
         put_overflowid((int)fd);
         break;
     case PF_STATUS:
-        rc = put_status((int)fd, host, pid == (int)sys_getpid());
+        rc = put_status((int)fd, host, pid);
         break;
     case PF_MAPS:
         rc = put_maps((int)fd, host);
@@ -2015,6 +2023,127 @@ int cng_procfs_fix_fd_statx(int fd, unsigned flags, unsigned mask,
 int cng_procfs_fix_path_statx(long dirfd, const char *path, unsigned flags,
                               unsigned mask, void *statx) {
     return fix_statx(dirfd, path, -1, flags, mask, statx);
+}
+
+/* ---- the owner of a process's entries ------------------------------------ */
+
+/* task_dump_owner(): /proc/<pid> and everything under it belong to the
+ * process's effective uid and gid — root's, for the entries other than the
+ * world-readable directories, while the process is not dumpable. That is how
+ * `ps` names a process's user (procps and busybox stat /proc/<pid>; procps
+ * then reads the Uid: line of its status as well, put_status), and a guest's
+ * entries are the host's ids, which the remap every file gets made the
+ * identity the run began as: a shell after `su - user` was root's. So an
+ * entry the host gave the host's ids takes the ids its process publishes —
+ * ours from the live set — and one it gave anyone else is left as it was: a
+ * host process's, or one the kernel made root's because the process is not
+ * dumpable. Dumpability is the host's, which a change of fake ids does not
+ * touch: an entry of a process that set its ids and has not executed since is
+ * its new owner's here, where the kernel would give it to root. */
+
+/* The device of the procfs mount; settled once (the probe is idempotent). */
+static unsigned long proc_dev(int *ok) {
+    static unsigned long dev;
+    static int state; /* 0 not probed, 1 known, -1 unavailable */
+    int st = __atomic_load_n(&state, __ATOMIC_ACQUIRE);
+    if (!st) {
+        char sb[128]; /* struct stat */
+        st = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, "/proc", sb, 0, 0, 0) == 0
+                 ? 1
+                 : -1;
+        if (st > 0)
+            dev = *(unsigned long *)(sb + STAT_DEV_OFF);
+        __atomic_store_n(&state, st, __ATOMIC_RELEASE);
+    }
+    *ok = st > 0;
+    return dev;
+}
+
+/* The pid of the process directory the host name at (dirfd, path) is in — or
+ * of fd `dirfd`, `path` being empty — or 0 for any other name. A relative
+ * name is read off the link of the directory it is relative to, and a memfd
+ * of ours (a synthesized file) by the name it stands for. A ".." is not
+ * walked: such a name keeps the remap. */
+static int owner_pid(long dirfd, const char *path) {
+    char name[CNG_PATH_MAX];
+    const char *n = path;
+    if (!path || path[0] != '/') {
+        char link[40], tgt[CNG_PATH_MAX];
+        if (dirfd == CNG_AT_FDCWD && path && path[0])
+            cng_strlcpy(link, "/proc/self/cwd", sizeof link);
+        else
+            cng_snprintf(link, sizeof link, "/proc/self/fd/%d", (int)dirfd);
+        long k = sys_readlinkat(CNG_AT_FDCWD, link, tgt, sizeof tgt - 1);
+        if (k <= 0)
+            return 0;
+        tgt[k] = '\0';
+        if (!cng_procfs_link_name(tgt, name, sizeof name))
+            cng_strlcpy(name, tgt, sizeof name);
+        if (path && path[0]) {
+            size_t l = strlen(name);
+            if (l + 1 + strlen(path) >= sizeof name)
+                return 0;
+            name[l] = '/';
+            cng_strlcpy(name + l + 1, path, sizeof name - l - 1);
+        }
+        n = name;
+    }
+    if (strncmp(n, "/proc/", 6))
+        return 0;
+    for (const char *q = n + 1; *q; q++) /* n[0] is the leading '/' */
+        if (q[0] == '.' && q[1] == '.' && q[-1] == '/' && (q[2] == '/' || !q[2]))
+            return 0;
+    n += 6;
+    if ((!strncmp(n, "self", 4) && (n[4] == '/' || !n[4])) ||
+        (!strncmp(n, "thread-self", 11) && (n[11] == '/' || !n[11])))
+        return (int)sys_getpid();
+    long pid = 0;
+    for (; *n >= '0' && *n <= '9'; n++)
+        if ((pid = pid * 10 + (*n - '0')) > 0x7fffffff)
+            return 0;
+    return pid > 0 && (*n == '/' || !*n) ? (int)pid : 0;
+}
+
+static int fix_owner(long dirfd, const char *path, unsigned long dev,
+                     unsigned *uid, unsigned *gid) {
+    int ok;
+    unsigned long pdev = proc_dev(&ok);
+    if (!cng_g_fake_id || !ok || dev != pdev ||
+        (*uid != cng_g_host_uid && *gid != cng_g_host_gid))
+        return 0;
+    int pid = owner_pid(dirfd, path);
+    if (pid <= 0)
+        return 0;
+    /* A thread's own directory, /proc/<tid>, is its process's. */
+    int tg = cng_procreg_has(pid) ? pid : cng_proc_tgid(pid);
+    unsigned eu, eg;
+    if (tg == (int)sys_getpid()) {
+        struct cng_cred_ids id;
+        cng_cred_ids(&id);
+        eu = id.euid, eg = id.egid;
+    } else {
+        struct cng_procids p;
+        if (tg <= 0 || !cng_procreg_ids(tg, &p) || !p.fake)
+            return 0;
+        eu = p.euid, eg = p.egid;
+    }
+    if (*uid == cng_g_host_uid)
+        *uid = eu;
+    if (*gid == cng_g_host_gid)
+        *gid = eg;
+    return 1;
+}
+
+int cng_procfs_owner(long dirfd, const char *path, void *stat) {
+    char *st = (char *)stat;
+    return fix_owner(dirfd, path, *(unsigned long *)(st + STAT_DEV_OFF),
+                     (unsigned *)(st + 24), (unsigned *)(st + 28));
+}
+
+int cng_procfs_owner_statx(long dirfd, const char *path, void *statx) {
+    char *sx = (char *)statx;
+    return fix_owner(dirfd, path, statx_dev(sx), (unsigned *)(sx + 20),
+                     (unsigned *)(sx + 24));
 }
 
 /* ---- a stat the host refused --------------------------------------------- */

@@ -348,10 +348,12 @@ set is its own, inherited across fork, and every guest process still has the
 host's ids in the kernel, which is what it tells a socket peer about. So a
 process also publishes its set in the guest-PID registry, and `SO_PEERCRED` and
 a received `SCM_CREDENTIALS` record name a guest peer by it. After `su - user`,
-a session bus is then told its clients are that user (M102). Capabilities are
-all of them for a fake root and none otherwise, and a `capset` is judged
-against that set by the kernel's rules, so dropping them is allowed to anyone
-(M103).
+a session bus is then told its clients are that user (M102). The groups are
+published with the ids, and `SO_PEERGROUPS`, another process's status file and
+the owner of its `/proc/<pid>` (by which `ps` names its user) come from there
+too (M104). Capabilities are all of them for a fake root and none otherwise,
+and a `capset` is judged against that set by the kernel's rules, so dropping
+them is allowed to anyone (M103).
 
 ### Guest ptrace
 

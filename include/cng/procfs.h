@@ -116,6 +116,16 @@ int cng_procfs_fstatfs(int fd, void *buf);
 int cng_procfs_fix_path_statfs(long dirfd, const char *path, void *buf);
 int cng_procfs_link_name(const char *tgt, char *out, size_t sz);
 
+/* The owner of a process's /proc entries, under --fake-id. The kernel makes
+ * /proc/<pid> and what is under it the process's effective ids, which for a
+ * guest are the host's; for a stat the kernel has just filled for the name at
+ * (dirfd, path) — or for fd `dirfd` itself when `path` is empty — that landed
+ * on procfs inside a guest process's directory and was given the host's ids,
+ * those are replaced with the ids that process publishes (procreg.h), and 1 is
+ * returned. 0 leaves the buffer for the remap every other file gets. */
+int cng_procfs_owner(long dirfd, const char *path, void *stat);
+int cng_procfs_owner_statx(long dirfd, const char *path, void *statx);
+
 /* A stat the host refused. Android's SELinux policy denies an app the getattr
  * and the read access check of the global files it hides — /proc/version,
  * loadavg, uptime, stat — so `stat`, `test -r` and an fstat on an O_PATH fd of

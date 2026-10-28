@@ -4514,7 +4514,7 @@ vfork/`posix_spawn` child-stack handling.
     not the message's, so an implicit record after a claim reads as that
     claim. Both differ only when the ids differ. `SO_PEERGROUPS` still
     reports the host's groups, and another process's `/proc/<pid>/status`
-    still shows the startup identity.
+    still shows the startup identity (both lifted by M104).
   - The broker namespace tag is now `cng-ipc.v5` and the registry file
     `chroot-ng-procreg.v3`, since `struct proc_ent` changed (M100 had changed
     it without a bump).
@@ -4555,6 +4555,53 @@ vfork/`posix_spawn` child-stack handling.
     kernel's answer to real root and to root dropped to 1234 (arm64 VM, row
     for row). The old build refuses the empty set. On the Pixel 5, headless
     Chrome as sylirre prints the page it was given.
+
+- [x] **M104 — another process's groups and /proc owner were the run's**
+  After M102 a socket peer's ids were its own, but three accounts of another
+  process still came from the host. `SO_PEERGROUPS` returned the host's
+  groups whoever the peer was (on Android the app's 3003, 9997, 20337, ...).
+  Another guest's status file had the host's line remapped, the startup
+  identity, and the host's groups. And `/proc/<pid>` and everything under it
+  were owned by the identity the run began as, for every process, our own
+  included. `ps` names a process's user by that owner (procps reads the
+  status `Uid:` line as well), so after `su - sylirre` the shell and all it
+  started were root's in `ps` and `top`. `ps -L` and `top -H` read each
+  thread's `task/<tid>/status`, which went through untouched: the host's uid
+  and groups.
+  - The registry entry carries all eight ids and the supplementary groups
+    (up to `CNG_NGROUPS_MAX`), written in one window and read as one.
+  - `SO_PEERGROUPS`: a peer the kernel names by the host's ids gets a
+    guest's published groups, or, any other, those of the identity the run
+    began as, which are none (the fake set starts with none). A peer named by
+    other ids is the kernel's to describe, and so is every error before there
+    is a peer (`ENODATA`, or `ENOPROTOOPT` before 4.13). A buffer too short is
+    `ERANGE` with the length the list needs written back.
+  - Status: another guest's `Uid:`, `Gid:` and `Groups:` lines are the ones
+    it publishes, and `task/<tid>/status` is synthesized as well, with its
+    process's ids.
+  - stat, statx and fstat of a procfs name inside a guest's process
+    directory that the host gave the host's ids take that process's
+    published effective uid and gid (ours from the live set), as
+    `task_dump_owner` gives them. An entry the host gave anyone else stands:
+    a host process's, or one the kernel made root's because the process is
+    not dumpable.
+  - Not exact: dumpability is the host's, which a change of fake ids does
+    not touch, so an entry other than the process's world-readable
+    directories is its new owner's until the next exec, where the kernel
+    would make it root's. `/proc/<tid>` of a thread that is not a group
+    leader stays hidden, as before.
+  - The broker namespace tag is now `cng-ipc.v6` and the registry file
+    `chroot-ng-procreg.v4`, since `struct proc_ent` changed.
+  - Test: m7, `tests/guests/peerid.c` again: each side also prints the
+    other's groups by `SO_PEERGROUPS` (and its `ERANGE`), the `Uid:`, `Gid:`
+    and `Groups:` lines of its status and its thread's, and the owner of its
+    `/proc/<pid>` by stat, fstat, fstatat (`task`, relative to `/proc`) and
+    statx, and the client the owner of its `/proc/self`. Every row is what
+    the kernel answers real root the same program (arm64 VM). The old build
+    reports the host's group and 0:0 there. m11's `-t proctest` checks that
+    a dropped child is read by all eight ids and its groups. On the Pixel 5,
+    as sylirre, `ps`, `ps -L` and `top` name the user's processes and
+    threads sylirre's and `su` root's.
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 

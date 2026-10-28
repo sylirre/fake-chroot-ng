@@ -93,7 +93,7 @@ u64 cng_broker_hash(const void *p, unsigned long n) {
  * which widened struct cng_breq; v3 added the hello, and widened the hash; v4
  * the netlink sockets, and a descriptor riding with a request; v5 the ids a
  * process publishes, and the argv and environ ranges, which were added
- * without a bump.) */
+ * without a bump; v6 the rest of its ids, and its groups.) */
 struct broker_ns {
     struct cng_sockaddr_un addr;
     unsigned alen;
@@ -108,13 +108,13 @@ static void broker_ns(struct broker_ns *ns, const char *rootfs, u64 sess) {
     size_t n;
     if (sess) {
         n = cng_snprintf(a->path + 1, sizeof a->path - 1,
-                         "cng-ipc.v5.%u.s%016llx", (unsigned)sys_getuid(),
+                         "cng-ipc.v6.%u.s%016llx", (unsigned)sys_getuid(),
                          (unsigned long long)sess);
         cng_snprintf(ns->key, sizeof ns->key, "%016llx",
                      (unsigned long long)sess);
     } else {
         n = cng_snprintf(a->path + 1, sizeof a->path - 1,
-                         "cng-ipc.v5.%u.%016llx", (unsigned)sys_getuid(),
+                         "cng-ipc.v6.%u.%016llx", (unsigned)sys_getuid(),
                          (unsigned long long)cng_broker_key_hash(rootfs));
         cng_strlcpy(ns->key, rootfs, sizeof ns->key);
     }

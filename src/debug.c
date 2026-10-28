@@ -6560,7 +6560,7 @@ int cng_cmd_sharedtest(int argc, char **argv, char **envp, unsigned long *auxv) 
     /* A key nobody else can be using: the scratch directory mktemp made. */
     char path[CNG_PATH_MAX];
     size_t n = cng_snprintf(path, sizeof path,
-                            "%s/chroot-ng-procreg.v3.%u.%016llx", dir,
+                            "%s/chroot-ng-procreg.v4.%u.%016llx", dir,
                             (unsigned)sys_getuid(),
                             (unsigned long long)cng_broker_key_hash(scratch));
     if (n >= sizeof path) {
@@ -8371,11 +8371,12 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
         fails += !ok;
 
         /* 8d) What a guest publishes of its ids (procreg.h): a forked child
-         *     that drops them is read by them — its effective uid is what
-         *     capget judges another guest by now, so a dropped one has no
-         *     capabilities — a claim is recorded with them, and the next
-         *     change of the set drops the claim. The child goes through the
-         *     dispatcher's own fork-child step first, as a guest does. */
+         *     that drops them is read by them, all eight and its groups —
+         *     its effective uid is what capget judges another guest by now,
+         *     so a dropped one has no capabilities — a claim is recorded
+         *     with them, and the next change of the set drops the claim. The
+         *     child goes through the dispatcher's own fork-child step first,
+         *     as a guest does. */
         int up[2] = {-1, -1}, dn[2] = {-1, -1};
         ok = CNG_SYS(__NR_pipe2, up, 0, 0, 0, 0, 0) == 0 &&
              CNG_SYS(__NR_pipe2, dn, 0, 0, 0, 0, 0) == 0;
@@ -8385,8 +8386,12 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
             cng_procreg_fork_child(forker);
             struct cng_cred_write w;
             struct cng_cred *c = cng_cred_write_begin(&w);
-            c->ruid = c->euid = c->suid = c->fsuid = 1234;
-            c->rgid = c->egid = c->sgid = c->fsgid = 1234;
+            c->ruid = c->euid = 1234;
+            c->suid = 1235, c->fsuid = 1236;
+            c->rgid = c->egid = 1234;
+            c->sgid = 1237, c->fsgid = 1238;
+            c->groups[0] = 7, c->groups[1] = 8;
+            c->ngroups = 2;
             cng_cred_write_end(&w, 1);
             cng_procreg_claim(0, 1234);
             char b = 'a';
@@ -8402,6 +8407,7 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
         struct cng_procids d1, d2;
         memset(&d1, 0, sizeof d1);
         memset(&d2, 0, sizeof d2);
+        u32 kg[CNG_PROCREG_GROUPS], nkg = 0;
         long cap_r = -1;
         unsigned cap_e = ~0u;
         int got1 = 0, got2 = 0;
@@ -8409,7 +8415,7 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
             cng_procreg_fork((int)kid);
             char b;
             if (sys_read(up[0], &b, 1) == 1) {
-                got1 = cng_procreg_ids((int)kid, &d1);
+                got1 = cng_procreg_cred((int)kid, &d1, kg, &nkg);
                 cap_e = dbg_capget((int)kid, &cap_r);
             }
             sys_write(dn[1], &b, 1);
@@ -8424,16 +8430,22 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
             if (dn[i] >= 0)
                 sys_close(dn[i]);
         }
+        if (nkg > 2)
+            nkg = 2; /* only two are printed, and checked */
         ok = got1 && d1.fake && d1.ruid == 1234 && d1.euid == 1234 &&
-             d1.rgid == 1234 && d1.egid == 1234 && d1.claim &&
+             d1.suid == 1235 && d1.fsuid == 1236 && d1.rgid == 1234 &&
+             d1.egid == 1234 && d1.sgid == 1237 && d1.fsgid == 1238 &&
+             nkg == 2 && kg[0] == 7 && kg[1] == 8 && d1.claim &&
              d1.claim_uid == 0 && d1.claim_gid == 1234 && cap_r == 0 &&
              cap_e == 0 && got2 && d2.euid == 1234 && !d2.claim;
         cng_dprintf(1,
-                    "proctest ids by pid: dropped=%d fake=%u %u/%u:%u/%u "
-                    "claim=%u %u:%u capget=%ld/%x changed=%d claim=%u -> %s\n",
-                    got1, d1.fake, d1.ruid, d1.euid, d1.rgid, d1.egid, d1.claim,
-                    d1.claim_uid, d1.claim_gid, cap_r, cap_e, got2, d2.claim,
-                    ok ? "OK" : "FAIL");
+                    "proctest ids by pid: dropped=%d fake=%u "
+                    "%u/%u/%u/%u:%u/%u/%u/%u groups=%u:%u,%u claim=%u %u:%u "
+                    "capget=%ld/%x changed=%d claim=%u -> %s\n",
+                    got1, d1.fake, d1.ruid, d1.euid, d1.suid, d1.fsuid, d1.rgid,
+                    d1.egid, d1.sgid, d1.fsgid, nkg, nkg > 0 ? kg[0] : 0,
+                    nkg > 1 ? kg[1] : 0, d1.claim, d1.claim_uid, d1.claim_gid,
+                    cap_r, cap_e, got2, d2.claim, ok ? "OK" : "FAIL");
         fails += !ok;
         cng_g_fake_id = 0;
         cng_cred_seed();

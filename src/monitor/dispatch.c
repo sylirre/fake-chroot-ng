@@ -3692,6 +3692,52 @@ static void peer_ids(unsigned uc[3], unsigned long n, int scm) {
     }
 }
 
+/* getsockopt(SOL_SOCKET, SO_PEERGROUPS): the peer's supplementary groups,
+ * which the kernel takes out of the struct cred SO_PEERCRED names the peer
+ * from. A peer the kernel names by the host's ids is told apart as peer_ids
+ * does it: a guest's are the groups it publishes beside its ids, and any
+ * other's are those of the identity the run began as, which are none (the
+ * fake set starts with none). They used to be the host's, which no guest has
+ * — on Android the app's 3003, 9997, 20337 and so on, whoever the peer was.
+ * A peer named by any other ids is the kernel's to describe, and so is every
+ * error before there is a peer to describe: the length word's EFAULT and
+ * then EINVAL for a negative one, as sk_getsockopt takes it, and then the
+ * option's own ENODATA (no peer) or ENOPROTOOPT (a kernel before 4.13). Then
+ * ERANGE with the length the list needs written back, the list, and the
+ * length it took. */
+static long peer_groups(long fd, long optval, long optlen) {
+    int len;
+    if (cng_user_copyin(&len, (void *)optlen, sizeof len) < 0)
+        return -EFAULT;
+    if (len < 0)
+        return -EINVAL;
+    int probe = 0; /* no room: 0 or ERANGE says there is a peer to describe */
+    long r = reissue(fd, CNG_SOL_SOCKET, CNG_SO_PEERGROUPS, 0, (long)&probe, 0,
+                     __NR_getsockopt);
+    if (r != 0 && r != -ERANGE)
+        return r;
+    unsigned uc[3] = {0, 0, 0}; /* struct ucred: pid,uid,gid */
+    int ul = sizeof uc;
+    if (reissue(fd, CNG_SOL_SOCKET, CNG_SO_PEERCRED, (long)uc, (long)&ul, 0,
+                __NR_getsockopt) != 0 ||
+        uc[1] != cng_g_host_uid)
+        return reissue(fd, CNG_SOL_SOCKET, CNG_SO_PEERGROUPS, optval, optlen, 0,
+                       __NR_getsockopt);
+    u32 g[CNG_PROCREG_GROUPS], n = 0;
+    struct cng_procids p;
+    if (!cng_procreg_cred((int)uc[0], &p, g, &n) || !p.fake)
+        n = 0;
+    int need = (int)(n * sizeof *g);
+    if (len < need)
+        return cng_user_copyout((void *)optlen, &need, sizeof need) < 0
+                   ? -EFAULT
+                   : -ERANGE;
+    if (n && cng_user_copyout((void *)optval, g, (unsigned long)need) < 0)
+        return -EFAULT;
+    return cng_user_copyout((void *)optlen, &need, sizeof need) < 0 ? -EFAULT
+                                                                    : 0;
+}
+
 /* Each SOL_SOCKET SCM_CREDENTIALS record in a control buffer of ours, walked
  * as __scm_send walks one (and scm_rights_walk above): a record that is not
  * CMSG_OK ends it, which is where the kernel stops with EINVAL. `fn` gets the
@@ -4773,7 +4819,8 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
         }
         if (r == 0 && byfd && a2 && cng_g_l2s)
             cng_l2s_fix_fd(a0, sb);
-        if (r == 0 && cng_g_fake_id && a2)
+        /* A process's /proc entries are its owner's (cng_procfs_owner). */
+        if (r == 0 && cng_g_fake_id && a2 && !cng_procfs_owner(a0, p, sb))
             stat_remap(sb);
         if (r == 0 && bounce && cng_user_copyout((void *)a2, sb, sizeof sb) < 0)
             return -EFAULT;
@@ -4822,7 +4869,7 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
         }
         if (r == 0 && byfd && a4 && cng_g_l2s)
             cng_l2s_fix_fd_statx(a0, sx);
-        if (r == 0 && cng_g_fake_id && a4)
+        if (r == 0 && cng_g_fake_id && a4 && !cng_procfs_owner_statx(a0, p, sx))
             statx_remap(sx);
         if (r == 0 && bounce && cng_user_copyout((void *)a4, sx, sizeof sx) < 0)
             return -EFAULT;
@@ -5018,7 +5065,7 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
                 cng_procfs_fix_fd((int)a0, sb);
             if (cng_g_l2s)
                 cng_l2s_fix_fd(a0, sb);
-            if (cng_g_fake_id)
+            if (cng_g_fake_id && !cng_procfs_owner(a0, "", sb))
                 stat_remap(sb);
             if (cng_user_copyout((void *)a1, sb, sizeof sb) < 0)
                 return -EFAULT;
@@ -5885,8 +5932,12 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
      * the meantime chose what was remapped. The length word is ours as well,
      * taken from the guest before the call as sock_getsockopt takes it: a
      * negative one is its EINVAL, a short one gets that many bytes of the
-     * struct, and what was written is reported back, in that order. */
+     * struct, and what was written is reported back, in that order.
+     * SO_PEERGROUPS, from the same struct cred, is peer_groups'. */
     case __NR_getsockopt: {
+        if (cng_g_fake_id && a1 == CNG_SOL_SOCKET && a2 == CNG_SO_PEERGROUPS &&
+            a4)
+            return peer_groups(a0, a3, a4);
         if (!(cng_g_fake_id && a1 == CNG_SOL_SOCKET && a2 == CNG_SO_PEERCRED &&
               a3 && a4))
             return reissue(a0, a1, a2, a3, a4, a5, nr);

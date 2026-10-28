@@ -389,6 +389,10 @@ rm -rf "$SCD"
 # peer by them. tests/guests/peerid.c: a server takes one identity and listens,
 # a client takes another and connects, and each says what it was told of the
 # other (the client by SO_PEERCRED, an own claim and SO_PASSCRED's record).
+# The groups are published with the ids: SO_PEERGROUPS used to name the
+# host's, and another process's status file and /proc directory — which `ps`
+# names a process's user by — the identity the run began as. Every row is
+# what the kernel answers real root the same program (measured on the VM).
 PRD=$(mktemp -d)
 if ! guest_xlate_ready "socket peer id legs"; then
     :
@@ -413,6 +417,41 @@ elif guest_cc_report "$PRD/peerid" tests/guests/peerid.c; then
                 "claim pid_ok=1 uid=$_c gid=$_c" "$out"
             check_contains "$_d: ...and so does SO_PASSCRED's own record" \
                 "implicit pid_ok=1 uid=$_c gid=$_c" "$out"
+            _sg="$((_s + 1)),$((_s + 2))" _cg="$((_c + 1)),$((_c + 2))"
+            case $out in
+            *"groups errno=92"*)
+                skip "$_d: SO_PEERGROUPS (the kernel predates it)" ;;
+            *)
+                check_contains "$_d: SO_PEERGROUPS names the client's groups" \
+                    "server groups=$_cg" "$out"
+                check_contains "$_d: ...and the server's" \
+                    "client groups=$_sg" "$out"
+                check_contains "$_d: ...too short a buffer is ERANGE and the length" \
+                    "server groups-short r=-1 errno=34 len=8" "$out"
+                ;;
+            esac
+            check_contains "$_d: the client's status has its ids and groups" \
+                "server status Uid:$_c,$_c,$_c,$_c Gid:$_c,$_c,$_c,$_c Groups:$_cg" \
+                "$out"
+            check_contains "$_d: ...and the server's its own" \
+                "client status Uid:$_s,$_s,$_s,$_s Gid:$_s,$_s,$_s,$_s Groups:$_sg" \
+                "$out"
+            check_contains "$_d: ...and so does its thread's (ps -L)" \
+                "server task-status Uid:$_c,$_c,$_c,$_c Gid:$_c,$_c,$_c,$_c Groups:$_cg" \
+                "$out"
+            check_contains "$_d: the client's /proc directory is its ids' (ps)" \
+                "server procdir $_c:$_c fd=$_c:$_c task=$_c:$_c" "$out"
+            check_contains "$_d: ...and the server's" \
+                "client procdir $_s:$_s fd=$_s:$_s task=$_s:$_s" "$out"
+            case $out in
+            *"procdir-statx errno=38"*) skip "$_d: statx (no such call)" ;;
+            *)
+                check_contains "$_d: ...by statx as well" \
+                    "server procdir-statx $_c:$_c" "$out"
+                ;;
+            esac
+            check_contains "$_d: /proc/self is the client's own" \
+                "client self $_c:$_c" "$out"
         done
     done
 fi

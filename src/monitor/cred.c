@@ -66,21 +66,43 @@ int cng_cred_read_retry(unsigned s) {
     return __atomic_load_n(&g_cred_seq, __ATOMIC_ACQUIRE) != s;
 }
 
+static void ids_of(const struct cng_cred *c, struct cng_cred_ids *out) {
+    out->ruid = c->ruid;
+    out->euid = c->euid;
+    out->suid = c->suid;
+    out->fsuid = c->fsuid;
+    out->rgid = c->rgid;
+    out->egid = c->egid;
+    out->sgid = c->sgid;
+    out->fsgid = c->fsgid;
+}
+
 void cng_cred_ids(struct cng_cred_ids *out) {
     const struct cng_cred *c;
     do {
         unsigned s = cng_cred_read_begin(&c);
-        out->ruid = c->ruid;
-        out->euid = c->euid;
-        out->suid = c->suid;
-        out->fsuid = c->fsuid;
-        out->rgid = c->rgid;
-        out->egid = c->egid;
-        out->sgid = c->sgid;
-        out->fsgid = c->fsgid;
+        ids_of(c, out);
         if (!cng_cred_read_retry(s))
             break;
     } while (1);
+}
+
+int cng_cred_groups(unsigned *out, struct cng_cred_ids *ids) {
+    const struct cng_cred *c;
+    int n;
+    do {
+        unsigned s = cng_cred_read_begin(&c);
+        n = c->ngroups;
+        if (n < 0 || n > CNG_NGROUPS_MAX)
+            n = 0; /* a buffer mid-copy: the sequence has moved, and we retry */
+        for (int i = 0; i < n; i++)
+            out[i] = c->groups[i];
+        if (ids)
+            ids_of(c, ids);
+        if (!cng_cred_read_retry(s))
+            break;
+    } while (1);
+    return n;
 }
 
 int cng_fake_root(void) {
@@ -366,18 +388,8 @@ static long do_setgroups(struct cng_cred *c, int priv, int n,
     return 0;
 }
 static long do_getgroups(int size, unsigned *g) {
-    /* The count and the list as one thing (see the published set above). */
     unsigned got[CNG_NGROUPS_MAX];
-    int n;
-    const struct cng_cred *c;
-    do {
-        unsigned s = cng_cred_read_begin(&c);
-        n = c->ngroups;
-        for (int i = 0; i < n; i++)
-            got[i] = c->groups[i];
-        if (!cng_cred_read_retry(s))
-            break;
-    } while (1);
+    int n = cng_cred_groups(got, 0);
     if (size == 0)
         return n;
     if (size < n)

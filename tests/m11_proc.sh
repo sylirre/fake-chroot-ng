@@ -208,11 +208,12 @@ check_contains "capget by pid: ourselves and a guest faked, the rest the kernel'
     "proctest capget by pid: self=0/ffffffff tid=0/ffffffff guest=0/ffffffff dead=-3 host=0 neg=-22 none=-3 -> OK" \
     "$out"
 # What a guest publishes of its ids, which is what a socket peer is told of it
-# (SO_PEERCRED, SCM_CREDENTIALS): a forked child that drops them is read by
-# them, and has no capabilities to capget; its claim is recorded beside them,
-# and the next change of its set drops the claim.
+# (SO_PEERCRED, SCM_CREDENTIALS, SO_PEERGROUPS) and what its status file and
+# /proc directory say: a forked child that drops them is read by all eight
+# and its groups, and has no capabilities to capget; its claim is recorded
+# beside them, and the next change of its set drops the claim.
 check_contains "a guest's published ids follow its drop, and capget with them" \
-    "proctest ids by pid: dropped=1 fake=1 1234/1234:1234/1234 claim=1 0:1234 capget=0/0 changed=1 claim=0 -> OK" \
+    "proctest ids by pid: dropped=1 fake=1 1234/1234/1235/1236:1234/1234/1237/1238 groups=2:7,8 claim=1 0:1234 capget=0/0 changed=1 claim=0 -> OK" \
     "$out"
 check_contains "--no-proc disables passthrough and synthesis" \
     "proctest no-proc -> OK" "$out"

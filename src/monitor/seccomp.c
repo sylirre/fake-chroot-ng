@@ -121,7 +121,8 @@ static const int id_syscalls[] = {
     __NR_fchown,    __NR_fchmod,    __NR_capget,    __NR_capset,
     /* SO_PEERCRED reports the real invoking uid, and ps/tmux/polkit-style peer
      * checks compare it against getuid() — which under --fake-id is the fake id.
-     * A guest daemon would reject its own client on the mismatch. */
+     * A guest daemon would reject its own client on the mismatch. SO_PEERGROUPS
+     * reports the host's groups, likewise. */
     __NR_getsockopt,
 };
 #define NID ((int)(sizeof(id_syscalls) / sizeof(id_syscalls[0])))

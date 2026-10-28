@@ -10,8 +10,9 @@
  * and its exe/cwd links name host paths. Each process therefore publishes the
  * guest view of itself here (argv, environ, auxv, exe, cwd) and procfs.c serves
  * that process's /proc entries from it. Under --fake-id it publishes its ids
- * as well, which the kernel's answers about a socket peer cannot carry (struct
- * cng_procids). cmdline and environ are published as
+ * and groups as well, which the kernel's answers about a socket peer, and its
+ * account of another process's ids, cannot carry (struct cng_procids).
+ * cmdline and environ are published as
  * where they live, too (struct cng_procargs): the kernel reads both out of the
  * process's memory at read time, so a title written over argv shows, and the
  * copies here are what is left when that memory cannot be read. Where the
@@ -56,6 +57,7 @@
 #define CNG_PROCREG_CMDLINE 1024 /* per-entry caps; longer values truncate */
 #define CNG_PROCREG_ENVIRON 4096
 #define CNG_PROCREG_AUXV     512
+#define CNG_PROCREG_GROUPS  1024 /* CNG_NGROUPS_MAX: all the fake set holds */
 #define CNG_PROCREG_PATH     512
 
 /* Where a process's argv and environment strings are in its own memory: the
@@ -69,18 +71,21 @@ struct cng_procargs {
     u32 kernel;
 };
 
-/* Who a process is to the other end of a socket: the ids the kernel would
- * name it by in SO_PEERCRED and SCM_CREDENTIALS, which it cannot here, since
- * every guest process of a --fake-id run has the host's ids. The kernel takes
- * them from the task's struct cred, so the process publishes its own copy of
- * its fake set whenever the set changes (cred.c), and a fork inherits it.
- * `fake` is 0 for a process without a fake identity, whose ids are the
- * kernel's own. `claim` says claim_uid/claim_gid hold the ids a credentials
- * record it sent last claimed under the published set. A change of ids drops
- * the claim. */
+/* Who a process is to the other end of a socket and to another process: the
+ * ids the kernel would name it by in SO_PEERCRED and SCM_CREDENTIALS, show in
+ * its status file and give its /proc/<pid> entries as their owner — which it
+ * cannot here, since every guest process of a --fake-id run has the host's
+ * ids. The kernel takes them from the task's struct cred, so the process
+ * publishes its own copy of its fake set whenever the set changes (cred.c),
+ * and a fork inherits it. The supplementary groups are published beside the
+ * ids, in the same write (cng_procreg_cred). `fake` is 0 for a process
+ * without a fake identity, whose ids are the kernel's own. `claim` says
+ * claim_uid/claim_gid hold the ids a credentials record it sent last claimed
+ * under the published set. A change of ids drops the claim. */
 struct cng_procids {
     u32 fake;
-    u32 ruid, euid, rgid, egid;
+    u32 ruid, euid, suid, fsuid;
+    u32 rgid, egid, sgid, fsgid;
     u32 claim;
     u32 claim_uid, claim_gid;
 };
@@ -97,6 +102,8 @@ struct cng_procsnap {
     u16 exe_len, cwd_len;
     struct cng_procargs args;
     struct cng_procids ids;
+    u32 ngroups;
+    u32 groups[CNG_PROCREG_GROUPS];
 };
 
 /* --shared-proc: back the registry per-rootfs so independent invocations share
@@ -137,18 +144,18 @@ void cng_procreg_fork(int child);
  * entry of its own when it forked in turn, so its child was never published:
  * invisible for good, refused by PTRACE_ATTACH and hidden from kill. Waits a
  * bounded time for the parent, then copies `forker`'s entry (the pid the clone
- * was issued from, sampled before it) itself, and republishes the ids it
- * inherited over the copy's. */
+ * was issued from, sampled before it) itself, and republishes the ids and
+ * groups it inherited over the copy's. */
 void cng_procreg_fork_child(int forker);
 
 /* Update just our own cwd (chdir/fchdir), so another process reading
  * /proc/<pid>/cwd sees the live value. */
 void cng_procreg_set_cwd(const char *cwd_guest);
 
-/* Republish our own ids from the live fake set (struct cng_procids): called
- * by every committed change of the set, under the writer's lock with signals
- * blocked, so two changes publish in the order they were made. Drops the
- * claim, which was made under the ids replaced. */
+/* Republish our own ids and groups from the live fake set (struct
+ * cng_procids): called by every committed change of the set, under the
+ * writer's lock with signals blocked, so two changes publish in the order
+ * they were made. Drops the claim, which was made under the ids replaced. */
 void cng_procreg_set_ids(void);
 
 /* Record a credentials record's claim, which the fake set allowed (dispatch.c
@@ -159,6 +166,12 @@ void cng_procreg_claim(unsigned uid, unsigned gid);
  * on a miss or a stale entry. Our own pid always answers, out of the live set
  * when the registry has no entry for us. */
 int cng_procreg_ids(int pid, struct cng_procids *out);
+
+/* The same, with the supplementary groups published beside the ids and read
+ * with them as one: their count in *ngroups, the list in
+ * groups[CNG_PROCREG_GROUPS]. */
+int cng_procreg_cred(int pid, struct cng_procids *ids, u32 *groups,
+                     u32 *ngroups);
 
 /* Is `pid` a guest process? Drives both the /proc/<pid> visibility rule and the
  * other-pid handlers in procfs.c. Our own pid always counts. */

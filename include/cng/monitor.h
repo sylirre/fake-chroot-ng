@@ -95,6 +95,11 @@ struct cng_cred_ids {
     unsigned rgid, egid, sgid, fsgid;
 };
 void cng_cred_ids(struct cng_cred_ids *out);
+/* The published set's supplementary groups into out[CNG_NGROUPS_MAX], and its
+ * ids into *ids when that is not NULL: the count, the list and the ids read as
+ * one thing, since a setgroups on another thread publishes a whole new set
+ * rather than editing this one. Returns the count. */
+int cng_cred_groups(unsigned *out, struct cng_cred_ids *ids);
 struct cng_cred_write {
     struct cng_cred *dst;
     unsigned long mask;

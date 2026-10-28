@@ -233,6 +233,7 @@ struct cng_prctl_mm_map {
 #define CNG_SO_RCVTIMEO  20 /* SO_RCVTIMEO_OLD: takes the 64-bit timeval */
 #define CNG_SO_SNDTIMEO  21 /* SO_SNDTIMEO_OLD, likewise */
 #define CNG_SO_PEERCRED  17
+#define CNG_SO_PEERGROUPS 59 /* the peer's supplementary groups (4.13+) */
 #define CNG_SO_SNDBUF    7
 #define CNG_SO_DOMAIN    39 /* the socket's own address family, in one call */
 #define CNG_SCM_RIGHTS   1
