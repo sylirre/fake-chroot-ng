@@ -391,7 +391,8 @@ static long reissue_cred(long nr, long a0, long a1, long a2, long a3, long a4,
                          long a5);
 
 /* capget/capset: the guest's own capability view. Under fake-root the full set
- * is reported and any change accepted; otherwise none / EPERM, like the host.
+ * is reported, otherwise none, and a capset is judged against that set by the
+ * kernel's rules (do_capset); what it changes is not kept.
  * Another task's set is the kernel's to report, except a guest process's (see
  * do_capget).
  * The header selects v1 (one 32-bit data block) or v2/v3 (two). The pointers
@@ -482,20 +483,66 @@ static long do_capget(struct cap_header *hdr, struct cap_data *data) {
     return 0;
 }
 
+/* The bits of the second data word that name a capability this kernel has:
+ * sys_capset clears the others (CAP_LAST_U32_VALID_MASK) before the sets are
+ * judged. PR_CAPBSET_READ is EINVAL past CAP_LAST_CAP. A kernel that answers
+ * it for none of them is taken to end at CAP_CHECKPOINT_RESTORE (40), where
+ * every kernel since 5.9 does. */
+static unsigned cap_high_mask(void) {
+    static unsigned mask; /* 0 = not probed yet; the probe is idempotent */
+    unsigned m = __atomic_load_n(&mask, __ATOMIC_RELAXED);
+    if (m)
+        return m;
+    int last = 63;
+    while (last >= 32 &&
+           CNG_SYS(__NR_prctl, CNG_PR_CAPBSET_READ, last, 0, 0, 0, 0) < 0)
+        last--;
+    if (last < 32)
+        last = 40;
+    m = (unsigned)((2ull << (last - 32)) - 1);
+    __atomic_store_n(&mask, m, __ATOMIC_RELAXED);
+    return m;
+}
+
 static long do_capset(struct cap_header *hdr, const struct cap_data *data) {
     int n = 0;
     struct cap_header h;
     long r = cap_magic(hdr, &h, &n);
     if (r != 0)
         return r;
-    if (h.pid != 0 && h.pid != (int)sys_getpid())
-        return -EPERM; /* "may only affect current", as the kernel puts it */
+    /* "may only affect current", as the kernel puts it: 0, or the caller's
+     * pid as task_pid_vnr(current) gives it, which is the calling thread's
+     * id, not its group's. */
+    if (h.pid != 0 && h.pid != (int)sys_gettid())
+        return -EPERM;
     /* The payload is copied in before any decision is taken, so a bad one is
      * -EFAULT whatever the caller's privilege would have been. */
-    struct cap_data blocks[2];
+    struct cap_data blocks[2] = {{0, 0, 0}, {0, 0, 0}};
     if (cng_user_copyin(blocks, data, (unsigned long)n * sizeof *blocks) < 0)
         return -EFAULT;
-    return cng_fake_root() ? 0 : -EPERM;
+    unsigned hi = cap_high_mask();
+    blocks[1].effective &= hi;
+    blocks[1].permitted &= hi;
+    blocks[1].inheritable &= hi;
+    /* cap_capset(): the new permitted set must lie within the old one, the
+     * effective within the new permitted, the inheritable within the old
+     * inheritable and permitted (or the bounding set, given CAP_SETPCAP). The
+     * set here is all of them for a fake root and none for anyone else, and a
+     * change is not recorded. So a fake root is refused only an effective bit
+     * it does not also permit, and anyone else any capability at all — but
+     * not a set that asks for none, which is a drop, and dropping is always
+     * allowed. That used to be EPERM too: Chrome's zygote drops every
+     * capability in each child it forks and CHECKs the answer, so as any user
+     * but root its first child died ("credentials.cc: Check failed: . :
+     * Operation not permitted") and the browser never came up. */
+    int root = cng_fake_root();
+    for (int i = 0; i < n; i++) {
+        const struct cap_data *b = &blocks[i];
+        if (root ? (b->effective & ~b->permitted) != 0
+                 : (b->effective | b->permitted | b->inheritable) != 0)
+            return -EPERM;
+    }
+    return 0;
 }
 
 /* Non-faking re-issue: consult the ambient block-list so a re-issue can never

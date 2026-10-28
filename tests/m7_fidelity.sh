@@ -418,6 +418,67 @@ elif guest_cc_report "$PRD/peerid" tests/guests/peerid.c; then
 fi
 rm -rf "$PRD"
 
+# --- capset, judged against the set ------------------------------------------
+# A fake root's capability set is all of them and anyone else's none, and a
+# capset used to be accepted whole for the one and refused whole for the
+# other. But the kernel lets any process drop what it has, nothing included:
+# Chrome's zygote drops every capability in each child it forks and CHECKs the
+# answer, and as any user but root its first child died ("credentials.cc:
+# Check failed: . : Operation not permitted"). tests/guests/capset.c runs each
+# row in a child of its own, so one that succeeds does not change what the
+# next is judged against. Every row is what the kernel answers real root, and
+# root dropped to 1234, the same program (measured on the VM).
+CPD=$(mktemp -d)
+cap_rows() { # description, tier, guest args...
+    _cd=$1 _ct=$2
+    shift 2
+    # shellcheck disable=SC2086  # $_ct and $GUEST_BINDS split on purpose
+    out=$(run_t 60 $_ct $GUEST_BINDS -u 0:0 "$CPD/rootfs" /bin/capset "$@" \
+        2>/dev/null)
+    check_contains "$_cd: a set that asks for nothing is a drop, and allowed" \
+        "none=0 errno=0" "$out"
+    check_contains "$_cd: ...in the one-word header version too" \
+        "none_v1=0 errno=0" "$out"
+    check_contains "$_cd: an effective bit not also permitted is refused" \
+        "eff_unpermitted=-1 errno=1" "$out"
+    check_contains "$_cd: a capability no kernel has is cleared, not judged" \
+        "beyond=0 errno=0" "$out"
+    check_contains "$_cd: a thread names itself by its own id" \
+        "thread_tid=0 errno=0" "$out"
+    check_contains "$_cd: ...and not by its process's" \
+        "thread_pid=-1 errno=1" "$out"
+    check_contains "$_cd: another process is refused" \
+        "other_pid=-1 errno=1" "$out"
+    check_contains "$_cd: a bad data pointer is EFAULT" \
+        "bad_data=-1 errno=14" "$out"
+}
+if ! guest_xlate_ready "capset legs"; then
+    :
+elif guest_cc_report "$CPD/capset" tests/guests/capset.c -pthread; then
+    mkdir -p "$CPD/rootfs/bin"
+    cp "$CPD/capset" "$CPD/rootfs/bin/"
+    tiers=-R
+    [ "$CNG_SECCOMP_LIVE" = 1 ] && tiers="-R none"
+    for tier in $tiers; do
+        t=$tier; [ "$t" = none ] && t=
+        cap_rows "capset as fake root ($tier)" "$t"
+        check_contains "capset as fake root ($tier): capget reports all of them" \
+            "full=1 errno=0" "$out"
+        check_contains "capset as fake root ($tier): ...and any may be kept" \
+            "permit=0 errno=0" "$out"
+        check_contains "capset as fake root ($tier): ...or made inheritable" \
+            "inherit=0 errno=0" "$out"
+        cap_rows "capset dropped to 1234 ($tier)" "$t" 1234
+        check_contains "capset dropped to 1234 ($tier): capget reports none" \
+            "full=0 errno=0" "$out"
+        check_contains "capset dropped to 1234 ($tier): ...none may be permitted" \
+            "permit=-1 errno=1" "$out"
+        check_contains "capset dropped to 1234 ($tier): ...or made inheritable" \
+            "inherit=-1 errno=1" "$out"
+    done
+fi
+rm -rf "$CPD"
+
 # A memfd reopened through its own /proc link. memfd_create only makes O_RDWR
 # files, and that open is the one way to a read-only description of one —
 # Chrome's read-only half of every shared-memory region, which it CHECKs with

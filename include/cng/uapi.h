@@ -143,6 +143,7 @@ struct cng_open_how {
 #define CNG_PR_GET_NO_NEW_PRIVS 39
 #define CNG_PR_SET_SECCOMP      22
 #define CNG_PR_GET_SECCOMP      21
+#define CNG_PR_CAPBSET_READ     23 /* EINVAL past CAP_LAST_CAP */
 #define CNG_PR_SET_TAGGED_ADDR_CTRL 55
 #define CNG_PR_GET_TAGGED_ADDR_CTRL 56
 /* Memory-Deny-Write-Execute (Linux 6.3+): with REFUSE_EXEC_GAIN set, an

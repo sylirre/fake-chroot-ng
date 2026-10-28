@@ -4527,6 +4527,35 @@ vfork/`posix_spawn` child-stack handling.
     On the Pixel 5, as sylirre, `xfconf-query` reaches xfconfd and `gdbus`
     and `dbus-send` reach the session bus.
 
+- [x] **M103 — a capset that dropped nothing was refused to anyone but root**
+  `google-chrome --no-sandbox` came up as the fake root of `chroot-ng -l -u
+  ... /bin/su - sylirre` and not as the user: "credentials.cc:365] Check
+  failed: . : Operation not permitted (1)", then "Did not receive ping from
+  zygote child". The zygote forks every child through
+  `ForkAndDropCapabilitiesInChild`, whose `capset` of three empty sets is
+  CHECKed, and under `-u` a capset was accepted whole for a fake root and
+  refused whole for anyone else. The kernel lets any process drop what it
+  has, nothing included.
+  - The set is all of them for a fake root and none for anyone else, as
+    `capget` reports it, and a capset is judged against it by `cap_capset`'s
+    rules: the new permitted set within the old, the effective within the new
+    permitted, the inheritable within the old inheritable and permitted. So a
+    fake root is refused an effective bit it does not also permit, and anyone
+    else any capability at all. The bits past `CAP_LAST_CAP` are cleared
+    first, as `sys_capset` clears them (the last one is probed with
+    `PR_CAPBSET_READ`).
+  - The header's pid is compared with the calling thread's id, which is what
+    `task_pid_vnr(current)` is: a thread naming itself by its own id is
+    allowed, and by its process's pid EPERM. It was the other way round.
+  - Not exact: a change is not recorded, so a fake root that drops its
+    capabilities still has them all, and a change of ids gives the set the
+    new euid implies (no `SECBIT_KEEP_CAPS`, no file capabilities).
+  - Test: m7, `tests/guests/capset.c`, on both tiers, as fake root and
+    dropped to 1234, each row in a child of its own; every row is the
+    kernel's answer to real root and to root dropped to 1234 (arm64 VM, row
+    for row). The old build refuses the empty set. On the Pixel 5, headless
+    Chrome as sylirre prints the page it was given.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes
