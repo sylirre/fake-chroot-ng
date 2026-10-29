@@ -1440,6 +1440,183 @@ static int sc_options(void) {
     return 0;
 }
 
+/* NT_PRFPREG, the FP/SIMD register file, at the two kinds of stop a crash
+ * reporter or a debugger meets first: the stop PTRACE_ATTACH makes, and a
+ * syscall stop. crashpad attaches to every thread of a crashed process and
+ * reads this from each; it got EINVAL from every one, because an attach stop
+ * did not keep the signal frame the registers were in, and a stop with no
+ * frame at all (the trampoline tier's) had nowhere else to look.
+ *
+ * One register carries a marker across the tracee's blocking read: set before
+ * the syscall, read back by the tracer at each stop, overwritten by it, and
+ * reported by the tracee once the read returns — so both directions are
+ * checked, and through each kind of stop. Then the length rules every regset
+ * shares (ptrace_regset): a length that is not a whole number of the regset's
+ * units is EINVAL, a longer one is cut to the regset, and iov_len says what was
+ * transferred. */
+#define FP_MARK1 0x1122334455667788ULL
+#define FP_MARK2 0x0badc0de8badf00dULL
+#define FP_MARK3 0x5a5a5a5aa5a5a5a5ULL
+#ifndef NT_PRFPREG
+#define NT_PRFPREG 2
+#endif
+#if defined(__aarch64__)
+#define FP_SIZE 528 /* struct user_fpsimd_state */
+#define FP_REG8 128 /* v8, whose low half the ABI has callers preserve */
+#else
+#define FP_SIZE 512 /* struct user_fpregs_struct */
+#define FP_REG8 288 /* xmm8 */
+#endif
+
+/* Put `mark` in the marker register, say so on `wfd`, then block in read(rfd)
+ * — retried across EINTR without touching the register, so the result does
+ * not depend on whether a stop restarts the read. Returns what the register
+ * held when the read returned. All in asm: nothing the compiler emits may sit
+ * between the marker and the syscalls. */
+static unsigned long long fp_hold(int rfd, int wfd, unsigned long long mark) {
+    char c = 'r';
+    unsigned long long v;
+#if defined(__aarch64__)
+    __asm__ volatile("fmov d8, %[m]\n\t"
+                     "mov x0, %[w]\n\tmov x1, %[b]\n\tmov x2, #1\n\t"
+                     "mov x8, #64\n\t" /* write */
+                     "svc #0\n"
+                     "1:\n\t"
+                     "mov x0, %[r]\n\tmov x1, %[b]\n\tmov x2, #1\n\t"
+                     "mov x8, #63\n\t" /* read */
+                     "svc #0\n\t"
+                     "cmn x0, #4\n\t" /* -EINTR */
+                     "b.eq 1b\n\t"
+                     "fmov %[v], d8"
+                     : [v] "=&r"(v)
+                     : [m] "r"(mark), [w] "r"((long)wfd), [r] "r"((long)rfd),
+                       [b] "r"(&c)
+                     : "x0", "x1", "x2", "x8", "v8", "memory", "cc");
+#else
+    __asm__ volatile("movq %[m], %%xmm8\n\t"
+                     "mov $1, %%eax\n\t" /* write */
+                     "mov %[w], %%rdi\n\tmov %[b], %%rsi\n\tmov $1, %%edx\n\t"
+                     "syscall\n"
+                     "1:\n\t"
+                     "xor %%eax, %%eax\n\t" /* read */
+                     "mov %[r], %%rdi\n\tmov %[b], %%rsi\n\tmov $1, %%edx\n\t"
+                     "syscall\n\t"
+                     "cmp $-4, %%rax\n\t" /* -EINTR */
+                     "je 1b\n\t"
+                     "movq %%xmm8, %[v]"
+                     : [v] "=&r"(v)
+                     : [m] "r"(mark), [w] "r"((long)wfd), [r] "r"((long)rfd),
+                       [b] "r"(&c)
+                     : "rax", "rdi", "rsi", "rdx", "rcx", "r11", "xmm8",
+                       "memory", "cc");
+#endif
+    return v;
+}
+
+/* Read the file and say whether the marker register holds `want`. */
+static void fp_check(pid_t pid, const char *where, unsigned long long want) {
+    unsigned char fp[FP_SIZE + 64];
+    memset(fp, 0, sizeof fp);
+    struct iovec io = {fp, FP_SIZE};
+    errno = 0;
+    long r = ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRFPREG, &io);
+    unsigned long long got;
+    memcpy(&got, fp + FP_REG8, sizeof got);
+    printf("%s: fpregs %s, %s, marker %s\n", where, ptres(r),
+           io.iov_len == FP_SIZE ? "whole" : "short",
+           r == 0 && got == want ? "ok" : "wrong");
+}
+
+static void fp_set(pid_t pid, const char *where, unsigned long long mark) {
+    unsigned char fp[FP_SIZE];
+    struct iovec io = {fp, FP_SIZE};
+    ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRFPREG, &io);
+    memcpy(fp + FP_REG8, &mark, sizeof mark);
+    io.iov_len = FP_SIZE;
+    errno = 0;
+    long r = ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRFPREG, &io);
+    printf("%s: fpregs write %s, %s\n", where, ptres(r),
+           io.iov_len == FP_SIZE ? "whole" : "short");
+}
+
+/* GETREGSET with `len`, reported as what came back. */
+static void fp_len(pid_t pid, long type, const char *name, size_t len,
+                   size_t full) {
+    unsigned char buf[FP_SIZE + 64];
+    struct iovec io = {buf, len};
+    errno = 0;
+    long r = ptrace(PTRACE_GETREGSET, pid, (void *)type, &io);
+    const char *asked = len == full + 64 ? "full+64" : len == 3 ? "3" : "16";
+    if (r != 0)
+        printf("%s len %s: %s\n", name, asked, ptres(r));
+    else
+        printf("%s len %s: iov_len %s\n", name, asked,
+               io.iov_len == full  ? "full"
+               : io.iov_len == len ? "as asked"
+                                   : "other");
+}
+
+static int sc_fpregs(void) {
+    int in[2], ready[2], rep[2];
+    if (pipe(in) != 0 || pipe(ready) != 0 || pipe(rep) != 0)
+        return 1;
+    pid_t pid = fork();
+    if (pid == 0) {
+        unsigned long long v = fp_hold(in[0], ready[1], FP_MARK1);
+        ssize_t ignore = write(rep[1], &v, sizeof v);
+        (void)ignore;
+        _exit(0);
+    }
+    char c;
+    if (read(ready[0], &c, 1) != 1)
+        return 1;
+    /* The marker is in place once the byte is: wait for the read to block,
+     * though the checks below hold wherever the attach lands. */
+    usleep(100000);
+    if (ptrace(PTRACE_ATTACH, pid, 0, 0) != 0) {
+        printf("attach failed %d\n", errno);
+        kill(pid, SIGKILL);
+        return 1;
+    }
+    int st;
+    wait_for(pid, &st);
+    printf("attach %s\n",
+           (WIFSTOPPED(st) && WSTOPSIG(st) == SIGSTOP) ? "stopped" : "odd");
+    fp_check(pid, "attach stop", FP_MARK1);
+    fp_len(pid, NT_PRFPREG, "fpregs", 3, FP_SIZE);
+    fp_len(pid, NT_PRFPREG, "fpregs", 16, FP_SIZE);
+    fp_len(pid, NT_PRFPREG, "fpregs", FP_SIZE + 64, FP_SIZE);
+    fp_len(pid, NT_PRSTATUS, "prstatus", 3, sizeof(struct uregs));
+    fp_len(pid, NT_PRSTATUS, "prstatus", 16, sizeof(struct uregs));
+    fp_len(pid, NT_PRSTATUS, "prstatus", sizeof(struct uregs) + 64,
+           sizeof(struct uregs));
+    fp_set(pid, "attach stop", FP_MARK2);
+    fp_check(pid, "attach stop", FP_MARK2);
+    /* On to the read's entry stop, which the write must have survived. */
+    ptrace(PTRACE_SYSCALL, pid, 0, 0);
+    wait_for(pid, &st);
+    printf("syscall stop %s\n",
+           (WIFSTOPPED(st) && WSTOPSIG(st) == SIGTRAP) ? "reached" : "odd");
+    fp_check(pid, "syscall stop", FP_MARK2);
+    fp_set(pid, "syscall stop", FP_MARK3);
+    /* Let the read return, and hear from the tracee what the register held
+     * when it did. */
+    ssize_t ignore = write(in[1], "x", 1);
+    (void)ignore;
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    unsigned long long v = 0;
+    ssize_t n = read(rep[0], &v, sizeof v);
+    printf("tracee saw %s\n",
+           n != (ssize_t)sizeof v ? "nothing"
+           : v == FP_MARK3        ? "the last write"
+           : v == FP_MARK2        ? "the attach stop's write"
+           : v == FP_MARK1        ? "its own marker"
+                                  : "garbage");
+    wait_for(pid, &st);
+    show(st);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, 0, _IOLBF, 0);
     if (argc > 1 && !strcmp(argv[1], "hello")) {
@@ -1499,6 +1676,8 @@ int main(int argc, char **argv) {
         return sc_waitnowait();
     if (!strcmp(s, "options"))
         return sc_options();
+    if (!strcmp(s, "fpregs"))
+        return sc_fpregs();
     fprintf(stderr, "unknown scenario %s\n", s);
     return 2;
 }

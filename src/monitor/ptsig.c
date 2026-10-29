@@ -243,7 +243,7 @@ static void pt_kick_handler(int sig, cng_siginfo_t *si, void *ucv) {
             break;
         case CNG_PT_KICK_ATTACH:
             cng_pt_set_frame(cng_pt_uregs(uc), uc);
-            cng_pt_service_kick(cng_pt_uregs(uc));
+            cng_pt_service_kick(uc);
             break;
         default:
             pt_deliver_to_guest(sig, si, ucv);

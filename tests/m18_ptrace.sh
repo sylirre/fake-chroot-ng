@@ -184,6 +184,14 @@ else
     pt_case step2
     # PTRACE_ATTACH to a process that is already running, and DETACH.
     pt_case attach
+    # The FP/SIMD register file at an attach stop and at a syscall stop, read
+    # and written, and the length rules GETREGSET applies to every regset.
+    # crashpad reads it from every thread of a crashed process, and every
+    # attach stop answered EINVAL: the stop had not kept the signal frame the
+    # registers were in, and a trampoline stop had none to keep. The frame's
+    # FPSIMD record was also read as if it were the ptrace layout, so even a
+    # stop that had one returned the registers shifted and lost a write.
+    pt_case fpregs
     # ...and to two hundred tasks of one process, one after another: the
     # tracee's per-task state used to sit in 128 slots that were never given
     # back, so the 129th attach was reported a success and never stopped.

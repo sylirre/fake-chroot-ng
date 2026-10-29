@@ -218,8 +218,9 @@ int cng_pt_report_signal(struct cng_uregs *r, int sig, int si_code, u64 addr);
 
 /* The kick signal arrived (see CNG_PT_KICK_*): adopt a pending attach, service
  * a pending PTRACE_INTERRUPT or a cooperative group-stop. Called from the
- * kick handler with the interrupted context. */
-void cng_pt_service_kick(struct cng_uregs *r);
+ * kick handler with its signal frame, which the stop then reads and writes —
+ * the general registers and the FP/SIMD state both. */
+void cng_pt_service_kick(struct cng_ucontext *uc);
 
 /* Queue the reserved kick signal at one task with one of the CNG_PT_KICK_*
  * magics in si_value. */

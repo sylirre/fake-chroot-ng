@@ -4604,6 +4604,62 @@ vfork/`posix_spawn` child-stack handling.
     as sylirre, `ps`, `ps -L` and `top` name the user's processes and
     threads sylirre's and `su` root's.
 
+- [x] **M105 — a tracer could not read the FP/SIMD registers**
+  A crashed Chrome left no crash report. Its crash handler (crashpad)
+  attaches to every thread of the crashed process and reads `NT_PRFPREG`
+  from each, and every one answered EINVAL: "ptracer.cc:228] ptrace: Invalid
+  argument (22)" once per thread, then "Couldn't initialize main thread",
+  "thread not found", and no minidump. The regset was wrong three ways.
+  - An attach stop had no signal frame. The kick handler records its frame
+    only for a task that already has a per-task slot, and the attach is what
+    makes the slot, so the stop knew the general registers but not where the
+    FP/SIMD state was. The adoption keeps the kick's frame now.
+  - A stop with no signal frame at all had nowhere to look: every syscall
+    stop on `-R`, one through a site already rewritten on the seccomp tier,
+    and the emulated execve's. These read and write the live registers,
+    which are the guest's there: the monitor is built `-mgeneral-regs-only`
+    and the kernel preserves them across the syscalls made since. (clang's
+    assembler rejects FP instructions under that flag even in inline asm, so
+    the two routines enable `fp` and `simd` for themselves.)
+  - A stop that did have a frame read its FPSIMD record as if it were a
+    `user_fpsimd_state`. The record has fpsr and fpcr first and the q
+    registers after, so the file came back shifted by 8 bytes, 8 bytes past
+    the record were read, and a write overwrote the next record's header.
+    Both directions convert now. A write over live SVE state goes into the
+    SVE record as well, since sigreturn restores the vectors from that one
+    then: zeroed, with the new q registers at the bottom of the z registers,
+    which is what the kernel's `sve_sync_from_fpsimd_zeropad` does.
+  - GETREGSET and SETREGSET apply `ptrace_regset`'s rules to every regset.
+    A length that is not a whole number of the regset's units is EINVAL, a
+    longer one is cut to the regset, and `iov_len` says what was
+    transferred; it used to be the full size even for a shorter buffer. A
+    short `NT_PRSTATUS` write replaces only that much, and a pstate outside
+    EL0t AArch64, or with D, A, I or F set, is refused as `valid_user_regs`
+    refuses it (sigreturn would have killed the task for it).
+  - Found while measuring this, not fixed:
+    - A stop taken while the thread was inside chroot-ng (blocked in a
+      dispatched syscall on `-R` or at a rewritten site, or in a bounced
+      masked wait) reports chroot-ng's own pc and sp. In the dump, the
+      crashed thread is in `CHROOT-NG+0x130`.
+    - On the seccomp tier, a blocking call dispatched from inside the
+      SIGSYS handler runs with every signal masked. That is the first call
+      from any site that traps. It cannot be signalled until it returns,
+      not even by SIGTERM's default action, and an attach to it hangs the
+      tracer.
+    - The kick has no `SA_RESTART`, so an attach makes the tracee's
+      interrupted syscall fail with EINTR where the kernel restarts it.
+  - Test: m18 `ptrace fpregs` (`tests/guests/pt_probe.c`). The tracee holds
+    a marker in v8 (xmm8 on the x86-64 oracle) across a blocking read. The
+    tracer reads the marker at the attach stop and at the read's entry stop
+    and writes a new one at each, and once the read returns the tracee
+    reports what it held. Then the length rules on `NT_PRFPREG` and
+    `NT_PRSTATUS`. The output matches the kernel on the dev host (`-R` under
+    qemu) and on the Zenfone 10 and Pixel 5 on both tiers (arm64 VM
+    oracle). The old build answers EINVAL at the attach stop and a shifted
+    file at a SIGSYS stop, and never shows the tracee a write. With the fix,
+    a headless Chrome renderer killed by SIGSEGV under `-l -u` leaves a
+    minidump in `Crash Reports/completed` with all 16 of its threads.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

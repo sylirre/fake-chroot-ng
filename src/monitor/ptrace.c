@@ -555,36 +555,183 @@ struct cng_ucontext *cng_pt_cur_uc(void) {
 
 /* ---- regset marshalling (runs in the tracee, on its own live frame) ---- */
 
-/* The FP/SIMD state of the current stop, when it happened in a signal frame:
- * the kernel appends an _aarch64_ctx-tagged record list to the sigcontext, and
- * writes back whatever we leave there on sigreturn — so this is both the read
- * and the write path for NT_PRFPREG. A stop reached from an -R trampoline has
- * no signal frame and answers -EINVAL. */
+/* NT_PRFPREG: the FP/SIMD register file, as the kernel's struct
+ * user_fpsimd_state lays it out — 32 q registers, then fpsr, fpcr and two
+ * reserved words. The kernel has it for every stop, so this answers at every
+ * stop too; where it is read from depends on how the stop was reached.
+ *
+ * In a signal frame — a SIGSYS trap, a signal- or attach-stop taken in one of
+ * our handlers — it is the frame's: the kernel appends an _aarch64_ctx-tagged
+ * record list to the sigcontext and restores whatever we leave there on
+ * sigreturn, so the frame is both the read and the write path. Its FPSIMD
+ * record is *not* a user_fpsimd_state: fpsr and fpcr come first, after the
+ * header, and the q registers follow, which is why the two are converted
+ * rather than copied.
+ *
+ * With no signal frame — an -R trampoline's syscall stop, or a rewritten site's
+ * on the seccomp tier, or the emulated execve's — the registers are the live
+ * ones, read and written in place. They are the guest's own there: nothing in
+ * the monitor is built to spend them (-mgeneral-regs-only, see the Makefile),
+ * and the kernel preserves them across every syscall made since, so what the
+ * trampoline returns to is exactly what the stop left in them. */
 #define PT_FPSIMD_MAGIC 0x46508001
+#define PT_SVE_MAGIC    0x53564501
+#define PT_EXTRA_MAGIC  0x45585401
 
 struct pt_aarch64_ctx {
     u32 magic, size;
 };
 
-static void *pt_fpsimd(struct pt_self *s, struct cng_uregs *r) {
+#define PT_FPSIMD_SZ 528 /* struct user_fpsimd_state */
+#define PT_FP_VREGS  0   /* its q0..q31 */
+#define PT_FP_FPSR   512
+#define PT_FP_FPCR   516
+#define PT_REC_FPSR  8 /* and the same in a frame's FPSIMD record */
+#define PT_REC_FPCR  12
+#define PT_REC_VREGS 16
+
+/* Find the `magic` record in the frame of the current stop, following an
+ * EXTRA record to the part of the list the kernel spills beyond the frame
+ * (it does for a large SVE vector length). 0 when the stop has no signal
+ * frame, or the frame has no such record. */
+static u8 *pt_frame_rec(struct pt_self *s, struct cng_uregs *r, u32 magic) {
     if (!s || !s->uc || cng_pt_uregs(s->uc) != r)
         return 0;
-    unsigned char *p = s->uc->uc_mcontext.__reserved;
-    unsigned char *end = p + sizeof s->uc->uc_mcontext.__reserved;
+    u8 *p = s->uc->uc_mcontext.__reserved;
+    u8 *end = p + sizeof s->uc->uc_mcontext.__reserved;
     while (p + sizeof(struct pt_aarch64_ctx) <= end) {
         struct pt_aarch64_ctx *c = (struct pt_aarch64_ctx *)p;
-        if (c->magic == 0 || c->size == 0)
+        if (c->magic == 0 || c->size < sizeof *c || c->size > end - p)
             return 0; /* end of the record list */
-        if (c->magic == PT_FPSIMD_MAGIC)
-            return p + sizeof *c; /* struct user_fpsimd_state follows the header */
-        if (c->size < sizeof *c)
-            return 0;
+        if (c->magic == magic)
+            return p;
+        if (c->magic == PT_EXTRA_MAGIC && c->size >= 24) {
+            /* struct extra_context { head; u64 datap; u32 size; ... }: the
+             * list goes on at datap, and this record is its last here. */
+            u8 *data = (u8 *)(unsigned long)*(u64 *)(p + 8);
+            u32 dsize = *(u32 *)(p + 16);
+            if (!data)
+                return 0;
+            p = data;
+            end = data + dsize;
+            continue;
+        }
         p += c->size;
     }
     return 0;
 }
 
-#define PT_FPSIMD_SZ 528 /* 32 * 16 vregs + fpsr + fpcr */
+/* The live registers, saved and loaded. The directives are for clang, whose
+ * assembler takes -mgeneral-regs-only to mean no FP instruction at all, inline
+ * asm included; gcc's leaves inline asm alone either way. */
+#define PT_FP_ARCH ".arch_extension fp\n\t.arch_extension simd\n\t"
+
+static void pt_fp_live_save(u8 *out) {
+    __asm__ volatile(PT_FP_ARCH
+                     "stp q0, q1, [%0, #0]\n\t"
+                     "stp q2, q3, [%0, #32]\n\t"
+                     "stp q4, q5, [%0, #64]\n\t"
+                     "stp q6, q7, [%0, #96]\n\t"
+                     "stp q8, q9, [%0, #128]\n\t"
+                     "stp q10, q11, [%0, #160]\n\t"
+                     "stp q12, q13, [%0, #192]\n\t"
+                     "stp q14, q15, [%0, #224]\n\t"
+                     "stp q16, q17, [%0, #256]\n\t"
+                     "stp q18, q19, [%0, #288]\n\t"
+                     "stp q20, q21, [%0, #320]\n\t"
+                     "stp q22, q23, [%0, #352]\n\t"
+                     "stp q24, q25, [%0, #384]\n\t"
+                     "stp q26, q27, [%0, #416]\n\t"
+                     "stp q28, q29, [%0, #448]\n\t"
+                     "stp q30, q31, [%0, #480]\n\t"
+                     "mrs x9, fpsr\n\t"
+                     "str w9, [%0, #512]\n\t"
+                     "mrs x9, fpcr\n\t"
+                     "str w9, [%0, #516]\n\t"
+                     "str xzr, [%0, #520]"
+                     :
+                     : "r"(out)
+                     : "x9", "memory");
+}
+
+/* No clobbers to declare: the registers written are the guest's, which is the
+ * point, and the compiler is not allowed to keep anything of its own there. */
+static void pt_fp_live_load(const u8 *in) {
+    __asm__ volatile(PT_FP_ARCH
+                     "ldp q0, q1, [%0, #0]\n\t"
+                     "ldp q2, q3, [%0, #32]\n\t"
+                     "ldp q4, q5, [%0, #64]\n\t"
+                     "ldp q6, q7, [%0, #96]\n\t"
+                     "ldp q8, q9, [%0, #128]\n\t"
+                     "ldp q10, q11, [%0, #160]\n\t"
+                     "ldp q12, q13, [%0, #192]\n\t"
+                     "ldp q14, q15, [%0, #224]\n\t"
+                     "ldp q16, q17, [%0, #256]\n\t"
+                     "ldp q18, q19, [%0, #288]\n\t"
+                     "ldp q20, q21, [%0, #320]\n\t"
+                     "ldp q22, q23, [%0, #352]\n\t"
+                     "ldp q24, q25, [%0, #384]\n\t"
+                     "ldp q26, q27, [%0, #416]\n\t"
+                     "ldp q28, q29, [%0, #448]\n\t"
+                     "ldp q30, q31, [%0, #480]\n\t"
+                     "ldr w9, [%0, #512]\n\t"
+                     "msr fpsr, x9\n\t"
+                     "ldr w9, [%0, #516]\n\t"
+                     "msr fpcr, x9"
+                     :
+                     : "r"(in)
+                     : "x9", "memory");
+}
+
+static void pt_fp_get(struct pt_self *s, struct cng_uregs *r, u8 *out) {
+    u8 *f = pt_frame_rec(s, r, PT_FPSIMD_MAGIC);
+    if (!f) {
+        pt_fp_live_save(out);
+        return;
+    }
+    memcpy(out + PT_FP_VREGS, f + PT_REC_VREGS, 512);
+    memcpy(out + PT_FP_FPSR, f + PT_REC_FPSR, 4);
+    memcpy(out + PT_FP_FPCR, f + PT_REC_FPCR, 4);
+    memset(out + PT_FP_FPCR + 4, 0, 8);
+}
+
+/* A write replaces the leading `len` bytes and keeps the rest, as the kernel's
+ * fpr_set copies in over the current state.
+ *
+ * A frame taken while the thread's SVE state was live carries it in an SVE
+ * record too, and then that is what sigreturn restores the vector registers
+ * from — the FPSIMD record only supplies fpsr and fpcr — so a write that
+ * stopped at the FPSIMD record would be silently undone. The kernel's own
+ * answer to a NT_PRFPREG write over live SVE state is to zero the whole SVE
+ * register file and put the new q registers in the bottom of the z registers
+ * (sve_sync_from_fpsimd_zeropad); the record is given the same. */
+static void pt_fp_set(struct pt_self *s, struct cng_uregs *r, const u8 *in,
+                      u32 len) {
+    u8 st[PT_FPSIMD_SZ];
+    pt_fp_get(s, r, st);
+    memcpy(st, in, len > sizeof st ? sizeof st : len);
+    u8 *f = pt_frame_rec(s, r, PT_FPSIMD_MAGIC);
+    if (!f) {
+        pt_fp_live_load(st);
+        return;
+    }
+    memcpy(f + PT_REC_VREGS, st + PT_FP_VREGS, 512);
+    memcpy(f + PT_REC_FPSR, st + PT_FP_FPSR, 4);
+    memcpy(f + PT_REC_FPCR, st + PT_FP_FPCR, 4);
+    /* struct sve_context { head; u16 vl; u16 flags; u16 reserved[2]; }, its
+     * registers from offset 16: z0..z31 of vl bytes each, then the predicates.
+     * A record no bigger than its header has none (the state was not live). */
+    u8 *z = pt_frame_rec(s, r, PT_SVE_MAGIC);
+    if (!z)
+        return;
+    u32 size = ((struct pt_aarch64_ctx *)z)->size;
+    u32 vl = *(u16 *)(z + 8);
+    if (size <= 16 || vl < 16 || (u64)vl * 32 > size - 16)
+        return;
+    memset(z + 16, 0, size - 16);
+    for (int i = 0; i < 32; i++)
+        memcpy(z + 16 + (u64)vl * i, st + PT_FP_VREGS + 16 * i, 16);
+}
 
 /* PACIA <Xd>, <Xn>: 0xDAC10000 | (Rn << 5) | Rd, spelled as a raw instruction
  * word so a baseline armv8-a assembler accepts it. Only ever executed once
@@ -640,19 +787,48 @@ static u64 pt_pac_mask(void) {
     return mask;
 }
 
+/* The kernel's geometry for each regset served here, which ptrace_regset
+ * applies before the regset is so much as asked: a length that is not a whole
+ * number of `unit`s is EINVAL, a longer one is cut to `size`, and the cut
+ * length is what iov_len says afterwards — for a write as for a read. 0 for a
+ * regset this does not have. */
+static u32 pt_regset_geom(u64 which, u32 *size) {
+    switch (which) {
+    case CNG_NT_PRSTATUS:
+        *size = (u32)sizeof(struct cng_uregs);
+        return 8;
+    case CNG_NT_PRFPREG:
+        *size = PT_FPSIMD_SZ;
+        return 4;
+    case CNG_NT_ARM_TLS:
+    case CNG_NT_ARM_TAGGED_ADDR_CTRL:
+        *size = 8;
+        return 8;
+    case CNG_NT_ARM_SYSTEM_CALL:
+        *size = 4;
+        return 4;
+    case CNG_NT_ARM_PAC_MASK:
+        *size = 16;
+        return 8;
+    }
+    return 0;
+}
+
+/* pstate bits a write may not set: an exception level other than EL0t, the
+ * AArch32 bit, and the D/A/I/F masks. The kernel's gpr_set refuses such a file
+ * whole (valid_user_regs) rather than return to user mode with it; here,
+ * sigreturn would kill the task for it instead. */
+#define PT_PSTATE_BAD 0x3dfull
+
 static u32 pt_build_regset(struct pt_self *s, struct cng_uregs *r, u32 which,
                            u8 *out) {
     switch (which) {
     case CNG_NT_PRSTATUS:
         memcpy(out, r, sizeof *r);
         return (u32)sizeof *r;
-    case CNG_NT_PRFPREG: {
-        void *f = pt_fpsimd(s, r);
-        if (!f)
-            return 0;
-        memcpy(out, f, PT_FPSIMD_SZ);
+    case CNG_NT_PRFPREG:
+        pt_fp_get(s, r, out);
         return PT_FPSIMD_SZ;
-    }
     case CNG_NT_ARM_TLS: {
         u64 tls;
         __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tls));
@@ -694,20 +870,19 @@ static u32 pt_build_regset(struct pt_self *s, struct cng_uregs *r, u32 which,
 static long pt_apply_regset(struct pt_self *s, struct cng_uregs *r, u32 which,
                             const u8 *in, u32 len) {
     switch (which) {
-    case CNG_NT_PRSTATUS:
-        if (len < sizeof *r)
+    case CNG_NT_PRSTATUS: {
+        /* A short write replaces that much of the file and keeps the rest,
+         * as the kernel's copies in over the current registers. */
+        struct cng_uregs nr = *r;
+        memcpy(&nr, in, len > sizeof nr ? sizeof nr : len);
+        if (nr.pstate & PT_PSTATE_BAD)
             return -EINVAL;
-        memcpy(r, in, sizeof *r);
-        return 0;
-    case CNG_NT_PRFPREG: {
-        void *f = pt_fpsimd(s, r);
-        if (!f)
-            return -EINVAL;
-        if (len > PT_FPSIMD_SZ)
-            len = PT_FPSIMD_SZ;
-        memcpy(f, in, len);
+        *r = nr;
         return 0;
     }
+    case CNG_NT_PRFPREG:
+        pt_fp_set(s, r, in, len);
+        return 0;
     case CNG_NT_ARM_TLS: {
         u64 tls;
         if (len < 8)
@@ -1437,9 +1612,10 @@ int cng_pt_report_signal(struct cng_uregs *r, int sig, int si_code, u64 addr) {
     return pt_stop(s, r, sig, event, 0, si_code, addr);
 }
 
-void cng_pt_service_kick(struct cng_uregs *r) {
+void cng_pt_service_kick(struct cng_ucontext *uc) {
     if (!g_tab)
         return;
+    struct cng_uregs *r = cng_pt_uregs(uc);
     struct pt_self *s = pt_self_get(0);
     if (!s || !s->active) {
         /* A pending PTRACE_ATTACH/SEIZE keyed by this task's own tid. */
@@ -1458,6 +1634,14 @@ void cng_pt_service_kick(struct cng_uregs *r) {
         s->link = e;
         s->active = 1;
         g_pt_local = 1;
+        /* The frame the kick handler could not record: cng_pt_set_frame keeps
+         * it only for a task that already has a slot, and this one got its
+         * slot just now. Without it the attach stop had registers but no
+         * signal frame, so it could not say where the FP/SIMD state was —
+         * crashpad, which attaches to every thread of a crashed process and
+         * reads NT_PRFPREG from each, got EINVAL for all of them. */
+        s->regs = r;
+        s->uc = uc;
         cng_pt_arm_tracee();
         pt_traced_inc();
         if (!e->seize) {
@@ -1793,6 +1977,9 @@ long cng_pt_syscall(long req, long pid, u64 addr, u64 data) {
         u64 iov[2]; /* {base, len} */
         if (cng_user_copyin(iov, (void *)data, sizeof iov) < 0)
             return -EFAULT;
+        u32 size, unit = pt_regset_geom(addr, &size);
+        if (!unit || iov[1] % unit)
+            return -EINVAL;
         pt_cmd(e, PT_CMD_GETREGS, addr, 0);
         if (e->result < 0)
             return -EINVAL;
@@ -1801,7 +1988,7 @@ long cng_pt_syscall(long req, long pid, u64 addr, u64 data) {
             n = (u32)iov[1];
         if (n && cng_user_copyout((void *)iov[0], e->data, n) < 0)
             return -EFAULT;
-        iov[1] = e->rlen;
+        iov[1] = n;
         if (cng_user_copyout((void *)data, iov, sizeof iov) < 0)
             return -EFAULT;
         return 0;
@@ -1810,12 +1997,22 @@ long cng_pt_syscall(long req, long pid, u64 addr, u64 data) {
         u64 iov[2];
         if (cng_user_copyin(iov, (void *)data, sizeof iov) < 0)
             return -EFAULT;
-        u32 n = (u32)(iov[1] > PT_MBOX ? PT_MBOX : iov[1]);
+        u32 size, unit = pt_regset_geom(addr, &size);
+        if (!unit || iov[1] % unit)
+            return -EINVAL;
+        u32 n = (u32)(iov[1] > size ? size : iov[1]);
         if (n && cng_user_copyin(e->data, (void *)iov[0], n) < 0)
             return -EFAULT;
-        e->rlen = n;
-        pt_cmd(e, PT_CMD_SETREGS, addr, 0);
-        return e->result < 0 ? (long)e->result : 0;
+        if (n) {
+            e->rlen = n;
+            pt_cmd(e, PT_CMD_SETREGS, addr, 0);
+            if (e->result < 0)
+                return (long)e->result;
+        }
+        iov[1] = n;
+        if (cng_user_copyout((void *)data, iov, sizeof iov) < 0)
+            return -EFAULT;
+        return 0;
     }
     case CNG_PTRACE_CONT:
         pt_cmd(e, PT_CMD_RESUME, data, PT_RES_CONT);
