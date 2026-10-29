@@ -237,7 +237,7 @@ static void pt_kick_handler(int sig, cng_siginfo_t *si, void *ucv) {
         case CNG_PT_KICK_WAKE:
         case CNG_PT_KICK_REWAKE:
             g_kick_seen++;
-            break; /* the EINTR it inflicts is the whole point */
+            break; /* its effect is on a native wait: cng_pt_kick_taken */
         case CNG_PT_KICK_ARM:
             cng_pt_arm_tracer();
             break;
@@ -249,6 +249,9 @@ static void pt_kick_handler(int sig, cng_siginfo_t *si, void *ucv) {
             pt_deliver_to_guest(sig, si, ucv);
             return;
         }
+        /* A bounced wait the kick cut short with EINTR, where the kernel
+         * would have restarted it (a stop has already put the frame back). */
+        cng_pt_kick_unwind(uc);
         /* Last, after an attach stop the kick may have been held in: what it
          * does to a native wait it interrupted is make it look again. */
         cng_pt_kick_taken(uc, magic);
@@ -318,11 +321,19 @@ void cng_pt_sig_install_kick(void) {
     struct pt_ksigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.handler = (void *)pt_kick_handler;
-    /* Deliberately no SA_RESTART: the kick's other job is to interrupt a tracer
-     * still blocked in a *native* wait4 — the window between its child's
-     * PTRACE_TRACEME and its own first trapped wait — so that the retry lands
-     * in the one that can see emulated stops. */
-    sa.flags = CNG_SA_SIGINFO | CNG_SA_RESTORER | CNG_SA_ONSTACK;
+    /* SA_RESTART, because the kick is not the guest's signal and must not show
+     * as one. An attach is a stop, not a delivery, and the kernel restarts the
+     * call the stop cut short; the kick used to end it with EINTR instead, so a
+     * tracee blocked in read() came out of an attach with -1. The restart is
+     * also what the kick's other job needs. A tracer blocked in a native wait4
+     * — the window between its child's PTRACE_TRACEME and its own first
+     * trapped wait — used to be knocked out of it by that EINTR, so that the
+     * retry would trap. The restart re-executes the svc, which the tracer
+     * filter the kick just stacked traps the same way, with no retry of the
+     * guest's needed. The -R tier's native wait is ended by the handler
+     * either way (cng_pt_kick_taken). */
+    sa.flags = CNG_SA_SIGINFO | CNG_SA_RESTORER | CNG_SA_ONSTACK |
+               CNG_SA_RESTART;
     sa.mask.sig[0] = ~0UL & ~(1UL << (CNG_SIGSYS - 1));
     sa.restorer = (void *)cng_sigrestore;
     sys_rt_sigaction(cng_g_kicksig, &sa, 0);

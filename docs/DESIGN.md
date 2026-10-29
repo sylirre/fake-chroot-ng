@@ -255,7 +255,13 @@ gate `[__cng_gate_start, __cng_gate_end)`. Every raw `svc` from anywhere —
 glibc, musl, Go's runtime, Rust, JIT — traps synchronously, in-process, to the
 `SIGSYS` handler, which reads args from the `ucontext`, translates the path into
 its own buffer, re-issues the real syscall through the gate, and writes the
-result back into the return register. Non-path syscalls run natively.
+result back into the return register. Non-path syscalls run natively. A trapped
+call that can block — a socket call on a blocking descriptor, a FIFO's open,
+a tracee's read — is not made in the handler, which runs with every signal
+masked and would leave it reachable by nothing but `SIGKILL`: the handler
+returns into a stub in the gate that makes the call from the guest's own
+context, the guest's call itself or the whole dispatch, and a second trap puts
+the registers back (`sigsys.c`, the bounce).
 
 **The mmap hook is the choke point** for both `noexec`-defeat and rewriting of
 dynamically-loaded code: when `ld.so` tries to `mmap(PROT_EXEC)` a `.so` from
@@ -380,6 +386,20 @@ mirror the guest's own flags and mask — which is what makes a gdb breakpoint, 
 `brk` poked into read-only text, arrive as a stop rather than kill the guest.
 See `src/monitor/ptrace.c`, `ptsig.c` and `ptstep.c`.
 
+A running task is reached by a kick signal of ours, and the kick lands wherever
+the thread is — which, for a thread blocked in a call made on its behalf, is
+inside chroot-ng: a bounce stub, an `-R` trampoline, or the dispatcher itself.
+The stop has to show what the kernel shows there, the thread's own registers
+with the call's arguments in place and `pc` at its syscall instruction, and the
+call has to be made again when it ends, with whatever the tracer left in the
+registers. The stubs and the trampolines hold the guest's registers in a
+record, so the kick's frame is put back to the guest's state, as if the call
+were not yet made or already over. The dispatcher's frames cannot be stepped
+out of: its stop reports the guest's registers from the dispatch's own record,
+and a tracer that changes them abandons the call in flight, which is then made
+again as the tracer left it. The kick is `SA_RESTART`, so a call it interrupts
+is restarted rather than failed with `EINTR`.
+
 ### Known hazards (why the tiers exist)
 
 - `execve` erases the in-process handler → emulate `execve` via the loader.
@@ -395,6 +415,14 @@ See `src/monitor/ptrace.c`, `ptsig.c` and `ptstep.c`.
   mask and `SIGSYS` is taken out of it; on the `SIGSYS` tier such a wait is run
   from the guest's own context through a stub in the gate, since the handler,
   which runs with every other signal blocked, cannot run it itself.
+- A call that blocks inside that handler cannot be interrupted at all: a
+  server in `accept` outlived `SIGTERM`, `^C` did not reach a FIFO's `open`, a
+  guest handler ran only after the call returned, and a ptrace attach, whose
+  kick is masked with the rest, hung its tracer → every trapped call that can
+  block is bounced into guest context the same way, where the kernel's own
+  rules interrupt and restart it. Under `-R` the first trap from a site is sent
+  back to the site once the rewrite has made it a branch, so it too runs
+  through the trampoline.
 - The guest (notably Go) can clobber the `SIGSYS` handler or block the signal →
   virtualize `rt_sigaction`/`rt_sigprocmask`/`seccomp`/`prctl`. A guest filter is
   layered on top of ours by the kernel and governs the syscalls the handler

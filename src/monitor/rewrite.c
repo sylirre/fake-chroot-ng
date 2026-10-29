@@ -4,6 +4,7 @@
 #include "cng/elf.h"
 #include "cng/loader.h"
 #include "cng/monitor.h"
+#include "cng/ptrace.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
 #include "cng/tab.h"
@@ -324,6 +325,106 @@ int cng_rewrite_seg(unsigned long lo, unsigned long hi, unsigned long foff,
                       pool, cap, used);
     }
     return count;
+}
+
+/* ---- a ptrace kick inside a trampoline -----------------------------------
+ *
+ * A kick can land on any instruction of a copy, and its frame is then neither
+ * the guest's nor the dispatcher's: sp lowered over the trampoline's frame,
+ * x16/x17 and the flags spent on the clone test, x0 on the call. A stop needs
+ * the guest's state, and it is all there: up to the call the trampoline has
+ * only saved, so the guest's state is that of a call not yet made, at the
+ * site's branch; after it the frame holds the guest's state as the dispatch
+ * left it, which is the call made. The copy is recognized by its words (only
+ * the two branches and the literals differ from the template), so nothing has
+ * to keep a list of pools. */
+extern char cng_svc_tramp_clone[];
+extern char cng_svc_tramp_call[];
+extern char cng_svc_tramp_gen[];
+
+#define TRAMP_WORDS 128 /* comfortably more than the template has */
+
+/* Is `w` (the template's size, read from a candidate copy) a trampoline? */
+static int tramp_is_copy(const uint32_t *w) {
+    const uint32_t *t = (const uint32_t *)cng_svc_tramp_tpl;
+    unsigned long code = (unsigned long)(cng_svc_tramp_disp - cng_svc_tramp_tpl);
+    unsigned long b1 = (unsigned long)(cng_svc_tramp_clone - cng_svc_tramp_tpl) + 4,
+                  b2 = (unsigned long)(cng_svc_tramp_back - cng_svc_tramp_tpl);
+    for (unsigned long o = 0; o < code; o += 4) {
+        if (o == b1 || o == b2) {
+            if ((w[o / 4] & 0xFC000000u) != B_OPCODE)
+                return 0;
+        } else if (w[o / 4] != t[o / 4]) {
+            return 0;
+        }
+    }
+    return *(const unsigned long *)((const char *)w + code) ==
+           (unsigned long)&cng_tramp_dispatch;
+}
+
+int cng_tramp_unwind(struct cng_uregs *u) {
+    unsigned long tsz = cng_tramp_size();
+    if (tsz > TRAMP_WORDS * 4 || (u->pc & 3))
+        return 0;
+    uint32_t cur;
+    if (cng_user_copyin(&cur, (const void *)u->pc, 4) < 0)
+        return 0;
+    const uint32_t *t = (const uint32_t *)cng_svc_tramp_tpl;
+    unsigned long code = (unsigned long)(cng_svc_tramp_disp - cng_svc_tramp_tpl);
+    unsigned long clone = (unsigned long)(cng_svc_tramp_clone - cng_svc_tramp_tpl),
+                  call = (unsigned long)(cng_svc_tramp_call - cng_svc_tramp_tpl),
+                  back = (unsigned long)(cng_svc_tramp_back - cng_svc_tramp_tpl),
+                  gen = (unsigned long)(cng_svc_tramp_gen - cng_svc_tramp_tpl),
+                  ret = (unsigned long)(cng_svc_tramp_ret - cng_svc_tramp_tpl);
+    for (unsigned long o = 0; o < code; o += 4) {
+        int br = o == clone + 4 || o == back;
+        if (br ? (cur & 0xFC000000u) != B_OPCODE : cur != t[o / 4])
+            continue;
+        uint32_t w[TRAMP_WORDS];
+        if (cng_user_copyin(w, (const void *)(u->pc - o), tsz) < 0 ||
+            !tramp_is_copy(w))
+            continue;
+        u64 site4 = *(const u64 *)((const char *)w + ret); /* S+4 */
+        if (o == clone + 4 || o == back) {
+            u->pc = site4; /* the call is over and every register restored */
+            return 1;
+        }
+        if (o == gen + 20) {
+            u->pc = u->x[16]; /* `br x16`: only pc is left to set */
+            return 1;
+        }
+        /* Up to the call: the guest's registers are the live ones, except
+         * what the trampoline has spent and saved so far. At the clone's svc
+         * everything is back already, and before the first save nothing has
+         * been spent but sp. */
+        if (o == clone || o < 8) {
+            if (o != clone && o >= 4)
+                u->sp += 288;
+            u->pc = site4 - 4;
+            return 1;
+        }
+        struct cng_uregs f; /* the trampoline's frame, at sp */
+        if (cng_user_copyin(&f, (const void *)u->sp, sizeof f) < 0)
+            return 0;
+        u64 nzcv = f.pstate & 0xF0000000ull;
+        if (o > call) {
+            /* The dispatch has returned and the epilogue is restoring from the
+             * frame: what it ends with is the frame, sp and pc included. */
+            f.pstate = (u->pstate & ~0xF0000000ull) | nzcv;
+            *u = f;
+            return 1;
+        }
+        u->sp += 288;
+        u->x[16] = f.x[16];
+        u->x[17] = f.x[17];
+        if (o >= 20) /* the clone test has spent the flags */
+            u->pstate = (u->pstate & ~0xF0000000ull) | nzcv;
+        if (o >= call - 4) /* `mov x0, sp` is made */
+            u->x[0] = f.x[0];
+        u->pc = site4 - 4;
+        return 1;
+    }
+    return 0;
 }
 
 /* ---- lazy rewriting: the site the CPU just trapped from ------------------

@@ -24,6 +24,7 @@
 #include "cng/ownmap.h"
 #include "cng/procreg.h"
 #include "cng/ptrace.h"
+#include "cng/rewrite.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
 #include "cng/tab.h"
@@ -127,6 +128,7 @@ struct pt_self {
     struct pt_link *link;
     struct cng_uregs *regs;  /* the frame this entry into monitor code runs on */
     struct cng_ucontext *uc; /* and the signal frame it came from, if any */
+    struct cng_ucontext *fpuc; /* a stop's FP/SIMD frame, when not that one */
     int active;              /* this task is a tracee */
     int armed;               /* resumed with PTRACE_SYSCALL */
     int entry_seen;          /* an entry stop was reported for the syscall in
@@ -326,11 +328,13 @@ static void pt_bump_gen(void) {
 /* Wake tracer `tr` after publishing a stop or an exit. Three channels, because
  * a tracer can be waiting in any of three ways: the poll futex (our own wait4),
  * SIGCHLD exactly as the kernel raises it on a tracee state change (a gdb-style
- * event loop), and the reserved kick signal, whose handler does nothing but
- * inflict EINTR on a tracer still blocked in a *native* wait4 — the window
- * before its first trapped wait, or on -R a wait that went to the kernel
- * before the tracer knew it was one. A repeated wake for a stop still
- * uncollected says so with its own magic (cng_pt_kick_taken). */
+ * event loop), and the reserved kick signal, for a tracer still blocked in a
+ * *native* wait4: on -R one that went to the kernel before the tracer knew it
+ * was one, which the kick's handler ends (cng_pt_kick_taken), and on the
+ * seccomp tier one from before its first trapped wait, which the kernel
+ * restarts once the handler returns, into the filter an arming kick has
+ * stacked by then. A repeated wake for a stop still uncollected says so with
+ * its own magic (cng_pt_kick_taken). */
 static void pt_kick_tracer(s32 tr, int magic) {
     if (tr <= 0)
         return;
@@ -384,6 +388,7 @@ static struct pt_self *pt_self_init(struct pt_self *s) {
     s->link = 0;
     s->regs = 0;
     s->uc = 0;
+    s->fpuc = 0;
     s->active = s->armed = s->step = 0;
     s->entry_seen = s->skip_exit_stop = s->in_stop = 0;
     s->traceall = s->tracer_armed = 0;
@@ -593,12 +598,25 @@ struct pt_aarch64_ctx {
 /* Find the `magic` record in the frame of the current stop, following an
  * EXTRA record to the part of the list the kernel spills beyond the frame
  * (it does for a large SVE vector length). 0 when the stop has no signal
- * frame, or the frame has no such record. */
+ * frame, or the frame has no such record.
+ *
+ * The frame has to be the one `r` is in: a stop taken in a guest handler that
+ * ran over a dispatch leaves the handler's frame recorded, dead, by the time
+ * the dispatch reports its own. The one exception is named: a stop taken
+ * inside a dispatch from guest context reports the guest's registers from the
+ * dispatch's record, and the FP/SIMD state from the frame of the kick that
+ * stopped it (s->fpuc, see pt_inflight_stop). */
 static u8 *pt_frame_rec(struct pt_self *s, struct cng_uregs *r, u32 magic) {
-    if (!s || !s->uc || cng_pt_uregs(s->uc) != r)
+    if (!s)
         return 0;
-    u8 *p = s->uc->uc_mcontext.__reserved;
-    u8 *end = p + sizeof s->uc->uc_mcontext.__reserved;
+    struct cng_ucontext *uc = s->fpuc;
+    if (!uc) {
+        if (!s->uc || cng_pt_uregs(s->uc) != r)
+            return 0;
+        uc = s->uc;
+    }
+    u8 *p = uc->uc_mcontext.__reserved;
+    u8 *end = p + sizeof uc->uc_mcontext.__reserved;
     while (p + sizeof(struct pt_aarch64_ctx) <= end) {
         struct pt_aarch64_ctx *c = (struct pt_aarch64_ctx *)p;
         if (c->magic == 0 || c->size < sizeof *c || c->size > end - p)
@@ -1359,6 +1377,21 @@ void cng_pt_syscall_exit(struct cng_uregs *r) {
     pt_stop(s, r, 5 /*SIGTRAP*/, 0, 2, 0, 0);
 }
 
+int cng_pt_entry_owed(void) {
+    if (!g_pt_local)
+        return 0;
+    struct pt_self *s = pt_self_get(0);
+    return s && s->entry_seen;
+}
+
+void cng_pt_entry_set(int owed) {
+    if (!g_pt_local)
+        return;
+    struct pt_self *s = pt_self_get(0);
+    if (s)
+        s->entry_seen = owed;
+}
+
 int cng_pt_stepping(void) {
     if (!g_pt_local || !g_tab)
         return 0;
@@ -1612,6 +1645,183 @@ int cng_pt_report_signal(struct cng_uregs *r, int sig, int si_code, u64 addr) {
     return pt_stop(s, r, sig, event, 0, si_code, addr);
 }
 
+/* ---- where a kick's stop finds the thread ----
+ *
+ * The kick is a signal, and its frame is wherever the thread was — which for a
+ * stop has to be the guest's state, and is not always. The kernel shows a
+ * thread blocked in a syscall at that syscall's svc, its arguments in x0..x5,
+ * the call to be made again when the stop ends (it rewinds pc before the stop
+ * for exactly this), and a thread between two instructions of its own exactly
+ * as it is. A guest thread can be in three places of ours instead: one of the
+ * bounce stubs (sigsys.c), one of the -R trampolines (rewrite.c), or the
+ * dispatcher itself, run from guest context by either. The first two keep the
+ * guest's registers in a record the frame can be put back from, and are put
+ * back, as if the call were not yet made or already over. The third cannot be
+ * stepped out of: its stop reports the guest's registers from the dispatch's
+ * record instead (pt_inflight_stop).
+ *
+ * A call whose entry stop its tracer saw owes it an exit stop first, as the
+ * kernel gives one with the restart code in x0 before the stop that cut it
+ * short. */
+
+/* That owed exit stop, on the frame `uc` just put back, which `undone` says is
+ * at the svc (x0 the argument) rather than after it (x0 the result); `rval` is
+ * the x0 the tracer sees. A tracer that changes a restart code there takes the
+ * restart away, as do_signal decides it from x0 after that stop: the thread
+ * then resumes after the svc with what the tracer left. */
+static void pt_owed_exit(struct pt_self *s, struct cng_ucontext *uc,
+                         int undone, long rval) {
+    struct cng_uregs *r = cng_pt_uregs(uc);
+    struct cng_uregs v = *r;
+    if (undone)
+        v.pc += 4;
+    v.x[0] = (u64)rval;
+    s->entry_seen = 1;
+    s->fpuc = uc;
+    cng_pt_syscall_exit(&v);
+    s->fpuc = 0;
+    u64 pc = r->pc, x0 = r->x[0];
+    *r = v;
+    if (undone && (s64)v.x[0] == rval) {
+        r->pc = pc;
+        r->x[0] = x0;
+    }
+}
+
+/* The stops a kick asks for — the attach's SIGSTOP, an INTERRUPT's event stop,
+ * a routed stop signal — taken on `r`. */
+static void pt_kick_take(struct pt_self *s, struct cng_uregs *r, int attach,
+                         int intr, int ss) {
+    struct pt_link *e = s->link;
+    if (attach)
+        pt_stop(s, r, 19 /*SIGSTOP*/, 0, 0, 0, 0);
+    if (intr && s->link == e)
+        pt_stop(s, r, 5 /*SIGTRAP*/, CNG_PTRACE_EVENT_STOP, 0, 0, 0);
+    if (ss && s->link == e)
+        pt_stop(s, r, ss, e->seize ? CNG_PTRACE_EVENT_STOP : 0, 0, 0, 0);
+}
+
+/* Is `pc` a gate svc the kernel has a restart pending at — a blocking call of
+ * the dispatcher's, cut short by this kick? */
+static int pt_gate_svc(u64 pc) {
+    if (pc < (u64)__cng_gate_start || pc + 4 > (u64)__cng_gate_end || (pc & 3))
+        return 0;
+    return *(const u32 *)(unsigned long)pc == 0xD4000001u /* svc #0 */;
+}
+
+/* A stop inside a dispatch running from guest context (see cng_gframe). The
+ * dispatcher's frames are live on its stack and cannot be stepped out of, so
+ * the stop is taken on a copy of the guest's registers: at the svc while the
+ * call is in flight, after it once it is done. The FP/SIMD state is the
+ * kick's frame's, which the dispatcher (built without FP code) leaves the
+ * guest's. A tracer that changes the copy abandons the call in flight: the
+ * blocking call is cut short if it is the one the kick interrupted, the
+ * dispatch's result is dropped when it returns, and the guest resumes with the
+ * registers the tracer set — which at the svc means the call is made again,
+ * with whatever the tracer put in them (cng_dispatch_bounced, tramp_body). */
+static void pt_inflight_stop(struct pt_self *s, struct cng_ucontext *uc,
+                             struct cng_gframe *gf, int attach, int intr,
+                             int ss) {
+    int done = gf->done;
+    struct cng_uregs before = *gf->r;
+    if (!done)
+        before.pc -= 4;
+    struct cng_uregs v = before;
+    s->fpuc = uc;
+    if (!done && gf->owed) {
+        /* The exit stop first, with the restart code; the dispatch's own is
+         * then not given. A tracer that answers it otherwise is answering the
+         * call, which is then abandoned with that answer. */
+        gf->owed = 0;
+        struct cng_uregs ev = *gf->r;
+        ev.x[0] = (u64)(s64)-512 /*ERESTARTSYS*/;
+        s->entry_seen = 1;
+        cng_pt_syscall_exit(&ev);
+        if ((s64)ev.x[0] != -512) {
+            s->fpuc = 0;
+            *gf->r = ev;
+            gf->abandon = 1;
+            goto cut;
+        }
+        v = ev;
+        v.x[0] = before.x[0];
+        v.pc = before.pc;
+    }
+    pt_kick_take(s, &v, attach, intr, ss);
+    int changed = memcmp(&v, &before, sizeof v) != 0;
+    if (done) {
+        s->fpuc = 0;
+        if (changed)
+            *gf->r = v; /* over already: what the trampoline's exit installs */
+        return;
+    }
+    if (changed) {
+        /* Made again from the svc, with its own entry stop, if the tracer
+         * left it there (tramp_body); otherwise the thread goes where it was
+         * sent. */
+        s->fpuc = 0;
+        *gf->r = v;
+        gf->abandon = 1;
+        goto cut;
+    }
+    /* Resumed into syscall tracing: the kernel's restart of the call is a
+     * syscall like any other and stops at its entry, so this one does too, as
+     * that restart — after the svc, where an entry stop is. The call goes on
+     * as it was if the tracer lets it; one it changes there is made again as
+     * the tracer left it, and one it cancels has its answer. */
+    if (s->active && s->link && s->armed) {
+        struct cng_uregs ev = v, eb;
+        ev.pc += 4;
+        eb = ev;
+        long nr2 = (long)ev.x[8];
+        int run = cng_pt_syscall_entry(&ev, &nr2);
+        gf->owed = s->entry_seen;
+        if (!run || nr2 != (long)eb.x[8] || memcmp(&ev, &eb, sizeof ev)) {
+            s->fpuc = 0;
+            *gf->r = ev;
+            gf->abandon = 1;
+            gf->entered = 1;
+            gf->nr = run ? nr2 : -1;
+            goto cut;
+        }
+    }
+    s->fpuc = 0;
+    return;
+cut:
+    if (pt_gate_svc(cng_pt_uregs(uc)->pc)) {
+        cng_pt_uregs(uc)->pc += 4;
+        cng_pt_uregs(uc)->x[0] = (u64)(s64)-EINTR;
+    }
+}
+
+/* Take the stops, with the thread wherever the kick found it (see above). */
+static void pt_kick_stops(struct pt_self *s, struct cng_ucontext *uc,
+                          int attach, int intr, int ss) {
+    /* Already parked in a stop (our trace handler mirrors the guest's mask,
+     * and the kick is not in it): a stop cannot be taken inside a stop, so
+     * there is nothing to report, and nothing of the call underneath — the
+     * exit stop it owes among it — is touched. */
+    if (s->in_stop)
+        return;
+    struct cng_uregs *r = cng_pt_uregs(uc);
+    int owed = 0;
+    long rval = 0;
+    int how = cng_bounce_unwind(uc, 1, &owed, &rval);
+    if (how == CNG_UNWIND_NONE) {
+        struct cng_gframe *gf;
+        if (!cng_tramp_unwind(r) && r->pc >= (u64)__cng_image_start &&
+            r->pc < (u64)__cng_image_end && (gf = cng_gframe_cur())) {
+            pt_inflight_stop(s, uc, gf, attach, intr, ss);
+            return;
+        }
+    } else if (owed) {
+        pt_owed_exit(s, uc, how == CNG_UNWIND_UNDONE, rval);
+    }
+    s->regs = r;
+    s->uc = uc;
+    pt_kick_take(s, r, attach, intr, ss);
+}
+
 void cng_pt_service_kick(struct cng_ucontext *uc) {
     if (!g_tab)
         return;
@@ -1645,7 +1855,7 @@ void cng_pt_service_kick(struct cng_ucontext *uc) {
         cng_pt_arm_tracee();
         pt_traced_inc();
         if (!e->seize) {
-            pt_stop(s, r, 19 /*SIGSTOP*/, 0, 0, 0, 0);
+            pt_kick_stops(s, uc, 1, 0, 0);
             return;
         }
         /* SEIZE attaches without a stop; fall through in case an INTERRUPT
@@ -1654,16 +1864,27 @@ void cng_pt_service_kick(struct cng_ucontext *uc) {
     struct pt_link *e = s->link;
     if (!e)
         return;
-    if (__atomic_load_n(&e->interrupt_pending, __ATOMIC_ACQUIRE)) {
+    int intr = __atomic_load_n(&e->interrupt_pending, __ATOMIC_ACQUIRE) != 0;
+    if (intr)
         __atomic_store_n(&e->interrupt_pending, 0, __ATOMIC_RELEASE);
-        pt_stop(s, r, 5 /*SIGTRAP*/, CNG_PTRACE_EVENT_STOP, 0, 0, 0);
-    }
     u32 ss = __atomic_load_n(&e->stopsig_pending, __ATOMIC_ACQUIRE);
-    if (ss) {
+    if (ss)
         __atomic_store_n(&e->stopsig_pending, 0, __ATOMIC_RELEASE);
-        int event = e->seize ? CNG_PTRACE_EVENT_STOP : 0;
-        pt_stop(s, r, (int)ss, event, 0, 0, 0);
-    }
+    if (intr || ss)
+        pt_kick_stops(s, uc, 0, intr, (int)ss);
+}
+
+/* Any other kick of ours: no stop, but a wait it cut short that the kernel
+ * would have restarted is put back to be made again (cng_bounce_unwind), with
+ * the exit stop a tracee owes for it. */
+void cng_pt_kick_unwind(struct cng_ucontext *uc) {
+    int owed = 0;
+    long rval = 0;
+    if (cng_bounce_unwind(uc, 0, &owed, &rval) != CNG_UNWIND_UNDONE || !owed)
+        return;
+    struct pt_self *s = pt_self_get(0);
+    if (s && s->active && s->link)
+        pt_owed_exit(s, uc, 1, rval);
 }
 
 /* ---- tracer: mailbox round-trip ---- */
@@ -1712,9 +1933,10 @@ static long pt_traceme(void) {
     pt_traced_inc();
     /* Our parent is now a tracer, but it has not called ptrace yet — the whole
      * point of TRACEME — so nothing has armed its side of the interception.
-     * Kick it: its handler installs the tracer filter, and the EINTR that comes
-     * with the kick knocks it out of any native wait4 it is already blocked in,
-     * so the retry lands in the trapped one that can see our stops. Any of its
+     * Kick it: its handler installs the tracer filter, and a native wait4 it is
+     * already blocked in is restarted by the kernel when the handler returns,
+     * which makes the svc again — into that filter, so the wait becomes the
+     * trapped one that can see our stops. Any of its
      * threads will do — arming kicks the rest (cng_pt_arm_tracer) — and one
      * that does not block the kick has to: a parent whose main thread blocks
      * every signal while another thread waits never armed at all. */
@@ -2199,6 +2421,15 @@ void cng_pt_note_reaped(long pid) {
 static int pt_signal_pending(const struct cng_ucontext *uc) {
     return cng_sig_deliverable_in(uc);
 }
+/* A ptrace kick is not a signal of the guest's, and must not end its wait the
+ * way one does. But masked in the handler, it could not land while the wait
+ * lasted, and a tracer attaching to this task (or interrupting it) would hang
+ * for as long as that: so the wait is made again from its svc instead
+ * (CNG_ERESTART), which is where the kernel shows a wait it is going to
+ * restart, and the kick lands there on the way. */
+static int pt_kick_waiting(const struct cng_ucontext *uc) {
+    return cng_sig_kick_pending(uc);
+}
 
 #define PT_WNOHANG   1
 #define PT_WPOLL_MS  50
@@ -2298,6 +2529,8 @@ long cng_pt_wait4(long pid, u64 status, long options, u64 rusage,
         }
         if (pt_signal_pending(uc))
             return -EINTR;
+        if (pt_kick_waiting(uc))
+            return -CNG_ERESTART;
         if (g_tab)
             fx_wait(&g_tab->global_gen, gen, PT_WPOLL_MS);
     }
@@ -2390,6 +2623,8 @@ long cng_pt_waitid(long idtype, long id, u64 infop, long options, u64 rusage,
         }
         if (pt_signal_pending(uc))
             return -EINTR;
+        if (pt_kick_waiting(uc))
+            return -CNG_ERESTART;
         if (g_tab)
             fx_wait(&g_tab->global_gen, gen, PT_WPOLL_MS);
     }
@@ -2654,8 +2889,9 @@ void cng_pt_kick_taken(struct cng_ucontext *uc, int magic) {
     /* Interrupted inside a native wait (cng_wait_unless): between its compare
      * and its svc the kick count it read is stale, and at the svc a restart
      * may be pending that would put the thread back to sleep on it, so resume
-     * at the bail instead; and an -EINTR the kick inflicted on the svc is ours,
-     * not the guest's, and is answered the same way. */
+     * at the bail instead. That pending restart is what the kick leaves on a
+     * wait it interrupts, being SA_RESTART; an -EINTR on the svc would be ours
+     * too, not the guest's, and is answered the same way. */
     struct cng_uregs *r = cng_pt_uregs(uc);
     if (r->pc >= (u64)cng_wait_unless_check &&
         r->pc <= (u64)cng_wait_unless_svc)

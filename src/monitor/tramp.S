@@ -40,6 +40,12 @@
     .global cng_svc_tramp_disp
     .global cng_svc_tramp_ret
     .global cng_svc_tramp_back
+    /* Landmarks for a ptrace kick that lands inside a copy, which has to put
+     * the thread back to the guest's own state before it can stop it there
+     * (cng_tramp_unwind in rewrite.c reads the stages off these). */
+    .global cng_svc_tramp_clone
+    .global cng_svc_tramp_call
+    .global cng_svc_tramp_gen
     .balign 8
 cng_svc_tramp_tpl:
     sub     sp, sp, #288
@@ -73,6 +79,7 @@ cng_svc_tramp_tpl:
     msr     nzcv, x16
     ldp     x16, x17, [sp, #128]
     add     sp, sp, #288
+cng_svc_tramp_clone:
     svc     #0                      /* exactly what an unrewritten site does */
     b       cng_svc_tramp_back      /* patched: b S+4 — the child arrives here
                                      * with the kernel's SP and returns to the
@@ -98,6 +105,7 @@ cng_svc_tramp_tpl:
     str     x16,      [sp, #256]
     mov     x0, sp                  /* cng_tramp_dispatch(&frame) */
     ldr     x16, cng_svc_tramp_disp
+cng_svc_tramp_call:
     blr     x16
     ldp     x0, x1,   [sp, #0]
     ldp     x2, x3,   [sp, #16]
@@ -129,6 +137,7 @@ cng_svc_tramp_tpl:
     add     sp, sp, #288
 cng_svc_tramp_back:
     brk     #0                      /* patched: b S+4 (loud if it ever is not) */
+cng_svc_tramp_gen:
 1:  ldr     x16,      [sp, #264]
     msr     nzcv, x16
     ldr     x17,      [sp, #248]    /* sp and pc last: both are ours to use */

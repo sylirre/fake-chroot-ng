@@ -96,13 +96,21 @@ static long ipc_wait_rpc(struct cng_breq *q, const void *payload, u64 plen,
          * returns and the signal is no longer pending to be found. Under the
          * SIGSYS handler nothing can be delivered, so the slice is what makes
          * the pending set visible at all. */
-        if (pr != -EINTR && !cng_sig_deliverable())
+        /* A ptrace kick, too, can only be seen pending from the handler, and
+         * has to end the wait or an attach to this thread hangs as long as it
+         * does. It is not the guest's signal, so a wait it cancels is not
+         * interrupted but made again from its svc, where the kick lands
+         * (CNG_ERESTART); one granted meanwhile is simply over. */
+        int kick = pr != -EINTR && cng_sig_kick_waiting();
+        if (pr != -EINTR && !kick && !cng_sig_deliverable())
             continue;
         struct cng_breq cq;
         memset(&cq, 0, sizeof cq);
         cq.op = CNG_REQ_CANCEL;
         cng_broker_send(s, &cq, sizeof cq, -1); /* EPIPE: a grant is en route */
         ret = cng_broker_read_full(s, r, sizeof *r) == 0 ? r->ret : -EIDRM;
+        if (kick && ret == -EINTR) /* the cancel-ack, not a grant */
+            ret = -CNG_ERESTART;
         break;
     }
     if (ret > 0 && rbuf) { /* a grant streams its payload behind the reply */

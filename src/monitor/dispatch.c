@@ -670,6 +670,27 @@ static long pin_args(long *nr, long *a, struct cng_pin *x, struct cng_pin *y,
     return 0;
 }
 
+/* How many dispatches of this process run from guest context for the SIGSYS
+ * handler right now (cng_dispatch_bounced). While there is none, which is
+ * nearly always, the re-issue below costs nothing extra. */
+static int g_disp_bounced;
+
+/* The re-issue's svc. Made for a bounced dispatch, which blocks there, it is
+ * made on the guest's own stack (the gframe's gsp): a guest handler delivered
+ * while it waits then lands on the stack the thread was on when it made the
+ * call, as for any call of its own, and not on our scratch stack — where a
+ * collector that scans the interrupted thread's stack from the handler's sp
+ * (a conservative GC's suspend signal) would be scanning ours. */
+static long reissue_svc(const long *a, long nr) {
+    if (__atomic_load_n(&g_disp_bounced, __ATOMIC_RELAXED)) {
+        struct cng_gframe *gf = cng_gframe_cur();
+        if (gf && gf->gsp)
+            return cng_syscall6_on(a[0], a[1], a[2], a[3], a[4], a[5], nr,
+                                   gf->gsp);
+    }
+    return cng_syscall6(a[0], a[1], a[2], a[3], a[4], a[5], nr);
+}
+
 static long reissue(long a0, long a1, long a2, long a3, long a4, long a5,
                     long nr) {
     char pb[CNG_PATH_MAX];
@@ -698,7 +719,7 @@ static long reissue(long a0, long a1, long a2, long a3, long a4, long a5,
     struct cng_open_how how;
     long r = pin_args(&callnr, a, &x, &y, spell, &how);
     if (r == 0) {
-        r = cng_syscall6(a[0], a[1], a[2], a[3], a[4], a[5], callnr);
+        r = reissue_svc(a, callnr);
         /* A kernel without the newer form: remembered, and the other form
          * taken this time and every time after. */
         if (r == -ENOSYS && callnr != nr &&
@@ -721,6 +742,113 @@ static long reissue(long a0, long a1, long a2, long a3, long a4, long a5,
         cng_dprintf(2, "[cng] nr=%ld %s -> errno=%ld\n", nr,
                     dbg_path(a0, a1, pb, sizeof pb), -r);
     return r;
+}
+
+/* --- calls that can block, from the SIGSYS handler -------------------------
+ *
+ * The handler runs with every signal masked, so a call it makes that blocks
+ * can be interrupted by nothing but SIGKILL: not the guest's own SIGTERM or
+ * ^C, not a ptrace attach, whose kick is masked with the rest. A CNG_DISP_HANDLER
+ * dispatch therefore does not make such a call. It answers CNG_EBOUNCE_RAW for
+ * one it would make exactly as the guest did, and CNG_EBOUNCE_DISP for one with
+ * something to translate, and the handler runs the call, or the whole
+ * dispatch, from guest context instead (sigsys.c, the bounce). Each test costs
+ * at most one syscall, made only for a call that is trapped already. */
+
+/* A socket call on `fd`, with MSG_* `msgflags` (0 for accept and connect):
+ * the bounce it takes from the handler when the descriptor blocks, RAW where
+ * `raw` says the dispatcher makes it as it stands. 0: make it here. */
+static long sock_bounce(int trapped, long nr, long fd, long msgflags, int raw) {
+    if (trapped != CNG_DISP_HANDLER || (msgflags & CNG_MSG_DONTWAIT))
+        return 0;
+    long fl = sys_fcntl((int)fd, CNG_F_GETFL, 0);
+    if (fl < 0 || (fl & CNG_O_NONBLOCK))
+        return 0;
+    /* accept(2) is made as accept4 where only that one is allowed (reissue),
+     * which is not the guest's call as it stands. */
+    if (raw && nr == __NR_accept && cng_blocked[__NR_accept])
+        raw = 0;
+    return raw ? -CNG_EBOUNCE_RAW : -CNG_EBOUNCE_DISP;
+}
+
+/* Is the address at `sa` (`len` bytes, as a guest passed it) an AF_UNIX one,
+ * which the dispatcher translates? One it cannot read is left to the call,
+ * which answers EFAULT for it, from the handler as before. */
+static int sun_family(const void *sa, long len, int *unreadable) {
+    unsigned short fam = 0;
+    *unreadable = 0;
+    if (!sa || len < (long)sizeof fam)
+        return 0;
+    if (cng_user_copyin(&fam, sa, sizeof fam) < 0) {
+        *unreadable = 1;
+        return 0;
+    }
+    return fam == CNG_AF_UNIX;
+}
+
+/* Can an open of `p` (translated, against `dirfd`) with `oflags` block? A
+ * FIFO's does until its other end is opened, and a character device's can (a
+ * serial line waiting for carrier), never with O_NONBLOCK; O_PATH and
+ * O_DIRECTORY open nothing to wait on. The memory devices (major 1: null,
+ * zero, random, ...) never block on open, and are most of the device opens
+ * there are. One fstatat, unpinned: a wrong answer costs a bounce, or an open
+ * that blocks in the handler as every open used to, never the open itself. */
+static int open_blocks(long dirfd, const char *p, long oflags) {
+    if (oflags & (CNG_O_NONBLOCK | CNG_O_PATH | CNG_O_DIRECTORY))
+        return 0;
+    char st[144];
+    if (CNG_SYS(__NR_newfstatat, dirfd, (long)p, (long)st,
+                (oflags & CNG_O_NOFOLLOW) ? CNG_AT_SYMLINK_NOFOLLOW : 0, 0,
+                0) != 0)
+        return 0;
+    unsigned type = *(unsigned *)(st + 16) & CNG_S_IFMT; /* st_mode */
+    if (type == 0010000u /* S_IFIFO */)
+        return 1;
+    if (type != 0020000u /* S_IFCHR */)
+        return 0;
+    unsigned long long rdev = *(unsigned long long *)(st + 32); /* st_rdev */
+    return (((rdev >> 8) & 0xfff) | ((rdev >> 32) & ~0xfffull)) != 1;
+}
+
+/* A tracee's call that the dispatcher makes as it stands and that can block:
+ * a tracee traps every syscall, so here are the ones that wait — on a pipe, a
+ * socket or a terminal, a futex, a lock, a timer. Its synthesized /proc files
+ * (fds from cng_g_synth_fd_base up) are regenerated before a read, and never
+ * block; an emulated netlink socket's read is not made as it stands either
+ * (see the read case). The mask-taking waits never get here (sigsys.c bounces
+ * them), nor the socket calls and opens, which have cases of their own. */
+static int tracee_blocks(long nr, long a0, long a1) {
+    switch (nr) {
+    case __NR_read:
+    case __NR_readv:
+    case __NR_pread64:
+    case __NR_preadv:
+    case __NR_preadv2:
+        return (!cng_g_synth_fd_base || a0 < cng_g_synth_fd_base) &&
+               !cng_nl_is_fake((int)a0);
+    case __NR_fcntl:
+        return a1 == 7 /*F_SETLKW*/ || a1 == 38 /*F_OFD_SETLKW*/;
+    case __NR_write:
+    case __NR_writev:
+    case __NR_pwrite64:
+    case __NR_pwritev:
+    case __NR_pwritev2:
+    case __NR_futex:
+    case __NR_nanosleep:
+    case __NR_clock_nanosleep:
+    case __NR_flock:
+    case __NR_splice:
+    case __NR_tee:
+    case __NR_vmsplice:
+    case __NR_sendfile:
+    case __NR_io_getevents:
+    case __NR_io_pgetevents:
+    case __NR_io_uring_enter:
+    case __NR_mq_timedsend:
+    case __NR_mq_timedreceive:
+        return 1;
+    }
+    return 0;
 }
 
 /* --- /proc magic links ---------------------------------------------------
@@ -4178,6 +4306,8 @@ void cng_clone_convert(struct cng_uregs *ur) {
         cng_nnp_fork_child(nnp); /* one task, holding what we held */
         cng_rseq_fork_child(rseq_keep);
         cng_exec_fork_child(); /* an exec another thread had in flight is not ours */
+        /* ...nor a bounced dispatch another thread was blocked in. */
+        __atomic_store_n(&g_disp_bounced, 0, __ATOMIC_RELAXED);
         /* The child inherited both the mappings and the attach list, so the
          * broker must count those attaches again (shm.c). */
         cng_shm_fork_child();
@@ -4306,6 +4436,12 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
             cng_dprintf(2, "[cng] nr=%ld denied (designed ENOSYS)\n", nr);
         return -ENOSYS;
     }
+
+    /* A tracee's waiting call, made as it stands: from guest context (see
+     * tracee_blocks). One Android refuses is left to be answered here. */
+    if (trapped == CNG_DISP_HANDLER && tracee_blocks(nr, a0, a1) &&
+        cng_pt_traceall() && !(nr < CNG_NR_MAX && cng_blocked[nr]))
+        return -CNG_EBOUNCE_RAW;
 
     switch (nr) {
     /* Simple translate + reissue: dirfd = a0, path = a1. */
@@ -4537,6 +4673,11 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
                    (nr == __NR_name_to_handle_at && !deref);
         if (l2nf && l2s_nofollow_data(rkd, rkp, 0, 0, l2d, sizeof l2d))
             p = l2d;
+        /* A FIFO's open waits for the other end: from guest context, where a
+         * signal can end it (see open_blocks). The dispatch starts over there,
+         * so nothing above may have changed anything yet, and nothing has. */
+        if (trapped == CNG_DISP_HANDLER && is_open && open_blocks(a0, p, oflags))
+            return -CNG_EBOUNCE_DISP;
         long r = reissue(a0, (long)p, ha2, ha3, a4, a5, rnr);
         /* O_NOFOLLOW through a real dirfd lands on the l2s symlink and draws
          * ELOOP where a real hardlink would open. Retry on the backing file —
@@ -5516,6 +5657,22 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
          * as the kernel's would be.
          * MSG_NOSIGNAL: a netlink send never raises SIGPIPE, and a pair whose
          * daemon has gone would. */
+        int is_send = (nr == __NR_sendto);
+        long aa = is_send ? a4 : a1;   /* sockaddr */
+        long al = is_send ? a5 : a2;   /* addrlen */
+        /* A connect or a send that can block is made from guest context: as
+         * it stands where there is no AF_UNIX path to translate. A bind never
+         * waits, nor a connect of an emulated netlink socket. */
+        int fake = cng_nl_is_fake((int)a0);
+        if (trapped == CNG_DISP_HANDLER &&
+            (is_send || (nr == __NR_connect && !fake))) {
+            int bad, sun = sun_family((const void *)aa, al, &bad);
+            long b = bad ? 0
+                         : sock_bounce(trapped, nr, a0, is_send ? a3 : 0,
+                                       !sun && !fake);
+            if (b)
+                return b;
+        }
         if (cng_nl_is_fake((int)a0)) {
             if (nr == __NR_bind || nr == __NR_connect)
                 return 0;
@@ -5524,9 +5681,6 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
                 cng_nl_sync((int)a0);
             return r;
         }
-        int is_send = (nr == __NR_sendto);
-        long aa = is_send ? a4 : a1;   /* sockaddr */
-        long al = is_send ? a5 : a2;   /* addrlen */
         struct cng_sun_xlate x;
         long r;
         int sx = cng_sun_in(&x, nr == __NR_bind ? (int)a0 : -1,
@@ -5555,6 +5709,19 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
         struct cng_msghdr mh;
         if (a1 && cng_user_copyin(&mh, (void *)a1, sizeof mh) < 0)
             return -EFAULT;
+        /* One that can block, from guest context: as it stands with neither
+         * an AF_UNIX name nor control data a fake identity has to rewrite. */
+        if (trapped == CNG_DISP_HANDLER) {
+            int bad = 0, plain = !a1;
+            if (a1)
+                plain = !sun_family(mh.name, (long)mh.namelen, &bad) &&
+                        !ctl_may_carry_creds(&mh);
+            long b = bad ? 0
+                         : sock_bounce(trapped, nr, a0, a2,
+                                       plain && !cng_nl_is_fake((int)a0));
+            if (b)
+                return b;
+        }
         if (cng_nl_is_fake((int)a0)) {
             /* Into the pair as sendto's request goes, every iovec of it one
              * record, as the kernel's netlink takes the whole message. The
@@ -5623,25 +5790,32 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
         unsigned long vlen = (unsigned)a2;
         if (vlen > CNG_UIO_MAXIOV) /* as the kernel clamps it */
             vlen = CNG_UIO_MAXIOV;
+        /* One that can block, from guest context: as it stands for a family
+         * with no address of the kind translated, as below. */
+        int dom = 0;
+        unsigned dlen = sizeof dom;
+        int plain = !v || !vlen ||
+                    (CNG_SYS(__NR_getsockopt, a0, CNG_SOL_SOCKET, CNG_SO_DOMAIN,
+                             &dom, &dlen, 0) == 0 &&
+                     dom != CNG_AF_UNIX &&
+                     !(cng_g_fake_id && dom == CNG_AF_NETLINK));
+        long b = sock_bounce(trapped, nr, a0, a3,
+                             plain && !cng_nl_is_fake((int)a0));
+        if (b)
+            return b;
         if (cng_nl_is_fake((int)a0)) {
             long r = reissue(a0, a1, a2, a3 | CNG_MSG_NOSIGNAL, a4, a5, nr);
             if (r > 0)
                 cng_nl_sync((int)a0);
             return r;
         }
-        if (!v || !vlen)
-            return reissue(a0, a1, a2, a3, a4, a5, nr);
         /* A socket that is not AF_UNIX cannot carry a sun_path at all, and a UDP
-         * batch is what this call exists for — so ask the socket once instead of
-         * reading up to 1024 addresses out of guest memory to find that out.
-         * (Each of those reads has to be probed first, since a fault in the
-         * handler is unblockable, and a probe is itself a syscall: the whole
-         * point of sendmmsg is not to spend one per message.) */
-        int dom = 0;
-        unsigned dlen = sizeof dom;
-        if (CNG_SYS(__NR_getsockopt, a0, CNG_SOL_SOCKET, CNG_SO_DOMAIN, &dom,
-                    &dlen, 0) == 0 &&
-            dom != CNG_AF_UNIX && !(cng_g_fake_id && dom == CNG_AF_NETLINK))
+         * batch is what this call exists for — so the socket was asked once
+         * instead of reading up to 1024 addresses out of guest memory to find
+         * that out. (Each of those reads has to be probed first, since a fault
+         * in the handler is unblockable, and a probe is itself a syscall: the
+         * whole point of sendmmsg is not to spend one per message.) */
+        if (plain)
             return reissue(a0, a1, a2, a3, a4, a5, nr);
         /* A window of the array at a time (mmsg_take), so the scan costs a
          * syscall per MMSG_WIN messages rather than one per message — and every
@@ -5721,6 +5895,16 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
         int is_recv = (nr == __NR_recvfrom);
         long aa = is_recv ? a4 : a1;
         long alp = is_recv ? a5 : a2;
+        /* An accept or a receive that can block, from guest context: as it
+         * stands when no address is wanted back. The name queries never wait;
+         * nor does an accept of an emulated netlink socket (EOPNOTSUPP). */
+        if (is_recv || ((nr == __NR_accept || nr == __NR_accept4) &&
+                        !cng_nl_is_fake((int)a0))) {
+            long b = sock_bounce(trapped, nr, a0, is_recv ? a3 : 0,
+                                 (!aa || !alp) && !cng_nl_is_fake((int)a0));
+            if (b)
+                return b;
+        }
         if (cng_nl_is_fake((int)a0)) {
             if (is_recv) {
                 /* The source address is handed back only for a receive that
@@ -5770,23 +5954,29 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
     }
 
     case __NR_recvmsg: {
-        if (cng_nl_is_fake((int)a0)) {
+        int fake = cng_nl_is_fake((int)a0);
+        /* msg_name is an output buffer of the guest's, so it gets the same
+         * bounce the single-address calls get, and the control data one of
+         * its own where descriptors could arrive in it (recvmsg_bounced). A
+         * header asking for neither is the kernel's to fill as it stands —
+         * and one that can block is made from guest context, as it stands or
+         * not (see sock_bounce). */
+        struct cng_msghdr *g = (struct cng_msghdr *)a1;
+        struct cng_msghdr snap; /* our copy of the guest's header, taken once */
+        int bad = !a1 || cng_user_copyin(&snap, g, sizeof snap) < 0;
+        int bname = !bad && snap.name && snap.namelen;
+        int bctl = !bad && ctl_may_carry_fds(&snap);
+        long b = sock_bounce(trapped, nr, a0, a2,
+                             !fake && (bad || (!bname && !bctl)));
+        if (b)
+            return b;
+        if (fake) {
             struct cng_msghdr h;
             if (cng_user_copyin(&h, (void *)a1, sizeof h) < 0)
                 return -EFAULT; /* a NULL header too, as the kernel says */
             return nl_recvmsg(a0, (struct cng_msghdr *)a1, &h, a2);
         }
-        /* msg_name is an output buffer of the guest's, so it gets the same
-         * bounce the single-address calls get, and the control data one of
-         * its own where descriptors could arrive in it (recvmsg_bounced). A
-         * header asking for neither is the kernel's to fill as it stands. */
-        struct cng_msghdr *g = (struct cng_msghdr *)a1;
-        struct cng_msghdr snap; /* our copy of the guest's header, taken once */
-        if (!a1 || cng_user_copyin(&snap, g, sizeof snap) < 0)
-            return reissue(a0, a1, a2, a3, a4, a5, nr);
-        int bname = snap.name && snap.namelen;
-        int bctl = ctl_may_carry_fds(&snap);
-        if (!bname && !bctl)
+        if (bad || (!bname && !bctl))
             return reissue(a0, a1, a2, a3, a4, a5, nr);
         return recvmsg_bounced(a0, g, &snap, a2, bname, bctl, 0);
     }
@@ -5802,6 +5992,21 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
         unsigned long vlen = (unsigned)a2;
         if (vlen > CNG_UIO_MAXIOV)
             vlen = CNG_UIO_MAXIOV;
+        /* One that can block, from guest context (see sock_bounce): as it
+         * stands for the families re-issued whole below. */
+        if (trapped == CNG_DISP_HANDLER) {
+            int dom = 0;
+            unsigned dlen = sizeof dom;
+            int plain = !cng_nl_is_fake((int)a0) &&
+                        (!v || !vlen ||
+                         (CNG_SYS(__NR_getsockopt, a0, CNG_SOL_SOCKET,
+                                  CNG_SO_DOMAIN, &dom, &dlen, 0) == 0 &&
+                          dom != CNG_AF_UNIX &&
+                          !(cng_g_fake_id && dom == CNG_AF_NETLINK)));
+            long b = sock_bounce(trapped, nr, a0, a3, plain);
+            if (b)
+                return b;
+        }
 
         /* An emulated netlink socket has to be taken apart per message instead,
          * each received as recvmsg receives one (nl_recvmsg): its replies are
@@ -6235,11 +6440,15 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
 
     /* The waits are trapped only on a tracer, but every -R site reaches the
      * dispatcher, so there the guest's own wait is made by the kernel unless
-     * this process could be owed an emulated stop (cng_pt_wait_native). */
+     * this process could be owed an emulated stop (cng_pt_wait_native). That
+     * wait needs the guest's own mask, which the SIGSYS handler does not run
+     * on. There a wait polls the registry instead, and ends for a ptrace kick
+     * with CNG_ERESTART (see cng_sig_kick_pending). */
     case __NR_wait4:
     case __NR_waitid: {
         long w;
-        if (!trapped && cng_pt_wait_native(nr, a0, a1, a2, a3, a4, &w))
+        if ((trapped == CNG_DISP_TRAMP || trapped == CNG_DISP_BOUNCED) &&
+            cng_pt_wait_native(nr, a0, a1, a2, a3, a4, &w))
             return w;
         if (nr == __NR_wait4)
             return cng_pt_wait4(a0, (u64)a1, a2, (u64)a3, cng_pt_cur_uc());
@@ -7015,48 +7224,120 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
  * read and write, and the same single-step report. `trapped` is 0 here — an
  * unhandled syscall on this path is an ordinary one to re-issue, not one
  * Android blocked. */
+/* The same entry serves a trap the SIGSYS handler sent back out to be
+ * dispatched from guest context (cng_dispatch_bounced): what differs is that
+ * the handler already reported the entry stop. */
+struct tramp_call {
+    struct cng_gframe f; /* f.r: the guest's registers */
+    long nr;
+    int mode;            /* CNG_DISP_TRAMP or CNG_DISP_BOUNCED */
+    int owed;            /* bounced: the handler reported the entry stop */
+};
+
 /* The trapped syscall itself, the -R counterpart of sigsys_syscall: the one
  * case that needs the register frame rather than six arguments (the converted
  * clone puts the child's stack into it, for the trampoline's exit to install),
- * then the dispatcher for everything else. */
-static void tramp_syscall(struct cng_uregs *r, long nr) {
+ * then the dispatcher for everything else. A tracer that changed the registers
+ * at a stop taken inside the call abandoned it (pt_inflight_stop in ptrace.c):
+ * its result is then dropped, and the registers are the tracer's. */
+static void tramp_syscall(struct tramp_call *c, long nr) {
+    struct cng_uregs *r = c->f.r;
     if (nr == __NR_clone) {
         cng_clone_convert(r);
-        return;
+    } else {
+        long res = cng_dispatch(nr, (long)r->x[0], (long)r->x[1], (long)r->x[2],
+                                (long)r->x[3], (long)r->x[4], (long)r->x[5],
+                                c->mode);
+        if (!c->f.abandon)
+            r->x[0] = (u64)res;
     }
-    r->x[0] = (u64)cng_dispatch(nr, (long)r->x[0], (long)r->x[1], (long)r->x[2],
-                                (long)r->x[3], (long)r->x[4], (long)r->x[5], 0);
+    c->f.done = 1;
 }
 
 static void tramp_body(void *p) {
-    struct cng_uregs *r = (struct cng_uregs *)p;
-    long nr = (long)r->x[8];
+    struct tramp_call *c = (struct tramp_call *)p;
+    struct cng_uregs *r = c->f.r;
+    long nr = c->nr;
+    u64 after = r->pc; /* the instruction after the guest's svc */
+    int entered = c->mode == CNG_DISP_BOUNCED;
     /* An untraced exit does not come back, so the slot it holds would stay
      * claimed and busy — and a thread that later inherits the tid would find it
      * so and run in place. Give it back while still on it: nothing nests below
      * an exit. Traced is left alone, since there a tracer can cancel the call
      * and make it return after all. */
-    if ((nr == __NR_exit || nr == __NR_exit_group) && !cng_pt_active())
+    if (!entered && (nr == __NR_exit || nr == __NR_exit_group) &&
+        !cng_pt_active())
         cng_scratch_leave();
     cng_pt_set_frame(r, 0);
-    if (!cng_pt_active()) {
-        tramp_syscall(r, nr);
-        return;
+    for (;;) {
+        if (!entered && cng_pt_active()) {
+            if (!cng_pt_syscall_entry(r, &nr)) {
+                cng_pt_syscall_exit(r); /* cancelled: x0 is the tracer's */
+                return;
+            }
+            c->owed = cng_pt_entry_owed();
+        }
+        c->f.owed = c->owed;
+        tramp_syscall(c, nr);
+        /* Active now, if not before: an attach can land in the call, and a
+         * tracer that resumed into syscall tracing then saw its restart's
+         * entry stop (pt_inflight_stop). A guest handler that ran over a call
+         * that blocked has had stops of its own, which settle the flag for
+         * theirs. */
+        if (!c->f.abandon && cng_pt_active()) {
+            cng_pt_entry_set(c->f.owed);
+            cng_pt_syscall_exit(r);
+            cng_pt_step_report(r);
+        }
+        if (!c->f.abandon)
+            return;
+        /* Abandoned at the restart's own entry stop: made again as the tracer
+         * left it, that stop already given — or, cancelled there, answered. */
+        if (c->f.entered) {
+            c->owed = c->f.owed;
+            if (c->f.nr == -1) {
+                cng_pt_entry_set(c->owed);
+                cng_pt_syscall_exit(r);
+                return;
+            }
+            nr = c->f.nr;
+            entered = 1;
+        } else {
+            /* Abandoned at the stop, and left at the svc: the call is made
+             * again, with the registers the tracer left — here rather than by
+             * resuming at the site, which under -R would spend x16/x17 on the
+             * trampoline's general exit. Left anywhere else, the thread goes
+             * there. */
+            if (r->pc != after - 4)
+                return;
+            r->pc = after;
+            nr = (long)r->x[8];
+            c->owed = 0;
+            entered = 0;
+        }
+        c->f.abandon = c->f.done = c->f.entered = 0;
     }
-    if (!cng_pt_syscall_entry(r, &nr)) {
-        cng_pt_syscall_exit(r); /* cancelled: x0 is the tracer's own answer */
-        return;
-    }
-    tramp_syscall(r, nr);
-    cng_pt_syscall_exit(r);
-    cng_pt_step_report(r);
 }
 
 void cng_tramp_dispatch(struct cng_uregs *r) {
+    struct tramp_call c = {.f = {.r = r}, .nr = (long)r->x[8],
+                           .mode = CNG_DISP_TRAMP};
     /* On the guest's own stack this is the same overflow the SIGSYS tier has a
      * 256 KiB scratch stack to avoid, and here it is not even a fault: the
      * dispatcher's frame is larger than a guard page, so it steps over the
      * guard and writes into ordinary guest memory below, silently. */
-    if (!cng_run_scratch(tramp_body, r))
-        tramp_body(r);
+    if (!cng_run_scratch_in(tramp_body, &c, &c.f))
+        tramp_body(&c);
+}
+
+void cng_dispatch_bounced(struct cng_uregs *r, long nr, int owed) {
+    struct tramp_call c = {.f = {.r = r}, .nr = nr, .mode = CNG_DISP_BOUNCED,
+                           .owed = owed};
+    /* Guest context, guest mask: the blocking call the dispatch makes runs on
+     * the guest's own stack, below the record (see reissue). */
+    c.f.gsp = ((unsigned long)r - 8) & ~15UL;
+    __atomic_add_fetch(&g_disp_bounced, 1, __ATOMIC_RELAXED);
+    if (!cng_run_scratch_in(tramp_body, &c, &c.f))
+        tramp_body(&c);
+    __atomic_sub_fetch(&g_disp_bounced, 1, __ATOMIC_RELAXED);
 }

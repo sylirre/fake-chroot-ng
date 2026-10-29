@@ -137,7 +137,7 @@ static inline struct cng_uregs *cng_pt_uregs(struct cng_ucontext *uc) {
  * si_value and forwarded to the guest's own handler. */
 #define CNG_PT_KICKSIG   64 /* the intent; cng_g_kicksig is what is used */
 #define CNG_PT_KICK_ATTACH 0x50544b21 /* "PTK!" — adopt attach/interrupt/stopsig */
-#define CNG_PT_KICK_WAKE   0x50545721 /* "PTW!" — no-op; EINTRs a blocked wait */
+#define CNG_PT_KICK_WAKE   0x50545721 /* "PTW!" — no-op; ends a native wait */
 #define CNG_PT_KICK_REWAKE 0x50545221 /* "PTR!" — WAKE again, for a stop still
                                        * uncollected after a while */
 #define CNG_PT_KICK_ARM    0x50544121 /* "PTA!" — install the tracer filter here */
@@ -174,6 +174,13 @@ int cng_pt_syscall_entry(struct cng_uregs *r, long *nr_out);
 /* Syscall-exit stop, with `r->x[0]` already holding the result. The tracer may
  * overwrite it, so the caller must not touch x0 afterwards. */
 void cng_pt_syscall_exit(struct cng_uregs *r);
+
+/* Is an exit stop owed — was the entry stop of the call in flight reported?
+ * And the same put back, by a caller that kept it across a call that blocked:
+ * a guest handler can run on top of such a call, and the stops of its own
+ * syscalls settle the flag for theirs. */
+int cng_pt_entry_owed(void);
+void cng_pt_entry_set(int owed);
 
 /* Post-execve stop (PTRACE_EVENT_EXEC, or a plain SIGTRAP without the option).
  * Called by the emulated execve once the new image is in place. */
@@ -228,10 +235,11 @@ void cng_pt_kick(s32 tgid, s32 tid, int magic);
 
 /* Record the register frame this entry into monitor code is running on, and
  * the signal frame it came from when there is one (an -R trampoline has none,
- * and answers NT_PRFPREG with -EINVAL). Every entry point that can reach a stop
- * sets it; the wait and exit paths read it back for the guest's signal mask and
- * for the registers of an exit stop. Both are no-ops, and both read back NULL,
- * until something in the process takes on a ptrace role. */
+ * and its stops read and write the FP/SIMD registers live). Every entry point
+ * that can reach a stop sets it; the wait and exit paths read it back for the
+ * guest's signal mask and for the registers of an exit stop. Both are no-ops,
+ * and both read back NULL, until something in the process takes on a ptrace
+ * role. */
 void cng_pt_set_frame(struct cng_uregs *r, struct cng_ucontext *uc);
 struct cng_uregs *cng_pt_cur_regs(void);
 struct cng_ucontext *cng_pt_cur_uc(void);
@@ -272,6 +280,10 @@ extern void (*cng_g_wait_native_probe)(void);
 /* The kick handler's report of a kick of ours (`magic`) it took, with the
  * frame it interrupted: what ends a native wait, see cng_wait_unless. */
 void cng_pt_kick_taken(struct cng_ucontext *uc, int magic);
+/* ...and, for every kick, a bounced wait it cut short with EINTR that the
+ * kernel would have restarted (an attach is a stop, not a delivery), put back
+ * to be made again (cng_bounce_unwind), after the exit stop it owes. */
+void cng_pt_kick_unwind(struct cng_ucontext *uc);
 
 /* process_vm_readv/writev where the peer is one of our stopped tracees: served
  * over the mailbox, because the host may refuse the real thing. `flags` is the

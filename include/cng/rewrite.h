@@ -79,4 +79,11 @@ int cng_rewrite_site(unsigned long site);
  * sites in them) are gone. */
 void cng_rewrite_lazy_reset(void);
 
+/* A ptrace kick landed with `u` (its frame's registers) inside a trampoline
+ * copy: rewrite `u` to the guest's own state — at the site's branch with the
+ * call not yet made, or after it with the call over — so a stop on the frame
+ * shows the guest, and return 1. 0 when pc is not in a trampoline. */
+struct cng_uregs;
+int cng_tramp_unwind(struct cng_uregs *u);
+
 #endif /* CNG_REWRITE_H */

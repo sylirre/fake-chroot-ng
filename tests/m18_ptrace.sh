@@ -108,6 +108,12 @@ pt_oracle_build() {
 # One scenario, both ways. Each side is given its own binary's path after the
 # scenario name (the exec scenarios re-exec themselves).
 #
+# The guest side runs under -R unless PT_TIER says otherwise; the SIGSYS tier
+# needs a view with something in it (an identity view installs no monitor),
+# which an identity bind of the scratch directory is.
+PT_TIER=-R
+PT_TIER_NAME=
+
 # pt_case SCENARIO [LACKING WHY] — LACKING is the line the kernel side prints
 # when this host's kernel predates what the scenario asks for. There is no
 # reference to compare with then: the emulation answers as the kernel uname
@@ -123,13 +129,15 @@ pt_case() {
             return ;;
         esac
     fi
-    _guest_out=$(run_t 90 -R / "$PT_GUEST" "$_sc" "$PT_GUEST" 2>/dev/null)
+    # shellcheck disable=SC2086  # $PT_TIER is a deliberately split arg list
+    _guest_out=$(run_t 90 $PT_TIER / "$PT_GUEST" "$_sc" "$PT_GUEST" 2>/dev/null)
     if [ "$_oracle_out" = "$_guest_out" ]; then
         pass=$((pass + 1))
-        printf '  ok   ptrace %s matches the kernel\n' "$_sc"
+        printf '  ok   ptrace %s matches the kernel%s\n' "$_sc" "$PT_TIER_NAME"
     else
         fail=$((fail + 1))
-        printf '  FAIL ptrace %s diverges from the kernel\n' "$_sc"
+        printf '  FAIL ptrace %s diverges from the kernel%s\n' "$_sc" \
+            "$PT_TIER_NAME"
         printf '       kernel: %s\n' "$(echo "$_oracle_out" | tr '\n' '|')"
         printf '       guest : %s\n' "$(echo "$_guest_out" | tr '\n' '|')"
     fi
@@ -192,6 +200,15 @@ else
     # FPSIMD record was also read as if it were the ptrace layout, so even a
     # stop that had one returned the registers shifted and lost a write.
     pt_case fpregs
+    # PTRACE_ATTACH to a thread blocked in a syscall, which is where a crash
+    # reporter finds most threads: the stop shows the call the kernel's way —
+    # the thread's own registers, its arguments in place, pc at the syscall
+    # instruction — and the call is made again when the stop ends, with what
+    # the tracer left in the registers. A call the emulation was making for the
+    # thread showed chroot-ng's own pc and sp, one made in the SIGSYS handler
+    # could not be stopped until it returned (the attach hung), and the kick
+    # that stops a thread ended its call with EINTR.
+    pt_case blocked
     # ...and to two hundred tasks of one process, one after another: the
     # tracee's per-task state used to sit in 128 slots that were never given
     # back, so the 129th attach was reported a success and never stopped.
@@ -268,6 +285,30 @@ else
     # done" stop is an event like the others, reported only under
     # TRACEVFORKDONE; it was reported for every vfork.
     pt_case options
+
+    # ...and every scenario again on the SIGSYS tier, which is the one a device
+    # runs without -R: a trapped call is made from the handler there, a call
+    # that can block is bounced to guest context, and the frames a stop reads
+    # are the kernel's. The legs above run under -R, so without these that tier
+    # had only the synthesized traps of -t ptracetest. Without a live filter
+    # nothing traps and the legs would be native.
+    if [ "$CNG_SECCOMP_LIVE" = 1 ]; then
+        PT_TIER="-b $PT_DIR:$PT_DIR"
+        PT_TIER_NAME=" (SIGSYS tier)"
+        for _sc in basic sysstop cancel poke signal deliver fork exec \
+            execstart patharg exitstop break step step2 attach fpregs blocked \
+            attachmany sigact sigchld sigchldw waitid waitnowait options; do
+            pt_case "$_sc"
+        done
+        pt_case sysinfo "syscall_info unsupported" \
+            "the host kernel predates PTRACE_GET_SYSCALL_INFO (5.3), so it is no reference"
+        pt_case vmrw "vmrw wrapcnt EINVAL" \
+            "the host kernel refuses an iovec count it does not narrow first (pre-import_iovec), so it is no reference"
+        PT_TIER=-R
+        PT_TIER_NAME=
+    else
+        skip "ptrace on the SIGSYS tier: the seccomp filter is inert here"
+    fi
 
     # ...and the same, with a rootfs actually in the way: the guest binary is
     # bound in so it can be loaded, and the trace must still read the guest's

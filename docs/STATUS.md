@@ -4636,16 +4636,16 @@ vfork/`posix_spawn` child-stack handling.
     short `NT_PRSTATUS` write replaces only that much, and a pstate outside
     EL0t AArch64, or with D, A, I or F set, is refused as `valid_user_regs`
     refuses it (sigreturn would have killed the task for it).
-  - Found while measuring this, not fixed:
+  - Found while measuring this, fixed by M106:
     - A stop taken while the thread was inside chroot-ng (blocked in a
       dispatched syscall on `-R` or at a rewritten site, or in a bounced
       masked wait) reports chroot-ng's own pc and sp. In the dump, the
       crashed thread is in `CHROOT-NG+0x130`.
     - On the seccomp tier, a blocking call dispatched from inside the
-      SIGSYS handler runs with every signal masked. That is the first call
-      from any site that traps. It cannot be signalled until it returns,
-      not even by SIGTERM's default action, and an attach to it hangs the
-      tracer.
+      SIGSYS handler runs with every signal masked. Without `-R` that is
+      every trapped call, not only a site's first. It cannot be signalled
+      until it returns, not even by SIGTERM's default action, and an
+      attach to it hangs the tracer.
     - The kick has no `SA_RESTART`, so an attach makes the tracee's
       interrupted syscall fail with EINTR where the kernel restarts it.
   - Test: m18 `ptrace fpregs` (`tests/guests/pt_probe.c`). The tracee holds
@@ -4659,6 +4659,100 @@ vfork/`posix_spawn` child-stack handling.
     file at a SIGSYS stop, and never shows the tracee a write. With the fix,
     a headless Chrome renderer killed by SIGSEGV under `-l -u` leaves a
     minidump in `Crash Reports/completed` with all 16 of its threads.
+
+- [x] **M106 — a call blocked in the SIGSYS handler could not be signalled**
+  On the seccomp tier, which is every run without `-R`, each trapped call is
+  made from the SIGSYS handler, and the handler runs with every signal but
+  SIGSYS masked. A call that blocked there could be reached by nothing but
+  SIGKILL. `busybox nc -l` outlived SIGTERM, `^C` did not reach a `cat` of a
+  FIFO, a guest handler ran only after the call returned, and a ptrace
+  attach hung its tracer, since the kick that stops a task is masked with
+  the rest. The trapped set has `accept`, `connect`, `recv*` and `send*` in
+  it for AF_UNIX translation, and a tracee traps every syscall. The M105
+  note blamed only a site's first call; that holds under `-R` alone.
+  - A trapped call that can block is no longer made in the handler. The
+    dispatcher answers it with an internal code, and the handler resumes the
+    thread in a stub in the gate that makes the call from guest context. A
+    call made as the guest made it runs from the masked-wait stub
+    (`cng_bounce_wait`) with its own registers. One with a path or a socket
+    address to translate runs the whole dispatch from guest context
+    (`cng_bounce_dispatch`, the -R trampoline's path, with the record below
+    the guest's sp as its register file). The completion trap puts the
+    registers back either way. The call then blocks on the guest's own
+    mask, and a signal ends or restarts it by the kernel's rules. A
+    dispatch made this way makes its blocking svc on the guest's own stack,
+    below the record, so a guest handler that runs meanwhile lands there and
+    not on the scratch stack. A conservative GC's suspend handler, which
+    scans from its own sp, depends on that.
+  - What can block: a socket call on a descriptor without `O_NONBLOCK` and
+    without `MSG_DONTWAIT` (one `fcntl`), an open of a FIFO or a character
+    device other than the memory devices without `O_NONBLOCK`, `O_PATH` or
+    `O_DIRECTORY` (one `fstatat`, the owner's choice of cost), and a
+    tracee's read, write, futex, sleep, lock, splice and AIO calls. A
+    descriptor that does not block costs one `fcntl`. A tracer's own
+    wait4/waitid and the System V IPC waits stay in the handler, which polls
+    them for signals.
+  - The ptrace kick is `SA_RESTART`. An attach is a stop, not a delivery,
+    and the kernel restarts the call it cut short; the kick used to fail it
+    with EINTR. A bounced ppoll, pselect6 or sigsuspend that the kick ended
+    with EINTR is put back to be made again, as the kernel restarts those
+    (ERESTARTNOHAND) when no handler runs; their timeouts are written back,
+    so the restart is the kernel's own. A wait polled in the handler that
+    sees a kick pending (one the guest's mask lets in) is restarted from its
+    svc, so the kick lands there. The TRACEME window, where a parent sits in
+    a native wait4 before it is armed, is restarted into the tracer filter
+    the arming kick stacks rather than knocked out with EINTR.
+  - A stop the kick takes shows the guest's registers. Landed in a bounce
+    stub or an `-R` trampoline, it puts the frame back to the guest's state,
+    as if the call were not yet made (pc at the svc, its arguments in x0..x5,
+    which is how the kernel shows a call it will restart) or already over.
+    Landed in the dispatcher, whose frames cannot be stepped out of, it
+    reports the guest's registers from the dispatch's record, which
+    `cng_run_scratch_in` keeps per thread (three stores per dispatch). The
+    FP/SIMD state then comes from the kick's own frame. A tracer that
+    changes the registers there abandons the call: the blocking svc is cut
+    short, its result dropped, and a call left at its svc is made again as
+    the tracer left it. A tracee's owed exit stop is given first, with
+    -ERESTARTSYS, and a tracer that resumes into syscall tracing sees the
+    restart's entry stop, as the kernel gives them.
+  - Under `-R`, the first trap from a site the rewrite just made a branch is
+    sent back to that site, so it runs through the trampoline like every
+    later call from there.
+  - Residue: a call native to the guest that the kernel answers
+    ERESTARTNOHAND or ERESTART_RESTARTBLOCK (poll, select, nanosleep,
+    clock_nanosleep, a timed futex) still sees EINTR after an attach, as
+    after any handled signal. The kick is a handler, and x0 is gone by the
+    time it runs, so it cannot make the call again. A siglongjmp out of a
+    guest handler that interrupted a dispatch made from guest context leaves
+    that dispatch behind, as on `-R`. Under `-R` a guest handler that runs
+    while a call blocks is still delivered on the scratch stack: putting the
+    svc on the guest's stack there would cost the hot path a lookup per call.
+  - Found while testing, not fixed: a crashed Chrome browser still hangs.
+    GLib's `gmain` thread blocks nearly every signal, the kick (SIGRTMAX)
+    among them, so crashpad's PTRACE_ATTACH to it never stops it, and
+    crashpad waits in its waitpid for good with every other thread parked
+    in its attach stop. The kernel attaches with SIGSTOP, which no mask
+    holds back. The kick would have to be as unblockable: taken out of guest
+    masks as SIGSYS is (which breaks a guest that blocks SIGRTMAX to
+    sigwait it), or sent as a SIGSYS of ours to a thread whose mask holds
+    the kick.
+  - Tests: m6 `tests/guests/blkcall.c` blocks in accept, recvfrom, a FIFO
+    open and an AF_UNIX recvfrom that wants the sender's address, signals
+    the thread with and without `SA_RESTART`, and checks SIGTERM against a
+    blocked accept. On the SIGSYS tier it also checks that the handler ran
+    on the thread's own stack. It matches the kernel on both tiers (arm64
+    VM). The old build ran every handler only after the call, gave no EINTR,
+    and SIGTERM did not kill. m18 `ptrace blocked` (`tests/guests/pt_probe.c`) attaches
+    to a thread blocked in a read and in an accept through one svc of known
+    address. It checks that pc is where the kernel shows a blocked call
+    (arm64 rewinds before the stop, x86-64 after), that arg0 is the fd and
+    that sp is the thread's own. It then points the read at another pipe
+    and checks that both calls restart. The old build reports chroot-ng's
+    registers on both tiers, answers EINTR, and hangs the attach to the
+    accept on the SIGSYS tier. m18 also runs every `pt_probe` scenario on
+    the SIGSYS tier when the filter is live; they ran under `-R` only, so
+    the tier a device runs by default had only `-t ptracetest`'s
+    synthesized traps. All 26 match the kernel there (arm64 VM).
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 

@@ -584,6 +584,45 @@ else
     else
         skip "masked waits: could not build tests/guests/maskwait.c with -pthread"
     fi
+    # The bounce is not for masked waits alone: every trapped call that can
+    # block is made from guest context, or a signal cannot reach it. Made in
+    # the SIGSYS handler, with every signal masked, an accept, a receive, or a
+    # FIFO's open ignored the guest's own handler until it returned, never
+    # failed with EINTR, and outlived SIGTERM. Against the kernel: the handler
+    # runs while the call blocks, SA_RESTART makes the call again and it goes on
+    # waiting, its absence is EINTR, and SIGTERM kills. The AF_UNIX receive with
+    # an address to map back is the one that runs the whole dispatch there. On
+    # the SIGSYS tier the handler must also run on the thread's own stack, as
+    # the kernel delivers it, which takes the dispatch's blocking svc being made
+    # there (`sp`); under -R it still runs on the scratch stack.
+    if guest_cc "$TED/blkcall" tests/guests/blkcall.c -pthread; then
+        cp "$TED/blkcall" "$TED/bin/blkcall"
+        mkdir -p "$TED/tmp"
+        for bc_tier in -R ""; do
+            if [ -z "$bc_tier" ] && [ "$CNG_SECCOMP_LIVE" != 1 ]; then
+                skip "blocking calls on the SIGSYS tier: the seccomp filter is inert on this host"
+                continue
+            fi
+            bc_sp=sp
+            [ -n "$bc_tier" ] && bc_sp=-
+            bc_k=$(emu_t 90 "$TED/blkcall" "$TED/tmp" "$bc_sp" 2>/dev/null)
+            # shellcheck disable=SC2086  # deliberately split arg lists
+            bc_g=$(run_t 120 $bc_tier $GUEST_BINDS "$TED" /bin/blkcall /tmp \
+                "$bc_sp" 2>/dev/null)
+            bc_t=${bc_tier:-the SIGSYS tier}
+            if [ -n "$bc_k" ] && [ "$bc_k" = "$bc_g" ]; then
+                pass=$((pass + 1))
+                echo "  ok   a signal against a blocking call acts as the kernel's ($bc_t)"
+            else
+                fail=$((fail + 1))
+                echo "  FAIL a signal against a blocking call diverges from the kernel ($bc_t)"
+                printf '       kernel: %s\n       guest : %s\n' \
+                    "$(echo "$bc_k" | tr '\n' '|')" "$(echo "$bc_g" | tr '\n' '|')"
+            fi
+        done
+    else
+        skip "blocking calls: could not build tests/guests/blkcall.c with -pthread"
+    fi
 fi
 rm -rf "$TED"
 

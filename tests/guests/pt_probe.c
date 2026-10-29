@@ -21,8 +21,11 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <arpa/inet.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <pthread.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #ifndef NT_PRSTATUS
@@ -1617,6 +1620,188 @@ static int sc_fpregs(void) {
     return 0;
 }
 
+/* PTRACE_ATTACH to a thread blocked in a syscall — the state a crash reporter
+ * or a debugger finds most threads in. The kernel stops it mid-call and shows
+ * the call as one it is going to restart: the registers are the thread's own,
+ * its arguments in place, pc at the syscall instruction (arm64 rewinds before
+ * the stop; x86-64 after it, so there it is still past the instruction), and
+ * when the stop ends the call is made again — with whatever the tracer left in
+ * the registers. It did not look like that here: a call the emulation was
+ * making for the thread showed chroot-ng's own pc and sp; one made in the
+ * SIGSYS handler could not be stopped at all until it returned, the attach
+ * hanging meanwhile; and the kick that does the stopping ended the call with
+ * EINTR instead of letting it restart.
+ *
+ * Two calls, through one svc of a known address: a read on a pipe, which the
+ * seccomp tier leaves native, and an accept, which it traps. The tracer checks
+ * the registers, points the read at another pipe, and lets both go; the
+ * tracee reports what each call returned. */
+#if defined(__aarch64__)
+#define R_ARG0(r)        ((r).x[0])
+#define R_SP(r)          ((r).sp)
+#define R_BLOCKED_PC(at) (at)
+#define NR_READ          63
+#define NR_ACCEPT4       242
+#else
+#define R_ARG0(r)        ((r).rdi)
+#define R_SP(r)          ((r).rsp)
+#define R_BLOCKED_PC(at) ((at) + 2)
+#define NR_READ          0
+#define NR_ACCEPT4       288
+#endif
+
+extern char blk_svc[];
+
+/* The one syscall instruction both calls are made through, at blk_svc. */
+__attribute__((noinline)) static long blk_call(long nr, long a0, long a1,
+                                               long a2) {
+#if defined(__aarch64__)
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x2 __asm__("x2") = a2;
+    register long x3 __asm__("x3") = 0;
+    register long x8 __asm__("x8") = nr;
+    __asm__ volatile(".globl blk_svc\nblk_svc:\n\tsvc #0"
+                     : "+r"(x0)
+                     : "r"(x1), "r"(x2), "r"(x3), "r"(x8)
+                     : "memory");
+    return x0;
+#else
+    long ret;
+    register long r10 __asm__("r10") = 0;
+    __asm__ volatile(".globl blk_svc\nblk_svc:\n\tsyscall"
+                     : "=a"(ret)
+                     : "a"(nr), "D"(a0), "S"(a1), "d"(a2), "r"(r10)
+                     : "rcx", "r11", "memory");
+    return ret;
+#endif
+}
+
+static pid_t blk_child;
+static void blk_hung(int s) {
+    (void)s;
+    printf("attach hung\n");
+    kill(blk_child, SIGKILL);
+    _exit(1);
+}
+
+/* Attach to `pid`, blocked in blk_call with `fd` as its first argument and
+ * its stack around `near`, and report the stop. */
+static int blk_attach(pid_t pid, long fd, unsigned long near) {
+    blk_child = pid;
+    signal(SIGALRM, blk_hung);
+    alarm(20);
+    if (ptrace(PTRACE_ATTACH, pid, 0, 0) != 0) {
+        printf("attach failed %d\n", errno);
+        return -1;
+    }
+    int st;
+    wait_for(pid, &st);
+    alarm(0);
+    printf("attach %s\n",
+           (WIFSTOPPED(st) && WSTOPSIG(st) == SIGSTOP) ? "stopped" : "odd");
+    struct uregs r;
+    if (getregs(pid, &r) != 0) {
+        printf("getregs failed %d\n", errno);
+        return -1;
+    }
+    unsigned long sp = (unsigned long)R_SP(r);
+    printf("pc where the kernel shows a blocked call: %s\n",
+           R_PC(r) == (unsigned long long)R_BLOCKED_PC((unsigned long)blk_svc)
+               ? "yes"
+               : "no");
+    printf("arg0 the fd: %s\n", (long)R_ARG0(r) == fd ? "yes" : "no");
+    printf("sp the thread's own: %s\n",
+           sp <= near && near - sp < 65536 ? "yes" : "no");
+    return 0;
+}
+
+static int sc_blocked(void) {
+    /* The read: on pipe a, redirected by the tracer to pipe b. */
+    int a[2], b[2], ready[2], rep[2];
+    if (pipe(a) != 0 || pipe(b) != 0 || pipe(ready) != 0 || pipe(rep) != 0)
+        return 1;
+    pid_t pid = fork();
+    if (pid == 0) {
+        unsigned long here = (unsigned long)&here;
+        ssize_t ignore = write(ready[1], &here, sizeof here);
+        char c = 0;
+        long n = blk_call(NR_READ, a[0], (long)&c, 1);
+        long out[2] = {n, c};
+        ignore = write(rep[1], out, sizeof out);
+        (void)ignore;
+        _exit(0);
+    }
+    unsigned long near = 0;
+    if (read(ready[0], &near, sizeof near) != sizeof near)
+        return 1;
+    usleep(200000); /* asleep in the read by now */
+    if (blk_attach(pid, a[0], near) != 0) {
+        kill(pid, SIGKILL);
+        return 1;
+    }
+    struct uregs r;
+    getregs(pid, &r);
+    R_ARG0(r) = (unsigned long long)b[0];
+    printf("redirect to the other pipe: %s\n", setregs(pid, &r) == 0 ? "ok" : "failed");
+    ptrace(PTRACE_DETACH, pid, 0, 0);
+    ssize_t ignore = write(b[1], "B", 1);
+    ignore = write(a[1], "A", 1);
+    (void)ignore;
+    long out[2] = {0, 0};
+    if (read(rep[0], out, sizeof out) != sizeof out)
+        return 1;
+    printf("read returned %s\n",
+           out[0] == 1 && out[1] == 'B' ? "the other pipe's byte"
+           : out[0] == 1               ? "the first pipe's byte"
+           : out[0] == -EINTR          ? "EINTR"
+                                       : "something else");
+    int st;
+    wait_for(pid, &st);
+    show(st);
+
+    /* The accept: on a listening socket of its own, let go untouched, and
+     * then given a connection. */
+    int ls = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t sl = sizeof sa;
+    if (ls < 0 || bind(ls, (struct sockaddr *)&sa, sizeof sa) != 0 ||
+        listen(ls, 1) != 0 || getsockname(ls, (struct sockaddr *)&sa, &sl) != 0)
+        return 1;
+    pid = fork();
+    if (pid == 0) {
+        unsigned long here = (unsigned long)&here;
+        ssize_t ignore = write(ready[1], &here, sizeof here);
+        long n = blk_call(NR_ACCEPT4, ls, 0, 0);
+        long out[2] = {n, 0};
+        ignore = write(rep[1], out, sizeof out);
+        (void)ignore;
+        _exit(0);
+    }
+    if (read(ready[0], &near, sizeof near) != sizeof near)
+        return 1;
+    usleep(200000);
+    if (blk_attach(pid, ls, near) != 0) {
+        kill(pid, SIGKILL);
+        return 1;
+    }
+    ptrace(PTRACE_DETACH, pid, 0, 0);
+    int cs = socket(AF_INET, SOCK_STREAM, 0);
+    if (cs < 0 || connect(cs, (struct sockaddr *)&sa, sizeof sa) != 0)
+        return 1;
+    if (read(rep[0], out, sizeof out) != sizeof out)
+        return 1;
+    printf("accept returned %s\n", out[0] >= 0         ? "a connection"
+                                   : out[0] == -EINTR ? "EINTR"
+                                                      : "an error");
+    wait_for(pid, &st);
+    show(st);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, 0, _IOLBF, 0);
     if (argc > 1 && !strcmp(argv[1], "hello")) {
@@ -1678,6 +1863,8 @@ int main(int argc, char **argv) {
         return sc_options();
     if (!strcmp(s, "fpregs"))
         return sc_fpregs();
+    if (!strcmp(s, "blocked"))
+        return sc_blocked();
     fprintf(stderr, "unknown scenario %s\n", s);
     return 2;
 }

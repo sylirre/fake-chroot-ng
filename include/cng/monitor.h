@@ -260,19 +260,75 @@ void cng_rseq_fork_child(int keep);
 void cng_close_cloexec(void);
 
 /* Emulate one syscall: translate path args, re-issue via the gate, return the
- * kernel result. `trapped` = 1 when invoked from the SIGSYS handler (a syscall
- * reaching `default` was trapped by Android => emulate ENOSYS), 0 from an M8
- * trampoline (an unhandled syscall is ordinary => re-issue it). Under fake
- * root, a path call the host refuses with EACCES is made again with root's DAC
- * bypass lent to the inode that refused it (dac_bypass in dispatch.c).
- * Directly callable for testing (no seccomp needed). */
+ * kernel result. `trapped` says how the call got here, and any nonzero value
+ * means the filter trapped it (a syscall reaching `default` was then trapped by
+ * Android => emulate ENOSYS); 0 is an M8 trampoline (an unhandled syscall is
+ * ordinary => re-issue it). Under fake root, a path call the host refuses with
+ * EACCES is made again with root's DAC bypass lent to the inode that refused it
+ * (dac_bypass in dispatch.c). Directly callable for testing (no seccomp
+ * needed), where 0 and 1 are what a caller passes.
+ *
+ * The other two values exist because the SIGSYS handler runs with every signal
+ * masked, and a call that blocks in there cannot be interrupted by anything
+ * but SIGKILL — not a guest's SIGTERM, not a ^C, not a ptrace attach. The
+ * handler passes CNG_DISP_HANDLER, which lets the dispatcher answer a call that
+ * can block with one of the CNG_EBOUNCE_* codes below instead of making it, and
+ * the handler then runs the call from guest context (sigsys.c, the bounce).
+ * CNG_DISP_BOUNCED is that dispatch, made again from there. */
+#define CNG_DISP_TRAMP   0
+#define CNG_DISP_TRAP    1 /* a trap, answered inside the handler */
+#define CNG_DISP_HANDLER 2 /* ...from the handler, which can bounce it */
+#define CNG_DISP_BOUNCED 3 /* a trap dispatched from guest context */
 long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                   int trapped);
+
+/* What a CNG_DISP_HANDLER dispatch answers instead of making a call that can
+ * block, as negative values. Internal: in the kernel's own range of codes that
+ * never reach user space (ERESTARTSYS is 512), and none of them ever does. */
+#define CNG_EBOUNCE_RAW  540 /* run the guest's call itself, as it stands */
+#define CNG_EBOUNCE_DISP 541 /* run this whole dispatch from guest context */
+#define CNG_ERESTART     542 /* make the call again from its svc: a ptrace kick
+                              * is pending, and it has to land in guest code */
 
 /* The -R trampoline's entry point (tramp.S calls it with the frame it built):
  * runs one rewritten syscall site, with the ptrace stops around it. */
 struct cng_uregs;
 void cng_tramp_dispatch(struct cng_uregs *r);
+
+/* The dispatch of a trapped call the handler moved into guest context
+ * (CNG_EBOUNCE_DISP): `r` is the guest's register file, saved below its stack
+ * by the handler, `nr` the call (a tracer may have redirected it), `owed` 1 when
+ * the handler reported the entry stop and the exit stop is this dispatch's to
+ * give. Writes the result into r->x[0]. */
+void cng_dispatch_bounced(struct cng_uregs *r, long nr, int owed);
+
+/* A dispatch in progress from guest context — the -R trampoline's, or a
+ * bounced one — as a ptrace stop taken inside it has to see it: the guest's
+ * registers, which hold the call's arguments until `done`, and its result
+ * after. Kept per thread, innermost first (a guest handler can run on top of a
+ * dispatch that is blocked, and make calls of its own), by cng_run_scratch_in. A
+ * stop inside the dispatch reports these instead of the monitor's own, and a
+ * tracer that changes them there `abandon`s the call: its result is dropped
+ * and the thread resumes with the registers the tracer left. `owed` is the
+ * exit stop the dispatch owes its tracer. A call abandoned at the entry stop
+ * of its own restart (the tracer resumed with PTRACE_SYSCALL, and changed it
+ * there) is `entered` already, with `nr` the number to make, -1 for one the
+ * tracer cancelled. `gsp`, when set, is a stack pointer on the guest's own
+ * stack for the blocking call the dispatch makes (reissue in dispatch.c): a
+ * guest handler that runs while it blocks is then delivered there, as for a
+ * call of its own, and not onto the scratch stack. */
+struct cng_gframe {
+    struct cng_uregs *r;
+    struct cng_gframe *prev;
+    int done;
+    int abandon;
+    int owed;
+    int entered;
+    long nr;
+    unsigned long gsp;
+};
+/* The innermost one on this thread, or 0. */
+struct cng_gframe *cng_gframe_cur(void);
 
 /* A trapped clone (the process-making kinds), answered in the guest's register
  * frame rather than by return value: CLONE_VM|CLONE_VFORK become a COW fork,
@@ -495,6 +551,14 @@ extern int cng_g_openat2_deny;
  * is not an interruption. cng_sig_deliverable() (sysvipc.h) finds the frame
  * itself. Implemented in sigsys.c, which owns it. */
 int cng_sig_deliverable_in(const struct cng_ucontext *uc);
+/* ...and for a wait made inside the SIGSYS handler (`uc` its frame, 0 for
+ * none, which is then never one): is a ptrace kick queued that the frame's mask
+ * would let in? The kick is masked in the handler like everything else, so a
+ * wait that will not end by itself has to end for it, with CNG_ERESTART: a
+ * thread asleep in one could not be attached to. _waiting finds the frame
+ * itself. */
+int cng_sig_kick_pending(const struct cng_ucontext *uc);
+int cng_sig_kick_waiting(void);
 
 /* What the guest's rt_sigprocmask asked for, as far as "every signal blocked"
  * goes, kept per thread (sigsys.c has the story): cng_sig_note_mask records it
@@ -513,6 +577,25 @@ int cng_sig_install(int signo, cng_sighandler_t h);
  * cng_scratch_leave gives the stack back for a call that never returns. */
 int cng_run_scratch(void (*fn)(void *), void *arg);
 void cng_scratch_leave(void);
+/* ...for a dispatch from guest context, with `f` (its r set) published as this
+ * thread's innermost cng_gframe for as long as `fn` runs. The slot lookup is
+ * the one the stack switch makes anyway, so this costs three stores. */
+int cng_run_scratch_in(void (*fn)(void *), void *arg, struct cng_gframe *f);
+
+/* A ptrace kick landed with `uc` inside one of the bounce stubs (sigsys.c):
+ * put the frame back to the guest's own state, as if the call had not been
+ * started (CNG_UNWIND_UNDONE: pc at the guest's svc, its arguments in x0..x5)
+ * or as if it had returned (CNG_UNWIND_DONE: pc after it, x0 its result), so
+ * that a stop taken on the frame shows the guest and a write to it is what the
+ * thread resumes with. `*owed` says an exit stop is owed for the call, and
+ * `*rval` is the result the tracer should see there (-ERESTARTSYS for an undo).
+ * An undo with `stop` 0 is made only for a wait the kernel would have
+ * restarted, and a frame left alone otherwise. CNG_UNWIND_NONE when `uc` is
+ * not in a stub, or was left alone. */
+#define CNG_UNWIND_NONE   0
+#define CNG_UNWIND_UNDONE 1
+#define CNG_UNWIND_DONE   2
+int cng_bounce_unwind(struct cng_ucontext *uc, int stop, int *owed, long *rval);
 
 /* The same allocator for a TID the caller names, with the slot's stack top (0
  * when there is no slot). Exposed for testing: filling the table takes hundreds
