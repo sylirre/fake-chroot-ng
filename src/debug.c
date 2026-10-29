@@ -9148,13 +9148,14 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
             u32 want;
         } tcases[] = {
             /* The point of the filter: a tracee must stop on everything, not
-             * just the path-bearing set the base filter traps. */
+             * just the path-bearing set the base filter traps — and with its
+             * tag, which is how a task that inherited it is known to. */
             {"traceall: read traps", __NR_read, 0x1000, 0,
-             CNG_SECCOMP_RET_TRAP},
+             CNG_SECCOMP_RET_TRAP | CNG_TRAP_TAG_TRACEALL},
             {"traceall: getpid traps", __NR_getpid, 0x1000, 0,
-             CNG_SECCOMP_RET_TRAP},
+             CNG_SECCOMP_RET_TRAP | CNG_TRAP_TAG_TRACEALL},
             {"traceall: openat traps", __NR_openat, 0x1000, 0,
-             CNG_SECCOMP_RET_TRAP},
+             CNG_SECCOMP_RET_TRAP | CNG_TRAP_TAG_TRACEALL},
             /* Our own re-issue must not re-trap, or the handler recurses. */
             {"traceall: in-gate reissue allowed", __NR_read, gate, 0,
              CNG_SECCOMP_RET_ALLOW},
@@ -9169,9 +9170,9 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
             {"traceall: thread clone stays native", __NR_clone, 0x1000,
              CNG_CLONE_VM | 0x10000, CNG_SECCOMP_RET_ALLOW},
             {"traceall: fork traps", __NR_clone, 0x1000, 17 /*SIGCHLD*/,
-             CNG_SECCOMP_RET_TRAP},
+             CNG_SECCOMP_RET_TRAP | CNG_TRAP_TAG_TRACEALL},
             {"traceall: vfork traps", __NR_clone, 0x1000,
-             CNG_CLONE_VM | CNG_CLONE_VFORK, CNG_SECCOMP_RET_TRAP},
+             CNG_CLONE_VM | CNG_CLONE_VFORK, CNG_SECCOMP_RET_TRAP | CNG_TRAP_TAG_TRACEALL},
         };
         int tf_ok = tn > 0;
         for (unsigned k = 0; tf_ok && k < sizeof tcases / sizeof tcases[0];
@@ -9199,12 +9200,16 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
         } rcases[] = {
             /* A tracer's wait has to account for stops that are not the
              * kernel's, and its SIGSTOP has to become a cooperative one. */
-            {"tracer: wait4 traps", __NR_wait4, CNG_SECCOMP_RET_TRAP},
-            {"tracer: waitid traps", __NR_waitid, CNG_SECCOMP_RET_TRAP},
-            {"tracer: kill traps", __NR_kill, CNG_SECCOMP_RET_TRAP},
-            {"tracer: tgkill traps", __NR_tgkill, CNG_SECCOMP_RET_TRAP},
+            {"tracer: wait4 traps", __NR_wait4,
+             CNG_SECCOMP_RET_TRAP | CNG_TRAP_TAG_TRACER},
+            {"tracer: waitid traps", __NR_waitid,
+             CNG_SECCOMP_RET_TRAP | CNG_TRAP_TAG_TRACER},
+            {"tracer: kill traps", __NR_kill,
+             CNG_SECCOMP_RET_TRAP | CNG_TRAP_TAG_TRACER},
+            {"tracer: tgkill traps", __NR_tgkill,
+             CNG_SECCOMP_RET_TRAP | CNG_TRAP_TAG_TRACER},
             {"tracer: process_vm_readv traps", __NR_process_vm_readv,
-             CNG_SECCOMP_RET_TRAP},
+             CNG_SECCOMP_RET_TRAP | CNG_TRAP_TAG_TRACER},
             /* ...and nothing else does: this is the filter an ordinary tracer
              * (gdb, strace) runs its own work through. */
             {"tracer: read stays native", __NR_read, CNG_SECCOMP_RET_ALLOW},

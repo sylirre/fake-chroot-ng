@@ -321,6 +321,12 @@ void cng_pt_arm_tracee(void);
  * "Android blocked this one". */
 int cng_pt_traceall(void);
 
+/* A trap with `tag` (si_errno, CNG_TRAP_TAG_* in monitor.h) was just taken on
+ * this task: the filter that tagged it is stacked here, recorded so for the
+ * questions above even where this task did not stack it itself (see the tag).
+ * Anything else is no news. */
+void cng_pt_note_trap(int tag);
+
 /* ---- single-step (ptstep.c) ---- */
 /* One step in flight, per task: the breakpoint planted at the instruction the
  * stepping task will reach next, and the word it displaced. Kept in the

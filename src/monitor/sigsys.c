@@ -556,6 +556,9 @@ void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si) {
     /* A trap out of the guest: the filter is live, and a trap a SIGSYS of
      * ours displaces is something that can happen here (cng_seccomp_traps). */
     cng_g_traps_live = 1;
+    /* ...and the filter that caught it said so, which is all a task that
+     * inherited one has to go by (cng_pt_note_trap). */
+    cng_pt_note_trap(si->si_errno);
 
     long nr = (long)r[8];
 
@@ -1078,6 +1081,36 @@ int cng_sig_returned_to(const struct cng_ucontext *uc) {
            cng_scr[i].back.x30 == r[30];
 }
 
+/* ---- asking the kernel which of our filters this task carries ----
+ *
+ * The tag on a trap says which filter caught it (monitor.h), but the trap a
+ * SIGSYS of ours displaced left no tag: its siginfo is ours. A task that
+ * inherited a filter and has not trapped through it since has no record of
+ * it either. So the question is put to the kernel: a call that only the
+ * filter asked about traps, made from the probe's svc, outside the gate, and
+ * answered by the handler below without dispatching it. getppid for the
+ * tracee's filter, which traps every call: neither of the others traps it.
+ * waitid, with no state asked for, for the tracer's: only the tracee's traps
+ * it too, and natively it is EINVAL before it looks at anything else. A first
+ * argument the trap is merged into (another SIGSYS pending) comes back as it
+ * was, and is asked again; one an ambient filter refuses is not asked. */
+extern long cng_probe_svc(long a0, long nr);
+extern char cng_probe_ret[];
+#define PROBE_HIT    (-1000L) /* what the handler answers a probe's trap with */
+#define PROBE_MERGED (-1001L) /* the first argument: no answer was given */
+
+int cng_sig_filter_stacked(int tag) {
+    long nr = tag == CNG_TRAP_TAG_TRACEALL ? __NR_getppid : __NR_waitid;
+    if (!cng_g_traps_live || cng_blocked[nr])
+        return 0;
+    for (int k = 0; k < 8; k++) {
+        long r = cng_probe_svc(PROBE_MERGED, nr);
+        if (r != PROBE_MERGED)
+            return r == PROBE_HIT;
+    }
+    return 0;
+}
+
 /* Is `pc` in one of the bounce stubs, which run in guest context? */
 static int pc_in_stub(unsigned long pc) {
     unsigned long w = (unsigned long)cng_bounce_wait,
@@ -1170,6 +1203,13 @@ static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {
          * installed may siglongjmp out and never come back, which a busy flag
          * or a disarmed alt-stack would not survive. It used to be consumed
          * here and nothing happened, where the default action is a core dump. */
+        /* A probe's trap (cng_sig_filter_stacked): answered, nothing more. */
+        if (si->si_code == CNG_SYS_SECCOMP &&
+            si->_u._sigsys.call_addr == (void *)cng_probe_ret) {
+            ((struct cng_ucontext *)ucv)->uc_mcontext.regs[0] =
+                (unsigned long long)PROBE_HIT;
+            return;
+        }
         if (sigsys_is_kick(si)) {
             sigsys_kick((struct cng_ucontext *)ucv);
             return;

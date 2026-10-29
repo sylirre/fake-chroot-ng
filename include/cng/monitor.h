@@ -576,6 +576,11 @@ void cng_sig_in_handler(int d);
 /* Set once the SIGSYS handler has taken a trap out of guest code: the filter
  * is live (it is not under qemu-user, which installs it and ignores it). */
 extern int cng_g_traps_live;
+/* Does the calling task carry the filter that tags its traps with `tag`
+ * (CNG_TRAP_TAG_*)? Asked of the kernel with a call that filter traps and no
+ * other filter of ours does, made outside the gate and answered by the handler
+ * without dispatching it. 0 when the answer cannot be had. */
+int cng_sig_filter_stacked(int tag);
 
 /* What the guest's rt_sigprocmask asked for, as far as "every signal blocked"
  * goes, kept per thread (sigsys.c has the story): cng_sig_note_mask records it
@@ -654,6 +659,18 @@ int cng_install_seccomp(void);
  * removed, so each is installed at most once per task (see cng_pt_arm_*). */
 int cng_install_seccomp_traceall(void);
 int cng_install_seccomp_tracer(void);
+
+/* The data the two put in their RET_TRAP, which the kernel hands the handler
+ * as si_errno: each trap says which filter caught it. Equal actions keep the
+ * newest filter's data, so a task that carries the tracee's filter has every
+ * trap tagged by it, and that is how a task that inherited one is known to
+ * have it. A thread or a fork child created after its creator stacked one
+ * carries the filter but none of the creator's per-task state, and until
+ * the tag, the dispatcher answered every call it does not handle itself with
+ * ENOSYS there, taking the trap for one an Android filter makes (cng_pt_note
+ * _trap, ptrace.c). The base filter's traps carry none. */
+#define CNG_TRAP_TAG_TRACEALL 0x7ace
+#define CNG_TRAP_TAG_TRACER   0x7acf
 
 /* ...and the same split the base filter has, so a self-test can simulate them.
  * Neither can be observed any other way: they are only installed once a guest

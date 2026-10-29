@@ -222,6 +222,17 @@ else
     # the call; the handler makes it again, unless the frame is the one a
     # handler of ours has just answered it with.
     pt_case blockspin
+    # A thread and a fork child that a tracee makes after the attach, which
+    # the tracer does not follow, run as any untraced task. Both inherit the
+    # tracee's trap-everything filter, and neither had a record of it: every
+    # call the dispatcher does not handle itself came back ENOSYS there. The
+    # trap's tag now says which filter caught it.
+    pt_case threadafter
+    pt_case forkafter
+    # ...and blockspin's attach to such a thread, spinning on a call that only
+    # the inherited filter traps: whether a trap the SIGSYS displaced is made
+    # again depends on knowing the filter is there.
+    pt_case spinafter
     # ...and to two hundred tasks of one process, one after another: the
     # tracee's per-task state used to sit in 128 slots that were never given
     # back, so the 129th attach was reported a success and never stopped.
@@ -310,8 +321,8 @@ else
         PT_TIER_NAME=" (SIGSYS tier)"
         for _sc in basic sysstop cancel poke signal deliver fork exec \
             execstart patharg exitstop break step step2 attach fpregs blocked \
-            blockedmask blockspin attachmany sigact sigchld sigchldw waitid \
-            waitnowait options; do
+            blockedmask blockspin threadafter forkafter spinafter attachmany \
+            sigact sigchld sigchldw waitid waitnowait options; do
             pt_case "$_sc"
         done
         pt_case sysinfo "syscall_info unsupported" \

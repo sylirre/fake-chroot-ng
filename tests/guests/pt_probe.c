@@ -27,6 +27,7 @@
 #include <pthread.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef NT_PRSTATUS
@@ -1881,6 +1882,193 @@ static int sc_blockspin(const char *self) {
     return 0;
 }
 
+/* Tasks a tracee makes after the attach, which the tracer does not follow:
+ * a thread (no PTRACE_O_TRACECLONE) and a fork child (no TRACEFORK). The
+ * kernel runs both as any untraced task. chroot-ng's tracee filter traps every
+ * call, and a thread's clone and a fork both hand it on, but not the record
+ * that says the task carries it: every call the dispatcher does not handle
+ * itself (sched_yield, getpid, write) came back ENOSYS in the new task. Each
+ * makes a handful and counts the ones that failed. */
+static int after_calls(int fd) {
+    int bad = 0;
+    struct timespec ts = {0, 1000};
+    bad += syscall(SYS_getpid) <= 0;
+    bad += syscall(SYS_getppid) <= 0;
+    bad += syscall(SYS_gettid) <= 0;
+    bad += syscall(SYS_sched_yield) != 0;
+    bad += syscall(SYS_nanosleep, &ts, 0) != 0;
+    bad += syscall(SYS_write, fd, "x", 1) != 1;
+    void *m = mmap(0, 4096, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    bad += m == MAP_FAILED || munmap(m, 4096) != 0;
+    int d = dup(fd);
+    bad += d < 0 || close(d) != 0;
+    return bad;
+}
+
+static volatile int *g_after;
+static int g_after_fd;
+
+static void *after_thr(void *a) {
+    (void)a;
+    g_after[0] = after_calls(g_after_fd);
+    g_after[1] = 1;
+    return 0;
+}
+
+/* `tracee_work` runs in the tracee once its tracer has attached and let it
+ * go; the tracer then follows it to its exit. */
+static int after_run(void (*tracee_work)(void), const char *what) {
+    int go[2], sink[2];
+    if (pipe(go) != 0 || pipe(sink) != 0)
+        return 1;
+    g_after = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS,
+                   -1, 0);
+    if (g_after == MAP_FAILED)
+        return 1;
+    g_after[0] = -1;
+    g_after[1] = 0;
+    g_after_fd = sink[1];
+    pid_t pid = fork();
+    if (pid == 0) {
+        char c;
+        if (read(go[0], &c, 1) != 1)
+            _exit(3);
+        tracee_work();
+        _exit(g_after[1] ? 0 : 4);
+    }
+    int st;
+    if (ptrace(PTRACE_ATTACH, pid, 0, 0) != 0) {
+        printf("attach failed %d\n", errno);
+        kill(pid, SIGKILL);
+        return 1;
+    }
+    wait_for(pid, &st);
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    if (write(go[1], "g", 1) != 1)
+        return 1;
+    for (;;) {
+        wait_for(pid, &st);
+        if (!WIFSTOPPED(st))
+            break;
+        ptrace(PTRACE_CONT, pid, 0,
+               WSTOPSIG(st) == SIGSTOP || WSTOPSIG(st) == SIGTRAP
+                   ? 0
+                   : WSTOPSIG(st));
+    }
+    printf("%s made its calls: %s\n", what,
+           !g_after[1]   ? "never ran"
+           : g_after[0] ? "some failed"
+                        : "yes");
+    show(st);
+    return 0;
+}
+
+static void after_thread(void) {
+    pthread_t t;
+    if (pthread_create(&t, 0, after_thr, 0) == 0)
+        pthread_join(t, 0);
+}
+
+static void after_fork(void) {
+    pid_t g = fork();
+    if (g == 0) {
+        after_thr(0);
+        _exit(0);
+    }
+    int st;
+    while (waitpid(g, &st, 0) < 0 && errno == EINTR)
+        ;
+}
+
+static int sc_threadafter(void) {
+    return after_run(after_thread, "a thread made after the attach");
+}
+
+static int sc_forkafter(void) {
+    return after_run(after_fork, "a fork child made after the attach");
+}
+
+/* blockspin's attach, to a thread made after its process was attached to:
+ * one that carries the tracee's filter it inherited and no record of it. It
+ * blocks every signal, so each attach reaches it as a SIGSYS of ours, and
+ * spins on a call that only the inherited filter traps: lseek by one on a
+ * file of its own, whose answer is the new offset. A call the SIGSYS displaced and that is not made
+ * again answers its first argument; one made twice moves the offset by two. */
+static volatile long *g_spin_sh;
+
+static void *spin_thr(void *a) {
+    int fd = (int)(long)a;
+    block_all();
+    g_spin_sh[2] = syscall(SYS_gettid);
+    for (long want = 1;; want++) {
+        if (syscall(SYS_lseek, fd, 1L, SEEK_CUR) != want) {
+            g_spin_sh[1]++;
+            want = lseek(fd, 0, SEEK_CUR);
+        }
+        g_spin_sh[0]++;
+    }
+    return 0;
+}
+
+static int sc_spinafter(const char *self) {
+    g_spin_sh = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS,
+                     -1, 0);
+    int go[2];
+    if (g_spin_sh == MAP_FAILED || pipe(go) != 0)
+        return 1;
+    g_spin_sh[0] = g_spin_sh[1] = g_spin_sh[2] = 0;
+    pid_t pid = fork();
+    if (pid == 0) {
+        char c;
+        int fd = open(self, O_RDONLY);
+        if (fd < 0 || read(go[0], &c, 1) != 1)
+            _exit(3);
+        pthread_t t;
+        pthread_create(&t, 0, spin_thr, (void *)(long)fd);
+        for (;;)
+            pause();
+    }
+    int st;
+    if (ptrace(PTRACE_ATTACH, pid, 0, 0) != 0) {
+        printf("attach failed %d\n", errno);
+        kill(pid, SIGKILL);
+        return 1;
+    }
+    wait_for(pid, &st);
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    if (write(go[1], "g", 1) != 1)
+        return 1;
+    while (g_spin_sh[0] < 100)
+        usleep(1000);
+    pid_t tid = (pid_t)g_spin_sh[2];
+    int stopped = 0;
+    signal(SIGALRM, blk_hung);
+    blk_child = pid;
+    for (int i = 0; i < SPIN_ROUNDS; i++) {
+        alarm(20);
+        if (ptrace(PTRACE_ATTACH, tid, 0, 0) != 0)
+            break;
+        while (waitpid(tid, &st, __WALL) < 0 && errno == EINTR)
+            ;
+        alarm(0);
+        if (WIFSTOPPED(st) && WSTOPSIG(st) == SIGSTOP)
+            stopped++;
+        ptrace(PTRACE_DETACH, tid, 0, 0);
+        long seen = g_spin_sh[0];
+        while (g_spin_sh[0] == seen)
+            usleep(100);
+    }
+    printf("attached to a thread made after its process was: %s\n",
+           stopped == SPIN_ROUNDS ? "stopped every time" : "missed stops");
+    printf("every call it made answered as it should: %s\n",
+           g_spin_sh[1] ? "no" : "yes");
+    kill(pid, SIGKILL);
+    wait_for(pid, &st);
+    show(st);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, 0, _IOLBF, 0);
     if (argc > 1 && !strcmp(argv[1], "hello")) {
@@ -1948,6 +2136,12 @@ int main(int argc, char **argv) {
         return sc_blocked(1);
     if (!strcmp(s, "blockspin"))
         return sc_blockspin(argc > 2 ? argv[2] : argv[0]);
+    if (!strcmp(s, "threadafter"))
+        return sc_threadafter();
+    if (!strcmp(s, "forkafter"))
+        return sc_forkafter();
+    if (!strcmp(s, "spinafter"))
+        return sc_spinafter(argc > 2 ? argv[2] : argv[0]);
     fprintf(stderr, "unknown scenario %s\n", s);
     return 2;
 }

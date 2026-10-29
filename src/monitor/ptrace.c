@@ -625,6 +625,33 @@ int cng_pt_traceall(void) {
     return s && s->traceall;
 }
 
+/* A task can carry a filter of ours that it did not stack: a thread created by
+ * a traced one, whose clone the tracee's filter lets run natively, or a fork
+ * child its tracer does not follow (cng_pt_fork_child) — both inherit every
+ * filter, and neither inherits the creator's record, which is keyed by tid.
+ * The dispatcher read every trap such a task took for a call it does not
+ * handle as one an Android filter makes, and answered ENOSYS: write,
+ * sched_yield and getpid failed in a thread made after an attach, and a fork
+ * child of a tracee could make nearly no call at all. The tag on the trap
+ * (monitor.h) says which filter caught it, so the record is made here from the
+ * first such trap, before the dispatcher asks. g_pt_local follows: the record
+ * is what it guards. */
+void cng_pt_note_trap(int tag) {
+    if (tag != CNG_TRAP_TAG_TRACEALL && tag != CNG_TRAP_TAG_TRACER)
+        return;
+    int all = tag == CNG_TRAP_TAG_TRACEALL;
+    struct pt_self *s = g_pt_local ? pt_self_get(0) : 0;
+    if (s && (all ? s->traceall : s->tracer_armed))
+        return;
+    if (!(s = pt_self_get(1)))
+        return;
+    if (all)
+        s->traceall = 1;
+    else
+        s->tracer_armed = 1;
+    g_pt_local = 1;
+}
+
 void cng_pt_set_frame(struct cng_uregs *r, struct cng_ucontext *uc) {
     if (!g_pt_local)
         return;
@@ -1977,6 +2004,22 @@ void cng_pt_service_kick(struct cng_ucontext *uc) {
  * was made, native or answered by a handler of ours that has just returned.
  * The first is told apart by asking the filters whether the call traps at
  * all, the second because the frame is the one that handler returned with. */
+/* Which of the tracee's and the tracer's filters this task carries: its
+ * record, which knows every filter it stacked and every one a tagged trap has
+ * shown it (cng_pt_note_trap), and failing that the kernel, asked by a call
+ * only that filter traps (cng_sig_filter_stacked). The record does not know
+ * one a task inherited and has not trapped through yet, and the trap this is
+ * asked about carried no tag — ours replaced its siginfo. */
+static int pt_filter_stacked(int tag) {
+    struct pt_self *s = g_pt_local ? pt_self_get(0) : 0;
+    if (s && (tag == CNG_TRAP_TAG_TRACEALL ? s->traceall : s->tracer_armed))
+        return 1;
+    if (!cng_sig_filter_stacked(tag))
+        return 0;
+    cng_pt_note_trap(tag);
+    return 1;
+}
+
 static int pt_trap_displaced(const struct cng_ucontext *uc) {
     const struct cng_uregs *r =
         (const struct cng_uregs *)&uc->uc_mcontext.regs[0];
@@ -1987,9 +2030,18 @@ static int pt_trap_displaced(const struct cng_ucontext *uc) {
         return 0;
     if (cng_sig_returned_to(uc))
         return 0;
-    struct pt_self *s = g_pt_local ? pt_self_get(0) : 0;
-    return cng_seccomp_traps((long)(s32)r->x[8], r->x, (unsigned long)r->pc,
-                             s && s->traceall, s && s->tracer_armed);
+    /* The base filter first, then each stacked one only where it would make
+     * the difference, so the kernel is asked only then. The tracee's filter
+     * traps everything the tracer's does, which it is asked about second. */
+    long nr = (long)(s32)r->x[8];
+    unsigned long pc = (unsigned long)r->pc;
+    if (cng_seccomp_traps(nr, r->x, pc, 0, 0))
+        return 1;
+    if (cng_seccomp_traps(nr, r->x, pc, 1, 0) &&
+        pt_filter_stacked(CNG_TRAP_TAG_TRACEALL))
+        return 1;
+    return cng_seccomp_traps(nr, r->x, pc, 0, 1) &&
+           pt_filter_stacked(CNG_TRAP_TAG_TRACER);
 }
 
 void cng_pt_sigsys_kick(struct cng_ucontext *uc, int direct) {

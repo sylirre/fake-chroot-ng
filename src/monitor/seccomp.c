@@ -841,7 +841,10 @@ static int install_filter(const struct sock_filter *f, int n) {
  *
  * Stacked filters compose by most-restrictive-action-wins, so this also
  * converts the base filter's RET_ERRNO answers into traps; the dispatcher
- * turns those back into -ENOSYS (see cng_denied_syscall). */
+ * turns those back into -ENOSYS (see cng_denied_syscall).
+ *
+ * Its trap carries a tag (CNG_TRAP_TAG_TRACEALL, see monitor.h), and so does
+ * the tracer's below. */
 int cng_build_seccomp_traceall(struct sock_filter *f, int cap) {
     if (cap < CNG_SECCOMP_TRACEALL_INSNS)
         return -1;
@@ -864,8 +867,8 @@ int cng_build_seccomp_traceall(struct sock_filter *f, int cap) {
         CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, 0, 0, 1); /* thread -> allow */
     f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
                                               CNG_SECCOMP_RET_ALLOW);
-    f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
-                                              CNG_SECCOMP_RET_TRAP);
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_RET | CNG_BPF_K, CNG_SECCOMP_RET_TRAP | CNG_TRAP_TAG_TRACEALL);
     return n;
 }
 
@@ -903,8 +906,8 @@ int cng_build_seccomp_tracer(struct sock_filter *f, int cap) {
             (uint8_t)(k - i), 0);
     f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
                                               CNG_SECCOMP_RET_ALLOW);
-    f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
-                                              CNG_SECCOMP_RET_TRAP);
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_RET | CNG_BPF_K, CNG_SECCOMP_RET_TRAP | CNG_TRAP_TAG_TRACER);
     return n;
 }
 
