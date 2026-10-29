@@ -43,10 +43,11 @@ vfork/`posix_spawn` child-stack handling.
   to entry. A static-PIE glibc guest runs end-to-end under qemu: correct
   argc/argv/env, live syscall, glibc init + self-relocation, exit code. This is
   the `noexec` defeat (file only ever opened O_RDONLY + read).
-  Known limitations (tracked for later):
+  Known limitations:
   - ET_EXEC guests at a fixed vaddr that collides with the non-PIE loader
-    (0x400000) are unsupported; Android guests are PIE so this is moot. Fixing
-    needs a static-PIE self-relocating loader.
+    (0x400000) were unsupported at first. Closed by **Relocate chroot-ng out of
+    the guest ET_EXEC range** below, which links chroot-ng at `0x1000000000`
+    instead of making the loader self-relocate.
   - Final protections are applied per host page as the union of every segment
     touching it (RWX where text and data share a page). The counterexample is
     a 4 KiB-max-page-size object on a 16 KiB kernel — Android's 16 KiB
