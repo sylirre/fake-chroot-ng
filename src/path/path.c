@@ -94,7 +94,11 @@ int cng_dev_shm_ok(void) { return !cng_g_no_dev && is_dir(g_shm_host); }
  * Best effort throughout: a host with no writable temp directory anywhere keeps
  * the old behaviour, which is that /dev/shm resolves to a name that is not
  * there, is left out of the listing, and — now — is left out of the mount
- * tables too.
+ * tables too. That much the guest can live with, but nothing in it points at
+ * the cause: shm_open fails ENOENT far from the launcher whose $TMPDIR was
+ * the trouble (an Android app's files directory, which the framework makes
+ * 0771). So the reasons each candidate was passed over are kept, and cng_run
+ * prints them on the way in (cng_dev_shm_missing).
  *
  * The name is predictable, and the last candidate is a directory every user
  * shares, so what is found under it is not ours by being there. mkdirat's
@@ -104,7 +108,7 @@ int cng_dev_shm_ok(void) { return !cng_g_no_dev && is_dir(g_shm_host); }
  * that user could read, replace or delete them, or refused them outright.
  * One is adopted now only as procreg adopts its shared file: reached without
  * a symlink at the name, a directory, ours, and private (shm_dir_ours) — in a
- * parent nobody else can rename it out of (shm_parent_safe). Anything else on
+ * parent nobody else can rename it out of (tmp_parent_unsafe). Anything else on
  * the name moves the search to the next candidate. Squatting every candidate
  * still leaves the guest without a /dev/shm, which is the degraded answer
  * above; nothing can keep a name in a shared directory from being taken
@@ -112,19 +116,26 @@ int cng_dev_shm_ok(void) { return !cng_g_no_dev && is_dir(g_shm_host); }
  * invocation shares. */
 static int canon_host_root(char *dst, size_t dstsz, const char *src);
 
-/* A directory nobody but us — and root — can take an entry of away: owned by
- * one of the two, and writable by anyone else only with the sticky bit, which
+/* Why the candidate `dir` cannot hold a directory of ours, or 0 when it can:
+ * a directory nobody but us — and root — can take an entry of away, owned by
+ * one of the two and writable by anyone else only with the sticky bit, which
  * leaves an entry to its own owner (/tmp's 1777). Followed: it is the
- * directory the candidate names that holds ours. */
-static int shm_parent_safe(const char *dir) {
+ * directory the candidate names that holds ours. The answer is the tail of a
+ * sentence about `dir`, for the warning cng_dev_shm_missing feeds. */
+static const char *tmp_parent_unsafe(const char *dir) {
     char st[144]; /* struct stat: st_mode at 16, st_uid at 24 */
-    if (CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, (long)dir, (long)st, 0, 0, 0) !=
-        0)
-        return 0;
+    long r = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, (long)dir, (long)st, 0, 0,
+                     0);
+    if (r != 0)
+        return r == -ENOENT ? "does not exist" : "cannot be reached";
     unsigned mode = *(unsigned *)(st + 16), uid = *(unsigned *)(st + 24);
+    if ((mode & 0170000) != 0040000)
+        return "is not a directory";
     if (uid != 0 && uid != (unsigned)sys_getuid())
-        return 0;
-    return !(mode & 022) || (mode & 01000);
+        return "is owned by another user";
+    if ((mode & 022) && !(mode & 01000))
+        return "is group- or world-writable and not sticky";
+    return 0;
 }
 
 /* The stand-in directory at `path` is ours to adopt: the name itself not a
@@ -157,6 +168,10 @@ static void canon_dev_dir(char *node, size_t sz) {
         cng_strlcpy(node, tmp, sz);
 }
 
+/* Why the stand-in could not be made, while g_shm_none says it was not. */
+static char g_shm_why[1024];
+static int g_shm_none;
+
 void cng_dev_shm_init(void) {
     if (cng_g_no_dev)
         return;
@@ -167,32 +182,72 @@ void cng_dev_shm_init(void) {
         canon_dev_dir(g_shm_host, sizeof g_shm_host);
         return;
     }
-    cng_private_tmp_dir("chroot-ng-shm.v1", g_shm_host, sizeof g_shm_host);
+    g_shm_none = cng_private_tmp_dir("chroot-ng-shm.v1", g_shm_host,
+                                     sizeof g_shm_host, g_shm_why,
+                                     sizeof g_shm_why) != 0;
+    /* Under the force knob the host's own /dev/shm is still there, on the
+     * name a failed stand-in leaves, so the guest would have one after all
+     * and the knob would stop pretending just where a device differs. A
+     * name in the root-owned /dev that nothing makes gives the guest what a
+     * device gives it: nothing. */
+    if (g_shm_none && is_dir(g_shm_host))
+        cng_strlcpy(g_shm_host, "/dev/.chroot-ng-no-shm", sizeof g_shm_host);
 }
 
-int cng_private_tmp_dir(const char *stem, char *out, size_t sz) {
+const char *cng_dev_shm_missing(void) { return g_shm_none ? g_shm_why : 0; }
+
+int cng_private_tmp_dir(const char *stem, char *out, size_t sz, char *why,
+                        size_t whysz) {
     /* Not cng_broker_shared_dir(): that list starts at /dev/shm, which is the
      * one place the /dev/shm stand-in cannot use — it is made because that is
      * unusable, and under the force knob because we are pretending it is. */
-    const char *cand[] = {cng_broker_env("TMPDIR"),
-                          cng_broker_env("XDG_RUNTIME_DIR"), "/data/local/tmp",
-                          "/tmp"};
+    const struct {
+        const char *var, *dir;
+    } cand[] = {{"TMPDIR", cng_broker_env("TMPDIR")},
+                {"XDG_RUNTIME_DIR", cng_broker_env("XDG_RUNTIME_DIR")},
+                {0, "/data/local/tmp"},
+                {0, "/tmp"}};
+    /* CNG_TMP_ENV_ONLY=1 passes over the fixed candidates, which is the only
+     * way a host whose /tmp would serve can see what a device sees. */
+    int env_only = cng_broker_env("CNG_TMP_ENV_ONLY") != 0;
+    size_t wn = 0;
+    if (why && whysz)
+        why[0] = '\0';
     for (unsigned i = 0; i < sizeof cand / sizeof cand[0]; i++) {
-        if (!cand[i] || !is_dir(cand[i]) || !shm_parent_safe(cand[i]))
+        const char *dir = cand[i].dir;
+        if (!dir || (env_only && !cand[i].var))
             continue;
-        char path[CNG_PATH_MAX];
+        char path[CNG_PATH_MAX], no_buf[128];
+        const char *no = tmp_parent_unsafe(dir);
         /* Same shape as the broker's own files: named, versioned, per-uid. */
-        if (cng_snprintf(path, sizeof path, "%s/%s.%u", cand[i], stem,
-                         (unsigned)sys_getuid()) >= sizeof path)
-            continue;
-        long r = CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, (long)path, 0700, 0, 0, 0);
-        if (r != 0 && r != -EEXIST)
-            continue;
-        if (!shm_dir_ours(path))
-            continue; /* something else is sitting on the name */
-        cng_strlcpy(out, path, sz);
-        canon_dev_dir(out, sz);
-        return 0;
+        if (!no && cng_snprintf(path, sizeof path, "%s/%s.%u", dir, stem,
+                                (unsigned)sys_getuid()) >= sizeof path)
+            no = "is too long a path to hold one";
+        long r = no ? 0
+                    : CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, (long)path, 0700, 0,
+                              0, 0);
+        if (r != 0 && r != -EEXIST) {
+            cng_snprintf(no_buf, sizeof no_buf,
+                         "refused a directory (errno %ld)", -r);
+            no = no_buf;
+        }
+        if (!no && !shm_dir_ours(path)) {
+            /* something else is sitting on the name */
+            cng_snprintf(no_buf, sizeof no_buf,
+                         "has a %s.%u that is not a private directory of ours",
+                         stem, (unsigned)sys_getuid());
+            no = no_buf;
+        }
+        if (!no) {
+            cng_strlcpy(out, path, sz);
+            canon_dev_dir(out, sz);
+            return 0;
+        }
+        if (why && wn < whysz)
+            wn += cng_snprintf(why + wn, whysz - wn, "%s%s%s%s%s %s",
+                               wn ? "; " : "", cand[i].var ? "$" : "",
+                               cand[i].var ? cand[i].var : "",
+                               cand[i].var ? "=" : "", dir, no);
     }
     return -1;
 }

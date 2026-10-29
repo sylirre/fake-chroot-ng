@@ -567,6 +567,26 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
                         " from an exec-permitted mount, and any code no object"
                         " carries, reaches the host untranslated)\n",
                         -mrc);
+
+        /* A host with no /dev/shm whose temp directories all failed the
+         * stand-in's checks (cng_dev_shm_init) leaves the guest without one,
+         * which it can run without — but its shm_open and sem_open then fail
+         * ENOENT, nowhere near the cause, which is the launcher's: an Android
+         * app that hands over its 0771 files directory as $TMPDIR, say. So
+         * this says which candidates were passed over and why. Only here,
+         * with the monitor in: without it the guest has the host's /dev,
+         * which is what it would have had anyway. */
+        const char *shm_why = cng_dev_shm_missing();
+        if (shm_why)
+            cng_dprintf(2,
+                        "chroot-ng: warning: no temp directory can stand in for"
+                        " the /dev/shm this host lacks, so the guest has none"
+                        " (shm_open and sem_open fail)\n"
+                        "           %s%s\n"
+                        "           (point $TMPDIR at a directory nobody else"
+                        " can write: mode 0700, or sticky like 1777)\n",
+                        *shm_why ? "passed over: " : "no candidate is set",
+                        shm_why);
     }
 
     cng_enter(sp, entry);

@@ -1061,7 +1061,8 @@ static int store_on(void) {
         long sf[16];
         if (ro >= 0)
             sys_close((int)ro);
-        else if (cng_private_tmp_dir(STORE_STEM, g_store, sizeof g_store) == 0 &&
+        else if (cng_private_tmp_dir(STORE_STEM, g_store, sizeof g_store, 0,
+                                     0) == 0 &&
                  CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, g_store, st, 0, 0, 0) ==
                      0 &&
                  CNG_SYS(__NR_statfs, g_store, sf, 0, 0, 0, 0) == 0) {

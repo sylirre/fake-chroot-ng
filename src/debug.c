@@ -7774,7 +7774,8 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
     }
     char ro_dir[CNG_PATH_MAX];
     if (ro_mfd >= 0 && ro_probe < 0 &&
-        cng_private_tmp_dir("chroot-ng-proc.v1", ro_dir, sizeof ro_dir) != 0) {
+        cng_private_tmp_dir("chroot-ng-proc.v1", ro_dir, sizeof ro_dir, 0,
+                            0) != 0) {
         cng_dprintf(1,
                     "proctest synth fd is read-only: unavailable (the host "
                     "refuses to reopen a memfd, errno %ld, and there is no "

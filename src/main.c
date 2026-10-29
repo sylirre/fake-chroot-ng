@@ -449,7 +449,10 @@ static void help(char **envp) {
                       "left out rather than listed and then refused — except "
                       "shm/, which where the host has no /dev/shm (Android) is "
                       "served from a per-uid directory under $TMPDIR, so the "
-                      "guest's shm_open/sem_open have somewhere to go. With "
+                      "guest's shm_open/sem_open have somewhere to go; a "
+                      "$TMPDIR that others can write (and is not sticky) will "
+                      "not do, and with no other temp directory to fall back "
+                      "on a warning says why the guest has no /dev/shm. With "
                       "this flag /dev is served from the rootfs (or a -b bind) "
                       "only."},
         {"    --no-proc", "Disable /proc emulation. By default the host /proc "
@@ -522,8 +525,15 @@ static void help(char **envp) {
                       "reaches that only with 256 threads live at once."},
         {"CNG_DEVSHM_FORCE_TMP", "Serve the guest's /dev/shm from the per-uid "
                       "directory under $TMPDIR even where the host has a real "
-                      "/dev/shm. Test aid: a host that has one otherwise never "
-                      "takes the stand-in path at all."},
+                      "/dev/shm; where none can be made the guest has no "
+                      "/dev/shm, as on a device. Test aid: a host that has "
+                      "one otherwise never takes the stand-in path at all."},
+        {"CNG_TMP_ENV_ONLY", "Look for chroot-ng's private temp directories "
+                      "(the /dev/shm stand-in, read-only /proc views) only "
+                      "under $TMPDIR and $XDG_RUNTIME_DIR, passing over "
+                      "/data/local/tmp and /tmp. Test aid: a host whose /tmp "
+                      "would serve never sees what an Android app with an "
+                      "unusable $TMPDIR does."},
         {"CNG_PROCSTAT_SYNTH", "Serve /proc/stat from the synthesized "
                       "fallback even where the host file is readable. Test "
                       "aid: Android's SELinux policy denies it, which is the "

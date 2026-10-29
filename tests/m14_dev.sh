@@ -263,6 +263,36 @@ else
     m14_squat "a parent anyone may rename entries out of" "$M14T" \
         "$M14T/chroot-ng-shm.v1.$m14_uid"
     rm -rf "$M14T"
+
+    # Every candidate passed over leaves the guest with no /dev/shm at all,
+    # and its shm_open fails ENOENT nowhere near the cause: an Android app
+    # whose $TMPDIR is the 0771 files directory the framework makes, which is
+    # how AndroidTerm's guests lost theirs while Termux's, under a 1777
+    # $PREFIX/tmp, kept it. A warning names each candidate and why it was
+    # passed over. CNG_TMP_ENV_ONLY drops /data/local/tmp and /tmp, which on
+    # a device are the shell user's and here would serve.
+    m14_tmpdir() { # mode of the $TMPDIR to hand over
+        M14T=$(mktemp -d)
+        chmod "$1" "$M14T"
+        got=$(TMPDIR="$M14T" XDG_RUNTIME_DIR= CNG_TMP_ENV_ONLY=1 \
+            CNG_DEVSHM_FORCE_TMP=1 run -R "$M14_ALPINE" /bin/busybox sh -c \
+            '[ -e /dev/shm ] && echo has-shm || echo no-shm' 2>&1)
+    }
+    m14_tmpdir 0771
+    check_contains \
+        "m14 a group-writable \$TMPDIR leaves the guest no /dev/shm" \
+        "no-shm" "$got"
+    check_contains "m14 ...and a warning says so" \
+        "chroot-ng: warning: no temp directory can stand in for the /dev/shm" \
+        "$got"
+    check_contains "m14 ...naming \$TMPDIR and why it was passed over" \
+        "\$TMPDIR=$M14T is group- or world-writable and not sticky" "$got"
+    rm -rf "$M14T"
+    m14_tmpdir 1777
+    check_contains "m14 a sticky \$TMPDIR anyone may write still holds it" \
+        "has-shm" "$got"
+    check_absent "m14 ...and warns about nothing" "no temp directory" "$got"
+    rm -rf "$M14T"
 fi
 
 # --- reaching an overlay entry through a dirfd ------------------------------

@@ -3148,6 +3148,21 @@ vfork/`posix_spawn` child-stack handling.
   0777 directory on the name, a symlink on it, and a 0777 non-sticky
   candidate are each passed over for the next candidate (all three were
   adopted by the previous build).
+  - Later: the degraded answer was silent, and an Android app hit it
+    without any squatter. AndroidTerm hands chroot-ng its `files`
+    directory as `$TMPDIR`, which the framework makes 0771, and on a device
+    `/data/local/tmp` and `/tmp` are the shell user's, so every candidate
+    was passed over and the guest's `shm_open` failed `ENOENT` while the
+    same rootfs under Termux (a 1777 `$PREFIX/tmp`) had its `/dev/shm`. A
+    launch that ends up with no stand-in now warns on the way in, naming
+    each candidate and why it was passed over (`shm_parent_safe` became
+    `tmp_parent_unsafe`, which returns the reason), and says how to fix
+    `$TMPDIR`. `CNG_DEVSHM_FORCE_TMP` now leaves the guest no `/dev/shm`
+    when the stand-in fails, as a device does, instead of falling back to
+    the host's, and `CNG_TMP_ENV_ONLY=1` drops the two fixed candidates so
+    a host whose `/tmp` would serve can take that path. m14 legs: a 0771
+    `$TMPDIR` leaves no `/dev/shm` and warns with its reason, a 1777 one
+    holds the stand-in and warns about nothing.
 
 - [x] **M62 — an emulated netlink slot judged stale was claimed from its next occupant**
   The table of emulated `NETLINK_ROUTE` sockets retires a slot lazily — close
