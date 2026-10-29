@@ -8475,49 +8475,9 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
  * not honor a guest's seccomp filter), so this is the only place its logic can
  * be verified before a build reaches a device. */
 
-/* Minimal classic-BPF interpreter over a seccomp_data buffer: the subset the
- * filter uses (LD W ABS, JEQ/JGE K, ALU AND K, RET K). */
-static u32 bpf_run(const struct sock_filter *f, int n, const u32 *data,
-                   int *bad) {
-    u32 A = 0;
-    for (int pc = 0; pc < n;) {
-        const struct sock_filter *i = &f[pc];
-        switch (i->code) {
-        case CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS:
-            if (i->k & 3 || i->k >= 64) { /* seccomp_data is 64 bytes */
-                *bad = 1;
-                return 0;
-            }
-            A = data[i->k / 4];
-            pc++;
-            break;
-        case CNG_BPF_ALU | CNG_BPF_AND | CNG_BPF_K:
-            A &= i->k;
-            pc++;
-            break;
-        case CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K:
-            pc += 1 + (A == i->k ? i->jt : i->jf);
-            break;
-        case CNG_BPF_JMP | CNG_BPF_JGE | CNG_BPF_K:
-            pc += 1 + (A >= i->k ? i->jt : i->jf);
-            break;
-        case CNG_BPF_JMP | CNG_BPF_JGT | CNG_BPF_K:
-            pc += 1 + (A > i->k ? i->jt : i->jf);
-            break;
-        case CNG_BPF_RET | CNG_BPF_K:
-            return i->k;
-        default:
-            *bad = 1; /* an opcode this interpreter does not model */
-            return 0;
-        }
-        if (pc < 0 || pc >= n) { /* fell off the end: the kernel rejects this */
-            *bad = 1;
-            return 0;
-        }
-    }
-    *bad = 1;
-    return 0;
-}
+/* The interpreter is the monitor's own (cng_bpf_run, seccomp.c): the one that
+ * also judges a trap a SIGSYS of ours displaced. */
+#define bpf_run cng_bpf_run
 
 /* Fill a seccomp_data image: nr, arch, instruction_pointer, args[0]. args[1]
  * mirrors args[0] so an ioctl case can drive the request without a second

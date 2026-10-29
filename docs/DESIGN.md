@@ -400,6 +400,15 @@ and a tracer that changes them abandons the call in flight, which is then made
 again as the tracer left it. The kick is `SA_RESTART`, so a call it interrupts
 is restarted rather than failed with `EINTR`.
 
+The kick is an ordinary signal, and a thread can block it, where the kernel's
+attach is a `SIGSTOP` no mask holds back. To a thread whose mask holds the
+kick, the request also goes as a `SIGSYS` of ours, the one signal a guest can
+never block, and is sent again while it is not taken. A standard signal
+absorbs a trap the thread takes while it is pending, so the handler makes a
+call that was skipped that way again. It judges whether the call trapped by
+running the installed filters over it, and whether a handler of ours already
+answered it by the frame that handler returned to.
+
 ### Known hazards (why the tiers exist)
 
 - `execve` erases the in-process handler → emulate `execve` via the loader.

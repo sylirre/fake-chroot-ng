@@ -25,7 +25,9 @@
  * The kick signal is separate and always installed: it is how a tracer reaches
  * a *running* task (PTRACE_ATTACH/SEIZE/INTERRUPT, a cooperative group-stop) and
  * how a process learns it has become a tracer. A guest-directed signal of the
- * same number is told apart by the magic in si_value and forwarded.
+ * same number is told apart by the magic in si_value and forwarded. A task
+ * that holds the kick blocked is sent the stopping kind as a SIGSYS as well,
+ * which the guest can never block (sigsys.c, sigsys_kick).
  */
 #include "cng/monitor.h"
 #include "cng/ptrace.h"
@@ -154,7 +156,11 @@ void cng_pt_deliver_sigsys(cng_siginfo_t *si, void *ucv) {
     struct cng_ucontext *uc = ucv;
     struct cng_uregs *r = cng_pt_uregs(uc);
     cng_pt_set_frame(r, uc);
+    cng_sig_in_handler(1); /* as pt_trace_handler does around its stop */
     int deliver = cng_pt_report_signal(r, CNG_SIGSYS, si->si_code, 0);
+    cng_sig_in_handler(-1);
+    if (cng_sig_take_deferred())
+        cng_pt_sigsys_kick(uc, 0);
     if (deliver == 0)
         return;
     if (deliver != CNG_SIGSYS) {
@@ -177,8 +183,9 @@ static int sig_is_fault(int s) {
 
 /* ---- our handler for a traced task's signals ---- */
 
-static void pt_trace_handler(int sig, cng_siginfo_t *si, void *ucv) {
-    struct cng_ucontext *uc = (struct cng_ucontext *)ucv;
+/* The handler's own work, up to the guest's disposition: 1 when that is to
+ * run, with the signal the tracer left as it was. */
+static int pt_trace_report(int sig, cng_siginfo_t *si, struct cng_ucontext *uc) {
     struct cng_uregs *r = cng_pt_uregs(uc);
     cng_pt_set_frame(r, uc);
 
@@ -187,7 +194,7 @@ static void pt_trace_handler(int sig, cng_siginfo_t *si, void *ucv) {
      * back never sees it). */
     if (sig == SIG_TRAP_ && cng_pt_step_hit(r->pc)) {
         cng_pt_step_report(r);
-        return;
+        return 0;
     }
     /* A sibling's step breakpoint: the text is shared, so a thread that runs
      * through the instruction a stepping thread is about to reach traps on
@@ -198,20 +205,35 @@ static void pt_trace_handler(int sig, cng_siginfo_t *si, void *ucv) {
     if (sig == SIG_TRAP_ && cng_pt_step_shared(r->pc, 0)) {
         while (cng_pt_step_shared(r->pc, 0))
             CNG_SYS(__NR_sched_yield, 0, 0, 0, 0, 0, 0);
-        return;
+        return 0;
     }
     int code = si->si_code;
     u64 addr = sig_is_fault(sig) ? pt_si_addr(si) : 0;
     int deliver = cng_pt_report_signal(r, sig, code, addr);
     if (deliver == 0)
-        return; /* suppressed by the tracer */
+        return 0; /* suppressed by the tracer */
     if (deliver != sig) {
         /* Substituted: raise the replacement instead. It goes through the same
          * mediation (our handler is installed for it too). */
         CNG_SYS(__NR_tgkill, sys_getpid(), sys_gettid(), deliver, 0, 0, 0);
-        return;
+        return 0;
     }
-    pt_deliver_to_guest(sig, si, uc);
+    return 1;
+}
+
+/* A ptrace request carried by SIGSYS that lands while this handler does its
+ * own work is left for it (sigsys.c, sigsys_kick), and taken here on the
+ * frame, which is the guest's — before the guest's handler, which may never
+ * come back. */
+static void pt_trace_handler(int sig, cng_siginfo_t *si, void *ucv) {
+    struct cng_ucontext *uc = (struct cng_ucontext *)ucv;
+    cng_sig_in_handler(1);
+    int run = pt_trace_report(sig, si, uc);
+    cng_sig_in_handler(-1);
+    if (cng_sig_take_deferred())
+        cng_pt_sigsys_kick(uc, 0);
+    if (run)
+        pt_deliver_to_guest(sig, si, uc);
 }
 
 /* ---- the kick signal ---- */
@@ -233,6 +255,13 @@ static void pt_kick_handler(int sig, cng_siginfo_t *si, void *ucv) {
      * to use the same number, and must reach the guest untouched. */
     if (si->si_code == -1) {
         int magic = (int)si->_u._pad[1];
+        /* Ours: its own work, where a request carried by SIGSYS is left for
+         * the end of it (sigsys.c, sigsys_kick). Not for the guest's signal
+         * of the same number, whose handler may never return. */
+        int ours = magic == CNG_PT_KICK_WAKE || magic == CNG_PT_KICK_REWAKE ||
+                   magic == CNG_PT_KICK_ARM || magic == CNG_PT_KICK_ATTACH;
+        if (ours)
+            cng_sig_in_handler(1);
         switch (magic) {
         case CNG_PT_KICK_WAKE:
         case CNG_PT_KICK_REWAKE:
@@ -255,6 +284,12 @@ static void pt_kick_handler(int sig, cng_siginfo_t *si, void *ucv) {
         /* Last, after an attach stop the kick may have been held in: what it
          * does to a native wait it interrupted is make it look again. */
         cng_pt_kick_taken(uc, magic);
+        cng_sig_in_handler(-1);
+        /* A request carried by SIGSYS that came in while this ran, left for
+         * it (sigsys.c, sigsys_kick); the frame is the guest's to stop on. */
+        if (cng_sig_take_deferred())
+            cng_pt_sigsys_kick(uc, 0);
+        cng_sig_note_return(uc);
         return;
     }
     pt_deliver_to_guest(sig, si, ucv);

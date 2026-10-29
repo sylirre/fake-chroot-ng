@@ -917,6 +917,12 @@ int cng_install_seccomp_tracer(void) {
 /* 0, or -errno: cng_run prints the number when the install is what ends the
  * run, so a failure here has to carry the kernel's own answer rather than -1
  * (which would read as EPERM). */
+/* The base filter as installed, kept for cng_seccomp_traps. Every guest task
+ * carries it from here on, inherited across fork and kept across the emulated
+ * execve, which is why one copy answers for all of them. */
+static struct sock_filter g_base[CNG_SECCOMP_MAX_INSNS];
+static int g_base_n;
+
 int cng_install_seccomp(void) {
     struct sock_filter f[CNG_SECCOMP_MAX_INSNS];
     int n = cng_build_seccomp(f, (int)(sizeof f / sizeof f[0]));
@@ -930,5 +936,91 @@ int cng_install_seccomp(void) {
     /* prctl path is 3.5+ (the seccomp() syscall is only 3.17+). */
     r = sys_prctl(CNG_PR_SET_SECCOMP, CNG_SECCOMP_MODE_FILTER,
                   (unsigned long)&prog, 0, 0);
+    if (r == 0) {
+        memcpy(g_base, f, (size_t)n * sizeof f[0]);
+        g_base_n = n;
+    }
     return (int)r;
+}
+
+uint32_t cng_bpf_run(const struct sock_filter *f, int n, const uint32_t *data,
+                     int *bad) {
+    uint32_t A = 0;
+    for (int pc = 0; pc < n;) {
+        const struct sock_filter *i = &f[pc];
+        switch (i->code) {
+        case CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS:
+            if (i->k & 3 || i->k >= 64) { /* seccomp_data is 64 bytes */
+                *bad = 1;
+                return 0;
+            }
+            A = data[i->k / 4];
+            pc++;
+            break;
+        case CNG_BPF_ALU | CNG_BPF_AND | CNG_BPF_K:
+            A &= i->k;
+            pc++;
+            break;
+        case CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K:
+            pc += 1 + (A == i->k ? i->jt : i->jf);
+            break;
+        case CNG_BPF_JMP | CNG_BPF_JGE | CNG_BPF_K:
+            pc += 1 + (A >= i->k ? i->jt : i->jf);
+            break;
+        case CNG_BPF_JMP | CNG_BPF_JGT | CNG_BPF_K:
+            pc += 1 + (A > i->k ? i->jt : i->jf);
+            break;
+        case CNG_BPF_RET | CNG_BPF_K:
+            return i->k;
+        default:
+            *bad = 1; /* an opcode this interpreter does not model */
+            return 0;
+        }
+        if (pc < 0 || pc >= n) { /* fell off the end: the kernel rejects this */
+            *bad = 1;
+            return 0;
+        }
+    }
+    *bad = 1;
+    return 0;
+}
+
+/* The kernel runs every filter stacked on a task and takes the most
+ * restrictive action, and of what ours return only KILL ranks above TRAP. A
+ * program the interpreter cannot run is taken to trap, which is the answer
+ * the caller can recover from: it makes the call again. */
+static int filter_traps(const struct sock_filter *f, int n, const uint32_t *d) {
+    int bad = 0;
+    uint32_t act = cng_bpf_run(f, n, d, &bad) & ~CNG_SECCOMP_RET_DATA;
+    return bad || act == CNG_SECCOMP_RET_TRAP;
+}
+
+int cng_seccomp_traps(long nr, const uint64_t *a, unsigned long ip,
+                      int traceall, int tracer) {
+    if (!g_base_n || !cng_g_traps_live)
+        return 0;
+    uint32_t d[16];
+    d[0] = (uint32_t)nr;
+    d[1] = CNG_AUDIT_ARCH_AARCH64;
+    d[2] = (uint32_t)ip;
+    d[3] = (uint32_t)(ip >> 32);
+    for (int i = 0; i < 6; i++) {
+        d[4 + 2 * i] = (uint32_t)a[i];
+        d[5 + 2 * i] = (uint32_t)(a[i] >> 32);
+    }
+    if (filter_traps(g_base, g_base_n, d))
+        return 1;
+    struct sock_filter f[CNG_SECCOMP_TRACEALL_INSNS > CNG_SECCOMP_TRACER_INSNS
+                             ? CNG_SECCOMP_TRACEALL_INSNS
+                             : CNG_SECCOMP_TRACER_INSNS];
+    int n;
+    if (traceall &&
+        (n = cng_build_seccomp_traceall(f, (int)(sizeof f / sizeof f[0]))) > 0 &&
+        filter_traps(f, n, d))
+        return 1;
+    if (tracer &&
+        (n = cng_build_seccomp_tracer(f, (int)(sizeof f / sizeof f[0]))) > 0 &&
+        filter_traps(f, n, d))
+        return 1;
+    return nr >= 0 && nr < CNG_NR_MAX && cng_blocked[nr];
 }

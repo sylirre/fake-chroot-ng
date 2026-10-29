@@ -50,4 +50,19 @@ struct sock_fprog {
 #define CNG_SD_IP   8
 #define CNG_SD_ARGS 16
 
+/* Run classic-BPF program `f` (n instructions) over a 64-byte seccomp_data
+ * image, the subset our filters use (LD W ABS, JEQ/JGE/JGT K, ALU AND K, RET
+ * K). Returns the action; *bad is set for anything outside that subset, or a
+ * program that runs off its end, as the kernel would have refused it. */
+uint32_t cng_bpf_run(const struct sock_filter *f, int n, const uint32_t *data,
+                     int *bad);
+
+/* Would the calling task's filters trap syscall `nr` with arguments `a`,
+ * made from the svc whose next instruction is `ip`? Our base filter as it was
+ * installed, the tracee's and the tracer's when `traceall`/`tracer` say they
+ * are stacked on this task, and an ambient one by the syscalls it was measured
+ * to refuse (cng_blocked). 0 before any filter of ours is installed. */
+int cng_seccomp_traps(long nr, const uint64_t *a, unsigned long ip,
+                      int traceall, int tracer);
+
 #endif /* CNG_SECCOMP_H */

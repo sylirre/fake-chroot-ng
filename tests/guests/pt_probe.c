@@ -25,6 +25,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -891,7 +892,8 @@ static int sc_attachmany(void) {
             w = waitpid(tid, &st, __WALL);
         } while (w < 0 && errno == EINTR);
         if (w != tid || !WIFSTOPPED(st)) {
-            printf("round %d: no stop\n", k);
+            printf("round %d: no stop (wait %d errno %d status %#x)\n", k,
+                   (int)w, w < 0 ? errno : 0, w < 0 ? 0 : st);
             break;
         }
         stopped++;
@@ -1716,13 +1718,26 @@ static int blk_attach(pid_t pid, long fd, unsigned long near) {
     return 0;
 }
 
-static int sc_blocked(void) {
+/* Block every signal in the calling thread, as GLib's threads do: no mask
+ * holds back the kernel's SIGSTOP, so an attach stops such a thread all the
+ * same. The one the emulation stops threads with is an ordinary signal, which
+ * a thread like this held pending for good — a crashed Chrome hung on its gmain
+ * thread, crashpad waiting for the stop. */
+static void block_all(void) {
+    sigset_t all;
+    sigfillset(&all);
+    sigprocmask(SIG_SETMASK, &all, 0);
+}
+
+static int sc_blocked(int mask) {
     /* The read: on pipe a, redirected by the tracer to pipe b. */
     int a[2], b[2], ready[2], rep[2];
     if (pipe(a) != 0 || pipe(b) != 0 || pipe(ready) != 0 || pipe(rep) != 0)
         return 1;
     pid_t pid = fork();
     if (pid == 0) {
+        if (mask)
+            block_all();
         unsigned long here = (unsigned long)&here;
         ssize_t ignore = write(ready[1], &here, sizeof here);
         char c = 0;
@@ -1773,6 +1788,8 @@ static int sc_blocked(void) {
         return 1;
     pid = fork();
     if (pid == 0) {
+        if (mask)
+            block_all();
         unsigned long here = (unsigned long)&here;
         ssize_t ignore = write(ready[1], &here, sizeof here);
         long n = blk_call(NR_ACCEPT4, ls, 0, 0);
@@ -1799,6 +1816,68 @@ static int sc_blocked(void) {
                                                       : "an error");
     wait_for(pid, &st);
     show(st);
+    return 0;
+}
+
+/* ...and a thread with every signal blocked that never sleeps, making calls
+ * the seccomp tier traps (a mkdir and an rmdir of one directory) as fast as it
+ * can, attached and detached a hundred times. Each attach must stop it. And
+ * none may cost it a call or make one twice: on the seccomp tier the stop is
+ * sent as a SIGSYS of ours, a SIGSYS pending when the thread traps absorbs the
+ * trap's, and the call the kernel then skips returns its own first argument
+ * (AT_FDCWD, -100) unless it is made again — but not one a handler of ours
+ * already made, which a second mkdir would answer EEXIST. The thread counts
+ * the calls that answered anything but 0. */
+#define SPIN_ROUNDS 100
+
+static int sc_blockspin(const char *self) {
+    char dir[4096];
+    snprintf(dir, sizeof dir, "%s.spin.d", self);
+    rmdir(dir);
+    volatile unsigned long *shared =
+        mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shared == MAP_FAILED)
+        return 1;
+    shared[0] = shared[1] = 0; /* calls made, calls that answered wrongly */
+    pid_t pid = fork();
+    if (pid == 0) {
+        block_all();
+        for (;;) {
+            if (syscall(SYS_mkdirat, AT_FDCWD, dir, 0700) != 0)
+                shared[1]++;
+            if (syscall(SYS_unlinkat, AT_FDCWD, dir, AT_REMOVEDIR) != 0)
+                shared[1]++;
+            shared[0]++;
+        }
+    }
+    while (shared[0] < 100)
+        usleep(1000);
+    int stopped = 0;
+    signal(SIGALRM, blk_hung);
+    blk_child = pid;
+    for (int i = 0; i < SPIN_ROUNDS; i++) {
+        alarm(20);
+        if (ptrace(PTRACE_ATTACH, pid, 0, 0) != 0)
+            break;
+        int st;
+        wait_for(pid, &st);
+        alarm(0);
+        if (WIFSTOPPED(st) && WSTOPSIG(st) == SIGSTOP)
+            stopped++;
+        ptrace(PTRACE_DETACH, pid, 0, 0);
+        unsigned long seen = shared[0];
+        while (shared[0] == seen) /* running again before the next attach */
+            usleep(100);
+    }
+    printf("attached to a spinning thread with every signal blocked: %s\n",
+           stopped == SPIN_ROUNDS ? "stopped every time" : "missed stops");
+    printf("every call it made answered as it should: %s\n",
+           shared[1] ? "no" : "yes");
+    kill(pid, SIGKILL);
+    int st;
+    wait_for(pid, &st);
+    show(st);
+    rmdir(dir);
     return 0;
 }
 
@@ -1864,7 +1943,11 @@ int main(int argc, char **argv) {
     if (!strcmp(s, "fpregs"))
         return sc_fpregs();
     if (!strcmp(s, "blocked"))
-        return sc_blocked();
+        return sc_blocked(0);
+    if (!strcmp(s, "blockedmask"))
+        return sc_blocked(1);
+    if (!strcmp(s, "blockspin"))
+        return sc_blockspin(argc > 2 ? argv[2] : argv[0]);
     fprintf(stderr, "unknown scenario %s\n", s);
     return 2;
 }

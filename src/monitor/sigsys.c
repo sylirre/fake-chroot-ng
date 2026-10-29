@@ -553,6 +553,9 @@ void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si) {
         r[0] = (unsigned long long)(long)-ENOSYS;
         return;
     }
+    /* A trap out of the guest: the filter is live, and a trap a SIGSYS of
+     * ours displaces is something that can happen here (cng_seccomp_traps). */
+    cng_g_traps_live = 1;
 
     long nr = (long)r[8];
 
@@ -655,6 +658,18 @@ static struct {
     /* The innermost dispatch this thread is running from guest context
      * (cng_run_scratch_in), for a ptrace stop that lands inside it. */
     struct cng_gframe *gf;
+    /* A ptrace request carried by SIGSYS that landed where no stop can be
+     * taken, left for the handler it interrupted to take (sigsys_kick); and
+     * how deep this thread is in our other handlers' own work, which is
+     * such a place (cng_sig_in_handler). */
+    int attach;
+    int inh;
+    /* The frame a handler of ours last returned this thread to: part of the
+     * register file, enough to tell it from any frame the guest has since
+     * run to (cng_sig_returned_to). */
+    struct {
+        unsigned long long pc, sp, x0, x1, x2, x8, x30;
+    } back;
 } cng_scr[CNG_SCR_N];
 
 /* Claim `*p` from `want` to `tid` (inline LL/SC so we need no libgcc atomics
@@ -804,6 +819,9 @@ static int cng_scratch_slot(long tid) {
         cng_scr[i].uc = 0;
         cng_scr[i].sigfull = 0;
         cng_scr[i].gf = 0;
+        cng_scr[i].attach = 0;
+        cng_scr[i].inh = 0;
+        memset(&cng_scr[i].back, 0, sizeof cng_scr[i].back);
         /* Its owner can have died between claiming the slot and mapping it. */
         if (!cng_scr[i].hi && scr_map(i) != 0)
             return -1;
@@ -907,6 +925,7 @@ int cng_scratch_slot_for(long tid, unsigned long *hi_out) {
  * registered it is exactly the guest at risk. */
 int cng_g_sigsys_nest = 0;
 unsigned long cng_g_sigsys_frame[2];
+int cng_g_traps_live;
 
 static void sigsys_on_scratch(void *ucv, void *si) {
     struct cng_ucontext *uc = ucv;
@@ -982,6 +1001,149 @@ static void takeover_on_scratch(void *ucv, void *si) {
     cng_exec_takeover_frame(uc);
 }
 
+/* ---- a ptrace request carried by SIGSYS ----
+ *
+ * The kick that stops a running task for its tracer (PTRACE_ATTACH, SEIZE's
+ * INTERRUPT, a routed stop signal) is a real-time signal, and a thread can
+ * block it: GLib's worker threads block nearly everything, gmain among them.
+ * The kernel attaches with SIGSTOP, which no mask holds back, so a crashed
+ * Chrome's crashpad stopped every thread and the kick to gmain sat pending
+ * for good, the reporter waiting on it, the browser never exiting. SIGSYS is
+ * the one signal of ours a guest can never block, so a tracer whose target
+ * holds the kick blocked sends the request as a SIGSYS too (ptrace.c,
+ * pt_kick_attach), and it is taken here.
+ *
+ * Where it lands decides what can be done with it. In guest code, or in a
+ * stub or a dispatch running in guest context, the stop is taken at once, the
+ * same way the kick's handler takes one (cng_pt_sigsys_kick). Anywhere else
+ * in chroot-ng — a dispatch this handler is making, or one of our other
+ * handlers — the frame is ours and no stop can be taken on it, so the request
+ * is noted and left: the handler underneath takes it on its way out, a wait it
+ * polls ends for it (cng_sig_kick_pending), and the tracer sends it again
+ * while it is not taken.
+ *
+ * SIGSYS also costs something the kick does not: it is a standard signal, of
+ * which a thread holds one pending at most, so a trap the thread takes while
+ * ours is pending is merged into ours and lost — the kernel skips the call
+ * and hands the handler our siginfo instead. cng_pt_sigsys_kick makes such a
+ * call again, which takes knowing whether the call behind the frame trapped
+ * at all (cng_seccomp_traps) and whether a handler of ours answered it and
+ * just returned (the frame noted below). */
+static int sigsys_is_kick(const cng_siginfo_t *si) {
+    return si->si_code == -1 /*SI_QUEUE*/ &&
+           (int)si->_u._pad[1] == CNG_PT_KICK_ATTACH;
+}
+
+/* Note the frame a handler of ours is returning this thread to. */
+static void scr_note_back(int i, const struct cng_ucontext *uc) {
+    if (i < 0)
+        return;
+    const unsigned long long *r = uc->uc_mcontext.regs;
+    cng_scr[i].back.pc = uc->uc_mcontext.pc;
+    cng_scr[i].back.sp = uc->uc_mcontext.sp;
+    cng_scr[i].back.x0 = r[0];
+    cng_scr[i].back.x1 = r[1];
+    cng_scr[i].back.x2 = r[2];
+    cng_scr[i].back.x8 = r[8];
+    cng_scr[i].back.x30 = r[30];
+}
+
+void cng_sig_note_return(const struct cng_ucontext *uc) {
+    scr_note_back(cng_scratch_slot(sys_gettid()), uc);
+}
+
+void cng_sig_in_handler(int d) {
+    int i = cng_scratch_slot(sys_gettid());
+    if (i >= 0)
+        cng_scr[i].inh += d;
+}
+
+int cng_sig_take_deferred(void) {
+    int i = cng_scratch_slot(sys_gettid());
+    if (i < 0 || !cng_scr[i].attach)
+        return 0;
+    cng_scr[i].attach = 0;
+    return 1;
+}
+
+int cng_sig_returned_to(const struct cng_ucontext *uc) {
+    int i = cng_scratch_slot(sys_gettid());
+    if (i < 0)
+        return 0;
+    const unsigned long long *r = uc->uc_mcontext.regs;
+    return cng_scr[i].back.pc == uc->uc_mcontext.pc &&
+           cng_scr[i].back.sp == uc->uc_mcontext.sp &&
+           cng_scr[i].back.x0 == r[0] && cng_scr[i].back.x1 == r[1] &&
+           cng_scr[i].back.x2 == r[2] && cng_scr[i].back.x8 == r[8] &&
+           cng_scr[i].back.x30 == r[30];
+}
+
+/* Is `pc` in one of the bounce stubs, which run in guest context? */
+static int pc_in_stub(unsigned long pc) {
+    unsigned long w = (unsigned long)cng_bounce_wait,
+                  d = (unsigned long)cng_bounce_dispatch;
+    return pc == w || pc == w + 4 || pc == (unsigned long)__cng_gate_end ||
+           pc == (unsigned long)cng_bounce_svc_end || (pc >= d && pc <= d + 12);
+}
+
+/* The request, served on the scratch stack with the guest's alt-stack out of
+ * the way, as a dispatch is (sigsys_on_scratch). `direct` is non-null for one
+ * delivered straight onto the frame (see cng_pt_sigsys_kick). */
+static void kick_on_scratch(void *ucv, void *direct) {
+    struct cng_ucontext *uc = ucv;
+    if (uc->uc_stack.ss_size && !(uc->uc_stack.ss_flags & CNG_SS_DISABLE)) {
+        cng_stack_t off = {0, CNG_SS_DISABLE, 0};
+        CNG_SYS(__NR_sigaltstack, (long)&off, 0, 0, 0, 0, 0);
+    }
+    cng_pt_sigsys_kick(uc, direct != 0);
+}
+
+static void sigsys_kick(struct cng_ucontext *uc) {
+    int i = cng_scratch_slot(sys_gettid());
+    unsigned long pc = (unsigned long)uc->uc_mcontext.pc;
+    /* Left for later: inside a dispatch this handler is making, inside the
+     * work of another handler of ours (one taking a stop, above all — a stop
+     * nested in it would be a second stop, its writes undone when that
+     * handler returns), or in any other code of ours but a dispatch running
+     * in guest context, which is where the kick's own stops are taken too. */
+    int later = i >= 0 && ((cng_scr[i].busy && cng_scr[i].uc) || cng_scr[i].inh);
+    if (!later && pc >= (unsigned long)__cng_image_start &&
+        pc < (unsigned long)__cng_image_end && !pc_in_stub(pc) &&
+        !(i >= 0 && cng_scr[i].gf))
+        later = 1;
+    if (later) {
+        if (i >= 0)
+            cng_scr[i].attach = 1;
+        return;
+    }
+    /* The first pass is the request itself, delivered onto this frame; a
+     * further one is a request left for it meanwhile, which displaced
+     * nothing here. */
+    int direct = 1;
+    do {
+        if (i >= 0)
+            cng_scr[i].attach = 0;
+        if (i >= 0 && !cng_scr[i].busy) {
+            cng_scr[i].busy = 1;
+            cng_scr[i].uc = uc;
+            cng_run_on_stack((void *)cng_scr[i].hi, (void *)kick_on_scratch, uc,
+                             direct ? (void *)1 : 0);
+            cng_scr[i].uc = 0;
+            cng_scr[i].busy = 0;
+        } else {
+            /* A dispatch from guest context holds the stack: in place, as the
+             * kick's handler serves one. */
+            if (i >= 0)
+                cng_scr[i].inh++;
+            cng_pt_sigsys_kick(uc, direct);
+            if (i >= 0)
+                cng_scr[i].inh--;
+        }
+        scr_note_back(i, uc);
+        direct = 0;
+    } while (i >= 0 && cng_scr[i].attach);
+}
+
 static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {
     (void)sig;
     /* A request from another thread of this process (execve.c's de_thread):
@@ -1008,8 +1170,13 @@ static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {
          * installed may siglongjmp out and never come back, which a busy flag
          * or a disarmed alt-stack would not survive. It used to be consumed
          * here and nothing happened, where the default action is a core dump. */
+        if (sigsys_is_kick(si)) {
+            sigsys_kick((struct cng_ucontext *)ucv);
+            return;
+        }
         if (si->si_code != CNG_SYS_SECCOMP) {
             cng_pt_deliver_sigsys(si, ucv);
+            cng_sig_note_return((struct cng_ucontext *)ucv);
             return;
         }
     }
@@ -1033,6 +1200,15 @@ static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {
     cng_scr[i].busy = 1;
     cng_scr[i].uc = (struct cng_ucontext *)ucv;
     cng_run_on_stack((void *)cng_scr[i].hi, (void *)fn, ucv, si);
+    scr_note_back(i, (struct cng_ucontext *)ucv);
+    /* A request that came in while this handler was busy (sigsys_kick): the
+     * frame is the guest's again, and it is taken on that, here. */
+    while (cng_scr[i].attach) {
+        cng_scr[i].attach = 0;
+        cng_run_on_stack((void *)cng_scr[i].hi, (void *)kick_on_scratch, ucv,
+                         0);
+        scr_note_back(i, (struct cng_ucontext *)ucv);
+    }
     cng_scr[i].uc = 0;
     cng_scr[i].busy = 0;
 }
@@ -1194,7 +1370,13 @@ int cng_sig_deliverable_in(const struct cng_ucontext *uc) {
  * mask holds back would not be delivered at the restart either. */
 int cng_sig_kick_pending(const struct cng_ucontext *uc) {
     unsigned long pend = 0, bit = 1UL << (cng_g_kicksig - 1);
-    if (!uc || (uc->uc_sigmask.sig[0] & bit))
+    if (!uc)
+        return 0;
+    /* ...or one carried by SIGSYS, left for this handler (sigsys_kick). */
+    int i = cng_scratch_slot(sys_gettid());
+    if (i >= 0 && cng_scr[i].attach)
+        return 1;
+    if (uc->uc_sigmask.sig[0] & bit)
         return 0;
     return CNG_SYS(__NR_rt_sigpending, &pend, sizeof pend, 0, 0, 0, 0) == 0 &&
            (pend & bit);

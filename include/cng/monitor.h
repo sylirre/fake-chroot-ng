@@ -560,6 +560,23 @@ int cng_sig_deliverable_in(const struct cng_ucontext *uc);
 int cng_sig_kick_pending(const struct cng_ucontext *uc);
 int cng_sig_kick_waiting(void);
 
+/* The frame a handler of ours last returned this thread to the guest with,
+ * noted (cng_sig_note_return) and asked about (cng_sig_returned_to): a ptrace
+ * request carried by SIGSYS that lands on that very frame was not delivered
+ * over a trap it displaced, since a handler of ours answered that trap. */
+void cng_sig_note_return(const struct cng_ucontext *uc);
+int cng_sig_returned_to(const struct cng_ucontext *uc);
+/* A ptrace request carried by SIGSYS left for the handler it landed in
+ * (sigsys.c, sigsys_kick): 1, and it is cleared, when there is one. */
+int cng_sig_take_deferred(void);
+/* Mark (d = 1) and unmark (d = -1) this thread as doing a handler of ours'
+ * own work, where a request carried by SIGSYS is left for later. Never across
+ * a guest's handler, which may siglongjmp out and leave the mark behind. */
+void cng_sig_in_handler(int d);
+/* Set once the SIGSYS handler has taken a trap out of guest code: the filter
+ * is live (it is not under qemu-user, which installs it and ignores it). */
+extern int cng_g_traps_live;
+
 /* What the guest's rt_sigprocmask asked for, as far as "every signal blocked"
  * goes, kept per thread (sigsys.c has the story): cng_sig_note_mask records it
  * from the emulated call, cng_sig_all_blocked reads it for another thread. The

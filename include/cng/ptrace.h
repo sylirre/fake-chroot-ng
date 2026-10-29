@@ -134,7 +134,10 @@ static inline struct cng_uregs *cng_pt_uregs(struct cng_ucontext *uc) {
  * tracer's own interception). SIGRTMAX: glibc claims SIGRTMIN..SIGRTMIN+2 and
  * Go preempts with SIGURG, so the top of the RT range is the quietest slot.
  * A guest-directed signal of the same number is told apart by the magic in
- * si_value and forwarded to the guest's own handler. */
+ * si_value and forwarded to the guest's own handler. A thread can block it,
+ * where the kernel's attach is a SIGSTOP nothing blocks, so a request of the
+ * ATTACH kind to a thread that holds it blocked goes as a SIGSYS of ours as
+ * well, with the same magic (ptrace.c pt_kick_attach, sigsys.c sigsys_kick). */
 #define CNG_PT_KICKSIG   64 /* the intent; cng_g_kicksig is what is used */
 #define CNG_PT_KICK_ATTACH 0x50544b21 /* "PTK!" — adopt attach/interrupt/stopsig */
 #define CNG_PT_KICK_WAKE   0x50545721 /* "PTW!" — no-op; ends a native wait */
@@ -284,6 +287,12 @@ void cng_pt_kick_taken(struct cng_ucontext *uc, int magic);
  * kernel would have restarted (an attach is a stop, not a delivery), put back
  * to be made again (cng_bounce_unwind), after the exit stop it owes. */
 void cng_pt_kick_unwind(struct cng_ucontext *uc);
+/* A request of the kick's kind carried by SIGSYS, to a thread that held the
+ * kick blocked (sigsys.c), on the frame it interrupted: a trap it displaced is
+ * made again when it was delivered `direct`ly onto that frame, and the stops
+ * are taken as the kick's handler takes them. A request left for a handler of
+ * ours and taken by it on its own frame is not direct. */
+void cng_pt_sigsys_kick(struct cng_ucontext *uc, int direct);
 
 /* process_vm_readv/writev where the peer is one of our stopped tracees: served
  * over the mailbox, because the host may refuse the real thing. `flags` is the

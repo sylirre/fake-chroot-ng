@@ -4275,7 +4275,11 @@ void (*cng_g_fork_parent_probe)(long kid);
  * tracer, finding a zombie, reported it killed by SIGKILL). SIGSYS stays open
  * for the gate-net, as in the handler, because a masked seccomp SIGSYS kills.
  * The child inherits the blocked mask, and each side puts the guest's back
- * once it is done with the fork. */
+ * once it is done with the fork. An attach sent as a SIGSYS of ours, to a
+ * thread that holds the kick blocked, is not held back by any mask, so the
+ * child marks the window as a handler's own work, where that request is left
+ * for later (sigsys.c, sigsys_kick); the kick lands once the guest's mask is
+ * back, or the tracer sends the SIGSYS again. */
 void cng_clone_convert(struct cng_uregs *ur) {
     unsigned long orig_flags = (unsigned long)ur->x[0];
     unsigned long child_stack = (unsigned long)ur->x[1];
@@ -4300,6 +4304,7 @@ void cng_clone_convert(struct cng_uregs *ur) {
     long ret = cng_syscall6(flags, 0, (long)ur->x[2], (long)ur->x[3],
                             (long)ur->x[4], (long)ur->x[5], __NR_clone);
     if (ret == 0) {
+        cng_sig_in_handler(1);
         if (cng_g_fork_child_probe)
             cng_g_fork_child_probe();
         cng_procreg_fork_child(forker); /* registered before any guest code */
@@ -4315,6 +4320,8 @@ void cng_clone_convert(struct cng_uregs *ur) {
             ur->sp = child_stack;
         ur->x[0] = 0;
         cng_pt_fork_child(ur, ev);
+        cng_sig_in_handler(-1);
+        (void)cng_sig_take_deferred(); /* it is sent again: see above */
         CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, &mask, 0, 8, 0, 0);
         return;
     }

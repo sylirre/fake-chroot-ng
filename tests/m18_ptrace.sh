@@ -209,6 +209,19 @@ else
     # could not be stopped until it returned (the attach hung), and the kick
     # that stops a thread ended its call with EINTR.
     pt_case blocked
+    # ...and the same with every signal blocked in the thread, as GLib's are.
+    # The kernel's attach is a SIGSTOP, which no mask holds back; ours is a
+    # kick, an ordinary signal, and the attach hung on such a thread for good —
+    # a crashed Chrome never exited, its crashpad waiting on gmain. The request
+    # is now sent as a SIGSYS too, which the guest can never block.
+    pt_case blockedmask
+    # ...and to such a thread that never sleeps, making trapped calls (a mkdir
+    # and an rmdir) as fast as it can, a hundred attaches: every one must stop
+    # it, and none may lose it a call or make one twice. A SIGSYS of ours
+    # pending when the thread traps absorbs the trap's, and the kernel skips
+    # the call; the handler makes it again, unless the frame is the one a
+    # handler of ours has just answered it with.
+    pt_case blockspin
     # ...and to two hundred tasks of one process, one after another: the
     # tracee's per-task state used to sit in 128 slots that were never given
     # back, so the 129th attach was reported a success and never stopped.
@@ -297,7 +310,8 @@ else
         PT_TIER_NAME=" (SIGSYS tier)"
         for _sc in basic sysstop cancel poke signal deliver fork exec \
             execstart patharg exitstop break step step2 attach fpregs blocked \
-            attachmany sigact sigchld sigchldw waitid waitnowait options; do
+            blockedmask blockspin attachmany sigact sigchld sigchldw waitid \
+            waitnowait options; do
             pt_case "$_sc"
         done
         pt_case sysinfo "syscall_info unsupported" \

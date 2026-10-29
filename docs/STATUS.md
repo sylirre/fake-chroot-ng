@@ -4727,15 +4727,12 @@ vfork/`posix_spawn` child-stack handling.
     that dispatch behind, as on `-R`. Under `-R` a guest handler that runs
     while a call blocks is still delivered on the scratch stack: putting the
     svc on the guest's stack there would cost the hot path a lookup per call.
-  - Found while testing, not fixed: a crashed Chrome browser still hangs.
-    GLib's `gmain` thread blocks nearly every signal, the kick (SIGRTMAX)
-    among them, so crashpad's PTRACE_ATTACH to it never stops it, and
-    crashpad waits in its waitpid for good with every other thread parked
-    in its attach stop. The kernel attaches with SIGSTOP, which no mask
-    holds back. The kick would have to be as unblockable: taken out of guest
-    masks as SIGSYS is (which breaks a guest that blocks SIGRTMAX to
-    sigwait it), or sent as a SIGSYS of ours to a thread whose mask holds
-    the kick.
+  - Found while testing, fixed by M107: a crashed Chrome browser still
+    hung. GLib's `gmain` thread blocks nearly every signal, the kick
+    (SIGRTMAX) among them, so crashpad's PTRACE_ATTACH to it never stopped
+    it, and crashpad waited in its waitpid for good with every other thread
+    parked in its attach stop. The kernel attaches with SIGSTOP, which no
+    mask holds back.
   - Tests: m6 `tests/guests/blkcall.c` blocks in accept, recvfrom, a FIFO
     open and an AF_UNIX recvfrom that wants the sender's address, signals
     the thread with and without `SA_RESTART`, and checks SIGTERM against a
@@ -4753,6 +4750,72 @@ vfork/`posix_spawn` child-stack handling.
     the SIGSYS tier when the filter is live; they ran under `-R` only, so
     the tier a device runs by default had only `-t ptracetest`'s
     synthesized traps. All 26 match the kernel there (arm64 VM).
+
+- [x] **M107 — an attach could not stop a thread that blocked the kick**
+  The kick that stops a running task for its tracer (PTRACE_ATTACH, SEIZE's
+  INTERRUPT, a routed stop signal) is a real-time signal, and a thread can
+  block it. GLib's threads block nearly everything. The kernel attaches with
+  SIGSTOP, which no mask holds back, so a crashed Chrome's crashpad stopped
+  every thread but `gmain`, whose kick sat pending for good. Crashpad waited
+  on it and the browser never exited. Owner's choice: send such a request
+  as a SIGSYS of ours, the one signal the guest can never block (SIGSYS is
+  taken out of every guest mask).
+  - The tracer reads the target thread's `SigBlk` when it sends the kick,
+    and sends the request as a SIGSYS as well (`SI_QUEUE`, the kick's magic)
+    when the kick is blocked. While a request is outstanding, its wait
+    sends the SIGSYS again every slice, as long as the kick is still
+    blocked there. A standard signal absorbs a second one, so the resend
+    costs nothing. It covers a thread that blocks the kick after the first
+    look, and a SIGSYS absorbed by one of the target's own traps. The
+    session must have our SIGSYS handler (`cng_g_sigsys_ready`): without
+    it, the default action would kill the target.
+  - The SIGSYS handler takes the request at once in guest code, in a bounce
+    stub, or in a dispatch running in guest context, the way the kick's
+    handler takes one. Anywhere else in chroot-ng no stop can be taken on
+    the frame: a dispatch the handler itself is making, the work of our kick
+    or trace handler (marked per thread, never across a guest's handler), or
+    a fork child's hooks, which M86 keeps the kick out of. There the request
+    is noted for later. The handler underneath takes it on its way out, a
+    wait it polls ends for it, and otherwise the tracer's resend reaches the
+    thread later. The pending requests are claimed atomically. A nested
+    request that took the attach too made a second SIGSTOP stop, which the
+    tracer never collected (found with `fpregs` under `-R`).
+  - SIGSYS costs what the kick does not. A thread holds at most one
+    standard signal pending, so a trap taken while our SIGSYS is pending is
+    merged into it. The kernel skips the call, puts its first argument back
+    in x0, and delivers our siginfo instead. The handler makes such a call
+    again (pc back to the svc, which is also where a stop shows a call about
+    to be made). To decide, it asks whether the call behind the frame traps
+    at all, by running the installed filters over it (`cng_seccomp_traps`,
+    `cng_bpf_run` moved out of the test code, the base program kept from its
+    install). An ambient refusal counts by `cng_blocked`, and a filter that
+    has never trapped (qemu-user) makes nothing a trap. A call a handler of
+    ours answered and just returned from leaves the same frame. Every return
+    of our SIGSYS and kick handlers therefore notes the frame it goes back
+    to (pc, sp, x0-x2, x8, x30), and a request that lands on exactly that
+    frame is not read as having displaced anything. Only a request delivered
+    straight onto the guest's frame is judged at all. One left for a handler
+    and taken on that handler's frame displaced nothing there. Judged anyway,
+    with the filters an attach had added since, a write the guest had just
+    made was taken for a displaced trap and made twice: `attachmany` on the
+    Pixel 5's SIGSYS tier, 1 run in 40.
+  - Residue: which of the tracee and tracer filters a thread carries comes
+    from its own per-task record, so a thread created by a traced one after
+    its attach, which inherits the filter but not the record, can have a
+    displaced trap misjudged. A request that lands in our trace handler
+    while it runs a guest's handler is not taken there; the resend reaches
+    it.
+  - Tests: m18 `ptrace blockedmask` is `blocked` with every signal blocked
+    in the tracee. `ptrace blockspin` attaches 100 times to a thread with
+    every signal blocked that spins on `mkdir`/`rmdir`, which trap. Every
+    attach must stop it. A lost call would return -100, and one made twice
+    would return EEXIST. Both run on both tiers and match the kernel (arm64
+    VM, dev host). The old build hangs the attach in both scenarios. With
+    the remake of a displaced call disabled, `blockspin` loses calls on the
+    SIGSYS tier in two runs of three, and with the returned-to frame
+    ignored it makes calls twice in three of three. On the Pixel 5, a
+    crashed Chrome browser now exits in 3 s and leaves a minidump with all
+    37 of its threads, none with a pc in chroot-ng.
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 

@@ -26,6 +26,7 @@
 #include "cng/ptrace.h"
 #include "cng/rewrite.h"
 #include "cng/rt.h"
+#include "cng/seccomp.h"
 #include "cng/syscall.h"
 #include "cng/tab.h"
 #include "cng/uapi.h"
@@ -369,6 +370,96 @@ void cng_pt_kick(s32 tgid, s32 tid, int magic) {
     if (tid <= 0 ||
         CNG_SYS(__NR_rt_tgsigqueueinfo, tgid, tid, cng_g_kicksig, &si, 0, 0) < 0)
         CNG_SYS(__NR_rt_sigqueueinfo, tgid, cng_g_kicksig, &si, 0, 0, 0);
+}
+
+/* The first `pat` in the NUL-terminated `s`, or 0. */
+static const char *pt_strfind(const char *s, const char *pat) {
+    size_t n = strlen(pat);
+    for (; *s; s++)
+        if (!strncmp(s, pat, n))
+            return s;
+    return 0;
+}
+
+/* Does thread `tid` of `tgid` hold the kick blocked? Asked of its own status
+ * file (SigBlk), which is the kernel's answer for the moment of reading: the
+ * guest's mask while it runs its own code, ours (everything) while it is in a
+ * handler of ours. 0 when it cannot be read. */
+static int pt_kick_blocked(s32 tgid, s32 tid) {
+    char path[64], buf[2048];
+    cng_snprintf(path, sizeof path, "/proc/%d/task/%d/status", (int)tgid,
+                 (int)tid);
+    long fd = sys_openat(CNG_AT_FDCWD, path, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    if (fd < 0)
+        return 0;
+    /* SigBlk sits past the Groups line, which a process with many groups
+     * makes long: a window at a time, the tail carried over. */
+    long keep = 0, n;
+    int blocked = 0;
+    while ((n = sys_read((int)fd, buf + keep, sizeof buf - 1 - (size_t)keep)) >
+           0) {
+        n += keep;
+        buf[n] = 0;
+        const char *f = pt_strfind(buf, "\nSigBlk:");
+        if (f && strchr(f + 1, '\n')) {
+            f += 9;
+            while (*f == ' ' || *f == '\t')
+                f++;
+            unsigned long long m = 0;
+            for (;; f++) {
+                int d = (*f >= '0' && *f <= '9')   ? *f - '0'
+                        : (*f >= 'a' && *f <= 'f') ? *f - 'a' + 10
+                                                   : -1;
+                if (d < 0)
+                    break;
+                m = m * 16 + (unsigned long long)d;
+            }
+            blocked = (m >> (cng_g_kicksig - 1)) & 1;
+            break;
+        }
+        keep = n > 64 ? 64 : n; /* enough for a field name split in two */
+        memmove(buf, buf + n - keep, (size_t)keep);
+    }
+    sys_close((int)fd);
+    return blocked;
+}
+
+/* Can a task of this session take a SIGSYS of ours? Every guest process has
+ * the handler from the moment the monitor is installed, which this process
+ * says for all of them; one without it — a self-test's — would be killed by
+ * the signal's default action. */
+static int pt_sigsys_kickable(void) { return cng_g_sigsys_ready; }
+
+/* The same request as a SIGSYS, which no guest mask holds back (see the
+ * request's side in sigsys.c, sigsys_kick). A standard signal: one already
+ * pending absorbs it, so sending it again costs nothing. */
+static void pt_sigsys_kick(s32 tgid, s32 tid) {
+    struct {
+        int signo, errno_, code;
+        int pad;
+        int pid;
+        unsigned uid;
+        int sival_int;
+        int pad2;
+        u64 rest[12];
+    } si;
+    memset(&si, 0, sizeof si);
+    si.signo = CNG_SIGSYS;
+    si.code = -1; /* SI_QUEUE */
+    si.pid = (int)sys_getpid();
+    si.sival_int = CNG_PT_KICK_ATTACH;
+    CNG_SYS(__NR_rt_tgsigqueueinfo, tgid, tid, CNG_SIGSYS, &si, 0, 0);
+}
+
+/* A request that stops task `tid` — an attach, an interrupt, a routed stop
+ * signal: the kick, and the SIGSYS as well when the task holds the kick
+ * blocked, as GLib's threads do (the kernel's SIGSTOP stops them all the
+ * same). The kick stays pending there, and finds nothing left to do if it is
+ * ever let in. */
+static void pt_kick_attach(s32 tgid, s32 tid) {
+    cng_pt_kick(tgid, tid, CNG_PT_KICK_ATTACH);
+    if (tid > 0 && pt_sigsys_kickable() && pt_kick_blocked(tgid, tid))
+        pt_sigsys_kick(tgid, tid);
 }
 
 /* ---- per-task state ---- */
@@ -1827,6 +1918,11 @@ void cng_pt_service_kick(struct cng_ucontext *uc) {
         return;
     struct cng_uregs *r = cng_pt_uregs(uc);
     struct pt_self *s = pt_self_get(0);
+    /* Parked in a stop already (a request carried by SIGSYS reaches a thread
+     * in any handler of ours): no stop can be taken inside one. What is
+     * pending stays so, for the next request to find. */
+    if (s && s->active && s->in_stop)
+        return;
     if (!s || !s->active) {
         /* A pending PTRACE_ATTACH/SEIZE keyed by this task's own tid. */
         struct pt_link *e = pt_find((s32)sys_gettid());
@@ -1836,11 +1932,13 @@ void cng_pt_service_kick(struct cng_ucontext *uc) {
         /* The state first, the flag after: the tracer was told its attach
          * succeeded, so a slot that cannot be had (the host would not give
          * the page) leaves the attach pending for the next stop point rather
-         * than consumed with nothing to show for it. */
+         * than consumed with nothing to show for it. The flag is claimed,
+         * not cleared: a request carried by SIGSYS can be taken on this same
+         * thread, nested over this one, and only one of the two may attach
+         * (each would stop the thread, and the tracer collects one stop). */
         s = pt_self_get(1);
-        if (!s)
+        if (!s || !__atomic_exchange_n(&e->attach_pending, 0, __ATOMIC_ACQ_REL))
             return;
-        __atomic_store_n(&e->attach_pending, 0, __ATOMIC_RELEASE);
         s->link = e;
         s->active = 1;
         g_pt_local = 1;
@@ -1864,14 +1962,50 @@ void cng_pt_service_kick(struct cng_ucontext *uc) {
     struct pt_link *e = s->link;
     if (!e)
         return;
-    int intr = __atomic_load_n(&e->interrupt_pending, __ATOMIC_ACQUIRE) != 0;
-    if (intr)
-        __atomic_store_n(&e->interrupt_pending, 0, __ATOMIC_RELEASE);
-    u32 ss = __atomic_load_n(&e->stopsig_pending, __ATOMIC_ACQUIRE);
-    if (ss)
-        __atomic_store_n(&e->stopsig_pending, 0, __ATOMIC_RELEASE);
+    /* Claimed, for the same reason as the attach above. */
+    int intr = __atomic_exchange_n(&e->interrupt_pending, 0, __ATOMIC_ACQ_REL) != 0;
+    u32 ss = __atomic_exchange_n(&e->stopsig_pending, 0, __ATOMIC_ACQ_REL);
     if (intr || ss)
         pt_kick_stops(s, uc, 0, intr, (int)ss);
+}
+
+/* Did the request this SIGSYS carries displace a trap? A thread takes the
+ * request at the first return to user mode after it was sent, and a trap
+ * taken while it was pending is merged into it: the kernel skips the call,
+ * puts back its first argument (x0 = orig_x0), and delivers our siginfo
+ * instead. That leaves the frame just past the svc — and so does a call that
+ * was made, native or answered by a handler of ours that has just returned.
+ * The first is told apart by asking the filters whether the call traps at
+ * all, the second because the frame is the one that handler returned with. */
+static int pt_trap_displaced(const struct cng_ucontext *uc) {
+    const struct cng_uregs *r =
+        (const struct cng_uregs *)&uc->uc_mcontext.regs[0];
+    u32 w;
+    if ((r->pc & 3) || r->pc < 4 ||
+        cng_user_copyin(&w, (const void *)(unsigned long)(r->pc - 4), 4) < 0 ||
+        w != 0xD4000001u /* svc #0 */)
+        return 0;
+    if (cng_sig_returned_to(uc))
+        return 0;
+    struct pt_self *s = g_pt_local ? pt_self_get(0) : 0;
+    return cng_seccomp_traps((long)(s32)r->x[8], r->x, (unsigned long)r->pc,
+                             s && s->traceall, s && s->tracer_armed);
+}
+
+void cng_pt_sigsys_kick(struct cng_ucontext *uc, int direct) {
+    struct cng_uregs *r = cng_pt_uregs(uc);
+    /* The displaced call is made again once the stops are over, from its svc,
+     * which is also where the kernel shows a call it is about to make. Only a
+     * request delivered straight onto the guest's frame can have displaced
+     * one: taken later, on the frame of the handler it was left for, the
+     * frame is that handler's, and whatever call it shows was made — with the
+     * filters as they were then, which an attach since may have added to. */
+    if (direct && pt_trap_displaced(uc))
+        r->pc -= 4;
+    cng_pt_set_frame(r, uc);
+    cng_pt_service_kick(uc);
+    cng_pt_kick_unwind(uc);
+    cng_pt_kick_taken(uc, CNG_PT_KICK_ATTACH);
 }
 
 /* Any other kick of ours: no stop, but a wait it cut short that the kernel
@@ -2061,7 +2195,7 @@ long cng_pt_syscall(long req, long pid, u64 addr, u64 data) {
         __atomic_store_n(&e->attach_pending, 1, __ATOMIC_RELEASE);
         __atomic_store_n(&g_tab->any_trace, 1, __ATOMIC_RELEASE);
         g_pt_local = 1;
-        cng_pt_kick(tgid, (s32)pid, CNG_PT_KICK_ATTACH);
+        pt_kick_attach(tgid, (s32)pid);
         return 0;
     }
 
@@ -2073,7 +2207,7 @@ long cng_pt_syscall(long req, long pid, u64 addr, u64 data) {
         if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_STOPPED)
             return 0; /* already stopped */
         __atomic_store_n(&e->interrupt_pending, 1, __ATOMIC_RELEASE);
-        cng_pt_kick(e->tgid, (s32)pid, CNG_PT_KICK_ATTACH);
+        pt_kick_attach(e->tgid, (s32)pid);
         return 0;
     }
 
@@ -2421,6 +2555,30 @@ void cng_pt_note_reaped(long pid) {
 static int pt_signal_pending(const struct cng_ucontext *uc) {
     return cng_sig_deliverable_in(uc);
 }
+/* Every request of this tracer's that has not been taken, sent again by SIGSYS
+ * where its task holds the kick blocked now: one sent while the task had the
+ * kick open can find it blocked by the time it arrives, and a SIGSYS sent
+ * while the task's own trap was pending was absorbed by that trap's. Asked
+ * once per slice of a wait, and of the status file only for a request still
+ * outstanding. */
+static void pt_rekick_blocked(void) {
+    if (!g_tab || !pt_sigsys_kickable())
+        return;
+    s32 me = (s32)sys_getpid();
+    for (int i = 0; i < PT_MAX; i++) {
+        struct pt_link *e = &g_tab->links[i];
+        s32 t = __atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE);
+        if (t <= 0 || __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) != me)
+            continue;
+        if (!__atomic_load_n(&e->attach_pending, __ATOMIC_ACQUIRE) &&
+            !__atomic_load_n(&e->interrupt_pending, __ATOMIC_ACQUIRE) &&
+            !__atomic_load_n(&e->stopsig_pending, __ATOMIC_ACQUIRE))
+            continue;
+        if (pt_kick_blocked(e->tgid, t))
+            pt_sigsys_kick(e->tgid, t);
+    }
+}
+
 /* A ptrace kick is not a signal of the guest's, and must not end its wait the
  * way one does. But masked in the handler, it could not land while the wait
  * lasted, and a tracer attaching to this task (or interrupting it) would hang
@@ -2531,6 +2689,7 @@ long cng_pt_wait4(long pid, u64 status, long options, u64 rusage,
             return -EINTR;
         if (pt_kick_waiting(uc))
             return -CNG_ERESTART;
+        pt_rekick_blocked();
         if (g_tab)
             fx_wait(&g_tab->global_gen, gen, PT_WPOLL_MS);
     }
@@ -2625,6 +2784,7 @@ long cng_pt_waitid(long idtype, long id, u64 infop, long options, u64 rusage,
             return -EINTR;
         if (pt_kick_waiting(uc))
             return -CNG_ERESTART;
+        pt_rekick_blocked();
         if (g_tab)
             fx_wait(&g_tab->global_gen, gen, PT_WPOLL_MS);
     }
@@ -2804,7 +2964,7 @@ int cng_pt_signal_route(long pid, int sig) {
          * we kick each live link, which is the same thing for a group whose
          * threads are all traced. */
         __atomic_store_n(&e->stopsig_pending, (u32)sig, __ATOMIC_RELEASE);
-        cng_pt_kick(e->tgid, t, CNG_PT_KICK_ATTACH);
+        pt_kick_attach(e->tgid, t);
         routed = 1;
     }
     return routed;
